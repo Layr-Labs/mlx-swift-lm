@@ -47,6 +47,7 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
         defer { scratch.release() }
         let count = min(maximumBytes, bytes - byteOffset)
         let packedBytes = role.packedCount * role.packedRowBytes
+        let encoder = try CBv2PreparedNativeCheckpointRowEncoder(role: role)
         let tokenCount = role.position - role.tokenStart
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
@@ -64,8 +65,7 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
                     descriptor: nativeDescriptor,
                     byteOffset: (head * tokenCount + token) * role.nativeRowBytes,
                     maximumBytes: role.nativeRowBytes, nativeWork: nativeWork)
-                let row =
-                    packed ? try CBv2NativeCheckpointRowCodec.encode(native, role: role) : native
+                let row = packed ? try encoder.encode(native) : native
                 guard row.count == rowBytes else {
                     throw CBv2CompleteCheckpointError.incompleteTransfer
                 }
