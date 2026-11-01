@@ -10,17 +10,8 @@ public struct Gemma4TensorParallelError: Error, CustomStringConvertible, Equatab
     init(_ description: String) { self.description = description }
 }
 
-/// One rank's equal share of a channel-parallel width (the dense MLP, or each
-/// routed expert) whose quantization groups may not divide evenly.
-///
-/// Each rank computes a contiguous half of the channels. The down projection
-/// is quantized in groups along its input axis, so its stored input columns
-/// widen to whole groups: with an odd group count (Gemma 4 26B: 2112 = 33 x
-/// 64, 704 = 11 x 64) both ranks store the middle group. Each rank's gate and
-/// up projections then carry zero rows for the other rank's half of that
-/// group (zero weights, scales and offsets), so those channels are exactly
-/// zero and the shared group's columns add nothing on the rank that does not
-/// own them. Both ranks hold the same local width.
+/// One rank's equal half of a channel width. With an odd group count both ranks store the
+/// middle down-projection group, and zero gate/up rows make the other rank's half of it add 0.
 public struct Gemma4ChannelShard: Sendable, Equatable {
     public let width: Int
     public let groupSize: Int
@@ -62,23 +53,9 @@ public struct Gemma4ChannelShard: Sendable, Equatable {
     public var paddingAfter: Int { localWidth - localChannels.upperBound }
 }
 
-/// One rank of a two-rank tensor-parallel Gemma 4 text model (the MoE
-/// variant): every layer on every rank, each holding half of each head- or
-/// channel-parallel weight.
-///
-/// - Attention: contiguous halves of the query heads with the KV heads they
-///   read (q, k, v rows; `o_proj` input columns). Query head `h` reads KV head
-///   `h / (queries / kv)`, so halves keep every group whole: sliding layers 8
-///   query and 4 KV heads per rank, full layers 8 and 1. Full layers keep K=V.
-/// - Dense MLP and every routed expert: half the channels each (gate/up
-///   output rows, down input columns), with the overlap and zero padding of
-///   `Gemma4ChannelShard`. The router is replicated, so ranks route alike.
-/// - The tied embedding is replicated for lookup; the head projects this
-///   rank's half of the vocabulary rows.
-///
-/// Each layer then needs two sums across ranks: the attention output before
-/// `post_attention_layernorm`, and one packed collective carrying the dense
-/// and the expert branches' FP32 partials before their separate post-norms.
+/// One rank of a two-rank Gemma 4 MoE text model: half the query heads with their KV heads, half
+/// of every channel width (`Gemma4ChannelShard`) and half the vocabulary rows of the tied head.
+/// Each layer sums the attention output and one packed feed-forward collective across ranks.
 public struct Gemma4TensorShard: Sendable, Equatable {
     public let rank: Int
     public let size: Int
@@ -151,6 +128,12 @@ public struct Gemma4TensorShard: Sendable, Equatable {
         local.moeIntermediateSize = try expertChannels(c).localWidth
         return local
     }
+}
+
+/// Submits a CBv2 forward's hidden rows every `stride` decoder layers (0: never).
+/// Evaluation order only: every value is the one the whole forward computes.
+public enum Gemma4LayerSubmission {
+    @TaskLocal public static var stride = 0
 }
 
 /// Unrounded FP32 partials of a row-parallel projection.
@@ -273,16 +256,8 @@ extension Gemma4DecoderLayer {
 }
 
 extension Gemma4Experts {
-    /// The routed experts of a tensor-parallel rank, whose down projection is
-    /// a `TensorParallelSwitchLinear`: every selected expert's FP32 partial
-    /// and `densePartial` (`[B, S, H]`) cross in ONE collective. Returns the
-    /// weighted expert output (`x`'s dtype) and the dense branch's FP32 sum.
-    ///
-    /// Where the unsharded block keeps singleton slices (the registered
-    /// prompt policy's tokens, the scoped batch decode's rows), each slice's
-    /// partial is computed as that slice's own call computes it, and all of
-    /// them are packed into the one collective; a collective adds each
-    /// element on its own, so each sum equals the slice's own collective.
+    /// Every selected expert's FP32 partial and `densePartial` summed in one collective: the
+    /// weighted expert output and the dense FP32 sum. Scoped singleton slices pack into it too.
     func tensorParallelCall(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray,
         isExpertPrefill: Bool, carrying densePartial: MLXArray
@@ -350,14 +325,8 @@ extension Gemma4TextModel {
         tensorParallelHead?.rows ?? 0 ..< configuration.vocabSize
     }
 
-    /// Makes this model, built from `shard.localConfiguration(full)` and
-    /// loaded with that rank's cut weights, one rank of a tensor-parallel
-    /// pair: each layer's `o_proj` sum, its packed feed-forward collective
-    /// (each expert down projection becomes a `TensorParallelSwitchLinear`),
-    /// and a head over this rank's vocabulary rows. `allSum` builds the
-    /// cross-rank FP32 sum into the graph; it must not evaluate by itself.
-    /// `packFeedForward: false` is a diagnostic: the dense partial then takes
-    /// its own collective (three a layer instead of two, the same values).
+    /// Makes this model, built from `shard.localConfiguration(full)` with the rank's cut weights,
+    /// one rank of a pair. `allSum` must stay lazy; `packFeedForward: false` is a diagnostic.
     public func installTensorParallel(
         shard: Gemma4TensorShard, full: Gemma4TextConfiguration,
         packFeedForward: Bool = true,

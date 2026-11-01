@@ -1858,6 +1858,7 @@ public class Gemma4TextModelInner: Module {
         // Forward through layers, tracking intermediate KV pairs for sharing
         var intermediates = [(kv: Gemma4SharedKVState?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
+        let submissionStride = Gemma4LayerSubmission.stride
 
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
@@ -1922,6 +1923,10 @@ public class Gemma4TextModelInner: Module {
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
+            } else if isCBv2, submissionStride > 0, layerNumber < layers.count,
+                layerNumber.isMultiple(of: submissionStride)
+            {
+                asyncEval(h)
             }
         }
 

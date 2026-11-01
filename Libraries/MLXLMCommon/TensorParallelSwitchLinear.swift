@@ -14,19 +14,12 @@ public protocol Qwen35TensorParallelPackedPartial: AnyObject {
 /// The name Qwen's routed-expert tensor parallel was built against.
 public typealias Qwen35TensorParallelSwitchLinear = TensorParallelSwitchLinear
 
-/// An expert projection whose outputs are sums of FP32 partials (a
-/// tensor-parallel rank's, or a single-process oracle of one). Its owning
-/// SwitchGLU keeps the unsort and weighted sum after it, so every expert row
-/// is summed and rounded before router weighting.
+/// An expert projection whose outputs are sums of FP32 partials: its SwitchGLU keeps the
+/// unsort and weighted sum, so each expert row is summed and rounded before router weighting.
 public protocol SwitchLinearPartialSum: AnyObject {}
 
-/// A channel-sharded expert down projection (Qwen 3.5 routed experts, Gemma 4
-/// `.gemma4ProductionGeGLU` experts). The collective receives unrounded FP32
-/// expert outputs, before the owning SwitchGLU restores route order and
-/// applies router weights. Whatever the owning block adds afterwards (Qwen's
-/// gated shared expert, Gemma's separately normalized dense branch) stays
-/// downstream; its own FP32 partial may ride in the same collective
-/// (`carrying`).
+/// A channel-sharded expert down projection (Qwen 3.5, Gemma 4) whose collective sums unrounded
+/// FP32 expert rows; another branch's FP32 partial may ride in it (`carrying`).
 public final class TensorParallelSwitchLinear: QuantizedSwitchLinear, SwitchLinearPartialSum {
     private final class Reduction {
         let sum: (MLXArray) -> MLXArray
