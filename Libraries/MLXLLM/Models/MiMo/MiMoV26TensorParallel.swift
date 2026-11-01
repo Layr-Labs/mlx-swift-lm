@@ -253,8 +253,8 @@ extension MiMoV26TextModel {
     /// and its feed-forward partial through `reduce`, and `lm_head` becomes
     /// an unloaded shell of `vocabularyRows`. `reduce` adds FP32 partials
     /// across ranks inside the graph; it must not evaluate by itself.
-    /// Paged, CBv2 and MTP owners refuse the model: its head is not the whole
-    /// vocabulary.
+    /// CBv2 and MTP owners refuse the model (its head is not the whole
+    /// vocabulary); independent-history pages serve it one row at a time.
     public func installTensorParallel(
         reduce: @escaping (MLXArray) -> MLXArray, vocabularyRows: Range<Int>
     ) throws {
