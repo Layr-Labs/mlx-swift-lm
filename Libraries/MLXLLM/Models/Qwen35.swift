@@ -2379,6 +2379,7 @@ public class Qwen35TextModelInner: Module {
                 var pending: MLXArray?
                 var attentionIndex = 0
                 let submissionStride = Qwen35LayerSubmission.stride
+                let observer = Qwen35LayerSubmission.observer
                 for (modelLayerIndex, layer) in layers.enumerated() {
                     let attentionCache: (any CBv2AttendingLayerCache)?
                     if layer.isLinear {
@@ -2399,7 +2400,10 @@ public class Qwen35TextModelInner: Module {
                         positionIds: positionIds,
                         captureRecurrentWindow: captureRecurrentWindow,
                         exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
-                    if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
+                    if let observer {
+                        // The layer's output h = x + T(r), as the next residual norm sums it.
+                        observer(modelLayerIndex, residual + pending!.asType(residual.dtype))
+                    } else if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
                         modelLayerIndex + 1 < layers.count
                     {
                         asyncEval(residual, pending!)
