@@ -94,7 +94,7 @@ struct Mistral3PixelLayoutAndMaskTests {
         let prompt = [[5, 7, 9, 11, 13, 15, 17, 19, 21]]
         let withoutCache = Mistral3MaskTinyModel.logits(model, prompt, cache: nil)
         let withCache = Mistral3MaskTinyModel.logits(
-            model, prompt, cache: model.newCache(parameters: nil))
+            model, prompt, cache: try model.newCache(parameters: nil))
         #expect(withoutCache.shape == [1, 9, 64], "logits shape without a cache")
         let difference = Mistral3MaskTinyModel.maxAbsDifference(withoutCache, withCache)
         #expect(

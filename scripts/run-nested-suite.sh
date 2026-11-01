@@ -5,7 +5,7 @@
 # `swift test` exits with 0 when the filter matches no test, so the exit code
 # alone does not show that the suite ran. The suites that use this script need
 # no model weights. The caller sets any environment variable that a test
-# needs: scripts/run-paged-kernel-tests.sh sets
+# needs: a group in .github/test-shards.json sets
 # DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 for one test. A skipped test means
 # that a precondition is broken, for example a missing Metal library.
 #

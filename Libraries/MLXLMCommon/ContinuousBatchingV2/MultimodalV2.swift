@@ -88,6 +88,12 @@ public enum CBv2CausalPositionRequirement: Sendable, Equatable {
     case scalarCacheOffset
 }
 
+/// Model-level explicit position contract passed through the generic language
+/// adapter. Absence preserves request-owned positions for existing models.
+public protocol CBv2CausalPositionRequirementProviding {
+    var cbv2CausalPositionRequirement: CBv2CausalPositionRequirement { get }
+}
+
 /// Optional attention-specific backend admission. A native causal-only owner
 /// can accept embedding substitution without pretending to implement a
 /// bidirectional span-mask setter. Existing providers retain the old gate.

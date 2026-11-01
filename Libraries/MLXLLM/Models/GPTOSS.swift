@@ -49,7 +49,7 @@ public struct GPTOSSConfiguration: Codable, Sendable {
         case layerTypes = "layer_types"
     }
 
-    public init(from decoder: Decoder) throws {
+    public init(from decoder: Swift.Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decode(String.self, forKey: .modelType)
         self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
@@ -78,6 +78,40 @@ private func mlxTopK(_ a: MLXArray, k: Int, axis: Int = -1) -> (values: MLXArray
     return (topKValues, topKIndices)
 }
 
+/// History serializer for GPT-OSS.
+///
+/// Relies entirely on structured `Chat.Message.tool` metadata. It never
+/// reconstructs tool calls by sniffing JSON out of `content` — that was both
+/// incorrect for Harmony (where content must not contain channel frames) and
+/// unsafe (any JSON-shaped assistant reply could be re-dispatched).
+///
+/// Harmony analysis is not serialized: the live tool continuation retains the
+/// exact generated tokens in the KV cache, while a later transcript rebuild
+/// keeps the response + tool-call structure without replaying private reasoning.
+package struct GPTOSSMessageGenerator: MessageGenerator {
+    package init() {}
+
+    package func generate(messages: [Chat.Message]) -> [Message] {
+        messages.map { generate(message: $0) }
+    }
+
+    package func generate(message: Chat.Message) -> Message {
+        var dictionary: Message = [
+            "role": message.role.rawValue,
+            "content": message.content,
+        ]
+        addToolMetadata(to: &dictionary, for: message)
+
+        // GPT-OSS template reads tool_calls[0] only. The Harmony router emits
+        // at most one call per turn, so this is a defensive clamp for history
+        // assembled by other paths.
+        if let calls = dictionary["tool_calls"] as? [[String: any Sendable]], calls.count > 1 {
+            dictionary["tool_calls"] = [calls[0]]
+        }
+        return dictionary
+    }
+}
+
 class AttentionBlock: Module {
     let headDim: Int
     let numAttentionHeads: Int
@@ -101,6 +135,7 @@ class AttentionBlock: Module {
         self.numKeyValueGroups = config.attentionHeads / config.kvHeads
 
         _sinks.wrappedValue = zeros([config.attentionHeads])
+
         _qProj.wrappedValue = Linear(
             config.hiddenSize, config.attentionHeads * config.headDim, bias: true)
         _kProj.wrappedValue = Linear(config.hiddenSize, config.kvHeads * config.headDim, bias: true)
@@ -153,9 +188,29 @@ class AttentionBlock: Module {
         let (B, L) = (x.dim(0), x.dim(1))
         let D = headDim
 
-        var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let independent = cache is any GPTOSSPerRowAttentionCache
+        func project(_ layer: Linear) -> MLXArray {
+            independent ? GPTOSSBatchDecodeProjection.linear(layer, x) : layer(x)
+        }
+        var q = project(qProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var k = project(kProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var v = project(vProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+
+        // Cluster stages can batch projections while retaining each request's
+        // ordinary full/sliding attention order. This model-owned hook avoids
+        // pretending a physical rotating cache has CBv2's chronological views.
+        if let perRow = cache as? any GPTOSSPerRowAttentionCache {
+            let offsets = perRow.scalarPositionOffsets
+            precondition(
+                offsets.count == B && offsets.allSatisfy { $0 >= 0 && $0 < Int(Int32.max) })
+            q = concatenated((0 ..< B).map { rope(q[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            k = concatenated((0 ..< B).map { rope(k[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            let attended = perRow.updateAndAttend(
+                queries: q, keys: k, values: v,
+                scale: smScale, sinks: sinksActiveResolved() ? sinks : nil)
+            return GPTOSSBatchDecodeProjection.linear(
+                oProj, attended.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
 
         // ContinuousBatchingV2: the layer cache owns the KV update and the
         // attention computation (per-row storage, no masks, no padding).
@@ -276,14 +331,22 @@ class GPTOSSTransformerBlock: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil
     ) -> MLXArray {
+        let independent = cache is any GPTOSSPerRowAttentionCache
         var residual = x
-        var x = inputLayerNorm(x)
+        var x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, inputLayerNorm.callAsFunction) : inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
         x = residual + x
 
         residual = x
-        x = postAttentionLayerNorm(x)
-        x = mlp(x)
+        x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, postAttentionLayerNorm.callAsFunction)
+            : postAttentionLayerNorm(x)
+        // Keep router top-k, MXFP4 expert dispatch and weighted reduction on
+        // the complete singleton graph; no cross-request routing rectangle.
+        x = independent ? GPTOSSBatchDecodeProjection.rows(x, mlp.callAsFunction) : mlp(x)
         x = residual + x
         return x
     }
@@ -325,8 +388,10 @@ public class GPTOSSModelInner: Module {
         inputEmbeddings: MLXArray? = nil,
         lastLayerLastQuery: Bool = false
     ) -> MLXArray {
-        let shapeCall = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var x: MLXArray
         if let inputEmbeddings {
@@ -343,7 +408,9 @@ public class GPTOSSModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
-            if (cache[i] as? (any CBv2AttendingLayerCache)) != nil {
+            if cache[i] is any GPTOSSPerRowAttentionCache
+                || (cache[i] as? (any CBv2AttendingLayerCache)) != nil
+            {
                 // ContinuousBatchingV2: attention and any masking are owned
                 // by the layer cache object — the model never builds masks
                 // (no left padding / shared frontier exists by construction).
@@ -371,11 +438,11 @@ public class GPTOSSModelInner: Module {
             }
 
             if lastLayerLastQuery,
-               gptossLastQueryPrefillEligible(
+                gptossLastQueryPrefillEligible(
                     sequenceLength: seqLen,
                     isFinalFullLayer: i == layers.count - 1 && layerTypes[i] == "full_attention",
                     cache: cache[i]),
-               let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
+                let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
             {
                 x = layer.prefillLastQuery(x, cache: lastQueryCache)
             } else {
@@ -383,7 +450,9 @@ public class GPTOSSModelInner: Module {
             }
         }
 
-        x = norm(x)
+        x =
+            cache.contains { $0 is any GPTOSSPerRowAttentionCache }
+            ? GPTOSSBatchDecodeProjection.rows(x, norm.callAsFunction) : norm(x)
 
         return x
     }
@@ -514,20 +583,17 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return fuseGateUpWeights(finalWeights, enabled: useFusedGateUp)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        var caches: [KVCache] = []
+    public func messageGenerator(tokenizer: any Tokenizer) -> any MessageGenerator {
+        GPTOSSMessageGenerator()
+    }
 
-        for lt in model.layerTypes {
-            if lt == "full_attention" {
-                caches.append(StandardKVCache())
-            } else {
-                caches.append(
-                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
-                )
-            }
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
+        try model.layerTypes.map { layerType in
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: configuration.slidingWindow,
+                usesSlidingWindow: layerType != "full_attention")
         }
-
-        return caches
     }
 }
 
@@ -592,7 +658,27 @@ extension GPTOSSModel {
     }
 }
 
-
 extension GPTOSSModel: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool { true }
+}
+
+// MARK: - Chat conventions
+
+extension GPTOSSModel {
+    /// Selects the Harmony streaming path in the generation token loop.
+    ///
+    /// `.gptOSS` is not "another tool-call JSON dialect" — it means the full
+    /// Harmony framing protocol (channels, recipients, terminators). The
+    /// `ToolCallFormat` enum is the existing selection knob on
+    /// `ChatConventionsProviding`; the implementation lives in
+    /// `HarmonyFrameParser` / `HarmonyOutputRouter`.
+    ///
+    /// Developer-provided `functions.*` calls are supported. Harmony's
+    /// built-in `browser.*` and `python` tools are intentionally not exposed
+    /// or dispatched by this model integration.
+    public var toolCallFormat: ToolCallFormat? { .gptOSS }
+
+    /// Harmony reasoning is channel-framed, not delimiter-scanned. Leave nil
+    /// so the `<think>` emitter is not applied to GPT-OSS.
+    public var reasoningConfig: ReasoningConfig? { nil }
 }

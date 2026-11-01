@@ -22,7 +22,7 @@ struct Gemma3nTextSanitizeTests {
     @Test func sanitizeCutsAPaddedEmbeddingTable() throws {
         let model = try Tiny.make()
         let padded = MLXArray(0 ..< Int32(70 * 32)).reshaped(70, 32).asType(.float32)
-        let sanitized = model.sanitize(weights: [
+        let sanitized = try model.sanitize(weights: [
             "model.language_model.embed_tokens.weight": padded
         ])
         let table = try #require(sanitized["language_model.embed_tokens.weight"])

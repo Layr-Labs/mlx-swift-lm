@@ -94,9 +94,9 @@ extension PagedKVPool {
         for (key, count) in pages {
             // Geometry was checked at construction; the token-dependent
             // products below still use checked arithmetic.
-            guard
-                let pageBytes = key.geometry?.storageBytes(
-                    tokens: config.pageSize, elementBytes: key.dtype.size),
+            guard let tokenBytes = try? key.bytesPerToken(),
+                let pageBytes = try? PagedKVQuantizationConfig.multiply(
+                    tokenBytes, config.pageSize),
                 let layout = try? PagedKVSegmentLayout(
                     pageBytes: pageBytes,
                     targetBytes: config.segmentSizeBytes ?? PagedKVSegmentLayout.defaultTargetBytes,
@@ -181,10 +181,14 @@ extension PagedKVPool {
             throw CBv2KVError.capacityExhausted(needed: physical, available: grant.bytes)
         }
         let previousPhysicalBytes = bytesMaterialized
+        let retainedBefore = retainedSegmentBytes
         // The plan contains all old backing plus every private new segment.
         // Admission charges the peak before the first native allocation.
         do { try physicalLease?.resize(to: physical) } catch {
             PagedKVStorageTelemetry.increment(&storageTelemetry.admissionRefusals)
+            // Retained backing is allocator memory in process headroom: free it
+            // before the refused admission retries.
+            releaseRetainedSegments()
             throw error
         }
         var prepared: [(PagedKVGroup, PagedKVGroup.PreparedGrowth)] = []
@@ -195,7 +199,8 @@ extension PagedKVPool {
                     (
                         item.group,
                         try item.group.prepareGrowth(
-                            item.plan, evaluate: slabEval, admission: memoryAdmission)
+                            item.plan, evaluate: slabEval, admission: memoryAdmission,
+                            hostZeroed: config.hostZeroedSegments)
                     ))
             }
             preparing = false
@@ -213,12 +218,16 @@ extension PagedKVPool {
             }
             physicalLease?.release(to: actual)
             storageTelemetry.recordSettlement(bound: physical, actual: actual)
+            if retainedSegmentBytes != retainedBefore {
+                retainedSegmentsTouchedNanos = Self.uptimeNanos()
+            }
         } catch {
             if preparing { PagedKVStorageTelemetry.increment(&storageTelemetry.allocationFailures) }
             // Failed preparation has already destroyed its local arrays. Drop
             // all earlier groups before refunding the private-allocation peak.
             prepared.removeAll()
             physicalLease?.release(to: previousPhysicalBytes)
+            if preparing { releaseRetainedSegments() }
             throw error
         }
     }
@@ -229,6 +238,9 @@ extension PagedKVPool {
         let capturedAt = storageTelemetry.capture()
         let accounting = physicalLease?.accountingSnapshot
         let committed = groups.values.reduce(0) { $0 + $1.committedSegmentBytes }
+        // Native recent generations have separate transient owners and do not
+        // occupy these segments. Keep every page gauge inside the same backing.
+        let livePages = groups.values.reduce(0) { $0 + $1.pagesInUse * $1.pageBytes }
         let poison = groups.values.reduce(0) { $0 + $1.segments.count * $1.pageBytes }
         let logical = groups.values.reduce(0) { $0 + $1.committedLogicalBytes }
         return PagedKVStorageSnapshot(
@@ -236,7 +248,7 @@ extension PagedKVPool {
             captureSequence: storageTelemetry.captureSequence,
             capturedUptimeNanoseconds: capturedAt,
             grantBytes: segmentGrant.snapshot().bytes, committedBytes: committed,
-            reservedPageBytes: bytesReserved, livePageBytes: bytesInUse,
+            reservedPageBytes: bytesReserved, livePageBytes: livePages,
             poisonBytes: poison, slackBytes: max(0, logical - poison - bytesReserved),
             allocatorPaddingBytes: max(0, committed - logical),
             lastAllocationAllowanceBytes: storageTelemetry.lastAllocationAllowanceBytes,

@@ -144,6 +144,22 @@ final class DiffusionGemmaAttention: Module {
         _ x: MLXArray, position: Int, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         keyValues: (MLXArray, MLXArray) -> (MLXArray, MLXArray)
     ) -> MLXArray {
+        let (q, k, v) = projected(x, position: position)
+        let (allKeys, allValues) = keyValues(k, v)
+        let attended = MLXFast.scaledDotProductAttention(
+            queries: q, keys: allKeys, values: allValues, scale: 1, mask: mask)
+        return projectedOutput(attended, batch: x.dim(0), length: x.dim(1))
+    }
+
+    func callWithAttention(
+        _ x: MLXArray, position: Int,
+        attend: (MLXArray, MLXArray, MLXArray) throws -> MLXArray
+    ) throws -> MLXArray {
+        let (q, k, v) = projected(x, position: position)
+        return projectedOutput(try attend(q, k, v), batch: x.dim(0), length: x.dim(1))
+    }
+
+    private func projected(_ x: MLXArray, position: Int) -> (MLXArray, MLXArray, MLXArray) {
         let (batch, length) = (x.dim(0), x.dim(1))
         var q = queryNorm(query(x).reshaped(batch, length, heads, headDimension)).transposed(
             0, 2, 1, 3)
@@ -153,10 +169,11 @@ final class DiffusionGemmaAttention: Module {
             value.map { $0(x).reshaped(batch, length, kvHeads, headDimension) } ?? rawKeys
         let k = rope(keyNorm(rawKeys).transposed(0, 2, 1, 3), offset: position)
         let v = valueNorm(rawValues).transposed(0, 2, 1, 3)
-        let (allKeys, allValues) = keyValues(k, v)
-        let attended = MLXFast.scaledDotProductAttention(
-            queries: q, keys: allKeys, values: allValues, scale: 1, mask: mask)
-        return output(attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+        return (q, k, v)
+    }
+
+    private func projectedOutput(_ attended: MLXArray, batch: Int, length: Int) -> MLXArray {
+        output(attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
     }
 }
 
@@ -202,6 +219,20 @@ public final class DiffusionGemmaTextBlock: Module {
         keyValues: (MLXArray, MLXArray) -> (MLXArray, MLXArray)
     ) -> MLXArray {
         let attended = attention(inputNorm(x), position: position, mask: mask, keyValues: keyValues)
+        return finish(x, attended: attended, encoderScalar: encoderScalar)
+    }
+
+    /// Packed-prefix attention receives projected native Q/K/V without an all-history gather.
+    func callWithAttention(
+        _ x: MLXArray, position: Int, encoderScalar: MLXArray? = nil,
+        attend: (MLXArray, MLXArray, MLXArray) throws -> MLXArray
+    ) throws -> MLXArray {
+        let attended = try attention.callWithAttention(
+            inputNorm(x), position: position, attend: attend)
+        return finish(x, attended: attended, encoderScalar: encoderScalar)
+    }
+
+    private func finish(_ x: MLXArray, attended: MLXArray, encoderScalar: MLXArray?) -> MLXArray {
         let residual = x + postAttentionNorm(attended)
         let dense = denseNorm(mlp(preFFN(residual)))
         let flat = residual.reshaped(-1, residual.dim(-1))

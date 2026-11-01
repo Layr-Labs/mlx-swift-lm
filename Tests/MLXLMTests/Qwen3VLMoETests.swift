@@ -3,9 +3,8 @@ import MLX
 import MLXNN
 import XCTest
 
-@testable import MLXVLM
 @testable import MLXLMCommon
-
+@testable import MLXVLM
 
 final class Qwen3VLMoETests: XCTestCase {
     func testPublishedMoEGeometryDecodes() throws {
@@ -76,7 +75,6 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertFalse(keys.contains("layers.0.mlp.switch_mlp.up_proj.weight"))
     }
 
-
     func testSplitCheckpointMigratesToFusedKeysAndStrictLoads() throws {
         let model = Qwen3VL(try decodeConfiguration(tinyAllMoEConfigurationJSON))
         let checkpoint = splitExpertCheckpoint(from: model, rawLanguagePrefix: true)
@@ -95,7 +93,8 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertNotNil(sanitized["\(base).gate_up_proj.weight"])
         XCTAssertNil(sanitized["\(base).gate_proj.weight"])
         XCTAssertNil(sanitized["\(base).up_proj.weight"])
-        let block = model.languageModel.model.layers[0].mlp
+        let block =
+            model.languageModel.model.layers[0].mlp
             as? Qwen3VLLanguage.SparseMoeBlock
         XCTAssertTrue(block?.switchMLP.hasFusedGateUp == true)
         XCTAssertEqual(
@@ -127,7 +126,8 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertNotNil(sanitized["\(base).gate_proj.weight"])
         XCTAssertNotNil(sanitized["\(base).up_proj.weight"])
         XCTAssertNil(sanitized["\(base).gate_up_proj.weight"])
-        let block = model.languageModel.model.layers[0].mlp
+        let block =
+            model.languageModel.model.layers[0].mlp
             as? Qwen3VLLanguage.SparseMoeBlock
         XCTAssertTrue(block?.switchMLP.hasFusedGateUp == false)
         XCTAssertNoThrow(
@@ -180,13 +180,14 @@ final class Qwen3VLMoETests: XCTestCase {
             expertGateWeights, [experts, hiddenDimensions, dimensions])
         let expertUp = MLXArray(
             expertUpWeights, [experts, hiddenDimensions, dimensions])
-        block.update(parameters: ModuleParameters.unflattened([
-            "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
-            "switch_mlp.gate_up_proj.weight": concatenated(
-                [expertGate, expertUp], axis: -2),
-            "switch_mlp.down_proj.weight": MLXArray(
-                expertDownWeights, [experts, dimensions, hiddenDimensions]),
-        ]))
+        block.update(
+            parameters: ModuleParameters.unflattened([
+                "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
+                "switch_mlp.gate_up_proj.weight": concatenated(
+                    [expertGate, expertUp], axis: -2),
+                "switch_mlp.down_proj.weight": MLXArray(
+                    expertDownWeights, [experts, dimensions, hiddenDimensions]),
+            ]))
 
         let input = MLXArray(inputValues, [1, rows, dimensions])
         let (indices, scores) = block.route(input)
@@ -221,13 +222,14 @@ final class Qwen3VLMoETests: XCTestCase {
 
         let splitBlock = Qwen3VLLanguage.SparseMoeBlock(config.textConfiguration)
         setSwitchGLUGateUpFused(false, at: "switch_mlp", in: splitBlock)
-        splitBlock.update(parameters: ModuleParameters.unflattened([
-            "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
-            "switch_mlp.gate_proj.weight": expertGate,
-            "switch_mlp.up_proj.weight": expertUp,
-            "switch_mlp.down_proj.weight": MLXArray(
-                expertDownWeights, [experts, dimensions, hiddenDimensions]),
-        ]))
+        splitBlock.update(
+            parameters: ModuleParameters.unflattened([
+                "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
+                "switch_mlp.gate_proj.weight": expertGate,
+                "switch_mlp.up_proj.weight": expertUp,
+                "switch_mlp.down_proj.weight": MLXArray(
+                    expertDownWeights, [experts, dimensions, hiddenDimensions]),
+            ]))
         let (splitIndices, splitScores) = splitBlock.route(input)
         let splitOutput = splitBlock(input)
         eval(splitIndices, splitScores, splitOutput)
@@ -241,7 +243,7 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertTrue(splitOutput.allClose(output, rtol: 1e-5, atol: 1e-6).item(Bool.self))
     }
 
-    func testCBv2LayerKindsAndCapabilitiesAreConservative() throws {
+    func testCBv2LayerKindsAndAuxiliaryCapabilitiesAreConservative() throws {
         let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
 
         XCTAssertEqual(
@@ -255,7 +257,7 @@ final class Qwen3VLMoETests: XCTestCase {
             model.cbv2Capabilities,
             CBv2ModelCapabilities(
                 supportsPrefixReuse: false,
-                supportsPagedKV: false,
+                supportsPagedKV: true,
                 supportsCompiledDecode: false,
                 supportsPackedPrefill: false,
                 supportsMTP: false))
@@ -289,7 +291,8 @@ final class Qwen3VLMoETests: XCTestCase {
     }
 
     func testQuantizedImageFeaturesUseEmbeddingActivationDType() throws {
-        let quantizableJSON = tinyDenseConfigurationJSON
+        let quantizableJSON =
+            tinyDenseConfigurationJSON
             .replacingOccurrences(of: "\"hidden_size\": 8", with: "\"hidden_size\": 32")
             .replacingOccurrences(of: "\"out_hidden_size\": 8", with: "\"out_hidden_size\": 32")
             .replacingOccurrences(of: "\"head_dim\": 8", with: "\"head_dim\": 32")
@@ -337,14 +340,16 @@ final class Qwen3VLMoETests: XCTestCase {
         let expected = model.languageModel(
             tokens,
             cache: nil,
+            state: nil,
             inputEmbeddings: nil,
             mask: nil,
             positionIds: nil,
-            visualMask: nil,
+            visualIndices: nil,
             deepstackEmbeds: nil,
             pixelValues: nil,
             imageGridTHW: nil,
-            videoGridTHW: nil).logits
+            videoGridTHW: nil
+        ).logits
         eval(actual, expected)
 
         XCTAssertEqual(actual.shape, expected.shape)
@@ -440,9 +445,10 @@ private func independentSparseReference(
         let selectedDenominator = selected.reduce(Float(0)) {
             $0 + probabilities[$1]
         }
-        let scoreMap = Dictionary(uniqueKeysWithValues: selected.map {
-            ($0, probabilities[$0] / selectedDenominator)
-        })
+        let scoreMap = Dictionary(
+            uniqueKeysWithValues: selected.map {
+                ($0, probabilities[$0] / selectedDenominator)
+            })
 
         selectedByRow.append(selected)
         scoresByRow.append(scoreMap)
@@ -489,8 +495,9 @@ private let tinyVisionConfigurationJSON = """
     """
 
 private let tinyDenseVisionConfigurationJSON = tinyVisionConfigurationJSON.replacingOccurrences(
-    of: "qwen3_vl_moe", with: "qwen3_vl").replacingOccurrences(
-        of: "gelu_pytorch_tanh", with: "gelu")
+    of: "qwen3_vl_moe", with: "qwen3_vl"
+).replacingOccurrences(
+    of: "gelu_pytorch_tanh", with: "gelu")
 
 private let realShapeConfigurationJSON = """
     {
@@ -584,3 +591,95 @@ private let tinyAllMoEConfigurationJSON = """
         \(tinyVisionConfigurationJSON)
     }
     """
+
+/// Upstream tests for the standalone `Qwen3VLMoE` model class. The fork
+/// registry resolves `qwen3_vl_moe` to `Qwen3VL` (see `Qwen3VLMoETests`); these
+/// tests construct `Qwen3VLMoE` directly.
+final class Qwen3VLMoEModelTests: XCTestCase {
+
+    private func minimalConfigData(
+        tieWordEmbeddings: Bool = false
+    ) -> Data {
+        let json = """
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": {
+                    "model_type": "qwen3_vl_moe",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "decoder_sparse_step": 1,
+                    "mlp_only_layers": [],
+                    "moe_intermediate_size": 12,
+                    "rms_norm_eps": 0.000001,
+                    "vocab_size": 32,
+                    "head_dim": 8,
+                    "rope_theta": 1000000,
+                    "max_position_embeddings": 32768,
+                    "rope_scaling": {
+                        "rope_type": "default",
+                        "mrope_section": [24, 20, 20]
+                    },
+                    "tie_word_embeddings": \(tieWordEmbeddings)
+                },
+                "vision_config": {
+                    "model_type": "qwen3_vl_moe",
+                    "depth": 1,
+                    "hidden_act": "gelu_pytorch_tanh",
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "out_hidden_size": 8,
+                    "num_heads": 1,
+                    "patch_size": 16,
+                    "spatial_merge_size": 1,
+                    "temporal_patch_size": 1,
+                    "num_position_embeddings": 8
+                }
+            }
+            """
+        return Data(json.utf8)
+    }
+
+    private func makeMinimalConfig(
+        tieWordEmbeddings: Bool = false
+    ) throws -> Qwen3VLMoEConfiguration {
+        try JSONDecoder().decode(
+            Qwen3VLMoEConfiguration.self,
+            from: minimalConfigData(tieWordEmbeddings: tieWordEmbeddings))
+    }
+
+    func testConfigurationDecodesMRoPESection() throws {
+        let config = try makeMinimalConfig()
+
+        XCTAssertEqual(config.modelType, "qwen3_vl_moe")
+        XCTAssertEqual(config.textConfiguration.ropeScaling?.mropeSection, [24, 20, 20])
+    }
+
+    func testConfigurationDecodesMoEFieldsAndDefaults() throws {
+        let config = try makeMinimalConfig()
+
+        XCTAssertEqual(config.imageTokenIndex, 151_655)
+        XCTAssertEqual(config.videoTokenIndex, 151_656)
+        XCTAssertEqual(config.textConfiguration.numExperts, 2)
+        XCTAssertEqual(config.textConfiguration.numExpertsPerTok, 1)
+        XCTAssertEqual(config.textConfiguration.decoderSparseStep, 1)
+        XCTAssertEqual(config.textConfiguration.moeIntermediateSize, 12)
+        XCTAssertEqual(config.textConfiguration.numKeyValueHeads, 1)
+        XCTAssertFalse(config.textConfiguration.tieWordEmbeddings)
+    }
+
+    func testDeclaresQwen3GenerationReasoningProtocol() throws {
+        let reasoning = try XCTUnwrap(Qwen3VLMoE(makeMinimalConfig()).reasoningConfig)
+
+        XCTAssertEqual(reasoning, QwenReasoningProtocol.tagged)
+        XCTAssertEqual(reasoning.startDelimiter, "<think>")
+        XCTAssertEqual(reasoning.implicitEndDelimiters, ["<tool_call>"])
+        // Sharing Qwen's delimiters does not automatically opt a distinct
+        // post-training family into Qwen3's model-specific transition.
+        XCTAssertNil(reasoning.budgetTransition)
+    }
+}

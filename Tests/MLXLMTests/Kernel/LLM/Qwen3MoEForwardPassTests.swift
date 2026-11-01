@@ -73,9 +73,9 @@ extension KernelTests {
             let overrides: [String: Any] =
                 rope == "linear" ? ["rope_scaling": ["type": "linear", "factor": 2.0]] : [:]
             let model = try Self.makeModel(overrides)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1), Self.row(2)], chunks: [4, 4, 1, 1, 1],
                 tolerance: Self.tolerance)
         }
@@ -116,7 +116,7 @@ extension KernelTests {
             let row = Self.row(1)
             let full = ForwardPassChecks.logits(model, [row])
 
-            var cache = model.newCache(parameters: nil)
+            var cache = try model.newCache(parameters: nil)
             _ = ForwardPassChecks.logits(model, [Array(row[..<8])], cache: cache)
             maybeQuantizeKVCache(cache: &cache, kvBits: 8, kvGroupSize: 32, quantizedKVStart: 0)
             #expect(cache.allSatisfy { $0 is QuantizedKVCache })

@@ -37,3 +37,30 @@ explicitly select the same HTTP policy as the SDK routes.
 generated text, after reasoning, after content and after a tool/usage event.
 These transport checks are separate from model success/argument-fidelity gates;
 a well-framed error is not a successful tool call.
+
+
+## Reasoning and response object compatibility
+
+For Qwen/DeepSeek think-tag parsers, an unclosed `<think>` block remains
+reasoning when generation ends, including a token-limit stop. Any answer text
+before the opening marker remains answer content. Explicit parser `none` keeps
+literal output unchanged, and native `.parsed` channels remain authoritative.
+Engines whose rendered prompt already opens a think block must carry that state
+into both collected and streaming output; the SDK cannot infer an unseen prompt
+from generated text alone. The provider prompt probe supplies this state.
+`CollectedReasoningTests` covers channel separation, length stops, usage,
+collection, retrieval and streamed snapshots without model execution.
+
+Model listings retain a supplied `created` timestamp. When a local catalog entry
+has none, the service uses one process-scoped fallback across service facades.
+This describes the local catalog representation, not model training or artifact
+publication time.
+
+Responses objects include flat function descriptors in `tools`, `tool_choice`
+and `parallel_tool_calls`, including collected/retrieved objects and created,
+in-progress and completed/incomplete/failed streaming snapshots. With no tools,
+the defaults are `[]`, `none` and `true`; with tools and no explicit choice,
+`tool_choice` defaults to `auto`. Named choices retain the function name; schemas,
+descriptions and strictness remain intact. Chat tool serialization is unchanged.
+`OpenAIObjectCompatibilityTests` covers these object contracts with scripted
+engines; actual HTTP and model qualification remain separate checks.

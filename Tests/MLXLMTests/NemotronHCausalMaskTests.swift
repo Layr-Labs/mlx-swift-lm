@@ -73,9 +73,9 @@ struct NemotronHCausalMaskTests {
 
         // Control: the same pass with a new cache is causal.
         let cachedOriginal = NemotronHMaskTinyModel.logits(
-            model, [row], cache: model.newCache(parameters: nil))
+            model, [row], cache: try model.newCache(parameters: nil))
         let cachedModified = NemotronHMaskTinyModel.logits(
-            model, [changed], cache: model.newCache(parameters: nil))
+            model, [changed], cache: try model.newCache(parameters: nil))
         let cachedBefore = NemotronHMaskTinyModel.maxAbsDifference(
             cachedOriginal[0..., ..<6], cachedModified[0..., ..<6])
         #expect(cachedBefore <= Self.tolerance, "cached positions before 6")

@@ -69,9 +69,15 @@ public final class CBv2TextDetokenizerFactory: CBv2DetokenizerFactory {
     }
 
     public func makeDetokenizer(stopStrings: [String]) -> CBv2IncrementalDetokenizer {
+        makeDetokenizer(stopStrings: stopStrings, scope: nil)
+    }
+
+    public func makeDetokenizer(
+        stopStrings: [String], scope: CBv2StopStringScope?
+    ) -> CBv2IncrementalDetokenizer {
         CBv2TextDetokenizer(
             detokenizer: DetokenizerV2(
                 tokenizer: tokenizer, skipSpecialTokens: skipSpecialTokens),
-            holdback: StopHoldback(stopStrings: stopStrings))
+            holdback: StopHoldback(stopStrings: stopStrings, scope: scope))
     }
 }

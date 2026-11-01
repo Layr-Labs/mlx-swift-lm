@@ -126,11 +126,12 @@ extension UnitTests {
             .init(
                 "Gemma4: Gemma4ProcessorConfiguration", MLXVLM.Gemma4ProcessorConfiguration.self,
                 json:
-                    #"{"audio_seq_length":526,"boi_token_id":527,"eoi_token_id":528,"image_seq_length":525,"max_soft_tokens":522,"patch_size":521,"pooling_kernel_size":524,"processor_class":"CustomProcessor","video_processor":{"max_soft_tokens":523}}"#,
+                    #"{"audio_seq_length":526,"boi_token_id":527,"do_normalize":true,"eoi_token_id":528,"image_seq_length":525,"max_soft_tokens":522,"patch_size":521,"pooling_kernel_size":524,"processor_class":"CustomProcessor","video_processor":{"max_soft_tokens":523}}"#,
                 requiredKeys: [],
                 fields: [
                     "audioSeqLength=526",
                     "boiTokenId=527",
+                    "doNormalize=true",
                     "eoiTokenId=528",
                     "imageSeqLength=525",
                     "maxSoftTokens=522",

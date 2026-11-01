@@ -34,6 +34,7 @@ public struct LoRAConfiguration: Sendable, Codable {
     public struct LoRAParameters: Sendable, Codable {
         public let rank: Int         // Low-rank dimension (default: 8)
         public let scale: Float      // Scaling factor (default: 10.0)
+        public let dropout: Float    // Training-only input dropout (default: 0.0)
         public let keys: [String]?   // Layer keys to adapt (nil = all Linear)
     }
 
@@ -61,6 +62,7 @@ let config = LoRAConfiguration(
     loraParameters: .init(
         rank: 16,
         scale: 20.0,
+        dropout: 0.05,
         keys: ["self_attn.q_proj", "self_attn.v_proj"]
     )
 )
@@ -75,6 +77,7 @@ let config = LoRAConfiguration(
   "lora_parameters": {
     "rank": 16,
     "scale": 20.0,
+    "dropout": 0.05,
     "keys": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
   }
 }
@@ -94,6 +97,10 @@ let adapter = try LoRAContainer.from(directory: adapterURL)
 // Apply to model
 try adapter.load(into: model)
 ```
+
+`ModelContext` places its model in evaluation mode, so adapters with nonzero dropout are
+deterministic during normal generation. If you invoke a model directly without a `ModelContext`,
+call `model.train(false)` before inference. `LoRATrain.train` enables training mode while it runs.
 
 ### From Model (Create New Adapter)
 
@@ -153,7 +160,7 @@ public class LoRALinear: Linear, LoRALayer {
     @ParameterInfo(key: "lora_a") var loraA: MLXArray
     @ParameterInfo(key: "lora_b") var loraB: MLXArray
 
-    // Forward: y = Wx + scale * (x @ A @ B)
+    // Forward: y = Wx + scale * (dropout(x) @ A @ B)
 }
 ```
 
@@ -230,8 +237,8 @@ public protocol LoRALayer: Module {
 ```swift
 // Load base model
 let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: .init(id: "mlx-community/Llama-3.2-3B-Instruct-4bit")
 )
 

@@ -17,7 +17,7 @@ final class Qwen35SanitizeTests: XCTestCase {
         let target = MLXArray([Float(0.25), Float(0.5)])
         let mtp = MLXArray([Float(1), Float(2)])
 
-        let sanitized = model.sanitize(
+        let sanitized = try model.sanitize(
             weights: [
                 "language_model.model.norm.weight": target,
                 "mtp.norm.weight": mtp,
@@ -93,12 +93,12 @@ final class Qwen35SanitizeTests: XCTestCase {
             "model.norm.weight": dummy,
             // Already-namespaced path — verify the existing rename branch
             // still fires.
-            "model.language_model.layers.0.mlp.up_proj.weight": dummy,
+            "model.language_model.layers.0.mlp.gate_proj.weight": dummy,
             // Top-level path the existing logic remaps.
             "lm_head.weight": dummy,
         ]
 
-        let sanitized = model.sanitize(weights: weights)
+        let sanitized = try model.sanitize(weights: weights)
 
         // Bare `model.*` keys are now under `language_model.model.*`.
         XCTAssertNotNil(
@@ -108,6 +108,7 @@ final class Qwen35SanitizeTests: XCTestCase {
             sanitized["language_model.model.layers.0.self_attn.q_proj.weight"])
         XCTAssertNotNil(sanitized["language_model.model.embed_tokens.weight"])
         XCTAssertNotNil(sanitized["language_model.model.norm.weight"])
+        XCTAssertNotNil(sanitized["language_model.model.layers.0.mlp.gate_proj.weight"])
 
         // The `lm_head` rename branch is preserved.
         XCTAssertNotNil(sanitized["language_model.lm_head.weight"])
@@ -120,5 +121,82 @@ final class Qwen35SanitizeTests: XCTestCase {
                     || key == "model.norm.weight",
                 "bare model.* key leaked through sanitize: \(key)")
         }
+    }
+
+    func testCompetingAliasesAreRejectedDuringCheckpointPreparation() throws {
+        let model = Qwen35(try makeMinimalConfig())
+        let weights = [
+            "model.layers.0.mlp.up_proj.weight": MLXArray.zeros([1, 1]),
+            "model.language_model.layers.0.mlp.up_proj.weight": MLXArray.ones([1, 1]),
+        ]
+        XCTAssertThrowsError(try model.prepareCheckpoint(.init(weights: weights))) { error in
+            XCTAssertTrue(error is ModelCheckpoint.MappingError)
+        }
+        XCTAssertThrowsError(try model.sanitize(weights: weights)) { error in
+            XCTAssertTrue(error is ModelCheckpoint.MappingError)
+        }
+    }
+
+    /// A pre-converted MLX checkpoint (conv1d already sanitized, trailing dim
+    /// == 1, no MTP tensors) already stores RMSNorm weights in the shifted
+    /// convention. Sanitize must NOT add the `+1` again: double-shifting every
+    /// layernorm decoheres the whole model and produces garbage tokens. This is
+    /// the VLM/LLM sanitize divergence — the LLM path gated the shift, the VLM
+    /// path did not.
+    func testPreConvertedNormWeightsAreNotShifted() throws {
+        let config = try makeMinimalConfig()
+        let model = Qwen35(config)
+
+        let weights: [String: MLXArray] = [
+            // Sanitized conv1d (trailing dim == 1) marks an already-converted
+            // checkpoint, so the norm shift must be suppressed.
+            "language_model.model.layers.0.linear_attn.conv1d.weight": MLXArray.zeros([8, 4, 1]),
+            "language_model.model.norm.weight": MLXArray.zeros([8]),
+        ]
+
+        let sanitized = try model.sanitize(weights: weights)
+
+        let norm = try XCTUnwrap(sanitized["language_model.model.norm.weight"])
+        XCTAssertEqual(
+            norm.sum().item(Float.self), 0.0, accuracy: 1e-6,
+            "pre-converted norm weight must not be +1 shifted (double-shift => garbage)")
+    }
+
+    /// A converted MLX checkpoint can keep its MTP head. Its keys must not
+    /// reach the model, or loading fails with unhandled keys.
+    func testMLXCheckpointDropsMTPWeights() throws {
+        let config = try makeMinimalConfig()
+        let model = Qwen35(config)
+
+        let dummy = MLXArray.zeros([1, 1])
+        let weights: [String: MLXArray] = [
+            "language_model.model.norm.weight": dummy,
+            "language_model.mtp.fc.weight": dummy,
+            "language_model.mtp.layers.0.self_attn.q_proj.weight": dummy,
+        ]
+
+        let sanitized = try model.sanitize(weights: weights, metadata: ["format": "mlx"])
+
+        XCTAssertEqual(Set(sanitized.keys), ["language_model.model.norm.weight"])
+    }
+
+    /// A raw HF checkpoint (unsanitized conv1d, trailing dim != 1) stores
+    /// RMSNorm weights un-shifted, so sanitize must add the `+1`.
+    func testRawCheckpointNormWeightsAreShifted() throws {
+        let config = try makeMinimalConfig()
+        let model = Qwen35(config)
+
+        let weights: [String: MLXArray] = [
+            // Unsanitized conv1d (trailing dim != 1) marks a raw checkpoint.
+            "language_model.model.layers.0.linear_attn.conv1d.weight": MLXArray.zeros([8, 1, 4]),
+            "language_model.model.norm.weight": MLXArray.zeros([8]),
+        ]
+
+        let sanitized = try model.sanitize(weights: weights)
+
+        let norm = try XCTUnwrap(sanitized["language_model.model.norm.weight"])
+        XCTAssertEqual(
+            norm.sum().item(Float.self), 8.0, accuracy: 1e-6,
+            "raw-checkpoint norm weight must be +1 shifted (8 zeros => sum 8)")
     }
 }

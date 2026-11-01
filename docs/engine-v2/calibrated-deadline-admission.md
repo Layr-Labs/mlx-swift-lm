@@ -76,6 +76,33 @@ the normal refusal and retirement paths. No default caller opts into this.
 Implementation: `DeadlineAdmission/NativeTargetPrefillRate.swift` and
 `DeadlineAdmission/EngineLoopV2+DeadlineProjection.swift`.
 
+## Decode-only steps between prompt chunks
+
+`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks` holds prompt work back
+for that many decode-only plans after each plan that carried a prompt chunk,
+while decode rows are live. The scheduler projection replays the same rule: it
+starts from the scheduler's live owed count, which already includes the launched
+step's plan, and charges every held step as a decode-only step of the rows
+decoding then. A request that waits behind held steps, or whose own chunks are
+separated by them, is priced for them:
+
+```text
+seconds = prefill / prefill_tps + decode_steps * measured_step_seconds
+```
+
+with `decode_steps` counting mixed and held steps alike, at the rows and width
+each step carries (`CBv2DecodeRateShape`, or the per-row charge without one).
+A held stretch ends early when the last decode row retires, exactly as in
+`plan()`. A full running set's decode stretch and its chained terminal
+successor count toward the owed steps. The prompt-row ceiling
+(`maxPrefillRowsPerStep`) is not modeled and still returns
+`unsupported_scheduler`.
+
+Regression coverage: `CBv2DecodeInterleaveProjectionTests` (projections with
+0, 8 and 24 held steps against the scheduler's own plans) and
+`CBv2DecodeInterleaveDeadlineTests` (a deadline that covers the held steps is
+admitted, a shorter one refused).
+
 ## Opt-in qualification timing
 
 `EngineV2.beginForwardShapeObservation()` enables bounded, scalar-only receipts.

@@ -53,15 +53,15 @@ final class MiMoV26NAXKeyRangeContext: @unchecked Sendable {
         guard MiMoV26NAXKeyRangeNative.requested, admission.hasProcessMemoryOwner,
             tracking.supported, tracking.engineID == budget.engineID,
             MiMoV26NAXGatherQMM.gpuStream(.default),
-            StreamOrDevice.default.stream == MLX.Stream.gpu,
+            MLXProcessStreams.isDefaultGPU(.default),
             MiMoV26NAXGatherQMM.naxAvailable
         else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let maximum = GPU.deviceInfo().maxBufferSize
-            guard maximum > 0 else { return nil }
-            maximumBufferBytes = maximum
+        let maximum = GPU.deviceInfo().maxBufferSize
+        guard maximum > 0 else { return nil }
+        maximumBufferBytes = maximum
         #else
-            return nil
+        return nil
         #endif
         self.budget = budget
         self.admission = admission

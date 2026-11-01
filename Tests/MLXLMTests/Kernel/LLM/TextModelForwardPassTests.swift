@@ -467,7 +467,7 @@ extension KernelTests {
                 BaichuanM1Model($0)
             }
             let head = MLXRandom.normal([64, 32], key: MLXRandom.key(4)) * 3
-            let sanitized = model.sanitize(weights: ["lm_head.weight": head])
+            let sanitized = try model.sanitize(weights: ["lm_head.weight": head])
             let norms = sqrt((sanitized["lm_head.weight"]! ** 2).sum(axis: -1))
             #expect(SyntheticModel.maxAbsDifference(norms, MLXArray.ones([64])) <= 1e-5)
         }

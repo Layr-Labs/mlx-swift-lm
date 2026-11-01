@@ -76,6 +76,14 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 // Note: GLM4 uses special tool call format
 ```
 
+### Mellum
+
+```swift
+// model_type: "mellum"
+LLMRegistry.mellum2_1_12b_a2_5b_thinking_6bit  // mlx-community/Mellum2.1-12B-A2.5B-Thinking-6bit
+// Note: Mellum uses Qwen-style <think> reasoning and JSON tool calls
+```
+
 ### Other Supported LLM Types
 
 | model_type | Description |
@@ -95,7 +103,7 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 | `exaone4` | EXAONE 4 |
 | `olmo2`, `olmo3`, `olmoe` | OLMo |
 | `falcon_h1` | Falcon H1 |
-| `jamba_3b` | Jamba |
+| `jamba` | Jamba |
 | `apertus` | Apertus |
 | `nanochat` | NanoChat |
 | `nemotron_h` | Nemotron H |
@@ -141,6 +149,7 @@ VLMRegistry.paligemma3bMix448_8bit // mlx-community/paligemma-3b-mix-448-8bit
 | `pixtral` | Pixtral |
 | `mistral3` | Mistral 3 VLM |
 | `lfm2_vl`, `lfm2-vl` | LFM2 VL |
+| `muse_glimmer` | Meta Muse Glimmer (text, image, reasoning, and ATEM tool calls) |
 
 ## Loading Any Model
 
@@ -150,19 +159,19 @@ Models not in registries can be loaded by ID:
 // Any mlx-community model
 let config = ModelConfiguration(id: "mlx-community/SomeModel-4bit")
 let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: config
 )
 
 // Specific revision
-let config = ModelConfiguration(
+let revisionConfig = ModelConfiguration(
     id: "mlx-community/Model",
     revision: "v1.0"
 )
 
 // Local model
-let config = ModelConfiguration(
+let localConfig = ModelConfiguration(
     directory: URL(filePath: "/path/to/model")
 )
 ```
@@ -210,32 +219,35 @@ let config = ModelConfiguration(
 ### Tokenizer Overrides
 
 ```swift
-// Override tokenizer class
-let config = ModelConfiguration(
-    id: "...",
-    overrideTokenizer: "PreTrainedTokenizer"
-)
-
-// Use tokenizer from different model
+// Use the tokenizer from a different model (remote id or local directory)
 let config = ModelConfiguration(
     id: "model-without-tokenizer",
-    tokenizerId: "different-model-with-tokenizer"
+    tokenizerSource: .id("different-model-with-tokenizer")
+)
+
+// From a local tokenizer directory
+let localTokenizerConfig = ModelConfiguration(
+    id: "model-without-tokenizer",
+    tokenizerSource: .directory(URL(filePath: "/path/to/tokenizer"))
 )
 ```
+
+`overrideTokenizer` is gone: the tokenizer *class* is no longer selected by
+`ModelConfiguration`. Tokenizer construction is owned by the `TokenizerLoader` passed to
+the factory, so supply a custom `TokenizerLoader` instead — see
+[tokenizer-chat.md](tokenizer-chat.md#unrecognized-tokenizer-classes).
 
 ## Adding New Model Types
 
 Extend the type registry for new architectures:
 
 ```swift
-// Custom model type
-LLMTypeRegistry.shared.register(
-    modelType: "custom_model",
-    creator: { configData in
-        let config = try JSONDecoder().decode(CustomConfig.self, from: configData)
-        return CustomModel(config)
-    }
-)
+// Custom model type — ModelTypeRegistry is an actor, so the call is `await`ed.
+// The first parameter is unlabeled and the method is `registerModelType(_:creator:)`.
+await LLMTypeRegistry.shared.registerModelType("custom_model") { configData in
+    let config = try JSONDecoder().decode(CustomConfig.self, from: configData)
+    return CustomModel(config)
+}
 ```
 
 ## Checking Supported Types

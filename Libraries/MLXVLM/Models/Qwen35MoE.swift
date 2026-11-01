@@ -31,15 +31,15 @@ public final class Qwen35MoE: Qwen35 {
     // dispatches back through the subclass `sanitize(weights:)`) is safe.
     public override func sanitize(
         weights: [String: MLXArray], metadata: [String: String]
-    ) -> [String: MLXArray] {
+    ) throws -> [String: MLXArray] {
         qwen35FuseSwitchMLPGateUp(
-            weights: super.sanitize(weights: weights, metadata: metadata),
+            weights: try super.sanitize(weights: weights, metadata: metadata),
             perLayerQuantization: checkpointPerLayerQuantization,
             setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) })
     }
 
-    public override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        super.sanitize(
+    public override func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try super.sanitize(
             weights: qwen35FuseSwitchMLPGateUp(
                 weights: weights,
                 perLayerQuantization: checkpointPerLayerQuantization,

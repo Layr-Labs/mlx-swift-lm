@@ -3,8 +3,10 @@ import MLX
 extension CBv2CompleteCheckpointCapture {
     /// Engine queue, before asyncEval and before constructing any successor.
     /// A candidate never enters the durable publication set before commit.
-    /// `position` may sit below the row frontier: full pages are immutable
-    /// below the frontier and each window copy proves its own ring residency.
+    /// Native `position` may sit below the row frontier: full pages are
+    /// immutable below it and each window copy proves its own ring residency.
+    /// Packed owners require the current frontier so a restored suffix sees
+    /// the same original-precision prefill chunk as its donor.
     ///
     /// Refuses (nil, the ordinary graceful path) when every donor's staged
     /// windows plus this checkpoint's would exceed the slot-wide cap: a
@@ -24,6 +26,18 @@ extension CBv2CompleteCheckpointCapture {
         guard !isClosed, let layout = codec.historicalLayout,
             state.count == layout.layers.count
         else { return nil }
+        // The live packed row keeps every token of its current chunk native,
+        // while a complete checkpoint retains only its exact recent band.
+        // An interior cut would turn formerly current tokens into coded
+        // history on replay. Refuse before quotes, copies or staging charges;
+        // explicitly native owners retain their existing interior contract.
+        for index in layout.owningIndices {
+            if let row = state[index] as? PagedSequenceKV,
+                row.groupKey.quantization != nil, row.absoluteOffset != position
+            {
+                return nil
+            }
+        }
         do {
             // Scalar policy projection first; no descriptor/page/token table
             // is built merely to ask the store whether this boundary fits.
@@ -59,7 +73,15 @@ extension CBv2CompleteCheckpointCapture {
                     row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
                     row.groupKey.dtype == layer.dtype.mlxDType
                 else { return nil }
-                guard layer.window != nil else { continue }
+                guard layer.window != nil else {
+                    if row.groupKey.quantization != nil {
+                        windowBytes = try CBv2CheckpointAllocationFootprint.add(
+                            windowBytes,
+                            CBv2QuantizedCheckpointRecent.reservationBytes(
+                                row: row, position: position))
+                    }
+                    continue
+                }
                 // Allocation-free: the same figure the window reserves.
                 let (next, overflow) = windowBytes.addingReportingOverflow(
                     try CBv2HistoricalWindow.reservationBytes(row: row, position: position))
@@ -96,7 +118,11 @@ extension CBv2CompleteCheckpointCapture {
                         owner.row, position, codec.admission)
                 }
                 candidate = .init(
-                    historical: .init(position: position, chunkSize: chunkSize, windows: windows))
+                    historical: .init(
+                        position: position, chunkSize: chunkSize, windows: windows,
+                        quantizedRecent: try codec.captureQuantizedRecent(
+                            state: state,
+                            position: position, includeWindows: false)))
             }
             inFlightHistoricalBytes +=
                 candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)

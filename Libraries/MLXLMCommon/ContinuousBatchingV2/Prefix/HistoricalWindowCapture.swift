@@ -18,6 +18,8 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
     private var combined: MLXArray?
     private var asymmetricKeys: MLXArray?
     private var asymmetricValues: MLXArray?
+    private var quantizedKey: PagedKVGroupKey?
+    private var recent: CBv2QuantizedCheckpointRecent?
     private var reservation: CBv2CheckpointReservation?
     private enum Evaluation { case pending, ready, failed }
     private var evaluation = Evaluation.pending
@@ -35,6 +37,7 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
     var evaluationRoots: [MLXArray] {
         if let combined { return [combined] }
         return [asymmetricKeys, asymmetricValues].compactMap { $0 }
+            + (recent?.evaluationRoots ?? [])
     }
 
     static func reservationBytes(row: PagedSequenceKV, position: Int) throws -> Int {
@@ -68,7 +71,18 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         }
         let output: Int
         let scalar: Int
-        if key.isAsymmetric {
+        if let format = key.quantization {
+            let keys = try PagedKVQuantizationConfig.multiply(
+                key.kvHeads * count,
+                format.rowLayout(headDim: key.headDim).keyRowBytes)
+            let values = try PagedKVQuantizationConfig.multiply(
+                key.kvHeads * count,
+                format.rowLayout(headDim: key.valueHeadDim).valueRowBytes)
+            output = try add(
+                add(bound(keys), bound(values)),
+                CBv2QuantizedCheckpointRecent.reservationBytes(row: row, position: position))
+            scalar = try multiply(2, bound(1))
+        } else if key.isAsymmetric {
             let keys = try CBv2CheckpointTensorDescriptor.checkedByteCount(
                 shape: [1, key.kvHeads, count, key.headDim], dtype: key.dtype)
             let values = try CBv2CheckpointTensorDescriptor.checkedByteCount(
@@ -93,7 +107,8 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         let hostRecords = try multiply(multiply(count, 4), MemoryLayout<Int32>.stride)
         let hostPages = try multiply(pageSpan, MemoryLayout<Int32>.stride)
         let host = try add(64 << 10, multiply(4, add(hostRecords, hostPages)))
-        let transfer = try multiply(segments, add(records, fence))
+        let valueBase = key.quantization == nil ? 0 : try bound(MemoryLayout<Int64>.stride)
+        let transfer = try multiply(segments, add(records, add(fence, valueBase)))
         return try add(transfer, add(output, add(scalar, add(fence, host))))
     }
 
@@ -108,7 +123,11 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         }
     ) throws {
         let bytes = try Self.reservationBytes(row: row, position: position)
-        let permit = try admission.reserveTransient(bytes: bytes)
+        let recentBytes =
+            row.groupKey.quantization == nil
+            ? 0
+            : try CBv2QuantizedCheckpointRecent.reservationBytes(row: row, position: position)
+        let permit = try admission.reserveTransient(bytes: bytes - recentBytes)
         self.position = position
         reservedBytes = bytes
         start = max(0, position - row.windowSize!)
@@ -130,7 +149,18 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
                     row.table[$0 % row.ringPages!]
                 }
                 let group = row.pool.group(row.groupKey)
-                if row.groupKey.isAsymmetric {
+                if row.groupKey.quantization != nil {
+                    quantizedKey = row.groupKey
+                    if recentBytes > 0 {
+                        recent = try .init(row: row, position: position, admission: admission)
+                    }
+                    let copied = PagedQuantizedTransfers.gatherPacked(
+                        group: group, pages: pages,
+                        firstSlot: start % pageSize, count: position - start,
+                        publishReadFence: false, stream: copyStream)
+                    asymmetricKeys = copied.keys
+                    asymmetricValues = copied.values
+                } else if row.groupKey.isAsymmetric {
                     let copied = PagedAsymmetricTransfers.gatherSegmented(
                         group: group, pages: pages, firstSlot: start % pageSize,
                         count: position - start, publishReadFence: false, stream: copyStream)
@@ -169,12 +199,13 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         case .pending: break
         }
         let roots = evaluationRoots
-        guard roots.count == (headDim == valueHeadDim ? 1 : 2) else {
+        guard quantizedKey != nil || roots.count == (headDim == valueHeadDim ? 1 : 2) else {
             throw CBv2CompleteCheckpointError.closed
         }
         do {
             submitted = true
             for root in roots { try evaluate(root) }
+            try recent?.finishEvaluation()
             evaluation = .ready
         } catch {
             // asyncEval may already have submitted part of the private copy.
@@ -190,6 +221,10 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
     }
 
     func read(values: Bool, byteOffset: Int, maximumBytes: Int) throws -> Data {
+        if let key = quantizedKey {
+            return try readQuantized(
+                key: key, values: values, byteOffset: byteOffset, maximumBytes: maximumBytes)
+        }
         guard let array = combined ?? (values ? asymmetricValues : asymmetricKeys) else {
             throw CBv2CompleteCheckpointError.closed
         }
@@ -212,6 +247,68 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
             bytes: UnsafeRawPointer(pointer).advanced(by: roleOffset + byteOffset), count: count)
     }
 
+    func matches(_ descriptor: CBv2CheckpointTensorDescriptor, values: Bool) -> Bool {
+        if let key = quantizedKey,
+            let expected = try? CBv2CheckpointPagedRoleLayout(
+                key: key,
+                position: position, tokenStart: start, values: values
+            ).descriptor(layer: descriptor.layer ?? 0)
+        {
+            return expected == descriptor
+        }
+        return descriptor.role == (values ? .values : .keys)
+            && descriptor.dtype.mlxDType == dtype
+            && descriptor.shape == [1, heads, position - start, values ? valueHeadDim : headDim]
+    }
+
+    private func readQuantized(
+        key: PagedKVGroupKey, values: Bool,
+        byteOffset: Int, maximumBytes: Int
+    ) throws -> Data {
+        let role = try CBv2CheckpointPagedRoleLayout(
+            key: key,
+            position: position, tokenStart: start, values: values)
+        let bytes = try PagedKVQuantizationConfig.multiply(heads, role.bytesPerHead)
+        guard byteOffset >= 0, byteOffset < bytes, maximumBytes > 0,
+            maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
+        else {
+            throw CBv2CompleteCheckpointError.invalidSegment
+        }
+        try finishEvaluation()
+        guard let array = values ? asymmetricValues : asymmetricKeys,
+            let pointer = mlx_array_data_uint8(array.ctx)
+        else {
+            throw CBv2CompleteCheckpointError.allocationFailed
+        }
+        let count = min(maximumBytes, bytes - byteOffset)
+        let packedBytes = role.packedCount * role.packedRowBytes
+        var result = Data(count: count)
+        try result.withUnsafeMutableBytes { destination in
+            var offset = byteOffset
+            var copied = 0
+            while copied < count {
+                let head = offset / role.bytesPerHead
+                let inHead = offset % role.bytesPerHead
+                let length: Int
+                if inHead < packedBytes {
+                    length = min(count - copied, packedBytes - inHead)
+                    let address = head * (position - start) * role.packedRowBytes + inHead
+                    destination.baseAddress!.advanced(by: copied).copyMemory(
+                        from: UnsafeRawPointer(pointer).advanced(by: address), byteCount: length)
+                } else {
+                    guard let recent else { throw CBv2CompleteCheckpointError.incompleteTransfer }
+                    length = min(count - copied, role.bytesPerHead - inHead)
+                    try recent.copy(
+                        values: values, head: head, byteOffset: inHead - packedBytes,
+                        count: length, destination: destination.baseAddress!.advanced(by: copied))
+                }
+                offset += length
+                copied += length
+            }
+        }
+        return result
+    }
+
     deinit {
         // eval() can return before Metal completion handlers drop their data
         // references. Keep the output and permit through that final retirement
@@ -224,6 +321,7 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         combined = nil
         asymmetricKeys = nil
         asymmetricValues = nil
+        recent = nil
         reservation?.release()
         reservation = nil
     }
@@ -239,12 +337,7 @@ final class CBv2HistoricalWindowTensorSource {
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
         guard let window else { return false }
-        return descriptor.role == (values ? .values : .keys)
-            && descriptor.dtype.mlxDType == window.dtype
-            && descriptor.shape == [
-                1, window.heads, window.position - window.start,
-                values ? window.valueHeadDim : window.headDim,
-            ]
+        return window.matches(descriptor, values: values)
     }
 
     func retainForNativeExport(_ work: CBv2NativeCompletePrefixWork) throws {

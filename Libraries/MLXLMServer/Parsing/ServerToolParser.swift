@@ -44,6 +44,8 @@ public enum ServerToolParser {
             return .qwen35
         case "glm4", "glm_4":
             return .glm4
+        case "glm5", "glm_5":
+            return .glm5
         case "gemma", "gemma4", "gemma_4":
             return .gemma
         case "kimi_k2", "kimi":

@@ -836,7 +836,7 @@ struct ToolCallParserIntegrationTests {
             case .qwen35, .mimoV2:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
-            case .glm4:
+            case .glm4, .flint, .glm5:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .kimiK2:
@@ -848,6 +848,15 @@ struct ToolCallParserIntegrationTests {
             case .llama3:
                 #expect(parser.startTag == nil)  // Llama 3 uses inline format
                 #expect(parser.endTag == nil)
+            case .gemma4:
+                #expect(parser.startTag == "<|tool_call>")
+                #expect(parser.endTag == "<tool_call|>")
+            case .atem:
+                #expect(parser.startTag == "<atem:function_calls>")
+                #expect(parser.endTag == "</atem:function_calls>")
+            case .gptOSS:
+                #expect(parser.startTag == "<tool_call>")
+                #expect(parser.endTag == "</tool_call>")
             }
         }
     }

@@ -82,6 +82,8 @@ public struct CBv2Request: Sendable {
     public var stopTokens: Set<Int>
     /// Stop strings; matched against held-back detokenized text.
     public var stopStrings: [String]
+    /// Where `stopStrings` apply; nil matches the whole generated text.
+    public var stopStringScope: CBv2StopStringScope?
     /// Higher value = more important. Used by admission and preemption.
     public var priority: Int
     /// Per-request prefix-cache scope (TB-007). When non-nil it REPLACES the
@@ -107,6 +109,17 @@ public struct CBv2Request: Sendable {
     /// at placeholder-token positions of `promptTokens`. nil = text-only —
     /// every code path is byte-identical to the pre-multimodal engine.
     /// See `CBv2MultimodalInput` for the full semantics.
+    /// MiMo private cluster encoded image envelope; only its distributed owner
+    /// may consume this CPU payload. Local engines reject it before allocation.
+    public var mimoClusterImages: Data? = nil
+    /// Bounded host payload for the distributed GLM worker; local engines refuse.
+    public var clusterStillImages: Data? = nil
+    /// GLM image and video envelope for the tensor-parallel pair's owner
+    /// (encoded bytes and digests, never pixels); local engines refuse.
+    public var clusterGLMMedia: Data? = nil
+    /// Encoded Qwen/Bonsai media bound to artifact, processor and three-axis
+    /// positions. Only an explicitly ready native cluster owner may consume it.
+    public var clusterQwenMedia: Data? = nil
     public var multimodal: CBv2MultimodalInput?
     /// Optional request-owned model positions. nil preserves the scalar
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated
@@ -142,7 +155,8 @@ public struct CBv2Request: Sendable {
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
-        prefixCheckpointTargetTokens: Int? = nil
+        prefixCheckpointTargetTokens: Int? = nil,
+        stopStringScope: CBv2StopStringScope? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -150,6 +164,7 @@ public struct CBv2Request: Sendable {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
         self.stopStrings = stopStrings
+        self.stopStringScope = stopStringScope
         self.priority = priority
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled
@@ -607,6 +622,20 @@ extension CBv2KVBackend {
         layerKinds: [CBv2LayerKind],
         maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        try makeSequenceState(
+            adopting: prefix,
+            plan: prefixReusePlan(adopting: prefix, layerKinds: layerKinds, maxLength: maxLength),
+            layerKinds: layerKinds,
+            maxLength: maxLength)
+    }
+
+    /// The compatibility plan the convenience above adopts a uniform full
+    /// prefix with, for a caller that adopts it through another entry point.
+    public func prefixReusePlan(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) throws -> CBv2PrefixReusePlan {
         guard let adoptedOffset = prefix.compactMap({ $0?.offset }).first else {
             throw CBv2KVError.backendIneligible(reason: "prefix contains no owning full snapshot")
         }
@@ -638,11 +667,7 @@ extension CBv2KVBackend {
                     capability.unsupportedReason?.rawValue
                     ?? "layout requires an explicit matched-boundary replay plan")
         }
-        return try makeSequenceState(
-            adopting: prefix,
-            plan: plan,
-            layerKinds: layerKinds,
-            maxLength: maxLength)
+        return plan
     }
 }
 
@@ -658,6 +683,29 @@ extension CBv2KVError {
     /// KV, not broken — so bridges must map finishes carrying this prefix to
     /// their retryable capacity error (429-class), never a server error.
     public static let capacityExhaustedFinishPrefix = "kv_capacity_exhausted: "
+}
+
+/// A step's transient scratch reservation (paged attention work, or the
+/// native MTP round's host tables) was refused BEFORE any row cursor, page
+/// table, write fence, MTP carry or graph changed. Only those pre-mutation
+/// reservation points throw it, so the engine may retry the step later
+/// instead of failing its rows. A refusal after mutation has begun (e.g. a
+/// serial verification column) is rethrown as `underlying`.
+public struct CBv2StepScratchRefusal: Error, CustomStringConvertible, Sendable {
+    public let needed: Int
+    public let available: Int
+
+    public init(needed: Int, available: Int) {
+        self.needed = needed
+        self.available = available
+    }
+
+    /// The error the reservation point threw before this type existed.
+    public var underlying: CBv2KVError {
+        .capacityExhausted(needed: needed, available: available)
+    }
+
+    public var description: String { "step scratch refused: \(underlying)" }
 }
 
 // MARK: - Attention dispatch (owned by the layer cache object)
@@ -750,6 +798,9 @@ public struct CBv2StepPlan: Sendable {
     /// them if this plan never executes.
     internal var demandedCheckpointContinuationUndo:
         [CBv2RequestID: CBv2DemandedCheckpointContinuationUndo] = [:]
+    /// The scheduler's decode-only step debt before this plan; rollback
+    /// restores it.
+    internal var decodeOnlyStepsOwedBefore = 0
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -806,11 +857,35 @@ public struct CBv2SchedulerConfig: Sendable {
     /// stripes, token budgets and capture byte grants never increase.
     /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
     public var demandedCheckpointPartitionIncludesLongPrompts = false
+    /// Opt-in for a chunk-agnostic recurrent COMPLETE codec whose prefill
+    /// chunk shares one step budget with decode rows (GLM): a donor with write
+    /// demand ends a range at its hinted target and at the deepest aligned
+    /// boundary below its prompt end, whatever chunk company left it. Without
+    /// this, decode tokens shorten every chunk, no range end lands on the
+    /// 256-token grid, and a donor served beside other requests captures
+    /// nothing. The value is the store's effective-token floor; nil preserves
+    /// the existing range geometry. When set, it replaces the short-checkpoint
+    /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
+    public var demandedCaptureBoundaryMinimumTokens: Int? = nil
+    /// Also end a range just below the prompt end, when that boundary is at
+    /// least this many tokens past the range's start. Nil keeps the existing
+    /// geometry. See docs/prefix-checkpoint-retention.md.
+    public var demandedLatestCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only
     /// after its genuine wider budget installs; other callers stay unchanged.
     public var soloPrefillStripeMediaCeiling: Int?
+    /// Optional plain-chunk ceiling for a request whose multimodal input has
+    /// bidirectional blocks (nil = `prefillChunkSize` for every request).
+    /// A paged span-bearing chunk attends in one unblocked call
+    /// (`PagedLayerCache.prefillAttend`), so its materialized score tensor
+    /// grows with the chunk length times the history; this lets a caller widen
+    /// text chunks without widening that tensor. A chunk that begins at a
+    /// block still extends over the whole block (bounded by the step budget),
+    /// the solo stripe never arms for these requests, and causal media keeps
+    /// `prefillChunkSize`. Nonpositive values are ignored.
+    public var bidirectionalMediaPrefillChunkCeiling: Int? = nil
     /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
     /// many RUNNING rows may be mid-prefill at once. Measured basis: with
     /// the unlimited interleave, every row in a 4x8K burst reaches its
@@ -834,6 +909,20 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxConcurrentPartialPrefills: Int?
     /// Per-engine mixed-step quota; nil preserves the legacy environment fallback.
     public var mixedStepPrefillTokenCap: Int?
+    /// Opt-in (nil = unlimited): at most this many rows receive prompt work
+    /// in one plan, counting a chunk that completes its prompt. With one, a
+    /// step never runs two prefill forwards, so a single prefill activation
+    /// allowance covers every step. The one-shot deferred multimodal-block
+    /// row is exempt but counts. Nonpositive values are unlimited.
+    public var maxPrefillRowsPerStep: Int? = nil
+    /// While decode-ready rows are live, the plans after one that carried
+    /// prompt work run this many decode-only steps before the next prompt
+    /// chunk; zero lets every step carry one. Chunk geometry is unchanged, so
+    /// this trades first-token latency for inter-token latency without
+    /// changing any request's arithmetic. A plan without decode rows is never
+    /// held back, nor is the one-shot deferred multimodal-block row. The
+    /// first-token deadline projection charges every held step.
+    public var decodeStepsBetweenPrefillChunks: Int = 0
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
@@ -858,6 +947,15 @@ public struct CBv2SchedulerConfig: Sendable {
         self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// A request's ordinary chunk cap. First-token projection never prices a
+    /// block-bearing row (`multimodalWork`), so only scheduling consults it.
+    func plainPrefillChunkSize(hasBidirectionalBlocks: Bool) -> Int {
+        guard hasBidirectionalBlocks, let ceiling = bidirectionalMediaPrefillChunkCeiling,
+            ceiling > 0
+        else { return prefillChunkSize }
+        return min(prefillChunkSize, ceiling)
     }
 
     /// Shared by real scheduling and first-token work projection. Block lists

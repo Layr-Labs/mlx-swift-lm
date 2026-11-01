@@ -324,7 +324,16 @@ final class CBv2PagedAttentionWorkReservationTests: XCTestCase {
             } else {
                 f.admission.updateBytesCapacity(before + needed - 1)
             }
-            XCTAssertThrowsError(try f.prepare(count: 16))
+            XCTAssertThrowsError(try f.prepare(count: 16)) { error in
+                // Typed and deferrable: the engine retries instead of failing rows.
+                guard let refusal = error as? CBv2StepScratchRefusal else {
+                    return XCTFail("expected a typed step-scratch refusal, got \(error)")
+                }
+                guard case .capacityExhausted = refusal.underlying else {
+                    return XCTFail("refusal must keep its capacity cause")
+                }
+                if !processCap { XCTAssertEqual(refusal.needed, needed) }
+            }
             XCTAssertEqual(row.absoluteOffset, 0)
             XCTAssertEqual(row.table, table)
             XCTAssertEqual(row.tableVersion, version)
@@ -685,6 +694,83 @@ final class CBv2PagedAttentionWorkReservationTests: XCTestCase {
         XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(f.process.snapshot.charge, 0)
         XCTAssertEqual(f.process.snapshot.materialized, 0)
+    }
+
+    /// A refused step scratch reservation defers the step instead of failing
+    /// its rows: the newcomer is requeued under an admission hold, the running
+    /// request keeps its contiguous tokens, and the newcomer runs after it.
+    func testActualEngineDefersRefusedStepScratchAndRequeuesNewcomer() async throws {
+        let kinds = [workKind(window: 17), workKind()]
+        let f = try PagedWorkFixture(kinds, bindAdmission: false)
+        let paged = actualEngine(f)
+        let cold = EngineV2(
+            model: PagedWorkEngineModel(), layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 1 << 30, kvDType: .float32)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 16,
+                prefillChunkSize: 16, maxWaiting: 4, enablePrefixCache: false),
+            admissionConfig: .init(watermarkFraction: 0, elementBytes: 4))
+        let running = CBv2Request(
+            id: .init(85), promptTokens: (0 ..< 23).map { ($0 * 5) % 29 },
+            sampling: .init(temperature: 0, seed: 0), maxTokens: 10)
+        let newcomer = CBv2Request(
+            id: .init(86), promptTokens: (0 ..< 9).map { ($0 * 3) % 31 },
+            sampling: .init(temperature: 0, seed: 0), maxTokens: 4)
+        let expectedRunning = await cbv2SchedCollect(try cold.submit(running))
+        let expectedNewcomer = await cbv2SchedCollect(try cold.submit(newcomer))
+        await cold.shutdown()
+
+        let loop = paged.loopForTesting
+        let admission = paged.admissionForTesting
+        let probe = CBv2StepScratchProbe()
+        loop.onEngineQueueSync {
+            f.backend.pool.stepScratchReservationObserverForTesting = { site, requests, _ in
+                probe.release()
+                let decoding = loop.scheduler.record(for: running.id)
+                if !probe.armed, let decoding, decoding.generatedTokenCount >= 2 {
+                    probe.armed = true
+                    probe.suspendedAt = loop.stepCount + 1
+                    loop.suspendStepExecutionAtCountForTesting = loop.stepCount + 1
+                }
+                guard requests.contains(newcomer.id) else { return }
+                if probe.refusedRequests == nil {
+                    probe.refusedRequests = requests
+                    probe.refusedSite = site
+                    probe.exhaust(admission)
+                } else if decoding?.status == .running {
+                    probe.admittedWhileHeld += 1
+                }
+            }
+        }
+        let first = try paged.submit(running)
+        let parked = await cbv2SchedWait(timeoutSeconds: 60) {
+            loop.onEngineQueueSync { probe.suspendedAt.map { loop.stepCount >= $0 } ?? false }
+        }
+        XCTAssertTrue(parked)
+        let second = try paged.submit(newcomer)
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+        let resultRunning = await cbv2SchedCollect(first)
+        let resultNewcomer = await cbv2SchedCollect(second)
+        let (deferrals, requeues) = loop.onEngineQueueSync {
+            f.backend.pool.stepScratchReservationObserverForTesting = nil
+            probe.release()
+            return (loop.stepScratchDeferralCount, loop.capacityRequeueCount)
+        }
+        await paged.shutdown()
+        XCTAssertEqual(resultRunning.finishReason, .length)
+        XCTAssertEqual(resultRunning.tokens, expectedRunning.tokens)
+        XCTAssertEqual(resultNewcomer.finishReason, .length)
+        XCTAssertEqual(resultNewcomer.tokens, expectedNewcomer.tokens)
+        XCTAssertEqual(probe.refusedRequests, Set([running.id, newcomer.id]))
+        XCTAssertEqual(probe.refusedSite, .attention)
+        XCTAssertEqual(probe.admittedWhileHeld, 0, "the hold keeps the newcomer queued")
+        XCTAssertEqual(deferrals, 1)
+        XCTAssertEqual(requeues, 1)
+        XCTAssertEqual(paged.pagedAttentionWorkBytesReserved, 0)
+        XCTAssertEqual(paged.admissionForTesting.bytesReserved, 0)
+        XCTAssertEqual(f.process.snapshot.charge, 0)
     }
 
     func testActualEngineMissingOwnerOrLargerSchedulerEnvelopeRefusesPublication() throws {

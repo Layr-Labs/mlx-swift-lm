@@ -196,11 +196,27 @@ public struct BaseConfiguration: Codable, Sendable {
         }
     }
 
+    private struct TextConfiguration: Codable, Sendable {
+        var eosTokenIds: IntOrIntArray?
+
+        enum CodingKeys: String, CodingKey {
+            case eosTokenIds = "eos_token_id"
+        }
+    }
+
     /// Internal storage for quantization details extracted from `config.json`.
     var quantizationContainer: QuantizationContainer?
 
+    /// Text-model metadata nested by composite model configurations.
+    private var textConfiguration: TextConfiguration?
+
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
+
+    /// EOS token IDs declared at either the model root or in `text_config`.
+    public var effectiveEOSTokenIds: Set<Int> {
+        Set(eosTokenIds?.values ?? textConfiguration?.eosTokenIds?.values ?? [])
+    }
 
     /// The default quantization settings.
     @available(*, deprecated, message: "Please use perLayerQuantization instead")
@@ -217,18 +233,47 @@ public struct BaseConfiguration: Codable, Sendable {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
         case quantizationConfiguration = "quantization_config"
+        case textConfiguration = "text_config"
         case eosTokenIds = "eos_token_id"
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         modelType = try container.decode(String.self, forKey: .modelType)
-        quantizationContainer =
-            try container.decodeIfPresent(
-                QuantizationContainer.self, forKey: .quantizationContainer)
-            ?? container.decodeIfPresent(
+        if let quantization = try container.decodeIfPresent(
+            QuantizationContainer.self, forKey: .quantizationContainer)
+        {
+            quantizationContainer = quantization
+        } else if let probe = try container.decodeIfPresent(
+            QuantizationMethodProbe.self, forKey: .quantizationConfiguration),
+            probe.isMLX
+        {
+            // An MLX `quantization_config` is a copy of `quantization`. A config whose
+            // `quant_method` names another quantizer (ParoQuant, FP8, AWQ, ...) has its
+            // own loader and is not MLX per-layer quantization, so it is not read here.
+            quantizationContainer = try container.decode(
                 QuantizationContainer.self, forKey: .quantizationConfiguration)
+        } else {
+            quantizationContainer = nil
+        }
+        textConfiguration = try container.decodeIfPresent(
+            TextConfiguration.self, forKey: .textConfiguration)
         eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+    }
+
+    /// The `quant_method` of a `quantization_config`, if it names one.
+    private struct QuantizationMethodProbe: Decodable {
+        let quantMethod: String?
+
+        /// No method, `mlx`, or an MLX quantization mode such as `affine`.
+        var isMLX: Bool {
+            guard let quantMethod else { return true }
+            return quantMethod == "mlx" || QuantizationMode(rawValue: quantMethod) != nil
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case quantMethod = "quant_method"
+        }
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -236,6 +281,7 @@ public struct BaseConfiguration: Codable, Sendable {
         try container.encode(modelType, forKey: .modelType)
         try container.encodeIfPresent(
             quantizationContainer, forKey: .quantizationContainer)
+        try container.encodeIfPresent(textConfiguration, forKey: .textConfiguration)
         try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
     }
 }

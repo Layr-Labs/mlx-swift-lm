@@ -163,7 +163,10 @@ public struct OpenAIResponseIncompleteDetails: Codable, Sendable, Equatable {
 public struct OpenAIResponseError: Codable, Sendable, Equatable {
     public var code: String
     public var message: String
-    public init(code: String, message: String) { self.code = code; self.message = message }
+    public init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
 }
 
 public struct OpenAIResponseOutputContent: Codable, Sendable, Equatable {
@@ -267,13 +270,15 @@ public struct OpenAIResponseUsage: Codable, Sendable, Equatable {
     }
 
     public init(chatUsage: OpenAIUsage) {
-        self.init(inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens,
-                  cachedInputTokens: chatUsage.promptTokensDetails?.cachedTokens)
+        self.init(
+            inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens,
+            cachedInputTokens: chatUsage.promptTokensDetails?.cachedTokens)
     }
 
     public var chatUsage: OpenAIUsage {
-        OpenAIUsage(promptTokens: inputTokens, completionTokens: outputTokens,
-                    cachedPromptTokens: inputTokensDetails?.cachedTokens)
+        OpenAIUsage(
+            promptTokens: inputTokens, completionTokens: outputTokens,
+            cachedPromptTokens: inputTokensDetails?.cachedTokens)
     }
 }
 
@@ -285,6 +290,10 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
     public var model: String
     public var output: [OpenAIResponseOutputItem]
     public var outputText: String
+    public var parallelToolCalls: Bool? = true
+    /// Responses uses flat function descriptors and named choices, unlike Chat.
+    public var toolChoice: JSONValue? = .string("none")
+    public var tools: [JSONValue]? = []
     public var usage: OpenAIResponseUsage?
     public var metadata: [String: JSONValue]?
     public var incompleteDetails: OpenAIResponseIncompleteDetails?
@@ -298,6 +307,9 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         case model
         case output
         case outputText = "output_text"
+        case parallelToolCalls = "parallel_tool_calls"
+        case toolChoice = "tool_choice"
+        case tools
         case usage
         case metadata
         case incompleteDetails = "incomplete_details"
@@ -327,5 +339,29 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         self.metadata = metadata
         self.incompleteDetails = incompleteDetails
         self.error = error
+    }
+}
+
+// Keep collection, initial streaming snapshots and terminal stored objects on
+// one request-derived representation. This does not change Chat tool coding.
+extension OpenAIResponse {
+    mutating func setToolConfiguration(from request: OpenAIResponseRequest) {
+        parallelToolCalls = request.parallelToolCalls ?? true
+        tools = (request.tools ?? []).map { tool in
+            var fields: [String: JSONValue] = [
+                "type": .string(tool.type), "name": .string(tool.function.name),
+            ]
+            if let description = tool.function.description {
+                fields["description"] = .string(description)
+            }
+            if let parameters = tool.function.parameters { fields["parameters"] = parameters }
+            if let strict = tool.function.strict { fields["strict"] = .bool(strict) }
+            return .object(fields)
+        }
+        switch request.toolChoice ?? .mode((request.tools ?? []).isEmpty ? .none : .auto) {
+        case .mode(let mode): toolChoice = .string(mode.rawValue)
+        case .function(let name):
+            toolChoice = .object(["type": .string("function"), "name": .string(name)])
+        }
     }
 }

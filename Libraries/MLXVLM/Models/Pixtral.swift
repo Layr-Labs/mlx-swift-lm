@@ -715,13 +715,9 @@ private enum PixtralLanguage {
             return out
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            (0 ..< config.numHiddenLayers).map { _ in
-                if let maxKVSize = parameters?.maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
-                } else {
-                    return KVCacheSimple()
-                }
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try (0 ..< config.numHiddenLayers).map { _ in
+                try makeAttentionKVCache(parameters: parameters)
             }
         }
     }
@@ -872,7 +868,9 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         return MLX.concatenated(finalEmbeddings, axis: 1)
     }
 
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         var inputIds = input.text.tokens
@@ -884,22 +882,18 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues
         )
 
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = embeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(
                 inputIds[0..., range], cache: cache,
                 inputsEmbeds: embeddings[0..., range, 0...])
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let logits = languageModel(
             inputIds[0..., processed...], cache: cache,
             inputsEmbeds: embeddings[0..., processed..., 0...])
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(.init(logits: logits))
     }
 
@@ -908,6 +902,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
         var newWeights: [String: MLXArray] = [:]
 
         for (key, value) in weights {
@@ -952,8 +948,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         return newWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 }
 

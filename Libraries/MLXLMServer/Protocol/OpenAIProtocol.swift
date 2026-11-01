@@ -142,6 +142,19 @@ public enum OpenAIMessageContent: Codable, Sendable, Equatable {
         }
     }
 
+    /// The `type` of the first part this server does not serve
+    /// (``OpenAIContentPart/unsupported(type:)``), nil when it serves every
+    /// part. ``text`` keeps only text parts, so request preparation refuses
+    /// such content instead of answering from what is left of it
+    /// (`OpenAIRequestValidation`).
+    public var unsupportedPartType: String? {
+        guard case .parts(let parts) = self else { return nil }
+        for part in parts {
+            if case .unsupported(let type) = part { return type }
+        }
+        return nil
+    }
+
     /// True if any content part carries image, video or audio media (which the
     /// text-only ``MLXModelContainerEngine`` cannot serve). ``text`` flattens
     /// content to its text parts only, so media would otherwise be silently
@@ -357,6 +370,40 @@ public struct OpenAIToolCall: Codable, Sendable, Equatable {
     }
 }
 
+/// A streamed `tool_calls` entry in the OpenAI chunk shape: a call's first
+/// fragment carries `id`, `type` and `function.name`; later fragments carry
+/// only `index` and an `arguments` fragment. A complete call is one entry
+/// and encodes exactly like `OpenAIToolCall`.
+public struct OpenAIToolCallDelta: Codable, Sendable, Equatable {
+    public struct Function: Codable, Sendable, Equatable {
+        public var name: String?
+        public var arguments: String?
+
+        public init(name: String? = nil, arguments: String? = nil) {
+            self.name = name
+            self.arguments = arguments
+        }
+    }
+
+    public var index: Int?
+    public var id: String?
+    public var type: String?
+    public var function: Function?
+
+    public init(index: Int?, id: String? = nil, type: String? = nil, function: Function? = nil) {
+        self.index = index
+        self.id = id
+        self.type = type
+        self.function = function
+    }
+
+    public init(_ call: OpenAIToolCall) {
+        self.init(
+            index: call.index, id: call.id, type: call.type,
+            function: .init(name: call.function.name, arguments: call.function.arguments))
+    }
+}
+
 public enum OpenAIToolChoice: Codable, Sendable, Equatable {
     public enum Mode: String, Codable, Sendable {
         case none
@@ -465,6 +512,10 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var seed: UInt64?
     public var logitBias: [String: Float]?
     public var streamOptions: OpenAIStreamOptions?
+    /// Set by `MLXOpenAIService.streamChatCompletionFrames`: the engine may
+    /// expose tool calls as `.toolCallDelta` while they are generated. Never
+    /// read from or written to the wire.
+    public var streamToolCallDeltas = false
 
     private enum CodingKeys: String, CodingKey {
         case model
@@ -539,6 +590,12 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.streamOptions = streamOptions
     }
 
+    /// The first unsupported content part type across the messages
+    /// (``OpenAIMessageContent/unsupportedPartType``), in message order.
+    public var unsupportedContentPartType: String? {
+        messages.lazy.compactMap(\.content.unsupportedPartType).first
+    }
+
     public var generationParameters: GenerateParameters {
         GenerateParameters(
             maxTokens: maxTokens,
@@ -606,17 +663,22 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         public var index: Int
         public var delta: Delta
         public var finishReason: String?
+        public var logprobs: OpenAIChatLogprobs?
 
         private enum CodingKeys: String, CodingKey {
             case index
             case delta
             case finishReason = "finish_reason"
+            case logprobs
         }
 
-        public init(index: Int, delta: Delta, finishReason: String?) {
+        public init(
+            index: Int, delta: Delta, finishReason: String?, logprobs: OpenAIChatLogprobs? = nil
+        ) {
             self.index = index
             self.delta = delta
             self.finishReason = finishReason
+            self.logprobs = logprobs
         }
     }
 
@@ -629,7 +691,7 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         /// round-trip to duplicate the field.
         public var reasoning: String?
         public var reasoningContent: String?
-        public var toolCalls: [OpenAIToolCall]?
+        public var toolCalls: [OpenAIToolCallDelta]?
 
         private enum CodingKeys: String, CodingKey {
             case role
@@ -643,7 +705,7 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
             role: String?,
             content: String?,
             reasoningContent: String?,
-            toolCalls: [OpenAIToolCall]?
+            toolCalls: [OpenAIToolCallDelta]?
         ) {
             self.role = role
             self.content = content

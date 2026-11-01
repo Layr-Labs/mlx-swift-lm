@@ -6,13 +6,13 @@ footer: |
 base:
   name: ml-explore/mlx-swift-lm
   url: https://github.com/ml-explore/mlx-swift-lm
-  # The upstream commit this fork branched from. CI (`scripts/check_forkdiff.py`)
-  # requires this to equal `git merge-base HEAD upstream/main`, so a rebase onto
-  # newer upstream fails the gate until the hash — and the sections below — are
-  # brought up to date. Upstream main as of 2026-04-17; the fork has not rebased
-  # since (upstream fixes were selectively ported instead, see "Selective upstream
-  # port" below).
-  hash: 7e2b7107be52ffbfe488f3c7987d3f52c1858b4b
+  # The last upstream commit merged into the fork. CI (`scripts/check_forkdiff.py`)
+  # requires this to equal `git merge-base HEAD upstream/main`.
+  # The fork merges upstream when David directs it. Each merge moves this hash
+  # and re-validates every section below.
+  # Between merges, upstream fixes are ported one at a time.
+  # Last merge: upstream main d02948b9 (2026-10-22). Previous base: 7e2b7107 (2026-04-17).
+  hash: d02948b99305fa74def75a2d7853013e1bb972c3
 fork:
   name: Layr-Labs/mlx-swift-lm
   url: https://github.com/Layr-Labs/mlx-swift-lm
@@ -38,10 +38,26 @@ def:
     - **Measurement** — benchmark executables, receipts and reports that back every performance claim.
 
     The fork tracks the MLX core through [`Layr-Labs/mlx-swift`](https://github.com/Layr-Labs/mlx-swift)
-    rather than upstream `mlx-swift`. Upstream `mlx-swift-lm` has since re-implemented several of these
-    ideas (MTP, batched KV) under a different single-stream architecture, so a full merge is not
-    feasible; high-value upstream fixes are hand-ported instead.
+    rather than upstream `mlx-swift`. Upstream `mlx-swift-lm` also has MTP and KV cache work under its
+    single-stream architecture. The fork merges upstream `main` when David directs it. Where both
+    sides change the same code, the fork keeps its serving behavior and takes upstream's new models,
+    parsers, fixes and API additions.
   sub:
+    - title: "Native Recursive Flint"
+      description: |
+        Native Swift hybrid-attention/MoE decoder and strict official mixed INT4/INT8
+        checkpoint loading, adapted with attribution from Prince Canuma's MIT mlx-vlm
+        Flint implementation and Recursive's Apache-2.0 rec reference. Independent
+        NumPy oracle, cache boundary tests and a strict opaque-value tool parser.
+        Full model/hardware acceptance is separate from the preview reference.
+      globs:
+        - "Libraries/MLXLLM/Models/Flint/**"
+        - "Libraries/MLXLMCommon/Models/Flint/**"
+        - "Tests/MLXLMTests/Integration/Flint/**"
+        - "Tests/MLXLMTests/Resources/flint-oracle.json"
+        - "ThirdPartyNotices/**"
+        - "docs/flint.md"
+        - "scripts/generate-flint-oracle.py"
     - title: "ContinuousBatchingV2 engine"
       description: |
         The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible
@@ -57,7 +73,9 @@ def:
             `EngineV2` / `EngineLoopV2` (the step loop and its forward-shape dispatch), `SchedulerV2`
             (admission, capacity shrink-retry, solo-prefill stripe, packed prefill, partial-prefill cap),
             `AdmissionV2` + first-token deadline admission with content-free unbounded guard reasons,
-            monotonic phase leases, per-row samplers
+            monotonic phase leases, and ordinary submission with exact stream-generation retirement
+            acknowledgements for hosts sharing capacity across engines. Early consumer termination
+            never acknowledges a live row; native work-admission guards remain authoritative. Per-row samplers
             with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
             streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
             attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
@@ -65,12 +83,19 @@ def:
             callbacks report actual cache-adjusted work before terminal delivery; last-confirmed-token
             stamps separate engine decode time from delivery tails. A per-engine mixed-prefill token cap
             drives both live scheduling and first-token projection without changing the solo stripe.
+            Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
+            run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
+            `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks, which
+            the first-token projection charges as decode steps).
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time
             receipts from existing launch/readback timestamps for mixed-prefill qualification.
             Bounded per-row confirmed-token receipts reuse the same readback timestamps,
             including committed MTP bursts; speculative proposals never count as delivery.
+            Sampled logits holding NaN or infinity fail their request closed
+            (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
+            acceptance packet, so a flagged row or committed verify position emits nothing.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -79,23 +104,57 @@ def:
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
             residency, segments, slab commitment with recoverable commit), a Metal paged-attention kernel
-            plus a reference implementation for parity, query-block attention over prompt chunks,
+            plus a reference implementation for parity, query-block attention over prompt chunks
+            (on both backends a full-attention chunk whose head geometry MLX fuses takes one
+            `.causal` SDPA call instead, `CBv2AttentionV1.usesFusedCausalPrefill`),
             segment dispatch plans/caches, native KV dtype probing, a decode profiler, and prefix-block
             sharing (`PrefixBlocks/`: block index, free queue, page handles, resident-prefix plan
             validation). Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
-            checkpoint storage.
+            checkpoint storage. Optional token-local affine K4/V4, K8/V4 and K8/V8 pages use
+            signed block Hadamard keys and direct mixed packed/native online attention. Original
+            recent128 and pending/speculative rows retain separately charged native owners until
+            evaluated commit and rollback finish; short windows and assistant-borrowed target
+            owners may stay native. SDK configuration remains native by default; provider policy
+            selects the load-time precision. Read-only diffusion canvas attention does not append.
+            Compact Qwen4 QSA reconstructs only selected rows with original recent overlays;
+            packed storage never enters the native selected reader. Bounded runtime probes
+            evaluate selected geometry/dtype kernel families before pool publication, using
+            runtime segment offsets and selection counts rather than allocation-size templates.
+            Every owner that builds a pool shares the live/checkpoint precision selection
+            (`PagedKVQuantizationPolicy`), the segmented serving pool builder and the kernel preflight
+            core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
+            them through `PagedKVBackend` as the engine does.
+            `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
+            - "docs/runtime-kv-quantization.md"
         - title: "Prefix checkpoints"
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
             sources, import plans and transfers, allocation footprint accounting, and the hybrid-prefix
-            replay that makes reuse exact for recurrent (DeltaNet) targets. Retained demanded fork
+            replay that makes reuse exact for recurrent (DeltaNet) targets. A model whose prefill
+            output depends on the chunk partition (`alignsRecurrentCheckpointsToPrefillChunks`) is
+            captured only at multiples of the fixed prefill chunk reached by whole chunks. A model whose
+            only out-of-band input is causal media at scalar positions
+            (`supportsCausalMediaCheckpointReuse`) checkpoints bound media requests without side state,
+            in their identity's scope. Retained demanded fork
             endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
             may opt into one aligned interior range boundary for a scoped, cold short text prompt with
             repeat demand; scheduling and first-token projection share that bounded geometry.
             The retention guide documents actual native frontiers, staged byte ownership and
-            tracked retirement; the library README links that checkpoint contract.
+            tracked retirement; the library README links that checkpoint contract. Packed complete
+            layouts persist every coded row and its exact native recent band, including historical
+            window captures. Import retains native-band DTOs as scratch through adoption and
+            transfers only page destinations into the physical pool floor. Legacy untyped native
+            snapshots are refused by packed pools before mutation.
+            Independent opt-in checkpoint quantization also encodes immutable native paged or
+            contiguous rows on the checkpoint queue, then reconstructs directly into native serving
+            destinations. Its distinct profile/dtype-bound formats retain an exact recent band and
+            native auxiliary state without changing live attention or decode chaining. Bounded row
+            scratch and native destination/retirement ownership remain explicitly admitted; lossy
+            restoration does not promise original-byte or repeated-encoding equality. Generic
+            symmetric contiguous targets may supply observed native dtypes without overriding a
+            model's own declaration or native binding.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "docs/prefix-checkpoint-retention.md"
@@ -105,9 +164,20 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. Model-specific drafters live under "Models".
+            target-authoritative. A rectangular round commits one common width for all rows unless the
+            drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
+            row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
+            plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
+            request-scoped media fallback
+            (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
+            `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
+            lifetime beside speculating text rows. Model-specific drafters live under "Models".
+            The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
+            falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
+            so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
+            - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
@@ -125,18 +195,22 @@ def:
             asymmetric model and actual complete-checkpoint lifecycle used by the retention test.
           globs:
             - "Tests/MLXLMTests/CBv2*"
+            - "Tests/MLXLMTests/Integration/Engine/**"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
+            - "Tests/MLXLMTests/Native*Checkpoint*"
             - "Tests/MLXLMTests/HistoricalWindow*"
             - "Tests/MLXLMTests/Fixtures/CompleteCheckpointFixtureModel.swift"
             - "Tests/MLXLMTests/Fixtures/MiMoNativeHistoricalRetentionFixture.swift"
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
+            - "Tests/MLXLMTests/QuantizedCompleteCheckpointTests.swift"
+            - "Tests/MLXLMTests/QuantizedHistoricalCheckpointBoundaryTests.swift"
+            - "Tests/MLXLMTests/Qwen3VLPagedQuantizedTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
             - "Tests/MLXLMTests/CompilableRotatingKVCacheRingTests.swift"
             - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
             - "Tests/MLXLMTests/DrafterMasksTests.swift"
-            - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
             - "Tests/MLXLMTests/PenaltyLongPromptTests.swift"
             - "Tests/MLXLMTests/ContinuousBatchingTestPlan.md"
             - "Tests/MLXLMTests/Resources/**"
@@ -175,22 +249,38 @@ def:
         - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
         - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
         - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
-        - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
       description: |
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
         channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
-        chat-template rendering.
+        chat-template rendering. GLM5 has schema-disambiguated values and response-wide
+        validation before committing calls; this does not register a GLM5 model or qualify grammar decoding.
+        `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
+        is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
+        argument JSON that the complete-frame parse must agree with when the frame closes.
+        `ToolCallPolicy.returnsFailedCallsAsText` defaults to true (David, 2026-10-23): the fork's frame state
+        machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
+        recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
+        FoundationModels router pass it.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
+        - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
+        - "Tests/MLXLMTests/ChatSessionTests.swift"
+        - "Tests/MLXLMTests/ChatSessionToolRoundTripTests.swift"
+        - "Tests/MLXLMTests/NamedJSONToolCallTests.swift"
+        - "Tests/MLXLMTests/ParameterCoercionTests.swift"
+        - "Tests/MLXLMTests/TextToolCallRecovery*.swift"
+        - "Tests/MLXLMTests/ToolArgumentNormalizationTests.swift"
+        - "Tests/MLXLMTests/ToolCall*.swift"
+        - "Tests/MLXLMTests/ToolSchemaValidatorTests.swift"
+        - "Tests/MLXLMTests/XMLFunctionParserStrictnessTests.swift"
         - "Tests/MLXLMTests/ToolTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
         - "Tests/MLXLMTests/GenerateTaskToolFilterTests.swift"
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
-        - "Tests/MLXLMTests/UserInputTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
     - title: "Models"
       description: |
@@ -198,14 +288,58 @@ def:
         gained a CBv2 seam (request-owned state, `targetForward(requirement:)` prompt-output
         narrowing) and, where the checkpoint ships `mtp.*` weights, an inline MTP drafter.
       sub:
+        - title: "GLM5 Next native candidate"
+          description: |
+            Native GLM-5.3-Flash target and trained prediction layer with bounded loading of
+            Q4, declared mixed-affine and NVFP4 hybrid artifacts (NVIDIA NVFP4 experts and
+            dense MLPs, affine 4-bit non-expert matrices, BF16 vision kept as stored), media
+            processing and sparse-state owners, with synthetic and official-reference oracles.
+            The provider loads the `GLM5NextExecutionPolicy.serving` preset (absorbed dense
+            history, parallel selection, device-table metadata, fused mHC norm, fused decode
+            and NAX prefill experts, chunked KDA prefill, fused norms, decode step, router,
+            input projections, native sparse decode and prefill); native prefill GEMM and
+            early async evaluation stay default-off. Native paged CBv2 runs 2048-token steps
+            with bounded history reads and a split step price, rectangular trained-MTP
+            verification with the complete-prefix cache and per-request MTP memory, and
+            prepared causal image rows (fused vision attention on the default GPU stream).
+            Safetensors descriptors request F_NOCACHE and disabled read-ahead before hashing
+            and range reads, refusing the load if either hint fails. Filesystem unit tests
+            cover real hashing, policy ordering and descriptor cleanup without MLX arrays.
+            Full-artifact verification retains all files with bounded parallel aligned chunks;
+            aligned tensor range reads price anonymous scratch and preserve stamp checks.
+            Production mHC threadgroup regression tests cover split/prefill/folded paths.
+            Bounded cluster PNG helpers share native image patch preparation and caller-owned
+            checkpoints; encoded cluster image envelopes are refused by local engines.
+            KDA cache ingress compacts retained state; full-model and pipeline transactions
+            fence current and rollback roots before publication. Lazy pending history and
+            allocator slack remain separate consumer admission obligations.
+            Registration and activation remain provider decisions.
+          globs:
+            - "Libraries/MLXLLM/Models/GLM5Next*.swift"
+            - "Libraries/MLXVLM/Models/GLM5Next*.swift"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/**"
+            - "Tests/MLXLMTests/Kernel/Layers/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/LLM/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Cache/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Engine/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Support/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Unit/Models/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Unit/Vision/GLM5Next*.swift"
+            - "docs/glm5-next/**"
         - title: "Gemma 4 (dense, MoE, MTP)"
           description: |
             Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused
             gate+up experts, bf16 conversion, a frozen-KV MTP drafter for CBv2 (`Gemma4CBv2MTPDrafter`,
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
+            Fork keeps its numerics over upstream 34a3fd2b: the Gemma 4 final-logit softcap runs in float32,
+            so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
+            Explicit cluster decode scopes preserve singleton packed projection, expert and
+            unscaled normalization arithmetic independently for each request row.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
@@ -234,9 +368,15 @@ def:
           description: |
             MXFP4 expert path split into focused extensions: checkpoint layout, weight materialization,
             compiled experts, gate+up fusion, last-query prefill and pruned prefill output.
+            The expert SwiGLU clamps with scalar bounds, which take the activation dtype. Upstream's float32
+            `MLXArray` bounds promote a bf16 checkpoint to float32 activations and K/V after layer 0.
+            `Kernel/LLM/GPTOSSActivationDTypeTests.swift` checks the expert, layer and K/V dtypes.
+            Independent-history cluster caches retain each request's original attention order,
+            scalar rotary offsets and singleton projection, normalization and expert graphs.
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+            - "Tests/MLXLMTests/Integration/GPTOSS/**"
         - title: "Granite MoE hybrid causal mask"
           description: |
             Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
@@ -258,18 +398,67 @@ def:
             A3B decode/prefill optimizations (fused routed-expert gate_up, direct expert reduction,
             E=256 tile route), complete-checkpoint export, inline MTP loading with top-two drafting, and
             the dense Qwen 3.8 MTP artifacts.
+            Request-owned paged assistant histories retain complete prefix checkpoints, bounded
+            rollback and checked retirement for tensor MTP owners.
+            The inline assistant flushes trusted history in evaluated blocks (`historyFlushRows`), and a
+            scoped batched verify rectangle projects each row as its own single-request window.
+            Those rows share a quantized call below MLX's vector-kernel limit (`Qwen35QuantizedVectorLimit`),
+            where each vector's arithmetic does not depend on the vector count (fewer launches; qmv_wide
+            still reads the weights once per tile of up to five vectors).
+            Where measured faster and byte-equal (Apple GPU family 17; family 15 float32 inputs), one
+            four-bit kernel (`Qwen35WideQuantizedKernel`, `qmv_wide_impl`'s per-vector arithmetic)
+            reads each projection's weights once for up to eight vector rows.
+            A CBv2 forward can submit its decoder layers in strides (`Qwen35LayerSubmission.stride`,
+            0 by default; evaluation order only), and a tensor-parallel sparse block sums every row's
+            packed float32 expert and shared-expert partials in one collective
+            (`Qwen35TensorParallelSwitchLinear`), each value as the row's own call computes it.
+            Scoped decode steps, verify windows and batched rows can route every affine projection
+            through `AffineQuantizedVectors` (`Qwen35BatchDecodeScope.exactVectors`): one fixed
+            arithmetic per GPU family and weight packing, so each vector gets the bits it gets alone
+            and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm
+            (a stream narrower than its norms, as in the Prism packs, keeps the unfused promoting sum),
+            the Gated DeltaNet convolution step and q/k norm, SwiGLU and the output gate on GPU families
+            measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`).
+            Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
+            run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
+            instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
+            the kernel chosen for a chunk never changes the recurrent state; `DARKBLOOM_TTFT_GDN_BLOCKED=0`
+            keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
+            The fused GDN input projection refuses projections with an NVFP4 global scale (port of upstream
+            1dc19efa), is built at load by `Qwen35TextModel.prepare()` and is cleared before a parameter or module
+            update runs. Parameter updates that start at a decoder layer or a model reach the GDN layers through
+            `ParameterUpdateObserving`, because mlx-swift 9bd73fc7 no longer calls a nested module's
+            `update(parameters:)` override.
+            Fork keeps its numerics over upstream c4084528: MLXLLM Qwen 3.5, MLXLLM Qwen3-Next and MLXVLM Qwen 3.5
+            normalize GDN q/k with rmsNorm eps 1e-6 as mlx-lm does (one eps across the fork's Qwen family); the
+            transformers-style eps 1e-6/D changes outputs only for near-zero q/k and would move the fork's validated
+            numerics. `GatedDeltaQKNormTests` expects the fork's eps.
+            Fork keeps its numerics over upstream 771e4ee0: `ssmAttn` threads the fp32 recurrent state of
+            `computeDt` through its windows and returns it without rounding it to the input or state dtype, as
+            mlx-lm does; the Nemotron Super fused SSD and prefill oracles depend on it.
+            `testSSMAttnPreservesRecurrentStateDTypeAcrossChunks` in `SSMTests` expects a float32 state.
+            The opt-in tensor expert-down projection reduces FP32 shard partials before activation
+            rounding and router weighting; CPU affine projection tests cover this reduction boundary.
+            A CBv2 forward may be submitted every few layers as it is built (`Qwen35LayerSubmission.stride`:
+            cluster decode steps and tensor-parallel prompt frames), and a bench may observe each layer as
+            it is built (`Qwen35LayerSubmission.observer`, diagnostic): evaluation order only, every value
+            unchanged.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
-            - "Libraries/MLXLLM/Models/GatedDelta.swift"
+            - "Libraries/MLXLMCommon/GatedDelta.swift"
+            - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
+            - "changelog.d/cluster-model-runtime.md"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2QwenClusterCarrierTests.swift"
+            - "Tests/MLXLMTests/Integration/Qwen/**"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
-            - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+            - "Tests/MLXLMTests/SSMTests.swift"
         - title: "Jamba per-expert checkpoint loading"
           description: |
             `JambaModel.sanitize(weights:)` stacks the per-expert tensors `feed_forward.experts.N.*` into `feed_forward.switch_mlp.*`.
@@ -283,7 +472,9 @@ def:
             Native dense Qwen text and vision wrappers for Prism's schema-2
             signed-Hadamard 2-bit pack. Strict metadata/sign/shape validation,
             FP16 packing with FP32 transform arithmetic, native CBv2 state,
-            and no MTP capability for the headless published artifact.
+            and no MTP capability for the headless 27B artifact. The 9B path adds
+            checkpoint image bounds, declared vision activation and strictly
+            validated optional F16 or affine Q4/group-64 MTP sidecars.
             Default-on eligible prefill carry submission keeps
             native arithmetic and engine-owned final evaluation/retirement,
             with explicit deferred-input and late-fault qualification tests.
@@ -296,6 +487,13 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
             - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
+            - "Libraries/MLXLLM/Models/Qwen35MTP+PrismValidation.swift"
+            - "Libraries/MLXVLM/Models/PrismHadamardImageProfile.swift"
+            - "Libraries/MLXVLM/Models/PrismHadamardQwen35.swift"
+            - "Libraries/MLXVLM/Models/QwenCheckpointImageConfiguration.swift"
+            - "Tests/MLXLMTests/Unit/Models/PrismMTPBindingTests.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/PrismHadamardProcessorTests.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/Qwen35VisionActivationTests.swift"
         - title: "Exaone 4 sliding-window mask"
           description: |
             Exaone 4 made one mask from the first layer cache, without the window, for all layers (issue #255).
@@ -338,11 +536,9 @@ def:
             - "docs/qwen4/**"
         - title: "OLMo 3 sliding-window cache"
           description: |
-            `Olmo3Model.newCache(parameters:)` now takes an optional argument, so it is the `LanguageModel` requirement (issue #260).
-            Generation then gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does. Port of upstream #462.
-            `Olmo3SlidingCacheTests` checks the caches and the cached pass against the full pass on a tiny model.
+            Upstream #462 now carries the model fix: generation gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does.
+            The fork keeps `Olmo3SlidingCacheTests` (issue #260). It checks the caches and the cached pass against the full pass on a tiny model.
           globs:
-            - "Libraries/MLXLLM/Models/Olmo3.swift"
             - "Tests/MLXLMTests/Olmo3SlidingCacheTests.swift"
         - title: "InternLM2 dynamic NTK RoPE"
           description: |
@@ -360,6 +556,8 @@ def:
             shape, device and numerical eligibility checks. Kernel activation,
             complete serving qualification and measured performance are tracked
             separately in docs/mimo-v26; draft support is not a release gate pass.
+            Model-owned independent-history forwards and page caches preserve full/sliding
+            attention order for cluster requests without changing standalone defaults.
           globs:
             - "Libraries/MLXLLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Models/MiMo/**"
@@ -367,6 +565,7 @@ def:
             - "Libraries/MLXVLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
             - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMTests/Integration/MiMo/**"
             - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
         - title: "OpenELM untied head"
@@ -381,6 +580,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            Lightning cluster decode uses explicit per-request projection/expert arithmetic
+            and compact owned recurrent rows so retiring lanes do not retain other histories.
             Without a cache, the attention layers of Nemotron-H get a causal mask. Upstream gave them no mask.
             `NemotronHCausalMaskTests` checks causality with and without a cache on a tiny model.
             The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
@@ -389,21 +590,99 @@ def:
             `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
+            - "Libraries/MLXLLM/Models/Nemotron35BatchDecode.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
             - "Libraries/MLXLLM/Models/Laguna.swift"
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
-            - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+            - "Tests/MLXLMTests/LFM2MoESigmoidRoutingTests.swift"
             - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
+        - title: "Nemotron 3.5 Super VL (ModelOpt NVFP4/FP8 components)"
+          description: |
+            Incomplete native components for NVIDIA's original mixed NVFP4/FP8/BF16 Nemotron 3.5
+            Super VL checkpoint. It is not a registered or qualified serving model.
+            `MLXLMCommon/Quantization` adds calibrated ModelOpt projections that keep the producer
+            scales, packed NVFP4 expert banks, the checkpoint inventory and residency quote, an E4M3
+            codec and a bounded unit-scale FP8 KV cache. Generic affine quantization does not replace them.
+            The projections and expert banks run a device-resident graph path by default, with no host
+            synchronization: Metal kernels that reproduce the eager activation quantization bit for bit,
+            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv.
+            Decode, row-exact batches and verify windows are bit-identical to the eager reference, which
+            remains selectable; prefill defaults to `.tiled` MLX matrix kernels, whose summation order
+            differs (`.rowwise` keeps it exact).
+            Each projection and expert bank carries a load-time `ModelOptActivationOverflow`.
+            The default `.eagerNaN` keeps ModelOpt's eager rule, which turns an activation beyond the
+            E4M3 range into NaN. The Super installation and MTP head loader select `.saturating`,
+            the SATFINITE conversion of deployment engines, because image embeddings can exceed the
+            text-calibrated input scales.
+            `NemotronSuperMTPModule` loads the embedded MTP head; its eager forward is the reference
+            and `graphForward` is the host-synchronization-free draft path. `NemotronSuperMTPAssistant`
+            is an opt-in request-stateful greedy text assistant bound to the exact target, with a
+            rewindable unit-scale FP8 KV history and a bounded admission declaration. It verifies
+            serially or, opt-in, through one captured `[B, 1 + k]` window of up to eight requests
+            (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
+            decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
+            `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
+            capture. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
+            (`ModelOptNVFP4Weights.calibratedMatmul`) calls `qqmm` on at most 4 rows at a time, so it stays one
+            matrix-vector product per row; since 3eb822ca larger bfloat16 calls with global scales take the tiled
+            matrix kernel, which sums in another order than the graph's `.rowwise` path.
+            Because no row depends on the batch shape, the assistant opts into the engine's
+            `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
+            accepted prefix.
+            `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in target seam.
+            Speculation is text-only: through `CBv2RecurrentMTPRequestScopedMediaFallback` (adopted only
+            by the Super MTP targets) causal image requests on the speculating engine run target-only,
+            with the ordinary adapter's embedding prefill and decode and no draft or assistant state.
+            `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
+            decode of independent requests; prompts and media stay serial. Its default row-exact
+            products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode:
+            FP8 projections, the router and latent projections share each weight read across an
+            eight-row dispatch (up to sixteen rows per call), and NVFP4 experts run one single-vector
+            product per row; `.shared` products use one M = B product per projection.
+            `NemotronSuperDecodeCharge` states the per-request admitted bytes. The adapter
+            resolves `cbv2RecurrentStateSpec` (a lazy probe forward of the trunk) once, not per step.
+            `exactPrefixCheckpoints` opts the plain adapter into the resident recurrent checkpoint
+            bank for text prompts, with checkpoints only on the fixed prefill chunk grid
+            (`alignsRecurrentCheckpointsToPrefillChunks`), where a restore continues a cold prefill
+            bit for bit. The MTP capture target opts in too: the assistant checkpoints its queued
+            prompt history (`CBv2MTPPrefixCheckpointDrafter`), from which the first draft step
+            builds the same draft history as a cold request. Image requests reuse only when the host
+            binds them to an identity of their evaluated embeddings (`supportsCausalMediaCheckpointReuse`).
+            The adapter and the MTP target also declare their attention KV types
+            (`CBv2CompleteCheckpointKVTypeProviding`), and the assistant encodes its prompt history for
+            complete checkpoints (`CBv2MTPPrefixCheckpointCoding`, FP8 codes widened to float16 integers),
+            so a host can keep the same text checkpoints durably instead of in the bank.
+            The adapter declares native paged KV support (`supportsPagedKV`, `requiresNativePagedKV`);
+            the host chooses the backend and contiguous stays the default.
+            The vision side (RADIO tower with its image and video tubelet embedders, projector,
+            image and video composition, video sampling and EVS token selection, loading epochs) is
+            in `MLXVLM`.
+            `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
+            open qualification and performance work. The tests use tiny synthetic fixtures, except
+            `NemotronSuperVideoReferenceTests`, a full-checkpoint video golden that runs only when
+            `NEMOTRON_SUPER_REFERENCE_DIR` and `NEMOTRON_SUPER_VIDEO_GOLDEN_DIR` are set;
+            `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
+            only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set, and `NemotronSuperBatchedDecodeBenchmark`
+            times batched decode at those dimensions only when `NEMOTRON_SUPER_BATCH_BENCH` is set.
+          globs:
+            - "Libraries/MLXLLM/Models/NemotronSuper*.swift"
+            - "Libraries/MLXLMCommon/Quantization/ModelOpt*.swift"
+            - "Libraries/MLXLMCommon/Quantization/NemotronSuper*.swift"
+            - "Libraries/MLXVLM/Models/NemotronSuper*.swift"
+            - "Libraries/MLXVLM/Models/NemotronRadio*.swift"
+            - "Libraries/MLXVLM/NemotronSuperImagePreprocessing.swift"
+            - "Libraries/MLXVLM/NemotronSuperVideoPreprocessing.swift"
+            - "Tests/MLXLMTests/Integration/Nemotron/**"
+            - "docs/nemotron-super.md"
         - title: "FalconH1 causal attention mask"
           description: |
-            FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
-            attention without a causal mask. The model now uses the causal mask of `MLXLMCommon`, as
-            mlx-lm `falcon_h1.py` does. The test checks causality and the cached path (issue #199).
+            Upstream (771e4ee0, 4716b631) now gives FalconH1 the causal mask of `MLXLMCommon`, as
+            mlx-lm `falcon_h1.py` does. The fork keeps its test, which checks causality and the cached
+            path (issue #199).
           globs:
-            - "Libraries/MLXLLM/Models/FalconH1.swift"
             - "Tests/MLXLMTests/FalconH1CausalMaskTests.swift"
         - title: "Quantized MoE kernels and SwitchGLU"
           description: |
@@ -478,6 +757,10 @@ def:
         sliding-window layers a mask without a cache. `Mistral3PixelLayoutAndMaskTests` checks this.
         The Gemma 3 text model casts the embedding scale to the dtype of the embeddings. Upstream cast it to the dtype of the token IDs, so a decode step scaled by 5, not 5.66.
         `Gemma3VLMEmbeddingScaleTests` compares a decode step after an image prompt with a longer prompt on a tiny model.
+        Qwen2-VL, Qwen2.5-VL, GLM-OCR and Qwen3-VL-MoE keep the stateless `callAsFunction(_:cache:)` that
+        fork callers use; upstream left only the typed entry point, so the protocol default aborted the
+        process. The stateless call carries no M-RoPE delta: a decode step after a media prompt uses the
+        typed call with the state that `prepare` returned (upstream 3f9c86f4), as the decode tests do.
       globs:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"
@@ -486,20 +769,24 @@ def:
         - "Tests/MLXLMTests/PixtralPixelLayoutAndImageBatchTests.swift"
         - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
-        - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
         - "Tests/MLXLMTests/Gemma3VLMEmbeddingScaleTests.swift"
-    - title: "Selective upstream port (embedders, macros, helpers)"
+    - title: "Hugging Face macros and the Gemma 4 masked embedder test"
       description: |
-        A full `git merge upstream/main` is infeasible — both trees rewrote `Gemma4.swift` and the KV
-        cache in opposite directions — so high-value upstream fixes are cherry-picked or hand-ported
-        (PR #50: SSM dtype fixes, VLM crash fixes, embedder load fixes, KV-quant hardening). The files
-        here are the ones touched *only* by that port; other ported fixes sit inside the sections above.
+        The tokenizer bridge macro adds the `applyChatTemplate(messages:chatTemplate:)` overloads and loads
+        the DiffusionGemma tokenizer configuration. `MaskedEmbedderTests` checks the Gemma 4 centroid
+        embedder. Earlier selective ports of upstream fixes (PR #50) are now part of the upstream merge.
       globs:
-        - "Libraries/MLXEmbedders/**"
         - "Libraries/MLXHuggingFaceMacros/**"
-        - "Libraries/IntegrationTestHelpers/**"
-        - "Tests/MLXLMTests/NomicBertTests.swift"
         - "Tests/MLXLMTests/MaskedEmbedderTests.swift"
+    - title: "GLM final-stage readout policy"
+      description: |
+        Final-stage readout defaults to allTokens for full-output compatibility. Opt-in lastToken
+        projects the last physical column; none keeps full hidden states without a head graph.
+        Candidate fences and cache adoption remain unchanged. Model CPU/GPU parity and performance
+        qualification are separate gates; no throughput claim follows from source staging.
+      globs:
+        - "Libraries/MLXLLM/Models/GLM5NextTextStage.swift"
+        - "Tests/MLXLMTests/Kernel/LLM/GLM5NextTextStageTests.swift"
     - title: "OpenAI-compatible server"
       description: |
         `mlx-server` and the `MLXLMServer` library: health, models, metrics, chat completions,
@@ -509,6 +796,11 @@ def:
         runtime `setMaxNumSeqs` for adaptive concurrency.
         Responses input replay retains reasoning and adjacent function calls in one assistant turn,
         preserving tool arguments and explicit message/result boundaries.
+        Collected think-tag parsing keeps unclosed generated or prompt-seeded blocks in reasoning;
+        providers must pass rendered prompt state for both collected and streamed requests.
+        Model listings preserve known creation dates and use a process-stable fallback when absent.
+        Responses snapshots, stored objects and retrieval retain flat function tools, named/default
+        tool_choice and parallel_tool_calls across completed, incomplete and failed streams.
         Shared service preparation rejects negative output-token limits before engine invocation
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
@@ -516,7 +808,9 @@ def:
         The embeddings engine builds the padding mask from the token counts (not from the pad token,
         which is the EOS token) and gives it to the model and the pooling, so a padded text in a
         batch keeps the embedding it has alone and an appended EOS token stays in the mean.
-        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
+        Chat streams request engine call fragments (`streamToolCallDeltas`) and render them as OpenAI
+        `tool_calls` deltas; collected chat and Responses keep whole calls.
+        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models and the tool-call delta rendering; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
@@ -551,7 +845,9 @@ def:
     - title: "Build and dependencies"
       description: |
         `Package.swift` points MLX at the Layr-Labs `mlx-swift` fork and adds the server, bench and
-        test targets; `patches/` carries the loader patches applied to that dependency; `.gitignore`
+        test targets. Its native pin includes the current-pass barrier before fast Metal fence
+        waits; this ordering correction does not qualify an installed distributed model.
+        `patches/` carries the loader patches applied to that dependency; `.gitignore`
         keeps reference implementations out of the tree and `.gitattributes` protects the immutable
         benchmark prompt whose byte content is committed alongside its token IDs and receipts.
       globs:
@@ -561,46 +857,91 @@ def:
         - ".gitattributes"
     - title: "Fork tooling"
       description: |
+        `.pre-commit-config.yaml` formats the staged Swift filenames supplied by pre-commit.
+        It keeps the shared `.swift-format` configuration without recursively rewriting unrelated files.
         This page and the gate that keeps it honest: `check_forkdiff.py` fails CI when `base.hash` is
         not the merge-base with upstream, or when a file the fork changes is not described by a section
         above.
 
-        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package on a GitHub-hosted Mac.
-        It runs the self-contained Metal test suites, one suite at a time.
-        A last step runs every test in the package once and writes the line coverage of the fork's sources to the job summary.
+        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a GitHub-hosted Mac.
+        Parallel jobs then run every test in the package once, in the shards of `.github/test-shards.json`.
+        A last job writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
-        A suite fails when it executes zero tests or skips a test.
-        Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
-        A suite fails when it executes zero tests or skips a test.
-        `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
+        A strict suite fails when it executes zero tests or skips a test.
+        `test-run-nested-suite.sh` tests that rule with a fake `swift` command.
         `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
         `CONTRIBUTING.md` documents the variable.
         `prepare-mimo-native-retention-fixtures.py` creates the closed, offline synthetic
         asymmetric payload required by the explicit native historical-retention CI selector.
       globs:
+        - ".pre-commit-config.yaml"
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
         - "scripts/stage-test-metallib.sh"
         - "scripts/run-nested-suite.sh"
-        - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
         - "scripts/prepare-mimo-native-retention-fixtures.py"
         - "Tests/MLXLMTests/ReferenceHardware.swift"
         - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
+    - title: "Upstream tests adapted to the fork"
+      description: |
+        Upstream tests that check code the fork changed run against the fork's equivalent code. No case is skipped.
+        `CompiledDecodeWeightUpdateTests` runs its Qwen 3.5 cases on the MLXVLM Qwen 3.5 language model, which has
+        the compiled decode segments; the MLXLLM Qwen 3.5 keeps the fork's decode path.
+        `Qwen35FusedGDNProjectionTests` checks the fork's fused GDN input projection (`projectInputs(_:B:S:)`,
+        `prepareFusedInputProjection()`); unfused references use projection copies that cannot fuse.
+        `Qwen35GDNDecodeBitwiseTests` compares the fork's `decodeConv(convState:qkv:)` and the conv state of a
+        cached decode step with a full-window convolution, bit for bit.
+        `Gemma4VideoInputTests` checks the fork's Gemma 4 video path: the video token default, image and video
+        scatter agreement, the per-frame token count of the patch grid and the processor's frame preparation.
+        `MoERouterFusedIntegrationTests` and `TiedWordEmbeddingSanitizationTests` compute their arrays instead of
+        storing them, because XCTest builds every test case object while the fork's unit step lists the tests
+        without a Metal library.
+        `CompiledTraceTests` reproduces the capture hazard with `MLX.compile(inputs:outputs:)`, because the
+        stateless `compile` of the pinned mlx-swift takes a `@Sendable` body.
+        `Qwen3VLMoETests` declares `hidden_act: gelu_pytorch_tanh` in its MoE vision config, as published
+        checkpoints do: the fork's Qwen3-VL vision default stays `gelu` (fe01df9f) and MoE vision configs must
+        name their activation.
+      globs:
+        - "Tests/MLXLMTests/CompiledDecodeWeightUpdateTests.swift"
+        - "Tests/MLXLMTests/CompiledTraceTests.swift"
+        - "Tests/MLXLMTests/Qwen35FusedGDNProjectionTests.swift"
+        - "Tests/MLXLMTests/Qwen35GDNDecodeBitwiseTests.swift"
+        - "Tests/MLXLMTests/Gemma4VideoInputTests.swift"
+        - "Tests/MLXLMTests/MoERouterFusedIntegrationTests.swift"
+        - "Tests/MLXLMTests/TiedWordEmbeddingSanitizationTests.swift"
+        - "Tests/MLXLMTests/Qwen3VLMoETests.swift"
+    - title: "Upstream test fixes for hosted CI runners"
+      description: |
+        `EvalTests.testVarianceNormalizedKVCache32KIngestAndDecodePeakMetalMemorySmoke` (upstream 6745899c) failed
+        on GitHub-hosted macos-26 runners about half the time. The fork changes the test only. The bounds stay the same.
+        The test runs two untimed decode steps before the timed decode. On a runner with a cold shader cache, the
+        first decode of a process includes the Metal pipeline compile: 0.45 s cold, 0.05 s warm, 5-10 ms steady.
+        The first step starts the raw tail of the cache and the second appends to it, so both paths are compiled.
+        The 0.25 s bound now measures decode and not the compile.
+        The test calls `Stream.gpu.synchronize()` before it samples the memory baseline. Without it, one 128 MiB
+        float32 temporary of `MLXRandom.normal` is sometimes still live, and the peak workspace is 451.8 MB or 586.0 MB
+        for the same absolute peak of 720.3 MB.
+      globs:
+        - "Tests/MLXLMTests/EvalTests.swift"
     - title: "Test types and unit tests"
       description: |
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
-        The Fork Tests workflow runs them before it builds the Metal library.
-        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations and the Qwen4 video prompt expansion.
+        The Fork Tests workflow runs them before it stages the Metal library.
+        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
-        `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
+        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
+        `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
+        `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorFrameStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
+        `TestTokenizer.swift` keeps the random test tokenizer that upstream removed (a86ee6a7); many fork tests use it.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
+        - "Tests/MLXLMTests/TestTokenizer.swift"
         - "Tests/MLXLMTests/Unit/**"
         - "scripts/check-unit-test-files.sh"
     - title: "Kernel tests with tiny random models"
@@ -614,9 +955,10 @@ def:
         `Kernel/Common/` tests model container generation, the embedder factory load, the wired memory measurement and the image array input.
         `Kernel/LLM/` also tests a table of dense text models (MiniCPM, OLMo 2, GLM-4, Gemma, Starcoder 2, Phi, ERNIE 4.5, Cohere, Lille, MiMo and the Gemma 4 wrapper) and the DeepSeek-V4 MTP head.
         `Kernel/LLM/ClassicTextModelForwardPassTests.swift` runs the table checks on the configuration variants of SmolLM3, Exaone 4, OLMoE, OLMo 3, PhiMoE, Phi-3, NanoChat, Granite, OpenELM and Gemma 2.
-        `Kernel/LLM/` tests Laguna, Qwen3-Next, Qwen3-MoE, Qwen 2, Qwen 3, Qwen 3.5 MoE, DeepSeek V4, BitNet, Gemma 3n and the loader of the Nemotron-H 3.5 MTP head. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        `Kernel/LLM/` tests Laguna, Qwen3-Next, Qwen3-MoE, Qwen 2, Qwen 3, Qwen 3.5 MoE, DeepSeek V4, BitNet, Gemma 3n and the loader of the Nemotron-H 3.5 MTP head. `Kernel/Cache/` tests the KV caches, the masks, the quantized attention and the fused causal prompt route of the CBv2 layer caches. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
         More text cases cover Apertus, InternLM2, Mistral 3 text, MiniMax, Bailing MoE, GLM-4 MoE, AfMoE, LFM2, LFM2 MoE, MiMo V2 Flash, GLM-4 MoE Lite, Granite MoE hybrid, Falcon H1, Jamba, Baichuan M1 and DeepSeek V3.
         `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
+        `Kernel/Quantization/` tests the ModelOpt NVFP4 and FP8 projections, including the opt-in lazy decode and lazy FP8 helpers, the graph paths against the eager reference, both activation overflow policies, and the Nemotron Super E4M3 codec, FP8 KV cache and rewindable MTP FP8 KV history. `ModelOptGraphBenchmarkTests` times one Super layer of each kind at the dimensions of a real `config.json` only when `MODELOPT_GRAPH_BENCH_CONFIG` is set.
         `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
       globs:
         - "Tests/MLXLMTests/Kernel/**"

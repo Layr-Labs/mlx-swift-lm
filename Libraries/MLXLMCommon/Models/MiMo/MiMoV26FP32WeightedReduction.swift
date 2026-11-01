@@ -50,11 +50,11 @@ func mimoV26FP32WeightedUnsortRefusal(
     else { return .unsupportedDType }
     guard weights.size >= 64 else { return .notSorted }
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        // Initial profile deliberately excludes CPU and private/nondefault streams.
-        guard StreamOrDevice.default.stream == MLX.Stream.gpu else { return .unsupportedStream }
-        return nil
+    // Initial profile deliberately excludes CPU and private/nondefault streams.
+    guard MLXProcessStreams.isDefaultGPU(.default) else { return .unsupportedStream }
+    return nil
     #else
-        return .unsupportedStream
+    return .unsupportedStream
     #endif
 }
 

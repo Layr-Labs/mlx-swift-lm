@@ -94,7 +94,7 @@ struct GenerateTaskToolFilterTests {
             switch generation {
             case .toolCall(let call): toolCalls.append(call)
             case .chunk(let chunk): text += chunk
-            case .info: break
+            case .info, .rejectedToolCall: break
             }
         }
         return (toolCalls, text)

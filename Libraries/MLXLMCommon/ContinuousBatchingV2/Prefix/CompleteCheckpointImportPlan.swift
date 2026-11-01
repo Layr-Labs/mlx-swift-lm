@@ -52,8 +52,20 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         return legacyCodec!
     }
     private(set) var destinationShapes: [[Int]]
+    /// Native destinations differ from wire descriptors only for storage-only
+    /// quantization. The compressed byte count never prices serving allocations.
+    let destinationDescriptors: [CBv2CheckpointTensorDescriptor]
     var evaluateDestinations: ([MLXArray]) throws -> Void = { arrays in
-        try withError { eval(arrays) }
+        try CBv2CompleteCheckpointImportPlan.evaluateUnavailable(arrays)
+    }
+
+    /// Host-materialized destinations are already available. Evaluating them
+    /// again would only wait for the process-wide MLX eval lock, which the
+    /// engine holds for a whole prefill chunk.
+    static func evaluateUnavailable(_ arrays: [MLXArray]) throws {
+        let pending = try arrays.filter { try $0.evaluatedBufferInfo() == nil }
+        guard !pending.isEmpty else { return }
+        try withError { eval(pending) }
     }
 
     init(
@@ -67,14 +79,21 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         let paged = try codec.pagedConfig.map {
             try CBv2PagedCheckpointStoragePlan(
                 layerKinds: codec.layerKinds, config: $0, position: manifest.position,
-                historicalLayout: codec.historicalLayout,
+                historicalLayout: codec.glm5NextLayout?.attention ?? codec.historicalLayout,
                 maximumSequenceLength: maximumSequenceLength)
         }
         pagedStoragePlan = paged
+        // GLM's own native descriptors also widen its narrowed auxiliary roles.
+        let nativeDescriptors =
+            try codec.checkpointQuantization == nil || codec.glm5NextLayout != nil
+            ? codec.nativeDescriptors(for: manifest)
+            : codec.nativeTargetDescriptors(position: manifest.position)
+                + Array(manifest.tensors.dropFirst(codec.targetTensorCount))
+        destinationDescriptors = nativeDescriptors
         let destinations =
             paged == nil
-            ? manifest.tensors
-            : Array(manifest.tensors.dropFirst(codec.targetTensorCount))
+            ? nativeDescriptors
+            : Array(nativeDescriptors.dropFirst(codec.targetTensorCount))
         var shapes: [[Int]] = []
         var target = 0
         var auxiliary = 0
@@ -96,20 +115,29 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             } else {
                 auxiliary = try CBv2CheckpointAllocationFootprint.add(auxiliary, bound)
             }
-            initializationScratch = try CBv2CheckpointAllocationFootprint.add(
-                initializationScratch,
-                CBv2CheckpointAllocationFootprint.bound(tensor.dtype.mlxDType.size))
+            // Host-zero sources are full-size and live one at a time.
+            initializationScratch = max(initializationScratch, bound)
             shapes.append(shape)
         }
         destinationShapes = shapes
-        var pageInitializationScratch = 0
+        var pageInitializationScratch = paged?.nativeRecentBytes ?? 0
         for group in paged?.groups ?? [] {
+            let segment =
+                group.layout.allocationBytes(
+                    addingUsablePages: group.layout.maximumUsablePages) ?? group.nativeBytes
             pageInitializationScratch = max(
-                pageInitializationScratch,
-                try CBv2CheckpointAllocationFootprint.bound(group.key.dtype.size))
+                pageInitializationScratch, min(segment, group.nativeBytes))
         }
-        scratchBytes = max(initializationScratch, pageInitializationScratch)
-        let totalTarget = try CBv2CheckpointAllocationFootprint.add(target, paged?.nativeBytes ?? 0)
+        // Imported original-precision bands are private input DTOs. They
+        // remain charged as scratch through the new active row's fenced copy,
+        // rather than being mistaken for physical page growth at handoff.
+        scratchBytes = try CBv2CheckpointAllocationFootprint.add(
+            CBv2CheckpointAllocationFootprint.add(
+                max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0
+            ),
+            codec.checkpointQuantization == nil ? 0 : CBv2NativeCheckpointRowCodec.scratchBytes)
+        let totalTarget = try CBv2CheckpointAllocationFootprint.add(
+            target, paged?.pageNativeBytes ?? 0)
         nativeTargetBytes = totalTarget
         nativeAuxiliaryBytes = auxiliary
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(totalTarget, auxiliary)
@@ -123,7 +151,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             retainedHostBytes = try CBv2CheckpointAllocationFootprint.add(tokens, 64 << 10)
         }
-        if codec.isNativePagedHistorical, let paged {
+        if codec.isNativePagedHistorical || codec.glm5NextLayout != nil, let paged {
             // Private segment/page maps and owner/control entries. This
             // conservative host allowance creates no map, native credit or
             // second owner; it stays on the original stage through retirement.
@@ -152,7 +180,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         guard let codec = stateLock.withLock({ legacyCodec }),
             work.purpose == .importing, work.codecIdentity == manifest.identity,
             (codec.contiguousLayout != nil && pagedStoragePlan == nil)
-                || (codec.isNativePagedHistorical && pagedStoragePlan != nil)
+                || (codec.isNativePagedComplete && pagedStoragePlan != nil)
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -192,7 +220,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 nativeWork = nil
                 // A retained consumed plan must not keep a test evaluator's
                 // captures or any model/codecs behind the transferred loan.
-                evaluateDestinations = { arrays in try withError { eval(arrays) } }
+                evaluateDestinations = { try Self.evaluateUnavailable($0) }
                 return (owner, work, evaluate)
             }
         } catch {
@@ -231,7 +259,9 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             }
             if let pagedStoragePlan {
                 let stage = try codec.admission.reserveCheckpointStage(
-                    targetBytes: pagedStoragePlan.nativeBytes, auxiliaryBytes: auxiliaryBytes,
+                    targetBytes: pagedStoragePlan.pageNativeBytes,
+                    auxiliaryBytes: CBv2CheckpointAllocationFootprint.add(
+                        auxiliaryBytes, checkpointHostBytes),
                     scratchBytes: scratch)
                 do {
                     return try .init(
@@ -265,7 +295,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             nativeMovedOrClosed = true
             nativeCodecOwner = nil
             nativeWork = nil
-            evaluateDestinations = { arrays in try withError { eval(arrays) } }
+            evaluateDestinations = { try Self.evaluateUnavailable($0) }
             return (owner, work)
         }
         if let (owner, work) = retired {

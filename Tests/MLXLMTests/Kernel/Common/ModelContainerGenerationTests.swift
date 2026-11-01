@@ -29,7 +29,10 @@ private final class ScriptedModel: Module, LanguageModel {
         return MLXArray(row).reshaped([1, 1, vocabularySize])
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         .logits(LMOutput(logits: nextLogits()))
     }
 
@@ -102,6 +105,7 @@ extension KernelTests {
                 case .chunk(let chunk): text += chunk
                 case .toolCall(let call): calls.append(call)
                 case .info(let value): info = value
+                case .rejectedToolCall: break
                 }
             }
             return (text, calls, info)

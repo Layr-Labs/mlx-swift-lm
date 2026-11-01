@@ -6,6 +6,8 @@ import Testing
 
 @testable import MLXLMCommon
 
+private let generateLoopTestStateKey = LMOutput.Key<MLXArray>("generateLoopTests.state")
+
 // MARK: - Fixtures
 
 /// A tiny Markov language model for the generation loop tests.
@@ -66,13 +68,16 @@ final class GenLoopMarkovModel: Module, LanguageModel, GenericGenerationValidati
         }
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         if returnsLogits {
             return .logits(
                 self(input.text[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil))
         }
         // Same chunk loop as the default `LLMModel.prepare`.
-        let step = windowSize ?? 512
+        let step = prefill.stepSize ?? 512
         var y = input.text
         while y.tokens.size > step {
             _ = self(y[.newAxis, ..<step], cache: cache.isEmpty ? nil : cache, state: nil)
@@ -86,7 +91,7 @@ final class GenLoopMarkovModel: Module, LanguageModel, GenericGenerationValidati
     {
         let tokens = input.tokens.reshaped(-1, input.tokens.dim(-1))
         callLengths.append(tokens.dim(1))
-        receivedStates.append(state?.crossAttentionStates?.item(Int.self))
+        receivedStates.append(state?[generateLoopTestStateKey]?.item(Int.self))
         if let first = cache?.first {
             let kv = MLXArray.zeros([tokens.dim(0), 1, tokens.dim(1), 1], type: Float32.self)
             _ = first.update(keys: kv, values: kv)
@@ -94,7 +99,11 @@ final class GenLoopMarkovModel: Module, LanguageModel, GenericGenerationValidati
         let logits = take(table, tokens.asType(.int32), axis: 0)
         let newState =
             emitsState
-            ? LMOutput.State(crossAttentionStates: MLXArray(Int32(callLengths.count))) : nil
+            ? {
+                var state = LMOutput.State()
+                state[generateLoopTestStateKey] = MLXArray(Int32(callLengths.count))
+                return state
+            }() : nil
         return LMOutput(logits: logits, state: newState)
     }
 
@@ -481,7 +490,7 @@ extension KernelTests {
 
             // Reference: the same calls that the iterator makes, by hand.
             // The ops and the data are the same, so the tokens must be equal.
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             var logits = model(MLXArray(prompt.map { Int32($0) })[.newAxis], cache: cache)
             var token = argMax(logits[0..., -1, 0...], axis: -1)
             var expected: [Int] = []
@@ -510,7 +519,7 @@ extension KernelTests {
 
             // The cache already holds the prefix. The iterator gets only the
             // suffix, in chunks of 2.
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             _ = ForwardPassChecks.logits(model, [prefix], cache: cache)
             var iterator = try TokenIterator(
                 input: GenLoopFixture.input(suffix), model: model, cache: cache,
@@ -678,6 +687,8 @@ extension KernelTests {
                 case .info(let value):
                     info = value
                     lastIsInfo = true
+                case .rejectedToolCall:
+                    break
                 }
             }
             return (text, toolCalls, info, lastIsInfo)

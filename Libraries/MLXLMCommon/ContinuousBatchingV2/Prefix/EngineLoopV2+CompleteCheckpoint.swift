@@ -26,6 +26,11 @@ extension EngineLoopV2 {
                 // Native graphs/fences were completed during staged lookup.
                 // This helper performs the metadata-only atomic move
                 // under the existing outer native commit.
+                if codec.isNativePagedGLM5Next {
+                    return try adoptPreparedNativeGLM5NextState(
+                        prepared, codec: codec, work: work,
+                        requestID: requestID, maximumSequenceLength: staged.maximumSequenceLength)
+                }
                 if codec.isNativePagedHistorical {
                     return try adoptPreparedNativePagedHistoricalState(
                         prepared, codec: codec,

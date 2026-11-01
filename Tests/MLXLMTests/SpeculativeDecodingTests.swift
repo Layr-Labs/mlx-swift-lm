@@ -3,9 +3,13 @@
 import Foundation
 import MLX
 import MLXLLM
-import MLXLMCommon
+import MLXNN
+import MLXScriptedLM
 import Testing
 
+@testable import MLXLMCommon
+
+@Suite(.serialized)
 struct SpeculativeDecodingTests {
 
     let processor: any UserInputProcessor
@@ -26,6 +30,18 @@ struct SpeculativeDecodingTests {
         )
 
         let mainModel = Gemma3TextModel(modelConfig)
+
+        // on hardware with a NAX, float32 (the default dtype) runs
+        // in tf32 in batch mode and float32 in non-batch.  this
+        // change in behavior can cause issues with prediction and
+        // doesn't match real world behavior (where float32 is not used)
+        mainModel.apply {
+            if $0.dtype == .float32 {
+                $0.asType(.float16)
+            } else {
+                $0
+            }
+        }
         let mainContext = ModelContext(
             configuration: processor.configuration,
             model: mainModel,
@@ -34,6 +50,13 @@ struct SpeculativeDecodingTests {
         )
 
         let draftModel = Gemma3TextModel(modelConfig)
+        draftModel.apply {
+            if $0.dtype == .float32 {
+                $0.asType(.float16)
+            } else {
+                $0
+            }
+        }
         let draftContext = ModelContext(
             configuration: processor.configuration,
             model: draftModel,
@@ -48,12 +71,26 @@ struct SpeculativeDecodingTests {
     }
 
     @Test(arguments: [2, 8, 48], [false, true])
-    func `Speculative decoding matches default token generation`(
+    func `Speculative decoding matches default token generation for stable logits`(
         numDraftTokens: Int,
         withLogitProcessor: Bool
     ) async throws {
-        let input = UserInput(prompt: "Input text")
-        let modelInput = try await processor.prepare(input: input)
+        let vocabularySize = 100
+        let tokenizer = PseudoWordTokenizer(vocabularySize: vocabularySize)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "stable-transition-test"),
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let model = StableTransitionLanguageModel(vocabularySize: vocabularySize)
+        let draftModel = StableTransitionLanguageModel(vocabularySize: vocabularySize)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: model,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let input = LMInput(tokens: MLXArray([92, 85, 2, 95, 55, 7, 94, 42]))
         let parameters = GenerateParameters(
             maxTokens: 32,
             temperature: 0.0,  // Use greedy decoding for deterministic output
@@ -64,15 +101,15 @@ struct SpeculativeDecodingTests {
 
         var normalTokens: [Int] = []
         for await generation in try generateTokens(
-            input: modelInput, parameters: parameters, context: mainContext
+            input: input, parameters: parameters, context: context
         ) {
             if let token = generation.token { normalTokens.append(token) }
         }
 
         var speculativeTokens: [Int] = []
         for await generation in try generateTokens(
-            input: modelInput, parameters: parameters, context: mainContext,
-            draftModel: draftContext.model, numDraftTokens: numDraftTokens
+            input: input, parameters: parameters, context: context,
+            draftModel: draftModel, numDraftTokens: numDraftTokens
         ) {
             if let token = generation.token { speculativeTokens.append(token) }
         }
@@ -80,5 +117,354 @@ struct SpeculativeDecodingTests {
         #expect(!normalTokens.isEmpty)
         #expect(!speculativeTokens.isEmpty)
         #expect(normalTokens == speculativeTokens)
+    }
+
+    @Test func `Speculative API keeps the drafter when log probabilities are requested`()
+        async throws
+    {
+        let vocabularySize = 100
+        let tokenizer = PseudoWordTokenizer(vocabularySize: vocabularySize)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "log-probability-speculative-test"),
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let mainCache = [KVCacheSimple()]
+        let draftCache = [KVCacheSimple()]
+        let parameters = GenerateParameters(maxTokens: 3, temperature: 0, logProbabilities: 2)
+
+        var tokens = [Int]()
+        var completion: GenerateCompletionInfo?
+        for await generation in try generateTokens(
+            input: LMInput(tokens: MLXArray([7])), cache: mainCache,
+            parameters: parameters, context: context,
+            draftModel: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            draftCache: draftCache, numDraftTokens: 2)
+        {
+            if let token = generation.token { tokens.append(token) }
+            if let info = generation.info {
+                completion = info
+            }
+        }
+
+        #expect(tokens.count == 3)
+        #expect(completion?.speculativeDecodingTelemetry?.roundCount == 1)
+        // Both caches advanced: prompt + 2 accepted drafts. The draft cache feeds
+        // the last accepted draft when generation ends.
+        #expect(mainCache.first?.offset == 3)
+        #expect(draftCache.first?.offset == 3)
+    }
+
+    @Test(arguments: [2, 8, 48], [false, true])
+    func `Speculative decoding Gemma3 smoke test`(
+        numDraftTokens: Int,
+        withLogitProcessor: Bool
+    ) async throws {
+        let input = UserInput(prompt: "Input text")
+        let modelInput = try await processor.prepare(input: input)
+        let maxTokens = 32
+        let parameters = GenerateParameters(
+            maxTokens: maxTokens,
+            temperature: 0.0,
+            repetitionPenalty: withLogitProcessor ? 1.5 : nil,
+            presencePenalty: withLogitProcessor ? 0.5 : nil,
+            frequencyPenalty: withLogitProcessor ? 0.2 : nil,
+        )
+
+        var speculativeTokens: [Int] = []
+        var telemetry: SpeculativeDecodingTelemetry?
+        for await generation in try generateTokens(
+            input: modelInput, parameters: parameters, context: mainContext,
+            draftModel: draftContext.model, numDraftTokens: numDraftTokens
+        ) {
+            if let token = generation.token { speculativeTokens.append(token) }
+            if let info = generation.info {
+                telemetry = info.speculativeDecodingTelemetry
+            }
+        }
+
+        // Real MLX model kernels may choose different argmaxes for batched
+        // verification and token-by-token decoding when logits are close.
+        // Keep this as model-path coverage; exact equality belongs to the
+        // stable-logit contract test above.
+        #expect(speculativeTokens.count == maxTokens)
+
+        let speculativeTelemetry = try #require(telemetry)
+        #expect(speculativeTelemetry.roundCount > 0)
+        #expect(speculativeTelemetry.draftTokenCount > 0)
+        #expect(speculativeTelemetry.targetModelCallCount == speculativeTelemetry.roundCount)
+        #expect(speculativeTelemetry.draftModelCallCount == speculativeTelemetry.draftTokenCount)
+        #expect(speculativeTelemetry.acceptanceRate >= 0)
+        #expect(speculativeTelemetry.acceptanceRate <= 1)
+    }
+
+    @Test func `Speculative telemetry emitted count matches generated tokens`() async throws {
+        let input = UserInput(prompt: "Input text")
+        let modelInput = try await processor.prepare(input: input)
+        let parameters = GenerateParameters(
+            maxTokens: 1,
+            temperature: 0.0
+        )
+
+        var tokenCount = 0
+        var info: GenerateCompletionInfo?
+        for await generation in try generateTokens(
+            input: modelInput, parameters: parameters, context: mainContext,
+            draftModel: draftContext.model, numDraftTokens: 8
+        ) {
+            if generation.token != nil {
+                tokenCount += 1
+            }
+            if let generationInfo = generation.info {
+                info = generationInfo
+            }
+        }
+
+        let completionInfo = try #require(info)
+        let telemetry = try #require(completionInfo.speculativeDecodingTelemetry)
+        #expect(completionInfo.generationTokenCount == tokenCount)
+        #expect(telemetry.emittedTokenCount == tokenCount)
+        #expect(telemetry.emittedTokenCount == completionInfo.generationTokenCount)
+    }
+
+    @Test func `Speculative telemetry emitted count works with direct iterator`() async throws {
+        let input = UserInput(prompt: "Input text")
+        let modelInput = try await processor.prepare(input: input)
+        let parameters = GenerateParameters(
+            maxTokens: 3,
+            temperature: 0.0
+        )
+
+        var iterator = try SpeculativeTokenIterator(
+            input: modelInput,
+            mainModel: mainContext.model,
+            draftModel: draftContext.model,
+            parameters: parameters,
+            numDraftTokens: 8
+        )
+
+        var tokenCount = 0
+        while iterator.next() != nil {
+            tokenCount += 1
+        }
+
+        let telemetry = try #require(iterator.speculativeDecodingTelemetry)
+        #expect(tokenCount == 3)
+        #expect(telemetry.emittedTokenCount == tokenCount)
+    }
+
+    @Test(arguments: [1, 2, 3, 4])
+    func `finalizeGeneration trims unreturned speculative lookahead`(consumedTokens: Int) throws {
+        // Contract: after `finalizeGeneration()` both caches must represent
+        // exactly the tokens returned to the generation loop — no verified
+        // but unreturned lookahead. ChatSession relies on this to reconcile
+        // its token ledger against the model-wide processed-token timeline,
+        // so the timeline must rewind together with the cache entries.
+        let vocabularySize = 100
+        let mainCache = [KVCacheSimple()]
+        let draftCache = [KVCacheSimple()]
+        var iterator = try SpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([7])),
+            mainModel: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            draftModel: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            mainCache: mainCache,
+            draftCache: draftCache,
+            parameters: GenerateParameters(maxTokens: 16, temperature: 0.0),
+            numDraftTokens: 3
+        )
+
+        // The first `next()` runs the opening round: the verifier sees the
+        // prompt plus 3 drafts and the deterministic draft matches everywhere,
+        // so 4 tokens pend and 3 are already committed to the main cache.
+        var consumed = 0
+        while consumed < consumedTokens {
+            #expect(iterator.next() != nil)
+            consumed += 1
+        }
+        #expect(mainCache.first?.offset == 4)  // prompt + 3 committed drafts
+        #expect(draftCache.first?.offset == 3)  // prompt + 2 fed drafts (trails by one)
+
+        iterator.finalizeGeneration()
+
+        // Once the third draft is returned, the draft cache feeds it too.
+        let expected = 1 + Swift.min(consumed, 3)
+        #expect(mainCache.first?.offset == expected)
+        #expect(draftCache.first?.offset == expected)
+        // The authoritative timeline rewound with the entries, not behind them.
+        #expect(iterator.mainCacheStorage.processedTokenCount == expected)
+        #expect(iterator.draftCacheStorage.processedTokenCount == expected)
+        #expect(iterator.mainCacheStorage.nativeAttentionOffsetsAreAligned)
+        #expect(iterator.draftCacheStorage.nativeAttentionOffsetsAreAligned)
+    }
+
+    @Test
+    func `SpeculativeTokenIterator scopes class logit processor state via copy`() throws {
+        final class RecordingClassProcessor: LogitProcessor, @unchecked Sendable {
+            var sampledTokens: [Int]
+
+            init(sampledTokens: [Int] = []) {
+                self.sampledTokens = sampledTokens
+            }
+
+            func prompt(_ prompt: MLXArray) {}
+            func process(logits: MLXArray) -> MLXArray { logits }
+
+            func didSample(token: MLXArray) {
+                sampledTokens.append(token.item(Int.self))
+            }
+
+            func copy() -> Self {
+                RecordingClassProcessor(sampledTokens: sampledTokens) as! Self
+            }
+        }
+
+        let recordingProcessor = RecordingClassProcessor()
+        var components = GenerationComponents()
+        components.logitProcessorFactory = { recordingProcessor }
+
+        let vocabularySize = 100
+        // Mismatching draft model so some draft tokens are rejected
+        let mainModel = StableTransitionLanguageModel(vocabularySize: vocabularySize)
+        let draftModel = DivergentTransitionLanguageModel(vocabularySize: vocabularySize)
+
+        var iterator = try SpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([10])),
+            mainModel: mainModel,
+            draftModel: draftModel,
+            parameters: GenerateParameters(maxTokens: 5, temperature: 0.0),
+            numDraftTokens: 3,
+            components: components
+        )
+
+        var emittedTokens: [Int] = []
+        while let token = iterator.next() {
+            emittedTokens.append(token)
+        }
+
+        #expect(emittedTokens.count == 5)
+        #expect(
+            recordingProcessor.sampledTokens == emittedTokens,
+            "Canonical processor didSample must match emitted tokens exactly; draft and verify copies must not pollute canonical state."
+        )
+    }
+}
+
+/// ``StableTransitionLanguageModel`` variant that maintains a real KV cache,
+/// so tests can assert cache-offset accounting (e.g. ``finalizeGeneration()``
+/// trimming verified-but-unreturned lookahead).
+private final class CacheTrackingTransitionModel: Module, LanguageModel,
+    KVCacheDimensionProvider
+{
+    let vocabularySize: Int
+    var kvHeads: [Int] { [1] }
+
+    init(vocabularySize: Int) {
+        self.vocabularySize = vocabularySize
+        super.init()
+    }
+
+    func prepare(
+        _ input: MLXLMCommon.LMInput, cache: [any MLXLMCommon.KVCache],
+        state: MLXLMCommon.LMOutput.State?, prefill: MLXLMCommon.PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let tokenIds = inputs.asArray(Int.self)
+        if let cache, let first = cache.first {
+            let entry = MLXArray.zeros([1, 1, tokenIds.count, 1])
+            _ = first.update(keys: entry, values: entry)
+        }
+
+        var logits = Array(
+            repeating: Float(-100),
+            count: tokenIds.count * vocabularySize
+        )
+        for (position, token) in tokenIds.enumerated() {
+            logits[position * vocabularySize + (token * 31 + 7) % vocabularySize] = 100
+        }
+        return MLXArray(logits, [1, tokenIds.count, vocabularySize])
+    }
+}
+
+/// Deterministic causal model for speculative decoding contract tests.
+///
+/// Each logit row predicts a high-margin transition from the token at the
+/// same position. Batched verification and token-by-token decoding therefore
+/// execute the same mathematical function, so equality failures point at the
+/// speculative iterator rather than at hardware-dependent MLX kernel drift.
+private final class StableTransitionLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let vocabularySize: Int
+    var kvHeads: [Int] { [] }
+
+    init(vocabularySize: Int) {
+        self.vocabularySize = vocabularySize
+        super.init()
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    )
+        throws -> PrepareResult
+    {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let tokenIds = inputs.asArray(Int.self)
+        var logits = Array(
+            repeating: Float(-100),
+            count: tokenIds.count * vocabularySize
+        )
+
+        for (position, token) in tokenIds.enumerated() {
+            logits[position * vocabularySize + nextToken(after: token)] = 100
+        }
+
+        return MLXArray(logits, [1, tokenIds.count, vocabularySize])
+    }
+
+    private func nextToken(after token: Int) -> Int {
+        (token * 31 + 7) % vocabularySize
+    }
+}
+
+/// Deterministic causal model predicting different transitions to induce rejections in speculative decoding.
+private final class DivergentTransitionLanguageModel: Module, LanguageModel,
+    KVCacheDimensionProvider
+{
+    let vocabularySize: Int
+    var kvHeads: [Int] { [] }
+
+    init(vocabularySize: Int) {
+        self.vocabularySize = vocabularySize
+        super.init()
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let tokenIds = inputs.asArray(Int.self)
+        var logits = Array(
+            repeating: Float(-100),
+            count: tokenIds.count * vocabularySize
+        )
+
+        for (position, token) in tokenIds.enumerated() {
+            logits[position * vocabularySize + ((token * 17 + 13) % vocabularySize)] = 100
+        }
+
+        return MLXArray(logits, [1, tokenIds.count, vocabularySize])
     }
 }

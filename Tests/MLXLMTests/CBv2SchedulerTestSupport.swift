@@ -534,10 +534,10 @@ func cbv2SchedCollect(
         }
         return collected
     }
-    let watchdog = Task {
-        try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-        task.cancel()
-    }
+    // Canceling a completed collector's timer must not throw a Swift
+    // CancellationError inside a concurrent native error-observation scope.
+    let watchdog = DispatchWorkItem { task.cancel() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: watchdog)
     let result = await task.value
     watchdog.cancel()
     return result

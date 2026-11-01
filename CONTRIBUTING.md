@@ -1,7 +1,27 @@
-# Contributing to MLX Swift Examples
+# Contributing to MLX Swift LM
 
 We want to make contributing to this project as easy and transparent as
 possible.
+
+## AI Usage Policy
+
+AI-generated code is allowed. What is not allowed is submitting code you do not
+understand. You are 100% responsible for every line, however it was produced, and
+must explicitly disclose the manner in which AI was employed. You must be able to
+explain the code you submit.
+
+AI-drafted prose is allowed too — commit messages, pull request descriptions,
+issues, discussions, and replies to reviewers. The condition is that you read
+every word before it is submitted and confirm it says what you mean. By
+contributing you agree that you have done so, and the pull request template asks
+you to confirm it for the description. Please don't ask a reviewer to read prose
+you did not read yourself.
+
+Violations of the above may result in the closure of PRs and a ban from
+contributing to the project.
+
+Agents working in this repo should follow [AGENTS.md](AGENTS.md), which encodes
+these rules.
 
 ## Pull Requests
 
@@ -25,7 +45,7 @@ Unit tests run without any special hardware and do not download models.
 Note: `swift test` [does not work yet](https://github.com/ml-explore/mlx-swift?tab=readme-ov-file#xcodebuild) — use `xcodebuild` instead:
 
 ```bash
-xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' -skipPackagePluginValidation
 ```
 
 Some tests compare the raw bits of floating-point results with frozen
@@ -120,7 +140,10 @@ The tests use no real weights and compare no frozen reference values.
 
 The float32 tolerances assume full float32 matrix products. On a Mac with an
 M5 GPU, MLX uses TF32 for float32 matrix products by default, and the cache
-tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac.
+tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac. The Fork Tests
+workflow sets this for the entire test job, including filtered suites and the
+coverage pass. This is a test precision setting; it does not change the
+production default or relax numerical assertions.
 
 #### Model configuration cases
 
@@ -144,14 +167,25 @@ JSON. To add a case for a new configuration type, write it by hand:
    whether the test or the decoder is wrong. Do not copy the decoder output
    into the test without that check.
 
+CPU integration fixtures must bound native allocations as well as logical array
+sizes: quantized matmul can materialize broadcast weights on the CPU device.
+The GPT-OSS projection regression evaluates packed vocabulary tiles at the
+registered input width and checks full-vocabulary graph shape without evaluation.
+Its separate explicitly invoked hardware probe retains the full-vocabulary
+numerical comparison; a lazy shape check is not that numerical proof.
+
 The `integration` type is not the same as the Xcode integration tests in the
 next section.
 
 ### Xcode integration tests
 
 Xcode integration tests verify end-to-end model loading and generation. They require
-macOS with Metal and download models from Hugging Face Hub on first run. These
-tests do not run in CI.
+macOS with Metal and download models from Hugging Face Hub on first run. They
+are not part of the pull request checks, so they never block a merge. In
+`ml-explore/mlx-swift-lm` they run nightly on a self-hosted macOS runner
+(`.github/workflows/integration_tests.yml`). The fork does not run them in CI.
+Run them locally when you change model loading, generation, or tokenizer
+behavior.
 
 Open `IntegrationTesting/IntegrationTesting.xcodeproj` in Xcode and run the
 test target (`Cmd+U` or via the Test Navigator), or use `xcodebuild`:
@@ -161,17 +195,26 @@ test target (`Cmd+U` or via the Test Navigator), or use `xcodebuild`:
 xcodebuild test \
   -project IntegrationTesting/IntegrationTesting.xcodeproj \
   -scheme IntegrationTesting \
-  -destination 'platform=macOS'
+  -destination 'platform=macOS' \
+  -skipPackagePluginValidation
 
 # Run a single test
 xcodebuild test \
   -project IntegrationTesting/IntegrationTesting.xcodeproj \
   -scheme IntegrationTesting \
   -destination 'platform=macOS' \
+  -skipPackagePluginValidation \
   -only-testing:IntegrationTestingTests/ToolCallIntegrationTests/qwen35FormatAutoDetection\(\)
 ```
 
 See [Libraries/IntegrationTestHelpers/README.md](Libraries/IntegrationTestHelpers/README.md) for more details.
+
+CI also verifies that DocC documentation builds without warnings for every
+library target. Run the same check locally with:
+
+```bash
+scripts/verify-docs.sh
+```
 
 ## Issues
 
@@ -180,5 +223,32 @@ clear and has sufficient instructions to be able to reproduce the issue.
 
 ## License
 
-By contributing to MLX Swift Examples, you agree that your contributions will be licensed
+By contributing to MLX Swift LM, you agree that your contributions will be licensed
 under the LICENSE file in the root directory of this source tree.
+
+Qwen3.5-family media consumers can reuse `Qwen3VLMediaProcessor` for deterministic
+processor configuration and preallocation geometry, and `Qwen35VisionTower` for
+a vision-only module with a serial weight-loading seam. Explicit embedding and
+three-axis-position methods keep MRoPE state request-owned. The ordinary wrapper
+uses the same preprocessing implementation. `QwenNativeMediaSeamTests` and
+`QwenNativeMediaForwardTests` cover these CPU interfaces with tiny tensors;
+production image/video, native memory and cross-device qualification remain the
+consumer's responsibility.
+
+The Qwen TP consumer can opt into `Qwen35BatchDecodeProjecting` to group a
+collective across rows while preserving singleton projection arithmetic. Its
+task-local `explicitPositionRows` mask retains fused text RoPE for text rows and
+MRoPE for media rows in the same decode rectangle. The owner must bind the mask
+to request positions and keep independent histories. The provider Runtime's
+`QwenTensorParallelBatchSessionTests` exercise these seams with physically cut
+tiny attention/hybrid models on both chips and both cache backends; they do not
+qualify the full artifact, RDMA, media tower or automatic planner.
+
+### Opaque Qwen cluster media carrier
+
+`CBv2Request.clusterQwenMedia` is an optional provider-owned encoded envelope.
+Only an explicitly ready native cluster owner validates and consumes it; the
+ordinary local `EngineV2` rejects it before KV allocation or model execution.
+Nil keeps the existing request behavior. Keep encoded lifetime and identity
+validation in the owning provider/native layer; the SDK carrier alone grants
+no image/video capability. `CBv2QwenClusterCarrierTests` covers local refusal.

@@ -208,13 +208,13 @@ enum ForwardPassChecks {
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
         parameters: GenerateParameters? = nil, cache: [KVCache]? = nil,
         sourceLocation: SourceLocation = #_sourceLocation
-    ) -> Float {
+    ) throws -> Float {
         let length = rows[0].count
         precondition(chunks.reduce(0, +) == length, "the chunks must cover the sequence")
 
         let full = logits(model, rows)
 
-        let cache = cache ?? model.newCache(parameters: parameters)
+        let cache = try cache ?? model.newCache(parameters: parameters)
         var start = 0
         var worst: Float = 0
         for chunk in chunks {

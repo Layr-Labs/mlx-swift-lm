@@ -109,22 +109,28 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen4_exp_text"
+        modelType =
+            try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen4_exp_text"
         hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 2560
         hiddenLayers = try container.decodeIfPresent(Int.self, forKey: .hiddenLayers) ?? 48
         attentionHeads = try container.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? 24
         kvHeads = try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? 2
         headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) ?? 256
-        linearNumValueHeads = try container.decodeIfPresent(Int.self, forKey: .linearNumValueHeads) ?? 48
-        linearNumKeyHeads = try container.decodeIfPresent(Int.self, forKey: .linearNumKeyHeads) ?? 16
+        linearNumValueHeads =
+            try container.decodeIfPresent(Int.self, forKey: .linearNumValueHeads) ?? 48
+        linearNumKeyHeads =
+            try container.decodeIfPresent(Int.self, forKey: .linearNumKeyHeads) ?? 16
         linearKeyHeadDim = try container.decodeIfPresent(Int.self, forKey: .linearKeyHeadDim) ?? 128
-        linearValueHeadDim = try container.decodeIfPresent(Int.self, forKey: .linearValueHeadDim) ?? 128
-        linearConvKernelDim = try container.decodeIfPresent(Int.self, forKey: .linearConvKernelDim) ?? 4
+        linearValueHeadDim =
+            try container.decodeIfPresent(Int.self, forKey: .linearValueHeadDim) ?? 128
+        linearConvKernelDim =
+            try container.decodeIfPresent(Int.self, forKey: .linearConvKernelDim) ?? 4
         rmsNormEps = try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
         vocabularySize = try container.decodeIfPresent(Int.self, forKey: .vocabularySize) ?? 248_320
         maxPositionEmbeddings =
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 262_144
-        tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         attentionBias = try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
         fullAttentionInterval =
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
@@ -147,7 +153,8 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         indexerBudget = try container.decodeIfPresent(Int.self, forKey: .indexerBudget) ?? 2048
         indexerCompressRatio =
             try container.decodeIfPresent(Int.self, forKey: .indexerCompressRatio) ?? 4
-        outputGateType = try container.decodeIfPresent(String.self, forKey: .outputGateType) ?? "sigmoid"
+        outputGateType =
+            try container.decodeIfPresent(String.self, forKey: .outputGateType) ?? "sigmoid"
         _ = try recurrentOutputGate(codingPath: decoder.codingPath)
         numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 512
         numExpertsPerTok = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 10
@@ -156,10 +163,14 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 640
         normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
-        mtpNumHiddenLayers = try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
-        seed = try container.decodeIfPresent(Int.self, forKey: .seed) ?? Qwen4ExpNGramGeometry.defaultSeed
+        mtpNumHiddenLayers =
+            try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        seed =
+            try container.decodeIfPresent(Int.self, forKey: .seed)
+            ?? Qwen4ExpNGramGeometry.defaultSeed
 
-        if let rope = try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeParameters)
+        if let rope = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
         {
             ropeTheta = rope["rope_theta"]?.asFloat() ?? 10_000_000
             partialRotaryFactor = rope["partial_rotary_factor"]?.asFloat() ?? 0.25
@@ -359,7 +370,8 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen4_exp"
-        if let text = try container.decodeIfPresent(Qwen4ExpTextConfiguration.self, forKey: .textConfig)
+        if let text = try container.decodeIfPresent(
+            Qwen4ExpTextConfiguration.self, forKey: .textConfig)
         {
             textConfig = text
         } else {
@@ -543,14 +555,14 @@ final class Qwen4ExpGatedResidual: Module {
     private var compiledDecode: (@Sendable ([MLXArray]) -> [MLXArray])?
 
     #if DEBUG
-        private let testPathLock = NSLock()
-        private var testCompiledCalls = 0
-        private var testCanonicalCalls = 0
-        /// Per-instance evidence: process-global counters include other
-        /// models and suites, so they cannot prove this module's dispatch.
-        var compilationCounts: (compiled: Int, canonical: Int) {
-            testPathLock.withLock { (testCompiledCalls, testCanonicalCalls) }
-        }
+    private let testPathLock = NSLock()
+    private var testCompiledCalls = 0
+    private var testCanonicalCalls = 0
+    /// Per-instance evidence: process-global counters include other
+    /// models and suites, so they cannot prove this module's dispatch.
+    var compilationCounts: (compiled: Int, canonical: Int) {
+        testPathLock.withLock { (testCompiledCalls, testCanonicalCalls) }
+    }
     #endif
 
     private func project(_ hyperInput: MLXArray) -> (mixed: MLXArray, injection: MLXArray) {
@@ -559,14 +571,14 @@ final class Qwen4ExpGatedResidual: Module {
             if out.count == 2 {
                 Qwen4ExpHyperConnectionCompile.recordCompiled()
                 #if DEBUG
-                    testPathLock.withLock { testCompiledCalls += 1 }
+                testPathLock.withLock { testCompiledCalls += 1 }
                 #endif
                 return (out[0], out[1])
             }
         }
         Qwen4ExpHyperConnectionCompile.recordCanonical()
         #if DEBUG
-            testPathLock.withLock { testCanonicalCalls += 1 }
+        testPathLock.withLock { testCanonicalCalls += 1 }
         #endif
         return projectCanonical(hyperInput)
     }
@@ -574,10 +586,15 @@ final class Qwen4ExpGatedResidual: Module {
     private func compiledDecodeForward() -> @Sendable ([MLXArray]) -> [MLXArray] {
         compiledDecodeLock.withLock {
             if let compiledDecode { return compiledDecode }
-            let fn: @Sendable ([MLXArray]) -> [MLXArray] = compile { [unowned self] args in
+            // The body reads module weights, so it uses MLX's non-Sendable
+            // `compile(inputs:outputs:)` overload with no declared state, as
+            // the earlier mlx-swift `compile` did. The wrapper calls it unchanged.
+            nonisolated(unsafe) let compiled = compile(inputs: [], outputs: []) {
+                [unowned self] (args: [MLXArray]) -> [MLXArray] in
                 let projected = self.projectCanonical(args[0])
                 return [projected.mixed, projected.injection]
             }
+            let fn: @Sendable ([MLXArray]) -> [MLXArray] = { compiled($0) }
             compiledDecode = fn
             return fn
         }
@@ -606,7 +623,8 @@ final class Qwen4ExpGatedResidual: Module {
                 Qwen4ExpAffineQMV.logShapeOnce(
                     "hc-hybrid-declined x=\(normed.shape) \(normed.dtype) hyper=\(hyperInput.dtype) "
                         + "down=\(d.map { "\($0.bits)b g\($0.groupSize) \(type(of: $0))" } ?? "dense") "
-                        + "inject=\(i.map { "\($0.bits)b g\($0.groupSize) \(type(of: $0))" } ?? "dense")")
+                        + "inject=\(i.map { "\($0.bits)b g\($0.groupSize) \(type(of: $0))" } ?? "dense")"
+                )
             }
             mix = Qwen4ExpAffineQMM.apply(inputMixWeightDown, normed)
         }
@@ -745,9 +763,11 @@ final class Qwen4ExpAttention: Module {
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
-        precondition(B == 1 || ((batchedQSAEnabled ?? self.batchedQSAEnabled)
-                     && B <= CBv2Qwen4BatchPolicy.maximumCandidateRows),
-                     "Qwen4 multirow QSA requires the explicit experimental batching capability")
+        precondition(
+            B == 1
+                || ((batchedQSAEnabled ?? self.batchedQSAEnabled)
+                    && B <= CBv2Qwen4BatchPolicy.maximumCandidateRows),
+            "Qwen4 multirow QSA requires the explicit experimental batching capability")
         let qSplit = qwen4Linear(qProj, x).reshaped(B, L, attentionHeads, -1).split(
             parts: 2, axis: -1)
         let qsaType = Qwen4ExpNativeSparseGQA.activationType(x.dtype)
@@ -774,11 +794,13 @@ final class Qwen4ExpAttention: Module {
             rows.reserveCapacity(B)
             for row in 0 ..< B {
                 let slice = row ..< row + 1
-                rows.append(attendProjected(
-                    x[slice], queries: queries[slice], keys: keys[slice], values: values[slice],
-                    cache: scope.caches[row],
-                    positionIds: Qwen4ExpBatchedQSA.positions(positionIds, row: row, batch: B, length: L),
-                    indexProjection: indexProjection[slice], batchedRow: true))
+                rows.append(
+                    attendProjected(
+                        x[slice], queries: queries[slice], keys: keys[slice], values: values[slice],
+                        cache: scope.caches[row],
+                        positionIds: Qwen4ExpBatchedQSA.positions(
+                            positionIds, row: row, batch: B, length: L),
+                        indexProjection: indexProjection[slice], batchedRow: true))
             }
             if scope.finish(length: L) {
                 Qwen4ExpBatchedQSAInvocation.record(batch: B)
@@ -835,15 +857,17 @@ final class Qwen4ExpAttention: Module {
             hidden: x, cache: gatheredCache, offset: offset,
             positionIds: positionIds, textPositions: textPositions, length: L,
             indexProjection: indexProjection)
-        precondition(!batchedRow || (indexerReady && indexQueries != nil),
-                     "Qwen4 batched QSA is missing the row's committed index history")
+        precondition(
+            !batchedRow || (indexerReady && indexQueries != nil),
+            "Qwen4 batched QSA is missing the row's committed index history")
         let longContextText = gatheredPrefillEligible(
             batch: B, length: L, offset: offset, positionIds: positionIds)
         if longContextText,
             let crossingCache = cache as? (any CBv2AttendingLayerCache & CBv2Qwen4GatheredCache),
             crossingCache.qwen4SerializesRectangularAttention,
             Qwen4ExpGatheredQSA.serialCrossoverEligible(
-                offset: offset, length: L, compressRatio: indexer.compressRatio, tokenBudget: indexer.tokenBudget)
+                offset: offset, length: L, compressRatio: indexer.compressRatio,
+                tokenBudget: indexer.tokenBudget)
         {
             guard indexerReady, let indexQueries else {
                 preconditionFailure("Qwen4 MTP crossover is missing trusted indexer state")
@@ -855,7 +879,9 @@ final class Qwen4ExpAttention: Module {
                 indexerHeadDim: indexer.headDim, compressRatio: indexer.compressRatio,
                 tokenBudget: indexer.tokenBudget, scale: scale,
                 indexKeyNorm: { self.indexer.kLayerNorm($0) },
-                applyIndexRope: { states, positions in self.applyIndexRope(states, positions: positions) })
+                applyIndexRope: { states, positions in
+                    self.applyIndexRope(states, positions: positions)
+                })
             return output.reshaped(B, L, -1).asType(x.dtype)
         }
         if longContextText, let gatheredCache,
@@ -865,7 +891,8 @@ final class Qwen4ExpAttention: Module {
                 selectedWidth: indexer.tokenBudget / indexer.compressRatio)
         {
             guard indexerReady, let indexQueries else {
-                preconditionFailure("Qwen4 canonical sparse verify is missing trusted indexer state")
+                preconditionFailure(
+                    "Qwen4 canonical sparse verify is missing trusted indexer state")
             }
             let views = gatheredCache.updateKVAndAdvanceOffsets(keys: keys, values: values)
             if gatheredCache.qwen4HasWriteFault {
@@ -873,12 +900,15 @@ final class Qwen4ExpAttention: Module {
             }
             precondition(views.count == 1)
             let output = Qwen4ExpGatheredQSA.attendCanonicalSparseColumns(
-                cache: gatheredCache, queries: queries, keys: views[0].keys, values: views[0].values,
+                cache: gatheredCache, queries: queries, keys: views[0].keys,
+                values: views[0].values,
                 indexQueries: indexQueries, queryHeads: attentionHeads, kvHeads: kvHeads,
                 headDim: headDim, indexerHeadDim: indexer.headDim,
                 compressRatio: indexer.compressRatio, tokenBudget: indexer.tokenBudget,
                 indexKeyNorm: { self.indexer.kLayerNorm($0) },
-                applyIndexRope: { states, positions in self.applyIndexRope(states, positions: positions) })
+                applyIndexRope: { states, positions in
+                    self.applyIndexRope(states, positions: positions)
+                })
             return output.reshaped(B, L, -1).asType(x.dtype)
         }
         if Qwen4ExpCompactQSA.enabled(), indexerReady, let indexQueries,
@@ -889,7 +919,9 @@ final class Qwen4ExpAttention: Module {
                 queries: queries, keys: keys, values: values, indexQueries: indexQueries,
                 cache: selectedCache, offset: offset, indexerHeadDim: indexer.headDim,
                 indexKeyNorm: { self.indexer.kLayerNorm($0) },
-                applyIndexRope: { states, positions in self.applyIndexRope(states, positions: positions) })
+                applyIndexRope: { states, positions in
+                    self.applyIndexRope(states, positions: positions)
+                })
         {
             return output.reshaped(B, L, -1).asType(x.dtype)
         }
@@ -937,9 +969,9 @@ final class Qwen4ExpAttention: Module {
                 let detail =
                     "gathered=\(gatheredCache != nil) ready=\(indexerReady) iq=\(indexQueries != nil) B=\(B) L=\(L) offset=\(offset) storedKeys=\(stored) storedPos=\(storedPos)"
                 #if DEBUG
-                    try? detail.write(
-                        to: URL(fileURLWithPath: "/tmp/qwen4-qsa-gathered-prefill-trap.txt"),
-                        atomically: true, encoding: .utf8)
+                try? detail.write(
+                    to: URL(fileURLWithPath: "/tmp/qwen4-qsa-gathered-prefill-trap.txt"),
+                    atomically: true, encoding: .utf8)
                 #endif
                 preconditionFailure(
                     "Qwen4 QSA long-context text prefill cannot fall back to dense SDPA \(detail)")
@@ -957,8 +989,9 @@ final class Qwen4ExpAttention: Module {
                 logicalTokens: kvLen,
                 indexKeyNorm: indexKeyNorm,
                 applyIndexRope: applyIndexRope)
-            guard let indexKeys = Qwen4ExpIndexCapacity.logicalTokens(
-                gatheredCache.qwen4IndexKeys, length: kvLen),
+            guard
+                let indexKeys = Qwen4ExpIndexCapacity.logicalTokens(
+                    gatheredCache.qwen4IndexKeys, length: kvLen),
                 let indexPositionIds = Qwen4ExpIndexCapacity.logicalPositions(
                     gatheredCache.qwen4IndexPositionIds, length: kvLen)
             else {
@@ -1002,40 +1035,49 @@ final class Qwen4ExpAttention: Module {
             let applyIndexRope: (MLXArray, MLXArray) -> MLXArray = { states, positions in
                 self.applyIndexRope(states, positions: positions)
             }
-            let pooled = Qwen4ExpDecodeProfile.stage("qsa.pool") { Qwen4ExpPooledIndex.reuseOrCompute(
-                cache: gatheredCache,
-                compressRatio: indexer.compressRatio,
-                logicalTokens: kvLen,
-                indexKeyNorm: indexKeyNorm,
-                applyIndexRope: applyIndexRope) }
-            let output = Qwen4ExpDecodeProfile.stage("qsa.attend") { Qwen4ExpGatheredQSA.attendDecode(
-                queries: queries,
-                keys: views[0].keys,
-                values: views[0].values,
-                indexQueries: indexQueries,
-                pooledIndexKeys: pooled,
-                queryHeads: attentionHeads,
-                kvHeads: kvHeads,
-                headDim: headDim,
-                indexerHeadDim: indexer.headDim,
-                compressRatio: indexer.compressRatio,
-                tokenBudget: indexer.tokenBudget) }
+            let pooled = Qwen4ExpDecodeProfile.stage("qsa.pool") {
+                Qwen4ExpPooledIndex.reuseOrCompute(
+                    cache: gatheredCache,
+                    compressRatio: indexer.compressRatio,
+                    logicalTokens: kvLen,
+                    indexKeyNorm: indexKeyNorm,
+                    applyIndexRope: applyIndexRope)
+            }
+            let output = Qwen4ExpDecodeProfile.stage("qsa.attend") {
+                Qwen4ExpGatheredQSA.attendDecode(
+                    queries: queries,
+                    keys: views[0].keys,
+                    values: views[0].values,
+                    indexQueries: indexQueries,
+                    pooledIndexKeys: pooled,
+                    queryHeads: attentionHeads,
+                    kvHeads: kvHeads,
+                    headDim: headDim,
+                    indexerHeadDim: indexer.headDim,
+                    compressRatio: indexer.compressRatio,
+                    tokenBudget: indexer.tokenBudget)
+            }
             return output.reshaped(B, L, -1).asType(x.dtype)
         }
         if batchedRow {
-            let sparseRequired = L > 1 ? offset + L > indexer.tokenBudget
+            let sparseRequired =
+                L > 1
+                ? offset + L > indexer.tokenBudget
                 : Qwen4ExpGatheredQSA.decodeCrossesBudget(
-                    offset: offset, compressRatio: indexer.compressRatio, tokenBudget: indexer.tokenBudget)
-            precondition(!sparseRequired,
-                         "Qwen4 batched long-context attention cannot fall back to dense SDPA")
+                    offset: offset, compressRatio: indexer.compressRatio,
+                    tokenBudget: indexer.tokenBudget)
+            precondition(
+                !sparseRequired,
+                "Qwen4 batched long-context attention cannot fall back to dense SDPA")
         }
         Qwen4ExpQSAInvocation.recordDense()
         let output = cache.updateAndAttend(
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: nil)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
-            .asType(x.dtype)
+            scale: scale, sinks: nil
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+        .asType(x.dtype)
         return output
     }
 
@@ -1072,9 +1114,10 @@ final class Qwen4ExpAttention: Module {
         guard keyTokens > Qwen4ExpGatheredQSA.verifyMinKeyTokens() else { return false }
         guard keyTokens > indexer.tokenBudget else { return false }
         let blockBudget = indexer.tokenBudget / max(indexer.compressRatio, 1)
-        guard let geom = Qwen4ExpGatheredQSA.verifyGeometry(
-            queryTokens: length, keyTokens: keyTokens,
-            compressRatio: indexer.compressRatio, blockBudget: blockBudget),
+        guard
+            let geom = Qwen4ExpGatheredQSA.verifyGeometry(
+                queryTokens: length, keyTokens: keyTokens,
+                compressRatio: indexer.compressRatio, blockBudget: blockBudget),
             geom.gatheredRows > 0, geom.gatheredRows < keyTokens
         else { return false }
         return Qwen4ExpGatheredQSA.decodeCrossesBudget(
@@ -1115,9 +1158,10 @@ final class Qwen4ExpAttention: Module {
                 _ = CBv2Qwen4IndexerBind.restore(cache, from: layer.rows[0])
             }
         }
-        guard CBv2Qwen4IndexerFrontier.covers(
-            offset, count: cache.qwen4IndexTokenCount,
-            keys: cache.qwen4IndexKeys, positions: cache.qwen4IndexPositionIds)
+        guard
+            CBv2Qwen4IndexerFrontier.covers(
+                offset, count: cache.qwen4IndexTokenCount,
+                keys: cache.qwen4IndexKeys, positions: cache.qwen4IndexPositionIds)
         else {
             cache.clearQwen4IndexerState()
             return (false, nil)
@@ -1126,8 +1170,10 @@ final class Qwen4ExpAttention: Module {
             cache: cache,
             committedTokens: offset,
             compressRatio: indexer.compressRatio)
-        let projected = indexProjection ?? qwen4Linear(indexer.indexQKProj, hidden).reshaped(
-            B, length, indexer.nHeads + indexer.kvHeads, indexer.headDim)
+        let projected =
+            indexProjection
+            ?? qwen4Linear(indexer.indexQKProj, hidden).reshaped(
+                B, length, indexer.nHeads + indexer.kvHeads, indexer.headDim)
         var indexQueries = indexer.qLayerNorm(projected[0..., 0..., 0 ..< indexer.nHeads, 0...])
             .transposed(0, 2, 1, 3)
         let rawKeys = projected[0..., 0..., indexer.nHeads..., 0...].squeezed(axis: 2)
@@ -1190,7 +1236,8 @@ final class Qwen4ExpAttention: Module {
             cache.clearQwen4IndexerState()
             return (false, nil)
         }
-        let keysReady = Qwen4ExpIndexCapacity.logicalTokens(cache.qwen4IndexKeys, length: end) != nil
+        let keysReady =
+            Qwen4ExpIndexCapacity.logicalTokens(cache.qwen4IndexKeys, length: end) != nil
             && Qwen4ExpIndexCapacity.logicalPositions(cache.qwen4IndexPositionIds, length: end)
                 != nil
         if keysReady {
@@ -1282,9 +1329,10 @@ final class Qwen4ExpDecoderLayer: Module {
         var hiddenStates = Qwen4ExpActivation.keep(x)
         if let ple {
             hiddenStates = P.stage("ple") {
-                hiddenStates + ple.cbv2Forward(
-                    hiddenStates, inputIds: inputIds, recurrentState: recurrentState,
-                    captureRecurrentWindow: captureRecurrentWindow)
+                hiddenStates
+                    + ple.cbv2Forward(
+                        hiddenStates, inputIds: inputIds, recurrentState: recurrentState,
+                        captureRecurrentWindow: captureRecurrentWindow)
             }
         }
         P.dumpStage("input", layer: modelLayerIndex, hiddenStates)
@@ -1338,7 +1386,8 @@ final class Qwen4ExpDecoderLayer: Module {
         branch: MLXArray, hyper: MLXArray, injection: MLXArray
     ) -> MLXArray {
         if Qwen4ExpFusions.isEnabled {
-            return Qwen4ExpFusions.hyperInjection(branch: branch, hyper: hyper, injection: injection)
+            return Qwen4ExpFusions.hyperInjection(
+                branch: branch, hyper: hyper, injection: injection)
         }
         let weighted = branch.expandedDimensions(axis: -2) * injection.expandedDimensions(axis: -1)
         return Qwen4ExpActivation.keep(hyper + weighted.reshaped(hyper.shape))
@@ -1380,7 +1429,8 @@ final class Qwen4ExpTextModelInner: Module {
         var hidden = embedAndTile(inputs)
         let pleCount = layers.filter { $0.ple != nil }.count
         if let cache {
-            precondition(cache.count == layers.count + pleCount,
+            precondition(
+                cache.count == layers.count + pleCount,
                 "Qwen4 request cache must include attention/GDN and PLE state")
         }
         let attentionCaches = cache.map { Array($0.prefix(layers.count)) }
@@ -1414,8 +1464,10 @@ final class Qwen4ExpTextModelInner: Module {
         captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         batchingPolicy.sealOnForward { currentBatchedQSAPolicy }
-        let shapeCall = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -2077,7 +2129,9 @@ extension Qwen4ExpTextModel: CBv2RecurrentMTPForwardable {
     }
 }
 
-extension Qwen4ExpTextModel: CBv2RecurrentCaptureMTPForwardable, CBv2RecurrentPrefillHiddenForwardable {
+extension Qwen4ExpTextModel: CBv2RecurrentCaptureMTPForwardable,
+    CBv2RecurrentPrefillHiddenForwardable
+{
     /// Lightning MTP consumes the pre-mixer residual `[B, T, hc·H]`.
     /// Logits still come from the mixed `[B, T, H]` tower — Fusion
     /// `capture_layer_ids == []`.
@@ -2198,7 +2252,8 @@ extension Qwen4ExpTextModel: CBv2MTPPolicyTopTwoProviding {
             logits.reshaped([1, rows, vocabularySize]))
         return (
             topTwo.ids.reshaped([batch, length, 2]),
-            topTwo.values.reshaped([batch, length, 2]))
+            topTwo.values.reshaped([batch, length, 2])
+        )
     }
 }
 

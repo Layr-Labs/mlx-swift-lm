@@ -110,6 +110,62 @@ final class MiMoV26VisionTests: XCTestCase {
         }
     }
 
+    func testSerialFlattenedLoaderAndBoundedForwardUseExistingScalarOracle() throws {
+        let corpus = try nativeCorpus()
+        let model = try makeModel(corpus)
+        var weights = arrays(corpus)
+        let patch = try XCTUnwrap(weights["visual.patch_embed.proj.weight"])
+        weights["visual.patch_embed.proj.weight"] = patch.reshaped(patch.dim(0), -1)
+        var readNames: [String] = []
+        try model.loadNativeWeightsSerial(
+            expectedDType: .float32, flattenedPatchStorage: true,
+            read: { name, shape in
+                readNames.append(name)
+                let value = try XCTUnwrap(weights[name])
+                XCTAssertEqual(value.shape, shape)
+                return value
+            },
+            checkpoint: {
+                eval($0)
+                Stream.gpu.synchronize()
+            })
+        XCTAssertEqual(readNames, weights.keys.sorted())
+        for fixture in corpus.cases {
+            let grids = fixture.grids.map {
+                MiMoV26VisionGrid(temporal: $0[0], height: $0[1], width: $0[2])
+            }
+            let patches = MLXArray(fixture.patches).reshaped(fixture.layout.patchCount, -1)
+            var checkpoints = 0
+            let output = try model.forwardBounded(
+                patches: patches, grids: grids, limits: smallLimits,
+                checkpoint: {
+                    checkpoints += 1
+                    eval($0)
+                    Stream.gpu.synchronize()
+                })
+            eval(output)
+            XCTAssertGreaterThan(checkpoints, 0)
+            XCTAssertEqual(output.shape, fixture.outputShape)
+            let actual = output.asType(.float32).asArray(Float.self)
+            XCTAssertEqual(actual.count, fixture.expected.count)
+            for (a, b) in zip(actual, fixture.expected) {
+                XCTAssertEqual(a, b, accuracy: 1e-4, fixture.id)
+            }
+        }
+        XCTAssertThrowsError(
+            try model.loadNativeWeightsSerial(
+                expectedDType: .float32,
+                read: { _, _ in MLXArray.zeros([1]) }, checkpoint: { eval($0) }))
+        let fixture = corpus.cases[0]
+        let patches = MLXArray(fixture.patches).reshaped(fixture.layout.patchCount, -1)
+        XCTAssertThrowsError(
+            try model.forwardBounded(
+                patches: patches,
+                grids: fixture.grids.map { .init(temporal: $0[0], height: $0[1], width: $0[2]) },
+                limits: smallLimits,
+                checkpoint: { eval($0) }))
+    }
+
     func testStrictLoadingAndInputFailuresAreRecoverable() throws {
         let corpus = try nativeCorpus()
         let model = try makeModel(corpus)
