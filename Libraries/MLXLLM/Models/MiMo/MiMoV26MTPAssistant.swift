@@ -407,7 +407,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
                 inputIDs: tokenHistory[0..., (depth + 1 - length)...],
                 target: target, cache: round.cache)
             round.cache.compactRetainedHistory(depth: depth)
-            let proposed = argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32)
+            let proposed = target.readoutArgMax(output.logits[0..., -1, 0...])
             // Proposal output belongs to the engine. Keeping a second native
             // view here would make the state claim an engine-owned allocation.
             state.headProposalCounts[depth] += 1
