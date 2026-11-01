@@ -44,8 +44,7 @@ final class MiMoV26DecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
     ) -> MLXArray {
-        let attention = selfAttention(inputNorm(x), mask: mask, cache: cache)
-        let residual = x + (tensorParallel?.sum(attention) ?? attention)
+        let residual = x + attentionOutput(inputNorm(x), mask: mask, cache: cache)
         return residual + feedForward(postAttentionNorm(residual))
     }
 }
@@ -94,10 +93,7 @@ public final class MiMoV26TextBackbone: Module {
                 h: hidden, cache: layerCache,
                 windowSize: layer.geometry.slidingWindow)
             let normalized = nextInput ?? layer.inputNorm(hidden)
-            var attention = layer.selfAttention(normalized, mask: mask, cache: layerCache)
-            if let tensorParallel = layer.tensorParallel {
-                attention = tensorParallel.sum(attention)
-            }
+            let attention = layer.attentionOutput(normalized, mask: mask, cache: layerCache)
             let nextNorm = index + 1 < layers.count ? layers[index + 1].inputNorm : norm
             if let fused = MiMoV26DecodeKernels.finishLayer(
                 hidden, attentionOutput: attention, layer: layer,

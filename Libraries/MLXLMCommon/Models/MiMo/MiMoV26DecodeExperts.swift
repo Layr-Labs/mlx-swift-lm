@@ -52,9 +52,10 @@ enum MiMoV26DecodeExperts {
 
     /// SwitchLayers calls this before its normal projection.
     /// No dtype conversion, CPU synchronization, tensor cache or layout memo.
+    /// `float32Rows` stores the down rows' FP32 sums unrounded.
     static func tryProject(
         _ x: MLXArray, indices: MLXArray, glu: SwitchGLU,
-        enabled: Bool
+        enabled: Bool, float32Rows: Bool = false
     ) -> Result? {
         guard enabled, glu.weightedReductionProfile == .mimoV26FP32,
             ObjectIdentifier(type(of: glu)) == ObjectIdentifier(SwitchGLU.self),
@@ -66,19 +67,21 @@ enum MiMoV26DecodeExperts {
             guard let gateUp = matrix(fused) else { return nil }
             return project(
                 x, indices: indices, gate: gateUp, up: gateUp, down: down,
-                upOffset: glu.hiddenDims)
+                upOffset: glu.hiddenDims, float32Rows: float32Rows)
         }
         guard let gate = glu.gateProj, let up = glu.upProj,
             let gateMatrix = matrix(gate), let upMatrix = matrix(up)
         else { return nil }
-        return project(x, indices: indices, gate: gateMatrix, up: upMatrix, down: down)
+        return project(
+            x, indices: indices, gate: gateMatrix, up: upMatrix, down: down,
+            float32Rows: float32Rows)
     }
 
     /// Internal raw packed-matrix seam also permits bounded synthetic fixtures.
     /// Production calls reach it only through the stock MiMo module gate above.
     static func project(
         _ x: MLXArray, indices: MLXArray, gate: Matrix, up: Matrix,
-        down: Matrix, upOffset: Int = 0
+        down: Matrix, upOffset: Int = 0, float32Rows: Bool = false
     ) -> Result? {
         let stream = StreamOrDevice.default
         guard gpuStream(stream), x.ndim == 3, x.dim(0) == 1,
@@ -115,14 +118,15 @@ enum MiMoV26DecodeExperts {
             ],
             grid: (32 * pairs, 2 * (intermediate / 8), 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 8, intermediate]], outputDTypes: [x.dtype], stream: stream)[0]
-        let output = downKernel(
+        let output = (float32Rows ? downFloat32Kernel : downKernel)(
             [activation, indices, down.weight, down.scales],
             template: [
                 ("T", x.dtype), ("KDIM", intermediate), ("NOUT", hidden),
                 ("TOPK", 8), ("NPAIRS", pairs), ("MAXDUP", rows), ("NSG", 2), ("RPS", 4),
             ],
             grid: (32 * pairs, 2 * (hidden / 8), 1), threadGroup: (32, 2, 1),
-            outputShapes: [[1, rows, 8, hidden]], outputDTypes: [x.dtype], stream: stream)[0]
+            outputShapes: [[1, rows, 8, hidden]],
+            outputDTypes: [float32Rows ? .float32 : x.dtype], stream: stream)[0]
         return Result(activation: activation, output: output)
     }
 
@@ -134,5 +138,10 @@ enum MiMoV26DecodeExperts {
     private static let downKernel = MLXFast.metalKernel(
         name: "mimo_v26_mxfp4_decode_down", inputNames: ["a", "inds", "w", "s"],
         outputNames: ["y"], source: MiMoV26DecodeExpertMetal.down,
+        header: MiMoV26DecodeExpertMetal.header, ensureRowContiguous: true)
+
+    private static let downFloat32Kernel = MLXFast.metalKernel(
+        name: "mimo_v26_mxfp4_decode_down_float32", inputNames: ["a", "inds", "w", "s"],
+        outputNames: ["y"], source: MiMoV26DecodeExpertMetal.downSource(output: "float"),
         header: MiMoV26DecodeExpertMetal.header, ensureRowContiguous: true)
 }

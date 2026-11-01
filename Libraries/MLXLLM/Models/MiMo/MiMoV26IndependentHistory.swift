@@ -238,11 +238,17 @@ extension MiMoV26TextModel {
                 }
             }
             written.append(layerRows)
-            var output = MiMoV26RectangularDense.projection(
-                attention.oProj,
-                concatenated(attended, axis: 2).transposed(0, 2, 1, 3).reshaped(1, rows, -1),
-                enabled: true)
-            if let tensorParallel = layer.tensorParallel { output = tensorParallel.sum(output) }
+            let attendedRows = concatenated(attended, axis: 2).transposed(0, 2, 1, 3)
+                .reshaped(1, rows, -1)
+            let output: MLXArray
+            if let tensorParallel = layer.tensorParallel {
+                output = tensorParallel.sum(
+                    MiMoV26RectangularDense.tensorParallelProjection(attention.oProj, attendedRows),
+                    as: normalized.dtype)
+            } else {
+                output = MiMoV26RectangularDense.projection(
+                    attention.oProj, attendedRows, enabled: true)
+            }
             let nextNorm =
                 index + 1 < model.layers.count ? model.layers[index + 1].inputNorm : model.norm
             if let fused = MiMoV26DecodeKernels.finishLayer(

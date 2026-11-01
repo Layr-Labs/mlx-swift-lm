@@ -99,6 +99,19 @@ enum MiMoV26RectangularDense {
         }
         return layer(x)
     }
+
+    /// A tensor-parallel rank's FP32 dense partial, one row at a time as the one-token step runs it.
+    static func tensorParallelPartial(_ dense: MiMoV26DenseMLP, _ x: MLXArray) -> MLXArray {
+        guard supports(x) else { return dense.tensorParallelPartial(x) }
+        return rows(x) { dense.tensorParallelPartial($0) }
+    }
+
+    /// A tensor-parallel rank's FP32 `o_proj` partial, one row at a time as the one-token step
+    /// runs it (the row-exact kernel is BF16/F16 only).
+    static func tensorParallelProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+        guard supports(x) else { return layer(x.asType(.float32)) }
+        return rows(x) { layer($0.asType(.float32)) }
+    }
 }
 
 extension MiMoV26RectangularDense {
