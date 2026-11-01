@@ -537,11 +537,11 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
     @inline(__always)
     private static func littleEndianLanes(_ words: SIMD8<UInt16>) -> SIMD8<UInt16> {
         #if _endian(little)
-            return words
+        return words
         #else
-            var swapped = words
-            for lane in swapped.indices { swapped[lane] = swapped[lane].littleEndian }
-            return swapped
+        var swapped = words
+        for lane in swapped.indices { swapped[lane] = swapped[lane].littleEndian }
+        return swapped
         #endif
     }
 
