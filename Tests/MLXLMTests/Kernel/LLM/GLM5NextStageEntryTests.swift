@@ -77,6 +77,61 @@ extension KernelTests {
             return try JSONDecoder().decode(
                 GLM5NextConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
         }
+
+        /// The serving stage, decode and verification-sized steps after a
+        /// prefill: tokens with the default validity (one-launch streams, the
+        /// shared validity, no `where`) against embeddings with an explicit
+        /// all-true validity (gathers, dequantize, broadcast, `where`).
+        @Test(arguments: [GLM5NextExecutionPolicy.serving, .reference])
+        func stageStepsAreBitwiseToTheSeparateEntryOnGPU(policy: GLM5NextExecutionPolicy)
+            throws
+        {
+            try Device.withDefaultDevice(.gpu) {
+                let fixture = try GLM5NextNVFP4ArtifactFixture(configuration: configuration())
+                let c = fixture.declared.textConfig
+                let stage = try fixture.loader(policy: policy).loadTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< c.hiddenLayers))
+                let embedding = try #require(stage.embedding)
+                #expect(embedding is GLM5NextPackedEmbedding)
+                let fused = stage.newCache()
+                let separate = stage.newCache()
+                let steps: [MLXArray] = [
+                    MLXArray([Int32(0), 2, 5, 3, 9, 7, 1, 4, 6], [1, 9]),
+                    MLXArray([Int32(4)], [1, 1]), MLXArray([Int32(9)], [1, 1]),
+                    MLXArray([Int32(3), 1, 8], [1, 3]), MLXArray([Int32(2)], [1, 1]),
+                ]
+                for (index, tokens) in steps.enumerated() {
+                    // The prefill and odd steps read the last token, the others all.
+                    let readout: GLM5NextTextStageReadout =
+                        index % 2 == 0 ? .lastToken : .allTokens
+                    let a = try stage.prepareForward(tokens: tokens, cache: fused, readout: readout)
+                    let b = try stage.prepareForward(
+                        embeddings: embedding(tokens), cache: separate,
+                        validity: MLXArray.ones([1, tokens.dim(1)], dtype: .bool), readout: readout)
+                    guard case .final(let x) = try a.commit(afterEvaluating: Self.fence),
+                        case .final(let y) = try b.commit(afterEvaluating: Self.fence)
+                    else {
+                        Issue.record("stage returned no final readout")
+                        return
+                    }
+                    let label = "\(policy == .serving ? "serving" : "reference") step \(index)"
+                    for (name, p, q) in [
+                        ("logits", x.logits, y.logits), ("hidden", x.hidden, y.hidden),
+                    ] {
+                        #expect(p.shape == q.shape && p.dtype == q.dtype, "\(label) \(name)")
+                        let differing = zip(Self.bits(p), Self.bits(q)).filter { $0 != $1 }.count
+                        #expect(differing == 0, "\(label) \(name): \(differing) differ")
+                    }
+                }
+                #expect(fused.offset == separate.offset)
+                for (p, q) in zip(
+                    fused.layers.flatMap { $0.innerState() },
+                    separate.layers.flatMap { $0.innerState() })
+                {
+                    #expect(Self.bits(p) == Self.bits(q), "cache state")
+                }
+            }
+        }
     }
 }
 

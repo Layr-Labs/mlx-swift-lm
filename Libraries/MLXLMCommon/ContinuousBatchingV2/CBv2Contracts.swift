@@ -82,6 +82,8 @@ public struct CBv2Request: Sendable {
     public var stopTokens: Set<Int>
     /// Stop strings; matched against held-back detokenized text.
     public var stopStrings: [String]
+    /// Where `stopStrings` apply; nil matches the whole generated text.
+    public var stopStringScope: CBv2StopStringScope?
     /// Higher value = more important. Used by admission and preemption.
     public var priority: Int
     /// Per-request prefix-cache scope (TB-007). When non-nil it REPLACES the
@@ -107,6 +109,17 @@ public struct CBv2Request: Sendable {
     /// at placeholder-token positions of `promptTokens`. nil = text-only —
     /// every code path is byte-identical to the pre-multimodal engine.
     /// See `CBv2MultimodalInput` for the full semantics.
+    /// MiMo private cluster encoded image envelope; only its distributed owner
+    /// may consume this CPU payload. Local engines reject it before allocation.
+    public var mimoClusterImages: Data? = nil
+    /// Bounded host payload for the distributed GLM worker; local engines refuse.
+    public var clusterStillImages: Data? = nil
+    /// GLM image and video envelope for the tensor-parallel pair's owner
+    /// (encoded bytes and digests, never pixels); local engines refuse.
+    public var clusterGLMMedia: Data? = nil
+    /// Encoded Qwen/Bonsai media bound to artifact, processor and three-axis
+    /// positions. Only an explicitly ready native cluster owner may consume it.
+    public var clusterQwenMedia: Data? = nil
     public var multimodal: CBv2MultimodalInput?
     /// Optional request-owned model positions. nil preserves the scalar
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated
@@ -142,7 +155,8 @@ public struct CBv2Request: Sendable {
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
-        prefixCheckpointTargetTokens: Int? = nil
+        prefixCheckpointTargetTokens: Int? = nil,
+        stopStringScope: CBv2StopStringScope? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -150,6 +164,7 @@ public struct CBv2Request: Sendable {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
         self.stopStrings = stopStrings
+        self.stopStringScope = stopStringScope
         self.priority = priority
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled
@@ -607,6 +622,20 @@ extension CBv2KVBackend {
         layerKinds: [CBv2LayerKind],
         maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        try makeSequenceState(
+            adopting: prefix,
+            plan: prefixReusePlan(adopting: prefix, layerKinds: layerKinds, maxLength: maxLength),
+            layerKinds: layerKinds,
+            maxLength: maxLength)
+    }
+
+    /// The compatibility plan the convenience above adopts a uniform full
+    /// prefix with, for a caller that adopts it through another entry point.
+    public func prefixReusePlan(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) throws -> CBv2PrefixReusePlan {
         guard let adoptedOffset = prefix.compactMap({ $0?.offset }).first else {
             throw CBv2KVError.backendIneligible(reason: "prefix contains no owning full snapshot")
         }
@@ -638,11 +667,7 @@ extension CBv2KVBackend {
                     capability.unsupportedReason?.rawValue
                     ?? "layout requires an explicit matched-boundary replay plan")
         }
-        return try makeSequenceState(
-            adopting: prefix,
-            plan: plan,
-            layerKinds: layerKinds,
-            maxLength: maxLength)
+        return plan
     }
 }
 
@@ -842,6 +867,10 @@ public struct CBv2SchedulerConfig: Sendable {
     /// the existing range geometry. When set, it replaces the short-checkpoint
     /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
     public var demandedCaptureBoundaryMinimumTokens: Int? = nil
+    /// Also end a range just below the prompt end, when that boundary is at
+    /// least this many tokens past the range's start. Nil keeps the existing
+    /// geometry. See docs/prefix-checkpoint-retention.md.
+    public var demandedLatestCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only

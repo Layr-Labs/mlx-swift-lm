@@ -63,7 +63,8 @@ extension MiMoV26MTPAssistant: CBv2HistoricalMTPPrefixCheckpointCoding {
     }
 
     private var prefixConfiguration: MiMoV26Configuration? {
-        guard let target, isCompatible(with: target), target.activationDType == .bfloat16,
+        guard historyStorage == .contiguous, let target, isCompatible(with: target),
+            target.activationDType == .bfloat16,
             predictor.headCount == 3
         else { return nil }
         return predictor.configuration

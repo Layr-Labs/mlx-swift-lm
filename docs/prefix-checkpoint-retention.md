@@ -60,19 +60,41 @@ policy can create one aligned interior endpoint:
 |---|---|---|
 | `demandedShortCheckpointMinimumTokens` | `nil` | Arm short-prompt capture using the caller's unchanged effective-token floor. |
 | `demandedCheckpointPartitionIncludesLongPrompts` | `false` | Explicit longer-prompt qualification extension; does not qualify an architecture. |
+| `demandedLatestCheckpointMinimumTokens` | `nil` | Also end one range just below the prompt end (see [End-of-prompt boundary](#end-of-prompt-boundary)). Ignored while `demandedCaptureBoundaryMinimumTokens` is set. |
 
 The SDK exposes the long flag with default `false`; the companion provider
-uses it only in typed benchmark qualification construction. This mechanism
-adds no production long-prompt eligibility. Architecture and artifact
+uses it only in typed benchmark qualification construction. The short-prompt
+partition adds no production long-prompt eligibility; the end-of-prompt boundary
+below is separate and applies at any prompt length. Architecture and artifact
 qualification belongs to the provider, not a model-family rule in this SDK.
 
 Actual scheduling and deadline projection share `demandedCheckpointRange`.
 The count-only `demandedShortCheckpointChunk` wrapper preserves existing short
 callers. The target floors `min(hint, promptLength - 1)` to compatible
 hash/query alignment. Zero demand, cache-disabled/unscoped input, media/position
-state, adopters, preemption and permanent capture disarm keep ordinary geometry.
+state, adopters, preemption and permanent capture disarm keep ordinary geometry
+in the short-prompt partition. The end-of-prompt boundary also applies to a
+request that adopted a prefix, above its restore point.
 Native historical capture is outside this recurrent opt-in and keeps its
 exact-frontier rules.
+
+### End-of-prompt boundary
+
+A solo recurrent donor prefills in wide stripes, so without this setting its
+deepest aligned range end can sit up to a stripe below the prompt end, and the
+next turn of a growing conversation re-prefills that gap. With
+`demandedLatestCheckpointMinimumTokens` set, a range also ends at
+`latest = ⌊(promptTokens − 1 − 64) / alignment⌋ · alignment`
+(`demandedLatestPromptEndMarginTokens = 64`, `alignment` the demanded boundary
+grid). The cut is made only when `latest` falls inside the range and is at least
+the minimum past the range's start, so a short tail stays one ordinary range;
+only for a request that allows a checkpoint, with the prefix cache on, and with
+write demand (no hint, or a hint at or above the minimum). The margin keeps the
+boundary inside the prefix the next turn shares after the template re-renders
+the generation prompt. It composes with the short-prompt partition (computed
+first), and the capture-boundary partition takes precedence. A cut range is
+marked for capture, which keeps it out of packed prefill. Scheduling and the
+first-token projection share the rule through `demandedCheckpointRange`.
 
 For qualified longer prompts, the policy remembers the **actual proposed
 range**, rather than deriving a global stripe grid. If a range `12288..<16384`
