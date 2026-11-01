@@ -145,9 +145,8 @@ final class MiMoV26MoE: Module, UnaryLayer {
 }
 
 extension MiMoV26TextModel {
-    /// Hands each routed layer's selected expert indices (`[B, L, K]`, not
-    /// evaluated) and its layer index to `observer`, in forward order. Nil stops.
-    /// Observation only: no forward changes.
+    /// Hands each routed layer's index and lazy selected experts (`[B, L, K]`) to `observer`;
+    /// nil stops. Observation only: no forward changes.
     public func observeRoutes(_ observer: ((Int, MLXArray) -> Void)?) {
         for (index, layer) in model.layers.enumerated() {
             guard let moe = layer.mlp as? MiMoV26MoE else { continue }

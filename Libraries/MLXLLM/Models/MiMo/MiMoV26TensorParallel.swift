@@ -10,21 +10,8 @@ public struct MiMoV26TensorParallelError: Error, CustomStringConvertible, Equata
     init(_ description: String) { self.description = description }
 }
 
-/// One rank of a two-rank tensor-parallel MiMo V2.6 text model: every layer on
-/// every rank, each holding half of each head- or channel-parallel weight.
-///
-/// - Attention: contiguous halves of the query heads with the KV heads they
-///   read (`q_proj`, `k_proj`, `v_proj` rows and the sink bias per query head;
-///   `o_proj` input columns). Full and sliding layers keep their own KV head
-///   counts and the unequal key and value head widths.
-/// - Dense MLP and every routed expert: half the channels (gate/up output
-///   rows, down input columns; expert banks are `[experts, out, in]`). The
-///   router is replicated, so both ranks choose the same experts.
-/// - The embedding is replicated for lookup; the untied head keeps this
-///   rank's vocabulary rows.
-///
-/// Equal halves land on whole quantization groups and packed words whenever
-/// every cut stored axis is even, which `localShape` checks.
+/// One rank of a two-rank tensor-parallel MiMo V2.6 text model: half the query heads with the KV
+/// heads they read, half of each channel width and of the head's vocabulary; the rest replicated.
 public struct MiMoV26TensorShard: Sendable, Equatable {
     public let rank: Int
     public let size: Int
@@ -37,9 +24,8 @@ public struct MiMoV26TensorShard: Sendable, Equatable {
         self.size = size
     }
 
-    /// The axis of a `MiMoV26TextModel` parameter (its module path, such as
-    /// `model.layers.3.mlp.switch_mlp.down_proj.weight`) that each rank keeps
-    /// a half of; nil replicates it. Names outside the text model throw.
+    /// The axis of a text-model parameter (module path) that each rank keeps half of; nil
+    /// replicates it. Names outside the text model, MTP included, throw.
     public static func splitAxis(_ name: String) throws -> Int? {
         let parts = name.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
         func refuse() -> MiMoV26TensorParallelError {
@@ -146,10 +132,8 @@ public struct MiMoV26TensorShard: Sendable, Equatable {
         return (rank * half) ..< ((rank + 1) * half)
     }
 
-    /// The configuration this rank's modules are built from: half the query
-    /// and KV heads of both layer kinds and half of both channel widths. The
-    /// trained MTP heads, the towers and their metadata are dropped; every
-    /// other field stays whole.
+    /// This rank's configuration: half of each layer kind's heads and of both channel widths,
+    /// without the MTP heads or the towers.
     public func localConfiguration(_ c: MiMoV26Configuration) throws -> MiMoV26Configuration {
         guard !c.tieWordEmbeddings else {
             throw MiMoV26TensorParallelError("MiMo tensor parallel splits the untied head only")
@@ -202,15 +186,14 @@ final class MiMoV26TensorParallelContext {
 }
 
 extension MiMoV26MoE {
-    /// The FP32 weighted combine of expert rows `[..., K, H]` with router
-    /// weights `[..., K]`: the unfused single-Mac combine without its final
-    /// rounding (each product rounded to FP32, then an FP32 sum).
+    /// The FP32 weighted combine of expert rows `[..., K, H]`: the single-Mac combine without its
+    /// final rounding (each product rounded to FP32, then an FP32 sum).
     static func combinePartial(_ experts: MLXArray, weights: MLXArray) -> MLXArray {
         (experts * weights[.ellipsis, .newAxis]).sum(axis: -2)
     }
 
-    /// This rank's FP32 partial: its half-width experts' rows from the stock
-    /// banks and kernels, combined locally with the replicated router's weights.
+    /// This rank's FP32 partial: one combined row, not `TensorParallelSwitchLinear`'s per-expert
+    /// rows, so the MXFP4 kernels run; each expert's half-width row is rounded to BF16 first.
     func tensorParallelPartial(_ x: MLXArray, rowLocalRouter: Bool = false) -> MLXArray {
         let routed = gate(x, rowLocal: rowLocalRouter)
         return Self.combinePartial(switchMLP(x, routed.indices), weights: routed.weights)
@@ -247,14 +230,9 @@ extension MiMoV26TextModel {
         tensorParallel?.vocabularyRows ?? 0 ..< configuration.vocabularySize
     }
 
-    /// Makes this freshly constructed model, built from a rank's
-    /// `MiMoV26TensorShard.localConfiguration`, one rank of a tensor-parallel
-    /// pair, before its weights load: each layer sums its `o_proj` partial
-    /// and its feed-forward partial through `reduce`, and `lm_head` becomes
-    /// an unloaded shell of `vocabularyRows`. `reduce` adds FP32 partials
-    /// across ranks inside the graph; it must not evaluate by itself.
-    /// CBv2 and MTP owners refuse the model (its head is not the whole
-    /// vocabulary); independent-history pages serve it one row at a time.
+    /// Makes this model, built from `MiMoV26TensorShard.localConfiguration`, one rank before its
+    /// weights load: each layer's two partials sum through the lazy `reduce`, and `lm_head` holds
+    /// `vocabularyRows`. CBv2 and MTP owners refuse the rank.
     public func installTensorParallel(
         reduce: @escaping (MLXArray) -> MLXArray, vocabularyRows: Range<Int>
     ) throws {
