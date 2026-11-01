@@ -20,6 +20,8 @@ final class MiMoV26DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionNorm: RMSNorm
     let mlp: UnaryLayer
     let geometry: MiMoV26AttentionGeometry
+    /// Set only on a tensor-parallel rank (`installTensorParallel`).
+    var tensorParallel: MiMoV26TensorParallelContext?
 
     init(_ config: MiMoV26Configuration, layer: Int) throws {
         geometry = try config.attentionGeometry(at: layer)
@@ -42,8 +44,9 @@ final class MiMoV26DecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
     ) -> MLXArray {
-        let residual = x + selfAttention(inputNorm(x), mask: mask, cache: cache)
-        return residual + mlp(postAttentionNorm(residual))
+        let attention = selfAttention(inputNorm(x), mask: mask, cache: cache)
+        let residual = x + (tensorParallel?.sum(attention) ?? attention)
+        return residual + feedForward(postAttentionNorm(residual))
     }
 }
 
@@ -91,7 +94,10 @@ public final class MiMoV26TextBackbone: Module {
                 h: hidden, cache: layerCache,
                 windowSize: layer.geometry.slidingWindow)
             let normalized = nextInput ?? layer.inputNorm(hidden)
-            let attention = layer.selfAttention(normalized, mask: mask, cache: layerCache)
+            var attention = layer.selfAttention(normalized, mask: mask, cache: layerCache)
+            if let tensorParallel = layer.tensorParallel {
+                attention = tensorParallel.sum(attention)
+            }
             let nextNorm = index + 1 < layers.count ? layers[index + 1].inputNorm : norm
             if let fused = MiMoV26DecodeKernels.finishLayer(
                 hidden, attentionOutput: attention, layer: layer,
@@ -101,7 +107,7 @@ public final class MiMoV26TextBackbone: Module {
                 nextInput = fused.normalized
             } else {
                 let residual = hidden + attention
-                hidden = residual + layer.mlp(layer.postAttentionNorm(residual))
+                hidden = residual + layer.feedForward(layer.postAttentionNorm(residual))
                 nextInput = nil
             }
             if captureLayers.contains(index) { features[index] = hidden }
@@ -129,6 +135,8 @@ public final class MiMoV26TextModel: Module {
     let activationDType: DType
     let identity = UUID()
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    /// Set only on a tensor-parallel rank (`installTensorParallel`).
+    var tensorParallel: MiMoV26TensorParallelContext?
 
     /// Packed storage dtype is not the activation dtype. Validate all declared
     /// affine parameters without materializing or dequantizing the full table.
@@ -150,22 +158,23 @@ public final class MiMoV26TextModel: Module {
             && embedding.weight.shape == [configuration.vocabularySize, configuration.hiddenSize]
     }
 
+    /// The whole vocabulary's readout; false on a tensor-parallel rank.
     var hasLoadedReadoutPrecision: Bool {
+        hasLoadedReadoutPrecision(rows: configuration.vocabularySize)
+    }
+
+    func hasLoadedReadoutPrecision(rows: Int) -> Bool {
         guard let readout = lmHead else { return hasLoadedEmbeddingPrecision }
         if let packed = readout as? QuantizedLinear {
             return packed.mode == .affine && packed.bits == 8 && packed.groupSize == 64
                 && packed.weight.dtype == .uint32 && packed.scales.dtype == activationDType
                 && packed.biases?.dtype == activationDType
-                && packed.weight.shape == [
-                    configuration.vocabularySize, configuration.hiddenSize / 4,
-                ]
-                && packed.scales.shape == [
-                    configuration.vocabularySize, configuration.hiddenSize / 64,
-                ]
+                && packed.weight.shape == [rows, configuration.hiddenSize / 4]
+                && packed.scales.shape == [rows, configuration.hiddenSize / 64]
                 && packed.biases?.shape == packed.scales.shape
         }
         return readout.weight.dtype == activationDType
-            && readout.weight.shape == [configuration.vocabularySize, configuration.hiddenSize]
+            && readout.weight.shape == [rows, configuration.hiddenSize]
     }
 
     public init(_ config: MiMoV26Configuration) throws {
@@ -311,7 +320,9 @@ public final class MiMoV26TextModel: Module {
             guard minimum >= 0, maximum < Int64(configuration.vocabularySize) else {
                 throw MiMoV26ExecutionError.invalidInput("token ID outside vocabulary")
             }
-            guard hasLoadedEmbeddingPrecision, hasLoadedReadoutPrecision else {
+            guard hasLoadedEmbeddingPrecision,
+                hasLoadedReadoutPrecision(rows: headVocabularyRange.count)
+            else {
                 throw MiMoV26ExecutionError.unsupportedConfiguration(
                     "embedding precision is not loaded")
             }
