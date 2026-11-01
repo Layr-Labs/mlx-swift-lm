@@ -307,6 +307,11 @@ public final class CBv2RecurrentRequestState {
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
+
+    /// What a settled verify window still holds beside the committed state
+    /// (its replay inputs, or the kept window's backing) until the next
+    /// committed generation or release. Inspection only (allocation checks).
+    public var retainedTransitionArrays: [MLXArray] { committedTransitionRetainedRoots }
     private var pending: [Generation] = []
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false

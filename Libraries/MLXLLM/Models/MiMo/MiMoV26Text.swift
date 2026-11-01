@@ -240,6 +240,18 @@ public final class MiMoV26TextModel: Module {
             : Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }
 
+    /// Embedding lookup for a stage-owned native media splice. Uses this model's
+    /// actual packed embedding; never creates an alternate embedding module.
+    public func embedForMedia(_ tokenIDs: [Int]) throws -> MLXArray {
+        guard !tokenIDs.isEmpty, tokenIDs.count <= configuration.maxPositionEmbeddings,
+            tokenIDs.allSatisfy({ (0 ..< configuration.vocabularySize).contains($0) }),
+            hasLoadedEmbeddingPrecision
+        else {
+            throw MiMoV26ExecutionError.invalidInput("native media embedding IDs/precision")
+        }
+        return model.embedTokens(MLXArray(tokenIDs.map(Int32.init)).reshaped([1, tokenIDs.count]))
+    }
+
     public func newCache() -> [KVCache] {
         model.layers.map { layer in
             if let window = layer.geometry.slidingWindow {
