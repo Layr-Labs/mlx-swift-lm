@@ -102,7 +102,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
     /// completed fence's two retained context banks during their replacement.
     /// Working buffers cover lazy graph dependencies until the successor fence;
     /// they are not an assertion that kernel-internal workspace is zero.
-    static func boundedRequestAllocation(
+    public static func boundedRequestAllocation(
         configuration c: MiMoV26Configuration,
         limits: CBv2MTPAllocationLimits,
         historyStorage: MiMoV26MTPHistoryStorage = .contiguous
