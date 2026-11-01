@@ -1,5 +1,6 @@
 import MLX
 import MLXLLM
+import MLXLMCommon
 
 /// Source-derived temporary allocation bound for forwardBounded. Every block
 /// and temporal grid is synchronously evaluated before its successor. Decoded
@@ -63,11 +64,11 @@ enum MiMoV26VisionWorkingSet {
         _ shape: MiMoV26VisionShape, stream: StreamOrDevice = .default
     ) -> Bool {
         #if os(macOS)
-            return stream == .gpu && shape.headDim == 64
-                && shape.config.queryHeads / shape.config.keyValueHeads <= 4
-                && shape.window <= 64
+        return MLXProcessStreams.isDefaultGPU(stream) && shape.headDim == 64
+            && shape.config.queryHeads / shape.config.keyValueHeads <= 4
+            && shape.window <= 64
         #else
-            return false
+        return false
         #endif
     }
 

@@ -48,7 +48,7 @@ struct BaichuanM1WindowMaskTiedHeadTests {
     @Test func cachedDecodeMatchesTheFullForwardPass() throws {
         let model = try Self.model(seed: 1)
         for rows in [[Self.row(1)], [Self.row(1), Self.row(2)]] {
-            TinyModel.checkCacheConsistency(
+            try TinyModel.checkCacheConsistency(
                 model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: 1e-4)
         }
     }
@@ -159,9 +159,9 @@ extension TinyModel {
     static func checkCacheConsistency(
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
         sourceLocation: SourceLocation = #_sourceLocation
-    ) {
+    ) throws {
         let full = logits(model, rows)
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         var start = 0
         for chunk in chunks {
             let part = rows.map { Array($0[start ..< start + chunk]) }

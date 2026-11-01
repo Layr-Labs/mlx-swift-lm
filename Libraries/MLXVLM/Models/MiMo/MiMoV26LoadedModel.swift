@@ -492,7 +492,10 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
     public func validateGenericGeneration() throws {
         throw MiMoV26FactoryError.nativeCBv2Required
     }
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         guard input.image == nil, input.video == nil else {

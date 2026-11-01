@@ -382,8 +382,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// use the installed W4/g64 exact projection geometry.
     func testExactGDNCapturedWindowMatchesSerialOracle() throws {
         func assertExact(_ actual: MLXArray, _ expected: MLXArray) {
-            let difference = max(abs(
-                actual.asType(.float32) - expected.asType(.float32)))
+            let difference = max(
+                abs(
+                    actual.asType(.float32) - expected.asType(.float32)))
             eval(difference)
             XCTAssertEqual(difference.item(Float.self), 0)
         }
@@ -493,21 +494,24 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     private func tokenwiseRecurrenceOracle(
         tape: ArraysCache.PrefixReplayTape, layer: Qwen35GatedDeltaNet
     ) throws -> [(conv: MLXArray, ssm: MLXArray)] {
-        var conv = tape.convInput[0..., 0..<tape.convStateRows, 0...]
+        var conv = tape.convInput[0..., 0 ..< tape.convStateRows, 0...]
         var ssm = try XCTUnwrap(tape.ssmPre)
         var snapshots: [(conv: MLXArray, ssm: MLXArray)] = []
-        for row in 0..<tape.rowCount {
-            let next = row..<(row + 1)
-            ssm = gatedDeltaUpdate(
-                q: tape.q[0..., next], k: tape.k[0..., next], v: tape.v[0..., next],
-                a: tape.a[0..., next], b: tape.b[0..., next],
-                aLog: layer.aLog, dtBias: layer.dtBias, state: ssm,
-                mask: tape.mask.map { $0[0..., next] }).1
+        for row in 0 ..< tape.rowCount {
+            let next = row ..< (row + 1)
+            ssm =
+                gatedDeltaUpdate(
+                    q: tape.q[0..., next], k: tape.k[0..., next], v: tape.v[0..., next],
+                    a: tape.a[0..., next], b: tape.b[0..., next],
+                    aLog: layer.aLog, dtBias: layer.dtBias, state: ssm,
+                    mask: tape.mask.map { $0[0..., next] }
+                ).1
             let incoming = tape.convStateRows + row
-            conv = concatenated([
-                conv[0..., 1..., 0...],
-                tape.convInput[0..., incoming..<(incoming + 1), 0...],
-            ], axis: 1)
+            conv = concatenated(
+                [
+                    conv[0..., 1..., 0...],
+                    tape.convInput[0..., incoming ..< (incoming + 1), 0...],
+                ], axis: 1)
             let snapshot = (conv: conv + 0, ssm: ssm + 0)
             eval(snapshot.conv, snapshot.ssm)
             snapshots.append(snapshot)
@@ -601,9 +605,12 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         try captured.commit(keepPositions: 4)
         let actual = capturedState.state(modelLayerIndex: 0)!
         let expected = ordinaryState.state(modelLayerIndex: 0)!
-        for (name, left, right) in [("conv", actual.conv!, expected.conv!),
-                                  ("ssm", actual.ssm!, expected.ssm!)] {
-            XCTAssertTrue(allClose(left, right, rtol: 1e-4, atol: 1e-5).item(Bool.self),
+        for (name, left, right) in [
+            ("conv", actual.conv!, expected.conv!),
+            ("ssm", actual.ssm!, expected.ssm!),
+        ] {
+            XCTAssertTrue(
+                allClose(left, right, rtol: 1e-4, atol: 1e-5).item(Bool.self),
                 "same-width captured \(name) must match ordinary forward")
         }
     }
@@ -698,8 +705,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
     // MARK: - 3. Compact recurrent prefix replay
 
-    private func legacyCaches(_ model: Qwen35TextModel) -> [any KVCache] {
-        model.newCache(parameters: nil).map { $0 as any KVCache }
+    private func legacyCaches(_ model: Qwen35TextModel) throws -> [any KVCache] {
+        try model.newCache(parameters: nil).map { $0 as any KVCache }
     }
 
     private func copiedCaches(_ caches: [any KVCache]) -> [any KVCache] {
@@ -729,7 +736,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertEqual(lhs.count, rhs.count, file: file, line: line)
         for index in lhs.indices {
             guard let left = lhs[index] as? MambaCache,
-                  let right = rhs[index] as? MambaCache
+                let right = rhs[index] as? MambaCache
             else { continue }
             XCTAssertEqual(left.state.count, right.state.count, file: file, line: line)
             for (leftArray, rightArray) in zip(left.state, right.state) {
@@ -751,7 +758,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let base = legacyCaches(model)
+        let base = try legacyCaches(model)
         _ = legacyForward(
             model, tokens: [1, 2, 3], caches: base, nConfirmed: 0)
         let baseAttentionOffsets = base.map(\.offset)
@@ -779,9 +786,10 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             for (index, cache) in verify.enumerated() {
                 guard let recurrent = cache as? MambaCache else { continue }
                 let tape = try XCTUnwrap(recurrent.prefixReplayTape)
-                let layer = try XCTUnwrap(model.model.namedModules().first {
-                    $0.0 == "layers.\(index).linear_attn"
-                }?.1 as? Qwen35GatedDeltaNet)
+                let layer = try XCTUnwrap(
+                    model.model.namedModules().first {
+                        $0.0 == "layers.\(index).linear_attn"
+                    }?.1 as? Qwen35GatedDeltaNet)
                 let prefixes = try tokenwiseRecurrenceOracle(tape: tape, layer: layer)
                 recurrentOracle[index] = prefixes[committedRows - 1]
             }
@@ -831,7 +839,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let caches = legacyCaches(model)
+        let caches = try legacyCaches(model)
         _ = legacyForward(
             model, tokens: [1, 2, 3, 4], caches: caches, nConfirmed: 1)
         let recurrent = caches.compactMap { $0 as? MambaCache }
@@ -874,7 +882,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let base = legacyCaches(model)
+        let base = try legacyCaches(model)
         let accepted = copiedCaches(base)
         _ = legacyForward(
             model, tokens: [1, 2, 3], caches: accepted, nConfirmed: 1)
@@ -909,7 +917,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertNotNil(resetCache.prefixReplayTape)
         resetCache.rollbackState = (
             try XCTUnwrap(resetCache[0]),
-            try XCTUnwrap(resetCache[1]))
+            try XCTUnwrap(resetCache[1])
+        )
         resetCache.state = []
         XCTAssertNil(resetCache.prefixReplayTape)
         XCTAssertNil(resetCache.rollbackState)

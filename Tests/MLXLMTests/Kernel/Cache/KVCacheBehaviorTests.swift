@@ -198,7 +198,8 @@ extension KernelTests {
                     SyntheticModel.maxAbsDifference(output, expected) <= Self.tolerance,
                     "chunk \(index) at offset \(previous)")
             }
-            #expect(cache.metaState == ["2", "5", "256", "11", "5"])
+            // keep, maxSize, step, offset, idx, capacity origin, wrapped (upstream 12d935f9).
+            #expect(cache.metaState == ["2", "5", "256", "11", "5", "modelNative", "true"])
         }
 
         @Test func rotatingCacheCopyContinuesLikeTheOriginal() {
@@ -365,11 +366,11 @@ extension KernelTests {
             #expect(unquantized.state[0].shape == [1, 2, 250, 32])
         }
 
-        @Test func simpleCacheQuantizesAndDequantizes() {
+        @Test func simpleCacheQuantizesAndDequantizes() throws {
             let cache = KVCacheSimple()
             let new = Self.tokens(6, seed: 7, headDim: 32)
             _ = cache.update(keys: new.keys, values: new.values)
-            let quantized = cache.toQuantized(groupSize: 64, bits: 8)
+            let quantized = try cache.toQuantized(groupSize: 64, bits: 8)
             #expect(quantized.groupSize == 32)
             #expect(quantized.offset == 6)
             let back = quantized.toUnquantized()
@@ -377,7 +378,7 @@ extension KernelTests {
             #expect(SyntheticModel.maxAbsDifference(back.state[0], new.keys) <= 0.05)
             #expect(SyntheticModel.maxAbsDifference(back.state[1], new.values) <= 0.05)
 
-            let empty = KVCacheSimple().toQuantized(groupSize: 64, bits: 4)
+            let empty = try KVCacheSimple().toQuantized(groupSize: 64, bits: 4)
             #expect(empty.offset == 0)
             #expect(empty.state.isEmpty)
         }
@@ -594,13 +595,13 @@ extension KernelTests {
             #expect(noMask == nil)
         }
 
-        @Test func promptCacheHelpersTrimOnlyTrimmableCaches() {
-            let rotating = makePromptCacheWithLayerCount(numLayers: 2, maxKVSize: 8)
+        @Test func promptCacheHelpersTrimOnlyTrimmableCaches() throws {
+            let rotating = try makePromptCacheWithLayerCount(numLayers: 2, maxKVSize: 8)
             #expect(rotating.count == 2)
             #expect(rotating.allSatisfy { $0 is RotatingKVCache })
             #expect(rotating[0].metaState[0] == "4", "keep 4 tokens")
             #expect(rotating[0].maxSize == 8)
-            let simple = makePromptCacheWithLayerCount(numLayers: 3)
+            let simple = try makePromptCacheWithLayerCount(numLayers: 3)
             #expect(simple.allSatisfy { type(of: $0) == KVCacheSimple.self })
 
             for cache in simple {

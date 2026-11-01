@@ -27,23 +27,25 @@ enum PagedSelectedGather {
     }
 
     private static let monolithic = MLXFast.metalKernel(
-        name: "cbv2_paged_selected_gather", inputNames: ["keys", "values", "table", "indices", "length", "previous"],
-        outputNames: ["output", "fence"], source: """
-        const int d = int(thread_position_in_grid.x);
-        const int h = int(thread_position_in_grid.y);
-        const int r = int(thread_position_in_grid.z);
-        const int token = indices[r];
-        const size_t target = ((size_t)h * R + r) * D + d;
-        T k = T(0), v = T(0);
-        if (token >= 0 && token < length[0]) {
-            const int page = table[token / S];
-            const size_t source = (((size_t)page * H + h) * S + token % S) * D + d;
-            k = keys[source]; v = values[source];
-        }
-        output[target] = k;
-        output[(size_t)H * R * D + target] = v;
-        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
-        """, ensureRowContiguous: true)
+        name: "cbv2_paged_selected_gather",
+        inputNames: ["keys", "values", "table", "indices", "length", "previous"],
+        outputNames: ["output", "fence"],
+        source: """
+            const int d = int(thread_position_in_grid.x);
+            const int h = int(thread_position_in_grid.y);
+            const int r = int(thread_position_in_grid.z);
+            const int token = indices[r];
+            const size_t target = ((size_t)h * R + r) * D + d;
+            T k = T(0), v = T(0);
+            if (token >= 0 && token < length[0]) {
+                const int page = table[token / S];
+                const size_t source = (((size_t)page * H + h) * S + token % S) * D + d;
+                k = keys[source]; v = values[source];
+            }
+            output[target] = k;
+            output[(size_t)H * R * D + target] = v;
+            if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+            """, ensureRowContiguous: true)
 
     private static let kernelLock = NSLock()
     nonisolated(unsafe) private static var segmentedKernels: [Int: MLXFast.MLXFastKernel] = [:]
@@ -51,24 +53,25 @@ enum PagedSelectedGather {
     private static let segmentedLegacy = MLXFast.metalKernel(
         name: "cbv2_segment_selected_gather",
         inputNames: ["storage", "table", "indices", "length", "output", "previous"],
-        outputNames: ["fence"], source: """
-        const int d = int(thread_position_in_grid.x);
-        const int h = int(thread_position_in_grid.y);
-        const int r = int(thread_position_in_grid.z);
-        const int token = indices[r];
-        if (token >= 0 && token < length[0]) {
-            const int page = table[token / S];
-            if (page > FIRST && page < END) {
-                const int local = page - FIRST;
-                const size_t source = (((size_t)local * H + h) * S + token % S) * D + d;
-                const size_t target = ((size_t)h * R + r) * D + d;
-                device T* destination = output;
-                destination[target] = storage[source];
-                destination[(size_t)H * R * D + target] = storage[VBASE + source];
+        outputNames: ["fence"],
+        source: """
+            const int d = int(thread_position_in_grid.x);
+            const int h = int(thread_position_in_grid.y);
+            const int r = int(thread_position_in_grid.z);
+            const int token = indices[r];
+            if (token >= 0 && token < length[0]) {
+                const int page = table[token / S];
+                if (page > FIRST && page < END) {
+                    const int local = page - FIRST;
+                    const size_t source = (((size_t)local * H + h) * S + token % S) * D + d;
+                    const size_t target = ((size_t)h * R + r) * D + d;
+                    device T* destination = output;
+                    destination[target] = storage[source];
+                    destination[(size_t)H * R * D + target] = storage[VBASE + source];
+                }
             }
-        }
-        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
-        """, ensureRowContiguous: true, mutableInputs: ["output"])
+            if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+            """, ensureRowContiguous: true, mutableInputs: ["output"])
 
     static func bindingBatches(segmentIDs: [Int]) -> [[Int]] {
         precondition(segmentIDs == Array(Set(segmentIDs)).sorted())
@@ -101,18 +104,18 @@ enum PagedSelectedGather {
                 """
         }.joined(separator: "\n")
         return """
-        const int d = int(thread_position_in_grid.x);
-        const int h = int(thread_position_in_grid.y);
-        const int r = int(thread_position_in_grid.z);
-        const int token = indices[r];
-        const size_t target = ((size_t)h * R + r) * D + d;
-        device T* destination = output;
-        if (token >= 0 && token < length[0]) {
-            const int page = table[token / S];
-        \(copies)
-        }
-        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
-        """
+            const int d = int(thread_position_in_grid.x);
+            const int h = int(thread_position_in_grid.y);
+            const int r = int(thread_position_in_grid.z);
+            const int token = indices[r];
+            const size_t target = ((size_t)h * R + r) * D + d;
+            device T* destination = output;
+            if (token >= 0 && token < length[0]) {
+                const int page = table[token / S];
+            \(copies)
+            }
+            if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+            """
     }
 
     private static func segmentedKernel(bindings: Int) -> MLXFast.MLXFastKernel {
@@ -133,25 +136,34 @@ enum PagedSelectedGather {
         source: "witness[0] = previous[0] + 1;", ensureRowContiguous: true)
 
     static func prepare(group: PagedKVGroup, pages: [Int32]) -> Plan {
-        let segmentIDs = group.segmentLayout.map { layout in
-            Array(Set(pages.map { layout.segmentIndex(page: $0) })).sorted()
-        } ?? []
+        let segmentIDs =
+            group.segmentLayout.map { layout in
+                Array(Set(pages.map { layout.segmentIndex(page: $0) })).sorted()
+            } ?? []
         return Plan(table: MLXArray(pages), segmentIDs: segmentIDs)
     }
 
     static func gather(group: PagedKVGroup, plan: Plan, indices: MLXArray, length: Int)
-        -> (keys: MLXArray, values: MLXArray) {
+        -> (keys: MLXArray, values: MLXArray)
+    {
+        precondition(
+            group.key.quantization == nil,
+            "packed selected KV requires its typed native recent reader")
         precondition(indices.ndim == 1 && indices.dtype == .int32 && indices.size > 0)
         precondition(length > 0 && plan.table.size * group.pageSize >= length)
-        let h = group.key.kvHeads, d = group.key.headDim, count = indices.size
+        let h = group.key.kvHeads
+        let d = group.key.headDim
+        let count = indices.size
         let logicalLength = MLXArray([Int32(length)])
         let common: [(String, any KernelTemplateArg)] = [
             ("T", group.dtype), ("H", h), ("D", d), ("S", group.pageSize),
-            ("R", count)]
+            ("R", count),
+        ]
         let output: MLXArray
         if group.segmentLayout == nil {
             let results = monolithic(
-                [group.kSlab, group.vSlab, plan.table, indices, logicalLength, group.writeFence], template: common,
+                [group.kSlab, group.vSlab, plan.table, indices, logicalLength, group.writeFence],
+                template: common,
                 grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
                 outputShapes: [[2, 1, h, count, d], [1]], outputDTypes: [group.dtype, .int32])
             output = results[0]
@@ -177,37 +189,51 @@ enum PagedSelectedGather {
                         return segment
                     }
                     var storage = segments.map(\.storage)
-                    storage.append(contentsOf: repeatElement(
-                        storage[0], count: bindingCount - storage.count))
+                    storage.append(
+                        contentsOf: repeatElement(
+                            storage[0], count: bindingCount - storage.count))
                     var bounds = segments.flatMap {
                         [Int32($0.pages.lowerBound), Int32($0.pages.upperBound)]
                     }
-                    bounds.append(contentsOf: repeatElement(
-                        Int32(0), count: 2 * (bindingCount - segments.count)))
+                    bounds.append(
+                        contentsOf: repeatElement(
+                            Int32(0), count: 2 * (bindingCount - segments.count)))
                     var valueOffsets = segments.map { Int64($0.valueOffset) }
-                    valueOffsets.append(contentsOf: repeatElement(
-                        Int64(0), count: bindingCount - segments.count))
-                    fence = segmentedKernel(bindings: bindingCount)(
-                        storage + [plan.table, indices, logicalLength, destination, fence,
-                            MLXArray(bounds), MLXArray(valueOffsets)], template: common,
-                        grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
-                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+                    valueOffsets.append(
+                        contentsOf: repeatElement(
+                            Int64(0), count: bindingCount - segments.count))
+                    fence =
+                        segmentedKernel(bindings: bindingCount)(
+                            storage + [
+                                plan.table, indices, logicalLength, destination, fence,
+                                MLXArray(bounds), MLXArray(valueOffsets),
+                            ], template: common,
+                            grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
+                            outputShapes: [[1]], outputDTypes: [.int32])[0]
                 }
             } else {
                 for index in plan.segmentIDs {
                     guard let segment = group.segments[index] else {
                         preconditionFailure("selected gather names an uncommitted segment")
                     }
-                    fence = segmentedLegacy(
-                        [segment.storage, plan.table, indices, logicalLength, destination, fence],
-                        template: common + [("FIRST", segment.pages.lowerBound),
-                            ("END", segment.pages.upperBound), ("VBASE", segment.valueOffset)],
-                        grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
-                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+                    fence =
+                        segmentedLegacy(
+                            [
+                                segment.storage, plan.table, indices, logicalLength, destination,
+                                fence,
+                            ],
+                            template: common + [
+                                ("FIRST", segment.pages.lowerBound),
+                                ("END", segment.pages.upperBound), ("VBASE", segment.valueOffset),
+                            ],
+                            grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
+                            outputShapes: [[1]], outputDTypes: [.int32])[0]
                 }
             }
-            fence = complete([fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
-                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            fence =
+                complete(
+                    [fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])[0]
             group.writeFence = fence
             output = depends(input: destination, dependencies: [fence])
         }
@@ -218,8 +244,9 @@ enum PagedSelectedGather {
 public enum PagedSelectedGatherInvocation: Sendable {
     private static let lock = NSLock()
     private static let logger = Logger(subsystem: "darkbloom", category: "PagedSelectedGather")
-    private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_DIAGNOSTICS"] == "1"
+    private static let diagnoseFirstPlan =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var didRecord = false
     nonisolated(unsafe) private static var calls = 0
 
@@ -233,7 +260,8 @@ public enum PagedSelectedGatherInvocation: Sendable {
         }
         if first {
             logger.info(
-                "paged_selected_gather first_planned_call=1 pages=\(pages, privacy: .public) segments=\(segments, privacy: .public) passes=\(passes, privacy: .public) selected_rows=\(selectedRows, privacy: .public) max_bindings=\(PagedSelectedGather.maximumBindings, privacy: .public)")
+                "paged_selected_gather first_planned_call=1 pages=\(pages, privacy: .public) segments=\(segments, privacy: .public) passes=\(passes, privacy: .public) selected_rows=\(selectedRows, privacy: .public) max_bindings=\(PagedSelectedGather.maximumBindings, privacy: .public)"
+            )
         }
     }
 

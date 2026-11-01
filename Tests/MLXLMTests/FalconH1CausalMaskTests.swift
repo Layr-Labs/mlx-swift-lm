@@ -66,7 +66,7 @@ struct FalconH1CausalMaskTests {
         let rowB = Self.tokens(count: 11, seed: 2)
         for rows in [[rowA], [rowA, rowB]] {
             let full = Self.logits(model, rows)
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             var start = 0
             for chunk in [5, 3, 1, 1, 1] {
                 let part = rows.map { Array($0[start ..< start + chunk]) }

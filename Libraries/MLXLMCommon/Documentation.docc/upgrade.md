@@ -40,6 +40,7 @@ let model = try await loadModelContainer(configuration: modelConfiguration)
 you would convert that like this:
 
 ```swift
+import Foundation
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
@@ -59,6 +60,7 @@ If you want a little more control over the downloader or the tokenizer loader, t
 expands to this:
 
 ```swift
+import Foundation
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
@@ -78,7 +80,7 @@ let model = try await loadModelContainer(
 
 ### Using Integration Packages
 
-If you are using an <doc:using#Integration-Packages>, such as [https://github.com/DePasqualeOrg/swift-tokenizers-mlx](https://github.com/DePasqualeOrg/swift-tokenizers-mlx), you would do something similar:
+If you are using an <doc:using#Integration-Packages> you would do something similar:
 
 ```swift
 import MLXLLM
@@ -93,15 +95,17 @@ let model = try await loadModelContainer(configuration: modelConfiguration)
 becomes:
 
 ```swift
+import Foundation
 import MLXLLM
 import MLXLMCommon
-
-import MLXLMHFAPI
-import MLXLMTokenizers
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
 let modelConfiguration = LLMRegistry.gemma3_1B_qat_4bit
 let model = try await loadModelContainer(
-    from: HubClient(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: modelConfiguration
 )
 
@@ -133,6 +137,7 @@ now, using the <doc:#Using-MLXHuggingFace-Macros> (see
 packages):
 
 ```swift
+import Foundation
 import MLXEmbedders
 import MLXLMCommon
 import MLXHuggingFace
@@ -150,7 +155,7 @@ let loader = #huggingFaceTokenizerLoader()
 let container = try await EmbedderModelFactory.shared.loadContainer(
     from: hub,
     using: loader,
-    configuration: configuration
+    configuration: defaultModelConfiguration
 )
 
 // use it ...
@@ -169,51 +174,6 @@ These types are removed or replaced:
 
 Detailed release notes.
 
-### New dependencies
-
-Add your preferred tokenizer and downloader adapters:
-
-```swift
-// Before (2.x) – single dependency
-.package(url: "https://github.com/ml-explore/mlx-swift-lm/", from: "2.30.0"),
-
-// After (3.x) – core + adapters
-.package(url: "https://github.com/ml-explore/mlx-swift-lm/", from: "3.0.0"),
-.package(url: "https://github.com/DePasqualeOrg/swift-tokenizers-mlx/", from: "0.2.0", traits: ["Swift"]),
-.package(url: "https://github.com/DePasqualeOrg/swift-hf-api-mlx/", from: "0.2.0"),
-```
-
-And add their products to your target:
-
-```swift
-.product(name: "MLXLMTokenizers", package: "swift-tokenizers-mlx"),
-.product(name: "MLXLMHFAPI", package: "swift-hf-api-mlx"),
-
-// If you use MLXEmbedders:
-.product(name: "MLXEmbeddersTokenizers", package: "swift-tokenizers-mlx"),
-.product(name: "MLXEmbeddersHFAPI", package: "swift-hf-api-mlx"),
-```
-
-### New imports
-
-```swift
-// Before (2.x)
-import MLXLLM
-
-// After (3.x)
-import MLXLLM
-import MLXLMHFAPI      // Downloader adapter
-import MLXLMTokenizers // Tokenizer adapter
-```
-
-If you use MLXEmbedders:
-
-```swift
-import MLXEmbedders
-import MLXEmbeddersHFAPI      // Downloader adapter
-import MLXEmbeddersTokenizers // Tokenizer adapter
-```
-
 ### Loading API changes
 
 The core APIs now include a `from:` parameter of type `URL` or `any Downloader` as well as a `using:` parameter for the tokenizer loader. Tokenizer integration packages may supply convenience methods with a default tokenizer loader, allowing you to omit the `using:` parameter.
@@ -228,13 +188,19 @@ Example when downloading from Hugging Face:
 ```swift
 // Before (2.x) – hub defaulted to HubApi()
 let container = try await loadModelContainer(
-    id: "mlx-community/Qwen3-4B-4bit"
+    configuration: LLMRegistry.gemma3_1B_qat_4bit
 )
 
-// After (3.x) – Using Swift Hugging Face + Swift Tokenizers
-let container = try await loadModelContainer(
-    from: HubClient.default,
-    id: "mlx-community/Qwen3-4B-4bit"
+// After (3.x) – Using HuggingFace integration macros
+import Foundation
+import MLXLLM
+import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
+
+let model = try await #huggingFaceLoadModelContainer(
+    configuration: LLMRegistry.gemma3_1B_qat_4bit
 )
 ```
 
@@ -247,14 +213,18 @@ Loading from a local directory:
 let container = try await loadModelContainer(directory: modelDirectory)
 
 // After (3.x)
-let container = try await loadModelContainer(from: modelDirectory)
+let container = try await loadModelContainer(
+    from: modelDirectory,
+    using: #huggingFaceTokenizerLoader()
+)
 ```
 
 Loading with a model factory:
 
 ```swift
 let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: modelConfiguration
 )
 ```
@@ -262,13 +232,17 @@ let container = try await LLMModelFactory.shared.loadContainer(
 Loading an embedder:
 
 ```swift
+import Foundation
 import MLXEmbedders
-import MLXEmbeddersHFAPI
-import MLXEmbeddersTokenizers
+import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
-let container = try await loadModelContainer(
-    from: HubClient.default,
-    configuration: .configuration(id: "sentence-transformers/all-MiniLM-L6-v2")
+let container = try await EmbedderModelFactory.shared.loadContainer(
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
+    configuration: EmbedderRegistry.minilm_l6
 )
 ```
 
@@ -288,11 +262,11 @@ let text = tokenizer.decode(tokenIds: ids)
 
 ### Loading API
 
-The `hub` parameter (previously `HubApi`) has been replaced with `from` (any `Downloader` or `URL` for a local directory). Functions that previously defaulted to `defaultHubApi` no longer have a default – callers must either pass a `Downloader` explicitly or use the convenience methods in `MLXLMHuggingFace` / `MLXEmbeddersHuggingFace`, which default to `HubClient.default`.
+The `hub` parameter (previously `HubApi`) has been replaced with `from` (any `Downloader` or `URL` for a local directory). Functions that previously defaulted to `defaultHubApi` no longer have a default – callers must pass a `Downloader` explicitly (for example the `#hubDownloader()` macro from `MLXHuggingFace`) or use the `#huggingFaceLoadModelContainer` / `#huggingFaceLoadModel` convenience macros.
 
-For most users who were using the default Hub client, adding `import MLXLMHuggingFace` or `import MLXEmbeddersHuggingFace` and using the convenience overloads is sufficient.
+For most users who were using the default Hub client, adding `import MLXHuggingFace` (together with `import HuggingFace` and `import Tokenizers`) and using `#hubDownloader()` + `#huggingFaceTokenizerLoader()` — or the `#huggingFaceLoadModelContainer` macro — is sufficient.
 
-Users who were passing a custom `HubApi` instance should create a `HubClient` instead and pass it as the `from` parameter. `HubClient` conforms to `Downloader` via `MLXLMHuggingFace`.
+Users who were passing a custom `HubApi` instance should create a `HuggingFace.HubClient` instead and wrap it with `#hubDownloader(_:)` to pass as the `from` parameter.
 
 ### `ModelConfiguration`
 
@@ -302,18 +276,54 @@ Users who were passing a custom `HubApi` instance should create a `HubClient` in
 
 ### Tokenizer loading
 
-`loadTokenizer(configuration:hub:)` has been removed. Tokenizer loading now uses `AutoTokenizer.from(directory:)` from Swift Tokenizers directly.
+`loadTokenizer(configuration:hub:)` has been removed. Tokenizer loading is now done by the `TokenizerLoader` passed to the load functions. `#huggingFaceTokenizerLoader()` uses `AutoTokenizer.from(modelFolder:)` from Swift Transformers.
 
-`replacementTokenizers` (the `TokenizerReplacementRegistry`) has been removed. Use `AutoTokenizer.register(_:for:)` from Swift Tokenizers instead.
+`replacementTokenizers` (the `TokenizerReplacementRegistry`) has been removed. To load a tokenizer class that `AutoTokenizer` does not support, pass your own `TokenizerLoader`.
 
 ### `defaultHubApi`
 
-The `defaultHubApi` global has been removed. Hugging Face Hub access is now provided by `HubClient.default` from the `HuggingFace` module.
+The `defaultHubApi` global has been removed. Hugging Face Hub access is now provided by the `#hubDownloader()` macro from `MLXHuggingFace`, which wraps a default `HuggingFace.HubClient`.
 
 ### Low-level APIs
 
 - `downloadModel(hub:configuration:progressHandler:)` → `Downloader.download(id:revision:matching:useLatest:progressHandler:)`
-- `loadTokenizerConfig(configuration:hub:)` → `AutoTokenizer.from(directory:)`
+- `loadTokenizerConfig(configuration:hub:)` → `TokenizerLoader.load(from:)`
 - `ModelFactory._load(hub:configuration:progressHandler:)` → `_load(configuration: ResolvedModelConfiguration)`
 - `ModelFactory._loadContainer`: removed (base `loadContainer` now builds the container from `_load`)
+
+### `UserInput.Image`, `UserInput.Video` and `UserInput.Audio`
+
+These three media types were enums with these cases:
+
+- `UserInput.Image`: `ciImage`, `url` and `array`.
+- `UserInput.Video`: `avAsset`, `url` and `frames`.
+- `UserInput.Audio`: `url` and `array`.
+
+Each type is now a struct with a nested `Source` enum. `Source` has the old cases and their payloads. The struct also has a `source` property and an `init(source:)`.
+
+`UserInput.Image` also has an optional `label`. A vision message generator writes the label into the prompt as `[label]`, immediately before the image.
+
+Each old case is now a static function with the same name and argument labels. So the code that creates a media value still compiles:
+
+```swift
+let image = UserInput.Image.url(imageURL)
+let videos = urls.map(UserInput.Video.url)
+let audio: UserInput.Audio = .array(samples)
+```
+
+A `switch`, `if case`, `guard case` or `for case` that matches a media value against a case no longer compiles. Match against the `source` of the media value instead:
+
+```swift
+// Before
+switch video {
+case .url(let url): print(url)
+default: break
+}
+
+// After
+switch video.source {
+case .url(let url): print(url)
+default: break
+}
+```
 

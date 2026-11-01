@@ -1,11 +1,12 @@
 // Copyright © 2024 Apple Inc.
 
 import AVFoundation
-import CoreImage.CIFilterBuiltins
+@preconcurrency import CoreImage.CIFilterBuiltins
 import MLX
 import MLXLMCommon
 
 public typealias VideoFrame = UserInput.VideoFrame
+public typealias VideoProcessing = UserInput.VideoProcessing
 
 public struct ProcessedFrames {
     public let frames: [MLXArray]
@@ -31,7 +32,11 @@ public struct VideoMetadata {
 // scan accumulates thousands of cached intermediate surfaces and hits the
 // per-process IOSurface limit of 16384, crashing the render pipeline.
 // Batch-processing never re-renders the same frame twice, so the cache buys nothing.
+#if compiler(>=6.2)  // proxy check for macOS 26 SDK, where CIContext is Sendable
 private let context = CIContext(options: [.cacheIntermediates: false])
+#else
+nonisolated(unsafe) private let context = CIContext(options: [.cacheIntermediates: false])
+#endif
 
 /// Collection of methods for processing media (images, video, etc.).
 ///
@@ -420,33 +425,74 @@ public enum MediaProcessing {
         return arrays
     }
 
-    static public func asProcessedSequence(
-        _ video: UserInput.Video,
-        samplesPerSecond: Int,
-        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
-    ) async throws -> ProcessedFrames {
-        return try await asProcessedSequence(
-            video,
-            targetFPS: { _ in Double(samplesPerSecond) },
-            maxFrames: Int.max,
-            frameProcessing: frameProcessing
-        )
+    static internal func sampleTimes(
+        duration: CMTime,
+        processing: UserInput.VideoProcessing,
+        targetFPS: ((CMTime) -> Double)?,
+        maxFrames: Int,
+        totalAvailableFrames: Int? = nil
+    ) -> [CMTime] {
+        let timescale = duration.timescale
+        let requestedCount: Int
+
+        if let targetFrames = processing.targetFrames {
+            requestedCount = targetFrames
+        } else {
+            let fps: Double
+            if let targetFPS = processing.targetFramesPerSecond {
+                fps = targetFPS
+            } else if let targetFPSClosure = targetFPS {
+                fps = targetFPSClosure(duration)
+            } else {
+                fps = 1.0
+            }
+            requestedCount = Int(round(duration.seconds * fps))
+        }
+
+        var count = max(min(requestedCount, maxFrames), 1)
+        if let totalAvailableFrames {
+            count = min(count, totalAvailableFrames)
+        }
+
+        if count <= 1 {
+            return [CMTime(value: 0, timescale: timescale)]
+        }
+
+        let step = Double(duration.value) / Double(count - 1)
+        return (0 ..< count).map { i in
+            let tick = Int64(round(Double(i) * step))
+            return CMTime(value: tick, timescale: timescale)
+        }
     }
 
-    static public func asProcessedSequence(
+    /// Extract and process a sequence of video frames according to video processing configuration.
+    ///
+    /// - Parameters:
+    ///   - video: The video to extract frames from (`AVAsset`, memory-backed asset, `URL`, or decoded `VideoFrame`s).
+    ///   - processing: Video processing configuration (such as `targetFrames` or `targetFramesPerSecond`).
+    ///   - targetFPS: Optional closure computing target FPS given duration; used when `processing` has neither `targetFrames` nor `targetFramesPerSecond`.
+    ///   - maxFrames: Maximum frame count budget.
+    ///   - frameProcessing: Transformation applied to each individual video frame.
+    /// - Returns: `ProcessedFrames` containing extracted MLXArray frames, timestamps, and total duration.
+    public static func asProcessedSequence(
         _ video: UserInput.Video,
-        targetFPS: (CMTime) -> Double,
+        processing: UserInput.VideoProcessing = .init(),
+        targetFPS: ((CMTime) -> Double)? = nil,
         maxFrames: Int = Int.max,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
         try Task.checkCancellation()
 
-        switch video
-        {
+        switch video.source {
         case .avAsset(let asset):
             try await Self.validateAsset(asset)
             return try await _asProcessedSequence(
-                asset, maxFrames: maxFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                asset,
+                processing: processing,
+                targetFPS: targetFPS,
+                maxFrames: maxFrames,
+                frameProcessing: frameProcessing
+            )
 
         case .memoryBacked(let owner):
             return try await owner.withAsset { asset in
@@ -454,48 +500,125 @@ public enum MediaProcessing {
                 try await Self.validateAsset(asset)
                 try Task.checkCancellation()
                 return try await _asProcessedSequence(
-                    asset, maxFrames: maxFrames, targetFPS: targetFPS,
-                    frameProcessing: frameProcessing)
+                    asset,
+                    processing: processing,
+                    targetFPS: targetFPS,
+                    maxFrames: maxFrames,
+                    frameProcessing: frameProcessing
+                )
             }
 
         case .url(let url):
             let asset = AVAsset(url: url)
             try await Self.validateAsset(asset)
             return try await _asProcessedSequence(
-                asset, maxFrames: maxFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                asset,
+                processing: processing,
+                targetFPS: targetFPS,
+                maxFrames: maxFrames,
+                frameProcessing: frameProcessing
+            )
 
         case .frames(let videoFrames):
             return try await _asProcessedSequence(
-                videoFrames, maxFrames: maxFrames, targetFPS: targetFPS,
-                frameProcessing: frameProcessing)
+                videoFrames,
+                processing: processing,
+                targetFPS: targetFPS,
+                maxFrames: maxFrames,
+                frameProcessing: frameProcessing
+            )
+        }
+    }
+
+    /// Extract and process a sequence of video frames according to `UserInput.Processing` options.
+    public static func asProcessedSequence(
+        _ video: UserInput.Video,
+        userProcessing: UserInput.Processing,
+        targetFPS: ((CMTime) -> Double)? = nil,
+        maxFrames: Int = Int.max,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
+        try await asProcessedSequence(
+            video,
+            processing: userProcessing.video,
+            targetFPS: targetFPS,
+            maxFrames: maxFrames,
+            frameProcessing: frameProcessing
+        )
+    }
+
+    /// Extract and process a sequence of video frames using a dynamic target FPS function.
+    public static func asProcessedSequence(
+        _ video: UserInput.Video,
+        targetFPS: (CMTime) -> Double,
+        maxFrames: Int = Int.max,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
+        try await withoutActuallyEscaping(targetFPS) { targetFPS in
+            try await asProcessedSequence(
+                video,
+                processing: .init(),
+                targetFPS: targetFPS,
+                maxFrames: maxFrames,
+                frameProcessing: frameProcessing
+            )
+        }
+    }
+
+    /// Extract and process a sequence of video frames at a constant sample rate.
+    public static func asProcessedSequence(
+        _ video: UserInput.Video,
+        samplesPerSecond: Int,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
+        try await asProcessedSequence(
+            video,
+            processing: .init(targetFramesPerSecond: Double(samplesPerSecond)),
+            targetFPS: nil,
+            maxFrames: Int.max,
+            frameProcessing: frameProcessing
+        )
+    }
+
+    @available(
+        *, deprecated, message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
+    )
+    public static func asProcessedSequence(
+        _ asset: AVAsset, maxFrames: Int, targetFPS: (CMTime) -> Double,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
+        try await withoutActuallyEscaping(targetFPS) { targetFPS in
+            try await Self._asProcessedSequence(
+                asset,
+                processing: .init(),
+                targetFPS: targetFPS,
+                maxFrames: maxFrames,
+                frameProcessing: frameProcessing
+            )
         }
     }
 
     @available(
         *, deprecated, message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
     )
-    static public func asProcessedSequence(
-        _ asset: AVAsset, maxFrames: Int, targetFPS: (CMTime) -> Double,
-        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
-    ) async throws -> ProcessedFrames {
-        return try await Self._asProcessedSequence(
-            asset, maxFrames: maxFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
-    }
-
-    @available(
-        *, deprecated, message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
-    )
-    static public func asProcessedSequence(
+    public static func asProcessedSequence(
         _ asset: AVAsset, samplesPerSecond: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
         return try await _asProcessedSequence(
-            asset, maxFrames: Int.max, targetFPS: { _ in Double(samplesPerSecond) },
-            frameProcessing: frameProcessing)
+            asset,
+            processing: .init(targetFramesPerSecond: Double(samplesPerSecond)),
+            targetFPS: nil,
+            maxFrames: Int.max,
+            frameProcessing: frameProcessing
+        )
     }
 
     static private func _asProcessedSequence(
-        _ asset: AVAsset, maxFrames: Int, targetFPS: (CMTime) -> Double,
+        _ asset: AVAsset,
+        processing: UserInput.VideoProcessing,
+        targetFPS: ((CMTime) -> Double)?,
+        maxFrames: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
         try Task.checkCancellation()
@@ -507,19 +630,13 @@ public enum MediaProcessing {
 
         let duration = try await loadDuration(asset)
         try Task.checkCancellation()
-        let fps = targetFPS(duration)
-        // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
-        let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(estimatedFrames, maxFrames)
-        let finalFrameCount = max(desiredFrames, 1)
 
-        let sampledTimeValues = MLXArray.linspace(
-            0, duration.value, count: Int(finalFrameCount)
-        ).asArray(Int64.self)
-
-        // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
-        let timescale = duration.timescale
-        let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
+        let sampledTimes = sampleTimes(
+            duration: duration,
+            processing: processing,
+            targetFPS: targetFPS,
+            maxFrames: maxFrames
+        )
 
         // Collect the frames
         var ciImages: [CIImage] = []
@@ -531,9 +648,9 @@ public enum MediaProcessing {
             case .success(requestedTime: _, let image, actualTime: let actual):
                 let ciImage = CIImage(
                     cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-                let frame = try frameProcessing(.init(frame: ciImage, timeStamp: actual))
+                let frame = try frameProcessing(.init(image: .ciImage(ciImage), timeStamp: actual))
                 try Task.checkCancellation()
-                ciImages.append(frame.frame)
+                ciImages.append(try frame.image.asCIImage())
                 timestamps.append(frame.timeStamp)
             case .failure(requestedTime: _, _):
                 break
@@ -550,13 +667,17 @@ public enum MediaProcessing {
     }
 
     static private func _asProcessedSequence(
-        _ videoFrames: [VideoFrame], maxFrames: Int,
-        targetFPS: (CMTime) -> Double,
+        _ videoFrames: [VideoFrame],
+        processing: UserInput.VideoProcessing,
+        targetFPS: ((CMTime) -> Double)?,
+        maxFrames: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
 
         try Task.checkCancellation()
-        precondition(videoFrames.isEmpty == false)
+        guard !videoFrames.isEmpty else {
+            throw VLMError.processing("Video frame input must contain at least one frame.")
+        }
 
         let startTime = videoFrames.first?.timeStamp ?? .zero
         let endTime = videoFrames.last?.timeStamp ?? .zero
@@ -564,19 +685,14 @@ public enum MediaProcessing {
 
         let duration = timeRangeOfVideoFrames.duration
 
-        let fps = targetFPS(duration)
+        let sampledTimes = sampleTimes(
+            duration: duration,
+            processing: processing,
+            targetFPS: targetFPS,
+            maxFrames: maxFrames,
+            totalAvailableFrames: videoFrames.count
+        )
         try Task.checkCancellation()
-        // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
-        let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(min(estimatedFrames, videoFrames.count), maxFrames)
-        let finalFrameCount = max(desiredFrames, 1)
-
-        let sampledTimeValues = MLXArray.linspace(
-            0, duration.value, count: Int(finalFrameCount)
-        ).asArray(Int64.self)
-
-        // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
-        let timescale = duration.timescale
 
         // Collect the frames
         var ciImages: [CIImage] = []
@@ -586,10 +702,10 @@ public enum MediaProcessing {
         // for rationalle for the follwing timing code
 
         var frameIndex = videoFrames.startIndex
-        for value in sampledTimeValues {
+        for sampledTime in sampledTimes {
             try Task.checkCancellation()
             // The sample times count from the first frame, not from time 0.
-            let targetTime = CMTimeAdd(startTime, CMTime(value: value, timescale: timescale))
+            let targetTime = CMTimeAdd(startTime, sampledTime)
 
             // find the last frame <= the targetTime
             var targetIndex: Int?
@@ -605,9 +721,9 @@ public enum MediaProcessing {
             if let targetIndex {
                 let videoFrame = videoFrames[targetIndex]
                 let frame = try frameProcessing(
-                    .init(frame: videoFrame.frame, timeStamp: videoFrame.timeStamp))
+                    .init(image: videoFrame.image, timeStamp: videoFrame.timeStamp))
                 try Task.checkCancellation()
-                ciImages.append(frame.frame)
+                ciImages.append(try frame.image.asCIImage())
                 timestamps.append(frame.timeStamp)
             }
         }

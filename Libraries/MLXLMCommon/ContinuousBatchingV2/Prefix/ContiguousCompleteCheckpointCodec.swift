@@ -105,7 +105,9 @@ extension CBv2CompleteCheckpointCodec {
             prefixTokens: Array(tokens.prefix(checkpoint.position)),
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
             tensors: descriptors, backendLayout: backendLayout,
-            attentionLayers: layout.layers)
+            attentionLayers: layout.layers,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes)
         _ = try validation.validateStructure()
         let manifest = try validation.owningMetadata(admission: admission)
         var arrays: [MLXArray] = []
@@ -119,7 +121,8 @@ extension CBv2CompleteCheckpointCodec {
         var exportOwners = retainedOwners
         if let checkpoint = checkpoint.assistant { exportOwners.append(checkpoint as AnyObject) }
         return .init(
-            manifest: manifest, arrays: arrays,
+            manifest: manifest,
+            sources: try checkpointSources(arrays: arrays, position: checkpoint.position),
             usesProcessMemoryOwner: admission.hasProcessMemoryOwner,
             retainedOwners: exportOwners)
     }

@@ -542,13 +542,14 @@ extension KernelTests {
                 "Qwen3VL: image and video tokens")
         }
 
-        /// Qwen3-VL gives text-only prompts a batch axis and a mask.
-        @Test func qwen3VLPrepareOfTextHasABatchAxisAndAMask() async throws {
+        /// Qwen3-VL gives text-only prompts a batch axis and no mask: one unpadded
+        /// sequence needs none, and a mask stops prompt-cache reuse (upstream
+        /// 72d9fdb5).
+        @Test func qwen3VLPrepareOfTextHasABatchAxisAndNoMask() async throws {
             let result = try await Self.qwen3().prepare(input: UserInput(prompt: "Hi."))
             let count = Self.tokenizer.encode(text: "user:Hi.").count
             #expect(result.text.tokens.shape == [1, count], "Qwen3VL text: [1, N] tokens")
-            #expect(result.text.mask?.shape == [1, count], "Qwen3VL text: mask shape")
-            #expect(result.text.mask?.dtype == .int8, "Qwen3VL text: mask dtype")
+            #expect(result.text.mask == nil, "Qwen3VL text: no mask")
             let noMedia = result.image == nil && result.video == nil
             #expect(noMedia, "Qwen3VL text: no media")
         }
@@ -861,7 +862,8 @@ extension KernelTests {
         static func logits(_ model: any LanguageModel, _ input: LMInput) throws -> MLXArray {
             guard
                 case .logits(let output) = try model.prepare(
-                    input, cache: model.newCache(parameters: nil), windowSize: nil)
+                    input, cache: model.newCache(parameters: nil), state: nil,
+                    prefill: PrefillParameters())
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -898,14 +900,18 @@ extension KernelTests {
             #expect(isFinite(logits).all().item(Bool.self), "Qwen3VL end to end: not finite")
         }
 
-        /// Qwen2-VL `prepare` returns the logits of the last position only.
+        /// Qwen2-VL `prepare` returns the logits of every prompt position, as
+        /// Qwen2.5-VL does (upstream e31237a6, #345, gave Qwen2-VL the M-RoPE
+        /// prepare of Qwen2.5-VL).
         @Test func qwen2VLProcessorOutputRunsThroughTheModel() async throws {
             let processor = try Self.qwen2()
             let model = try Self.qwen2VLModel(seed: 1)
             for (name, userInput) in [("video", Self.videoOnly), ("both", Self.imageAndVideo)] {
                 let input = try await processor.prepare(input: userInput)
                 let logits = try Self.logits(model, input)
-                #expect(logits.shape == [1, 1, 64], "Qwen2VL end to end \(name): shape")
+                #expect(
+                    logits.shape == [1, input.text.tokens.dim(1), 64],
+                    "Qwen2VL end to end \(name): shape")
                 #expect(
                     isFinite(logits).all().item(Bool.self),
                     "Qwen2VL end to end \(name): not finite")
@@ -978,25 +984,44 @@ extension KernelTests {
 
         /// Hugging Face keys move under `vision_tower` and `language_model`,
         /// `position_ids` buffers go away, and a convolution weight in the
-        /// MLX layout (last axis = 3 channels) stays as it is.
+        /// MLX layout (last axis = 3 channels) stays as it is. A model with
+        /// tied word embeddings has no `lm_head`, so its `lm_head` weight goes
+        /// away (upstream 3de04ab3, #532); an untied model keeps it, renamed.
         @Test func qwen2And25SanitizeRenameKeysAndKeepTheMLXLayout() throws {
-            let models: [(String, any LanguageModel)] = try [
-                ("Qwen2VL", Self.qwen2VLModel(seed: 1)),
-                ("Qwen25VL", Self.qwen25VLModel(seed: 1)),
+            var untiedQwen2 = Self.qwen2VLModelConfiguration
+            untiedQwen2["tie_word_embeddings"] = false
+            var untiedQwen25 = Self.qwen25VLModelConfiguration
+            untiedQwen25["tie_word_embeddings"] = false
+            let models: [(String, any LanguageModel, Bool)] = try [
+                ("Qwen2VL", Self.qwen2VLModel(seed: 1), true),
+                ("Qwen25VL", Self.qwen25VLModel(seed: 1), true),
+                (
+                    "Qwen2VL untied",
+                    ModelCase.build(Qwen2VLConfiguration.self, untiedQwen2, seed: 1, Qwen2VL.init),
+                    false
+                ),
+                (
+                    "Qwen25VL untied",
+                    ModelCase.build(
+                        Qwen25VLConfiguration.self, untiedQwen25, seed: 1, Qwen25VL.init),
+                    false
+                ),
             ]
-            for (name, model) in models {
-                let sanitized = model.sanitize(weights: [
+            for (name, model, tied) in models {
+                let sanitized = try model.sanitize(weights: [
                     "visual.patch_embed.proj.weight": MLXArray.zeros([32, 2, 4, 4, 3]),
                     "visual.position_ids": MLXArray.zeros([4]),
                     "model.embed_tokens.weight": MLXArray.zeros([64, 32]),
                     "lm_head.weight": MLXArray.zeros([64, 32]),
                 ])
+                let expected: Set<String> = [
+                    "vision_tower.patch_embed.proj.weight",
+                    "language_model.model.embed_tokens.weight",
+                ]
                 #expect(
-                    Set(sanitized.keys) == [
-                        "vision_tower.patch_embed.proj.weight",
-                        "language_model.model.embed_tokens.weight",
-                        "language_model.lm_head.weight",
-                    ], "\(name): sanitized keys")
+                    Set(sanitized.keys)
+                        == (tied ? expected : expected.union(["language_model.lm_head.weight"])),
+                    "\(name): sanitized keys")
                 #expect(
                     sanitized["vision_tower.patch_embed.proj.weight"]?.shape == [32, 2, 4, 4, 3],
                     "\(name): MLX convolution layout is kept")
@@ -1009,7 +1034,7 @@ extension KernelTests {
         /// not 4-D or 5-D stays as it is.
         @Test func glmOcrSanitizeConvertsTheCheckpoint() throws {
             let model = try Self.glmOcrModel(seed: 1)
-            let sanitized = model.sanitize(weights: [
+            let sanitized = try model.sanitize(weights: [
                 "model.visual.downsample.weight": MLXArray.zeros([32, 32, 2, 2]),
                 "model.visual.patch_embed.proj.weight": MLXArray.zeros([32, 2, 4, 4, 3]),
                 "model.visual.position_ids": MLXArray.zeros([4]),
@@ -1030,7 +1055,7 @@ extension KernelTests {
                 sanitized["vision_tower.patch_embed.proj.weight"]?.shape == [32, 2, 4, 4, 3],
                 "GlmOcr: MLX patch weight is kept")
 
-            let other = model.sanitize(weights: [
+            let other = try model.sanitize(weights: [
                 "vision_tower.downsample.weight": MLXArray.zeros([2, 2, 2])
             ])
             #expect(

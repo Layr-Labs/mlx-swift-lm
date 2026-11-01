@@ -49,12 +49,12 @@ struct Gemma3nTextBatchTests {
         let rowA = Tiny.row(1)
         let rowB = Tiny.row(2)
         let chunks = [5, 3, 1, 1, 1]
-        let batched = Tiny.chunkedLogits(model, [rowA, rowB], chunks: chunks)
+        let batched = try Tiny.chunkedLogits(model, [rowA, rowB], chunks: chunks)
         #expect(batched.shape == [2, 11, Tiny.vocabularySize])
         let differenceA = Tiny.maxAbsDifference(
-            batched[0 ..< 1], Tiny.chunkedLogits(model, [rowA], chunks: chunks))
+            batched[0 ..< 1], try Tiny.chunkedLogits(model, [rowA], chunks: chunks))
         let differenceB = Tiny.maxAbsDifference(
-            batched[1 ..< 2], Tiny.chunkedLogits(model, [rowB], chunks: chunks))
+            batched[1 ..< 2], try Tiny.chunkedLogits(model, [rowB], chunks: chunks))
         #expect(differenceA <= Tiny.tolerance, "row 0 differs by \(differenceA)")
         #expect(differenceB <= Tiny.tolerance, "row 1 differs by \(differenceB)")
     }

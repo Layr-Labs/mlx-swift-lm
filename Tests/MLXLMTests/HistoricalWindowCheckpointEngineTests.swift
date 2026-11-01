@@ -914,3 +914,251 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
     }
 
 }
+
+private final class TypedHistoricalAttentionModel: HistoricalAttentionModel,
+    CBv2CompleteCheckpointKVTypeProviding
+{
+    let cbv2CompleteCheckpointKVDTypes: [DType]? = Array(repeating: .float32, count: 4)
+}
+
+extension HistoricalWindowCheckpointEngineTests {
+    private var checkpointStorageProfile: PagedKVQuantizationConfig {
+        .init(
+            keyBits: 4, valueBits: 8, groupSize: 64,
+            rotationBlockSize: 64, recentTokenCount: 8)
+    }
+
+    private func contiguousEngine(
+        _ store: CompleteCheckpointFixtureStore?,
+        profile: PagedKVQuantizationConfig? = nil,
+        observedDTypes: [DType]? = Array(repeating: .float32, count: 4),
+        model: CBv2SteppableModel = HistoricalAttentionModel()
+    ) -> (EngineV2, CBv2ContiguousKVBackend) {
+        let kinds = [
+            CBv2LayerKind(attention: .slidingWindow(17), headDim: 64, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(
+                attention: .slidingWindow(17), sharesKVWithLayer: 0,
+                headDim: 64, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(
+                attention: .full, sharesKVWithLayer: 1,
+                headDim: 64, kvHeads: 1, queryHeads: 2),
+        ]
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 256 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: store != nil),
+            admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
+            checkpointQuantization: profile, completeCheckpointKVDTypes: observedDTypes)
+        addTeardownBlock { await engine.shutdown() }
+        engine.loopForTesting.onEngineQueueSync {
+            engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = chunk
+        }
+        return (engine, backend)
+    }
+
+    private func contiguousRequest(_ id: UInt64, tokens: [Int]) -> CBv2Request {
+        .init(
+            id: .init(id), promptTokens: tokens, maxTokens: 4,
+            cacheSalt: "contiguous-tenant", prefixCacheReceiptID: .init(id + 1000))
+    }
+
+    private func assertContiguousReleased(
+        _ engine: EngineV2, _ backend: CBv2ContiguousKVBackend,
+        store: CompleteCheckpointFixtureStore? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        store?.finishPublicationCallbacks(engine: engine)
+        engine.loopForTesting.onEngineQueueSync {
+            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0, file: file, line: line)
+            XCTAssertEqual(
+                engine.admissionForTesting.transientBytesReserved, 0, file: file, line: line)
+            XCTAssertTrue(engine.loopForTesting.kvStates.isEmpty, file: file, line: line)
+            XCTAssertTrue(
+                engine.completeCheckpointCapture?.staged.isEmpty ?? true, file: file, line: line)
+            XCTAssertTrue(
+                engine.completeCheckpointCapture?.retentions.isEmpty ?? true,
+                file: file, line: line)
+        }
+        XCTAssertEqual(backend.bytesReserved, 0, file: file, line: line)
+        XCTAssertEqual(backend.bytesInUse, 0, file: file, line: line)
+    }
+
+    func testContiguousNativeAndCompressedCheckpointsRestoreEarlierWindowsDeterministically()
+        async throws
+    {
+        let tokens = (0 ..< 3 * chunk + 1).map { ($0 * 7) % 29 }
+        let branch =
+            Array(tokens.prefix(chunk))
+            + (0 ..< 2 * chunk + 1).map { ($0 * 11 + 3) % 29 }
+        let (baseline, baselineBackend) = contiguousEngine(nil)
+        let cold = await cbv2SchedCollect(try baseline.submit(contiguousRequest(1, tokens: tokens)))
+        let coldBranch = await cbv2SchedCollect(
+            try baseline.submit(contiguousRequest(2, tokens: branch)))
+        XCTAssertEqual(cold.finishReason, .length)
+        XCTAssertEqual(coldBranch.finishReason, .length)
+        assertContiguousReleased(baseline, baselineBackend)
+        await baseline.shutdown()
+
+        // Zero queries ignore quantized K, and constant V rows encode exactly.
+        // This checks restore wiring, not the quality of general lossy inputs.
+        var nativeBytes: [Int: Int] = [:]
+        for profile in [nil, checkpointStorageProfile] as [PagedKVQuantizationConfig?] {
+            let layout =
+                profile == nil
+                ? CBv2CompleteCheckpointManifest.nativeContiguousHistoricalLayout
+                : CBv2CompleteCheckpointManifest.nativeQuantizedContiguousHistoricalLayout
+            let store = CompleteCheckpointFixtureStore(segmentBytes: 257)
+            let (donor, donorBackend) = contiguousEngine(store, profile: profile)
+            let codec = try XCTUnwrap(donor.completeCheckpointCodec)
+            XCTAssertEqual(codec.backendLayout, layout)
+            XCTAssertNil(codec.pagedConfig)
+            XCTAssertEqual(codec.checkpointQuantization, profile)
+            XCTAssertEqual(codec.kvDTypes, Array(repeating: DType.float32, count: 4))
+            XCTAssertEqual(donorBackend.prefixReuseBackend, .contiguousUnquantized)
+            XCTAssertEqual(donor.admissionForTesting.fullKVBytesPerToken, 512)
+
+            let donated = await cbv2SchedCollect(
+                try donor.submit(contiguousRequest(10, tokens: tokens)))
+            XCTAssertEqual(donated.finishReason, .length)
+            XCTAssertEqual(
+                donated.tokens, cold.tokens, "Checkpoint storage must not change cold inference")
+            assertContiguousReleased(donor, donorBackend, store: store)
+            XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
+            for archive in store.saved {
+                let manifest = archive.manifest
+                XCTAssertEqual(manifest.backendLayout, layout)
+                XCTAssertEqual(manifest.checkpointQuantization, profile)
+                XCTAssertEqual(manifest.tensors.map(\.layer), [0, 0, 1, 1])
+                XCTAssertEqual(manifest.attentionLayers?.count, 4)
+                XCTAssertTrue(
+                    manifest.tensors.allSatisfy {
+                        $0.dtype == (profile == nil ? .float32 : .uint8)
+                    })
+                let bytes = manifest.tensors.reduce(0) { $0 + $1.byteCount }
+                if profile == nil {
+                    XCTAssertNil(manifest.checkpointNativeDTypes)
+                    nativeBytes[manifest.position] = bytes
+                } else {
+                    XCTAssertEqual(
+                        manifest.checkpointNativeDTypes,
+                        Array(repeating: CBv2CheckpointDType.float32, count: 4))
+                    XCTAssertLessThan(bytes, try XCTUnwrap(nativeBytes[manifest.position]))
+                }
+                XCTAssertNoThrow(try manifest.validateStructure())
+            }
+            let earlier = try XCTUnwrap(store.saved.first { $0.manifest.position == chunk })
+            XCTAssertEqual(earlier.manifest.prefixTokens, Array(tokens.prefix(chunk)))
+            XCTAssertGreaterThan(tokens.count - earlier.manifest.position, 2 * 17)
+            await donor.shutdown()
+
+            // Each run starts from the same byte archive, after the donor's
+            // window has wrapped repeatedly, and computes a different suffix.
+            var firstRestoredTokens: [Int]?
+            for attempt in 0 ..< 2 {
+                let reopened = CompleteCheckpointFixtureStore(
+                    archives: [earlier], segmentBytes: 257)
+                let (restored, backend) = contiguousEngine(reopened, profile: profile)
+                let capture = try XCTUnwrap(restored.completeCheckpointCapture)
+                var nativeCapturePositions: [Int] = []
+                restored.loopForTesting.onEngineQueueSync {
+                    capture.makeContiguousCheckpoint = { codec, position, chunkSize, rows in
+                        XCTAssertEqual(rows.count, 4)
+                        XCTAssertTrue(rows[0] is CBv2WindowedSequenceKV)
+                        XCTAssertTrue(rows[1] is CBv2FullSequenceKV)
+                        XCTAssertNil(rows[2])
+                        XCTAssertNil(rows[3])
+                        for row in rows.compactMap({ $0 }) {
+                            let snapshot = row.snapshot()
+                            XCTAssertEqual(snapshot.keys.dtype, .float32)
+                            XCTAssertEqual(snapshot.values.dtype, .float32)
+                        }
+                        nativeCapturePositions.append(position)
+                        return try CBv2ContiguousHistoricalCheckpoint(
+                            codec: codec, position: position, chunkSize: chunkSize, state: rows)
+                    }
+                }
+                let request = contiguousRequest(UInt64(20 + attempt), tokens: branch)
+                XCTAssertTrue(try reopened.stage(engine: restored, request: request))
+                let actual = await cbv2SchedCollect(try restored.submit(request))
+                XCTAssertEqual(actual.finishReason, .length)
+                XCTAssertEqual(actual.tokens, coldBranch.tokens)
+                XCTAssertEqual(actual.usage?.prefixCachePrefillTokensSaved, chunk)
+                XCTAssertEqual(actual.usage?.prefixCacheReplayTokens, 0)
+                if let firstRestoredTokens {
+                    XCTAssertEqual(actual.tokens, firstRestoredTokens)
+                } else {
+                    firstRestoredTokens = actual.tokens
+                }
+                XCTAssertFalse(
+                    restored.loopForTesting.onEngineQueueSync {
+                        nativeCapturePositions.isEmpty
+                    })
+                assertContiguousReleased(restored, backend, store: reopened)
+                XCTAssertEqual(reopened.releaseCount, 1)
+                await restored.shutdown()
+                assertContiguousReleased(restored, backend)
+            }
+        }
+    }
+
+    func testContiguousCheckpointTypeFallbackDisablesOnlyCaching() async throws {
+        let tokens = (0 ..< 2 * chunk + 1).map { ($0 * 5 + 1) % 29 }
+        let (baseline, baselineBackend) = contiguousEngine(nil)
+        let expected = await cbv2SchedCollect(
+            try baseline.submit(contiguousRequest(100, tokens: tokens)))
+        XCTAssertEqual(expected.finishReason, .length)
+        assertContiguousReleased(baseline, baselineBackend)
+        await baseline.shutdown()
+
+        let observed = Array(repeating: DType.float32, count: 4)
+        let profile = checkpointStorageProfile
+        let cases:
+            [(
+                name: String, model: HistoricalAttentionModel, observed: [DType]?,
+                profile: PagedKVQuantizationConfig?, enabled: Bool
+            )] = [
+                ("missing observations", HistoricalAttentionModel(), nil, nil, false),
+                ("untyped compression", HistoricalAttentionModel(), nil, profile, false),
+                ("incomplete observations", HistoricalAttentionModel(), [.float32], profile, false),
+                (
+                    "unsupported observations", HistoricalAttentionModel(),
+                    Array(repeating: .uint8, count: 4), profile, false
+                ),
+                ("legacy typed defaults", TypedHistoricalAttentionModel(), nil, nil, false),
+                ("matching declaration", TypedHistoricalAttentionModel(), observed, nil, true),
+                ("declared compression", TypedHistoricalAttentionModel(), nil, profile, true),
+                (
+                    "conflicting declaration", TypedHistoricalAttentionModel(),
+                    Array(repeating: .float16, count: 4), profile, false
+                ),
+            ]
+        for (index, item) in cases.enumerated() {
+            let store = CompleteCheckpointFixtureStore(segmentBytes: 257)
+            let (engine, backend) = contiguousEngine(
+                store, profile: item.profile, observedDTypes: item.observed, model: item.model)
+            XCTAssertEqual(engine.completeCheckpointCodec != nil, item.enabled, item.name)
+            XCTAssertEqual(engine.completeCheckpointCapture != nil, item.enabled, item.name)
+            if item.enabled {
+                XCTAssertEqual(engine.completeCheckpointCodec?.kvDTypes, observed, item.name)
+                XCTAssertEqual(
+                    engine.completeCheckpointCodec?.checkpointQuantization, item.profile, item.name)
+            } else {
+                XCTAssertNil(engine.completePrefixCache, item.name)
+            }
+            let actual = await cbv2SchedCollect(
+                try engine.submit(contiguousRequest(UInt64(110 + index), tokens: tokens)))
+            XCTAssertEqual(actual.finishReason, .length, item.name)
+            XCTAssertEqual(actual.tokens, expected.tokens, item.name)
+            XCTAssertEqual(actual.usage?.prefixCachePrefillTokensSaved, 0, item.name)
+            assertContiguousReleased(engine, backend, store: store)
+            XCTAssertEqual(!store.saved.isEmpty, item.enabled, item.name)
+            await engine.shutdown()
+            assertContiguousReleased(engine, backend)
+        }
+    }
+}

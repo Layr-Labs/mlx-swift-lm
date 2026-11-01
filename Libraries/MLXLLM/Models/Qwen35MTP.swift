@@ -36,7 +36,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration(let detail):
             return "Invalid inline Qwen MTP configuration: \(detail)."
         case .incompatibleTarget(let field, let artifact, let target):
-            return "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
+            return
+                "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
         case .invalidWeightIndex(let detail):
             return "Invalid inline Qwen MTP weight index: \(detail)."
         case .missingWeights:
@@ -44,7 +45,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .duplicateWeight(let key):
             return "The inline Qwen MTP tensor \(key) appears more than once."
         case .missingQuantization(let path):
-            return "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
+            return
+                "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
         }
     }
 }
@@ -224,6 +226,26 @@ final class Qwen35MTPModule: Module {
         let mask = createAttentionMask(h: current, cache: cache[0])
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
+
+    /// Append committed rows through the same embedding, pre-FC norms, FC and
+    /// K/V-only path, producing no decoder output. False for multi-layer heads,
+    /// before any cache mutation.
+    func appendHistoryKV(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> Bool {
+        guard layers.count == 1, cache.count == 1,
+            hidden.dim(1) > 0,
+            nextTokenIds.dim(1) == hidden.dim(1)
+        else { return false }
+
+        let e = preFcNormEmbedding(embedTokens(nextTokenIds))
+        let h = preFcNormHidden(hidden)
+        layers[0].appendHistoryKV(fc(concatenated([e, h], axis: -1)), cache: cache[0])
+        return true
+    }
 }
 
 // MARK: - Artifact-scoped inline assistant
@@ -240,24 +262,49 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
     private let installedVerificationMode: CBv2MTPVerificationMode
+    private let allowsShortlist: Bool
+    private let maximumDraftDepth: Int
+    private let minimumStateElementBytes: Int
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
 
-    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String) {
-        (target.configuration.hiddenSize, target.model.norm.weight.dtype,
-         target.vocabularySize, installedVerificationMode.rawValue)
+    /// Opt-in bound on trusted-history flushes. When set, leading trusted rows
+    /// enter the head K/V in blocks of at most this many rows, each evaluated
+    /// before the next is built, so no flush holds a whole-history rectangle.
+    /// nil keeps the single-rectangle flush. Only draft accumulation geometry
+    /// changes; committed tokens stay target-authoritative.
+    public var historyFlushRows: Int? {
+        didSet {
+            precondition(
+                historyFlushRows.map { $0 > 0 } ?? true,
+                "inline Qwen MTP history flush rows must be positive")
+        }
+    }
+
+    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
+    {
+        (
+            target.configuration.hiddenSize, target.model.norm.weight.dtype,
+            target.vocabularySize, installedVerificationMode.rawValue
+        )
     }
 
     private init(
         configuration: Qwen35TextConfiguration,
         blockSize: Int,
         target: Qwen35TextModel,
-        verificationMode: CBv2MTPVerificationMode?
+        verificationMode: CBv2MTPVerificationMode?,
+        allowsShortlist: Bool = true,
+        maximumDraftDepth: Int = 4,
+        minimumStateElementBytes: Int = 0
     ) {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
         self.target = target
+        self.allowsShortlist = allowsShortlist
+        self.maximumDraftDepth = maximumDraftDepth
+        self.minimumStateElementBytes = minimumStateElementBytes
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -350,6 +397,9 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// quantized-matmul path; float heads (small test fixtures) gather
     /// plain rows.
     func shortlistLogits(hidden: MLXArray, ids: MLXArray) -> MLXArray {
+        // Custom projections may transform inputs before packed matmul. Calling
+        // the complete module preserves that contract even for direct callers.
+        if !allowsShortlist { return headLogits(hidden)[.ellipsis, ids] }
         if target.configuration.tieWordEmbeddings {
             let embed = target.model.embedTokens
             if let quantized = embed as? QuantizedEmbedding {
@@ -407,16 +457,63 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             indexed = try loadIndexedWeights(
                 from: modelDirectory, prefix: metadata.prefix)
         }
+        return try construct(
+            metadata: metadata, indexed: indexed, target: target,
+            verificationMode: verificationMode, allowsShortlist: true)
+    }
+
+    /// Construct from caller-verified metadata and prefix-stripped tensors.
+    /// No paths are reopened. The caller owns source provenance, read/LOAD
+    /// limits and checked native cleanup. A custom collective output head must
+    /// disable shortlist projection so its full module is always invoked.
+    /// `retainDuringLoad` runs before quantization/update/evaluation and lets
+    /// native callers preserve failed construction until checked retirement.
+    public static func load(
+        configurationData: Data,
+        indexedWeights: [String: MLXArray],
+        target: any LanguageModel,
+        verificationMode: CBv2MTPVerificationMode? = nil,
+        allowsShortlist: Bool = true,
+        retainDuringLoad: ((Qwen35InlineMTPAssistant) -> Void)? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
+        let target = try qwen35TextTarget(target)
+        let mode = resolvedVerificationMode(
+            requested: verificationMode, forceSerialEnvironment: forceSerialVerification)
+        guard mode != .rectangularExact || target.model.exactTargetVerify else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "rectangular_exact verification requires exact target arithmetic")
+        }
+        let metadata = try loadMetadata(configurationData: configurationData)
+        try validate(metadata.textConfiguration, against: target.configuration)
+        guard !indexedWeights.isEmpty else { throw Qwen35InlineMTPError.missingWeights }
+        return try construct(
+            metadata: metadata, indexed: indexedWeights, target: target,
+            verificationMode: verificationMode, allowsShortlist: allowsShortlist,
+            retainDuringLoad: retainDuringLoad)
+    }
+
+    private static func construct(
+        metadata: Qwen35InlineMTPMetadata,
+        indexed: [String: MLXArray],
+        target: Qwen35TextModel,
+        verificationMode: CBv2MTPVerificationMode?,
+        allowsShortlist: Bool,
+        retainDuringLoad: ((Qwen35InlineMTPAssistant) -> Void)? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration,
             blockSize: metadata.blockSize,
             target: target,
-            verificationMode: verificationMode)
+            verificationMode: verificationMode, allowsShortlist: allowsShortlist)
+        // A native loader can keep failed construction roots alive until its
+        // checked stream drain. Existing path-based callers keep their policy.
+        retainDuringLoad?(assistant)
 
-        let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
-            guard key.hasSuffix(".scales") else { return nil }
-            return String(key.dropLast(".scales".count))
-        })
+        let scaledPaths = Set(
+            indexed.keys.compactMap { key -> String? in
+                guard key.hasSuffix(".scales") else { return nil }
+                return String(key.dropLast(".scales".count))
+            })
         for path in scaledPaths
         where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
@@ -434,6 +531,60 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return assistant
     }
 
+    /// Bind a validated one-layer F16 or affine Q4 Bonsai 9B sidecar to an already loaded
+    /// Prism target. This does not modify the base checkpoint or enable inline
+    /// MTP construction. Callers must separately verify artifact provenance.
+    public static func loadPrism9BSidecar(
+        from modelDirectory: URL,
+        target: Qwen35TextModel,
+        targetConfigurationData: Data,
+        verificationMode: CBv2MTPVerificationMode? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
+        let metadata = try loadMetadata(from: modelDirectory)
+        let artifactData = try Data(
+            contentsOf: modelDirectory.appendingPathComponent("config.json"))
+        try validatePrism9BMetadata(metadata, against: target.configuration)
+        try validatePrism9BTextConfiguration(
+            artifactData: artifactData, targetData: targetConfigurationData)
+        guard let embedding = target.model.embedTokens as? HadamardQuantizedEmbedding,
+            let head = target.lmHead as? HadamardQuantizedLinear,
+            embedding.bits == 2, embedding.groupSize == 128,
+            embedding.transform.width == 4096, embedding.transform.blockSize == 4096,
+            head.bits == 2, head.groupSize == 128,
+            head.transform.width == 4096, head.transform.blockSize == 4096,
+            head.gdnLayout == nil, head.bias == nil
+        else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "Prism 9B MTP requires loaded packed Hadamard embedding and output modules")
+        }
+        let mode = resolvedVerificationMode(
+            requested: verificationMode, forceSerialEnvironment: forceSerialVerification)
+        guard mode != .rectangularExact || target.model.exactTargetVerify else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "rectangular_exact verification requires exact target arithmetic")
+        }
+        let weights = try loadStandaloneWeights(from: modelDirectory, requiredFormat: "mlx")
+        try validatePrism9BWeights(
+            weights.mapValues { ($0.shape, $0.dtype) }, quantization: metadata.quantization)
+        let assistant = Qwen35InlineMTPAssistant(
+            configuration: metadata.textConfiguration, blockSize: metadata.blockSize,
+            target: target, verificationMode: verificationMode, allowsShortlist: false,
+            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size)
+        if let quantization = metadata.quantization?.quantization {
+            let matrixPaths = Set(
+                prism9BWeightShapes.compactMap { key, shape in
+                    shape.count == 2 ? String(key.dropLast(".weight".count)) : nil
+                })
+            quantize(model: assistant.mtp) { path, _ in
+                matrixPaths.contains(path) ? quantization.asTuple : nil
+            }
+        }
+        // format=mlx already contains converted RMSNorm weights; never add 1.
+        try assistant.mtp.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(assistant.mtp)
+        return assistant
+    }
+
     private static func qwen35TextTarget(
         _ target: any LanguageModel
     ) throws -> Qwen35TextModel {
@@ -444,14 +595,14 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     private static let globalQuantizationKeys: Set<String> = [
-        "group_size", "bits", "mode"
+        "group_size", "bits", "mode",
     ]
 
     /// Scalar keys understood or deliberately ignored by
     /// `BaseConfiguration.QuantizationContainer`; all other keys name modules.
     private static let quantizationMetadataKeys =
         globalQuantizationKeys.union([
-            "quant_method", "linear_class", "quantization_mode"
+            "quant_method", "linear_class", "quantization_mode",
         ])
 
     private static func selectedJSONObject(
@@ -510,7 +661,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
-        let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        try loadMetadata(
+            configurationData: Data(contentsOf: directory.appendingPathComponent("config.json")))
+    }
+
+    static func loadMetadata(configurationData data: Data) throws -> Qwen35InlineMTPMetadata {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let text = root["text_config"] as? [String: Any]
         else {
@@ -549,7 +704,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 primaryKey: "quantization",
                 fallbackKey: "quantization_config")
         }
-        guard (2...8).contains(blockSize) else {
+        guard (2 ... 8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
         }
@@ -627,15 +782,16 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     static func loadStandaloneWeights(
-        from directory: URL
+        from directory: URL, requiredFormat: String? = nil
     ) throws -> [String: MLXArray] {
         let urls: [URL]
         do {
             urls = try FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
         } catch {
             throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
         }
@@ -645,7 +801,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
         var weights: [String: MLXArray] = [:]
         for url in urls {
-            let (shard, _) = try loadArraysAndMetadata(url: url)
+            let (shard, metadata) = try loadArraysAndMetadata(url: url)
+            if let requiredFormat, metadata["format"] != requiredFormat {
+                throw Qwen35InlineMTPError.invalidWeightIndex(
+                    "standalone tensor metadata must declare format=\(requiredFormat)")
+            }
             for (key, value) in shard {
                 guard !key.isEmpty, key.utf8.count <= 1024 else {
                     throw Qwen35InlineMTPError.invalidWeightIndex(
@@ -800,10 +960,16 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
         installedVerificationMode
     }
-    /// Production Qwen drafting self-applies the recurrent MTP head up to
-    /// four times. The legacy double-forward oracle stays a k=1 A/B control.
-    public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : 4 }
+    /// Drafting self-applies the recurrent MTP head up to the binding's depth
+    /// limit. The legacy double-forward oracle stays a k=1 A/B control.
+    public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
+    /// `draftHidden`/`recordDraft` are available (not the legacy double-forward oracle).
+    public var splitsDrafts: Bool { !Self.forceDoubleForward }
     public var maximumSpeculativeBatch: Int? { 1 }
+    /// Observation only queues lazy normalized views, and every committed
+    /// position hands over the pre-norm target hidden that a seed would, so
+    /// batch-gated rows may chain and a final prompt row may seed the carry.
+    public var supportsOrdinaryDecodeHistory: Bool { true }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
     /// the engine sampler supports verify pre-sampling.
@@ -851,29 +1017,48 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
-        Self.forceDoubleForward ? nil : Self.shortlistSize
+        Self.resolvedDraftShortlistSize(
+            requested: Self.shortlistSize, allowsShortlist: allowsShortlist,
+            forceDoubleForward: Self.forceDoubleForward)
+    }
+
+    static func resolvedDraftShortlistSize(
+        requested: Int?, allowsShortlist: Bool, forceDoubleForward: Bool
+    ) -> Int? {
+        allowsShortlist && !forceDoubleForward ? requested : nil
     }
     public var requestStateBytesPerToken: Int {
         Self.stateBytesPerToken(
             configuration: target.configuration,
             layerCount: mtp.layers.count,
-            cacheElementBytes: mtp.norm.weight.dtype.size,
-            hiddenElementBytes: target.model.norm.weight.dtype.size)
+            cacheElementBytes: requestCacheElementBytes,
+            hiddenElementBytes: requestHiddenElementBytes)
+    }
+    // Prism's FP32 trusted hidden requires FP32 state reservations, independent
+    // of F16 or packed Q4 sidecar matrices and their F16 norms/scales.
+    private var requestCacheElementBytes: Int {
+        max(mtp.norm.weight.dtype.size, minimumStateElementBytes)
+    }
+    private var requestHiddenElementBytes: Int {
+        max(target.model.norm.weight.dtype.size, minimumStateElementBytes)
     }
     public var requestStateTokenGranularity: Int { Self.cacheAllocationStep }
     public var requestStateTokenAllocationPadding: Int { 4 }
 
     public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         let config = target.configuration
-        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(by: config.headDim ?? 0)
-        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(by: mtp.norm.weight.dtype.size)
+        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(
+            by: config.headDim ?? 0)
+        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(
+            by: requestCacheElementBytes)
         let (cacheCount, countOverflow) = mtp.layers.count.multipliedReportingOverflow(by: 2)
         let (hiddenRow, hiddenOverflow) = config.hiddenSize.multipliedReportingOverflow(
-            by: target.model.norm.weight.dtype.size)
+            by: requestHiddenElementBytes)
         guard !geometryOverflow, !cacheOverflow, !countOverflow, !hiddenOverflow else { return nil }
         return [
-            .init(bytesPerToken: cacheRow, allocationCount: cacheCount,
-                  tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
+            .init(
+                bytesPerToken: cacheRow, allocationCount: cacheCount,
+                tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
             // Backlog and frontier are views of normalized committed chunks;
             // the bound covers every possible partition of the retained rows.
             .init(bytesPerToken: hiddenRow, tokenPadding: 4, partitioned: true),
@@ -917,6 +1102,23 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public func makeRequestState() -> any CBv2MTPRequestState {
         RequestState(caches: makeCache())
+    }
+
+    /// A bounded, request-owned paged assistant history for cluster owners.
+    /// The bound includes any speculative rows that may later be rolled back.
+    /// Admission must also cover full-attention gathers, partial-page writes,
+    /// and the ordinary trusted-hidden backlog. This does not alter the
+    /// standalone engine's default state factory or allocation quotation.
+    public func makePagedRequestState(maximumSequenceLength: Int) throws -> any CBv2MTPRequestState
+    {
+        guard (1 ... Qwen35MTPPagedKVCache.maximumTokens).contains(maximumSequenceLength) else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "paged assistant history exceeds its bounded context")
+        }
+        return RequestState(
+            caches: mtp.layers.map { _ in
+                Qwen35MTPPagedKVCache(capacityTokens: maximumSequenceLength)
+            })
     }
 
     public func observeCommittedTarget(
@@ -981,6 +1183,97 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return legacyDoubleForwardDraftStep(tokens: tokens, hidden: hidden, state: state)
         }
 
+        let lastHidden = proposalHidden(tokens: tokens, hidden: hidden, state: state)
+        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        recordProposal(lastHidden: lastHidden, draft: draft, state: state)
+        return (draft, lastHidden)
+    }
+
+    /// `draftStep` without its head: this request's assistant hidden for the
+    /// next proposal, its round and history advanced exactly as `draftStep`
+    /// advances them. A caller that chooses several requests' proposals with
+    /// one head call (each row's arithmetic that of its own call) passes each
+    /// row's choice to `recordDraft` before evaluating `evaluationTargets`.
+    /// Not for the legacy double-forward oracle.
+    public func draftHidden(
+        tokens: MLXArray, hidden: MLXArray, requestState: any CBv2MTPRequestState
+    ) -> MLXArray {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP drafted with released request state")
+        precondition(
+            tokens.ndim == 2 && hidden.ndim == 3
+                && tokens.dim(0) == 1 && tokens.dim(1) == 1
+                && hidden.dim(0) == 1 && hidden.dim(1) == 1,
+            "inline Qwen MTP draft input shape mismatch")
+        precondition(
+            !Self.forceDoubleForward, "inline Qwen MTP split drafts exclude the legacy oracle")
+        return proposalHidden(tokens: tokens, hidden: hidden, state: state)
+    }
+
+    /// Whether `draftHiddens` covers this assistant: one decoder layer with a
+    /// dense MLP, and not the legacy double-forward oracle.
+    public var draftsRowsTogether: Bool { mtp.draftsRowsTogether && !Self.forceDoubleForward }
+
+    /// A later step (after its round's first, which `draftHidden` ran) for
+    /// several requests at once: each row's next proposal hidden `[B, 1, H]`,
+    /// row `b` being `requestStates[b]`'s, its assistant history advanced
+    /// exactly as `draftHidden` advances it. `project` must give each row the
+    /// bits that row gets alone. The caller then passes each row's choice to
+    /// `recordDraft` with that row's `[1, 1, H]` slice before evaluating
+    /// `evaluationTargets`. One request uses it too (one row), so a row's step
+    /// is the same alone or in any cohort.
+    public func draftHiddens(
+        tokens: [MLXArray], hiddens: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        project: (Linear, MLXArray) -> MLXArray
+    ) -> MLXArray {
+        precondition(
+            draftsRowsTogether && !tokens.isEmpty && tokens.count == hiddens.count
+                && hiddens.count == requestStates.count,
+            "inline Qwen MTP draft rows differ from their requests")
+        let states = requestStates.map { requestState -> RequestState in
+            guard let state = requestState as? RequestState else {
+                preconditionFailure("inline Qwen MTP received foreign request state")
+            }
+            precondition(
+                !state.isReleased && state.roundInFlight
+                    && (1 ..< 4).contains(state.roundDraftSteps)
+                    && state.caches.count == 1,
+                "inline Qwen MTP drafted rows outside a round's later steps")
+            return state
+        }
+        precondition(
+            Set(states.map { ObjectIdentifier($0) }).count == states.count,
+            "inline Qwen MTP draft rows repeat a request")
+        for (token, hidden) in zip(tokens, hiddens) {
+            precondition(
+                token.shape == [1, 1] && hidden.ndim == 3 && hidden.dim(0) == 1
+                    && hidden.dim(1) == 1,
+                "inline Qwen MTP draft input shape mismatch")
+        }
+        return mtp.draftStepRows(
+            hidden: hiddens.count == 1 ? hiddens[0] : concatenated(hiddens, axis: 0),
+            nextTokenIds: tokens.count == 1 ? tokens[0] : concatenated(tokens, axis: 0),
+            embedTokens: target.model.embedTokens,
+            caches: states.map { $0.caches[0] }, project: project)
+    }
+
+    /// The proposal chosen for `draftHidden`'s row: a `[1]` int32 token.
+    public func recordDraft(
+        lastHidden: MLXArray, draft: MLXArray, requestState: any CBv2MTPRequestState
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(
+            !state.isReleased && state.roundInFlight && draft.shape == [1] && draft.dtype == .int32,
+            "inline Qwen MTP recorded a draft outside its round")
+        recordProposal(lastHidden: lastHidden, draft: draft, state: state)
+    }
+
+    private func proposalHidden(tokens: MLXArray, hidden: MLXArray, state: RequestState) -> MLXArray
+    {
         let isFirstStep = !state.roundInFlight
         let feed: (tokens: MLXArray, hidden: MLXArray)
         if isFirstStep {
@@ -992,16 +1285,24 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             feed = (tokens, hidden)
         }
 
-        let output =
-            isFirstStep
-            ? (moduleLastHiddenWithKVOnlyHistory(
-                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+        let output: MLXArray
+        if isFirstStep {
+            let remainder = flushLeadingHistory(feed, state: state)
+            output =
+                moduleLastHiddenWithKVOnlyHistory(
+                    hidden: remainder.hidden, tokens: remainder.tokens, cache: state.caches)
                 ?? moduleForward(
-                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches))
-            : moduleForward(
+                    hidden: remainder.hidden, tokens: remainder.tokens, cache: state.caches)
+        } else {
+            output = moduleForward(
                 hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
-        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
-        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        }
+        return output[0..., (output.dim(1) - 1)..., 0...]
+    }
+
+    private func recordProposal(lastHidden: MLXArray, draft: MLXArray, state: RequestState) {
+        // `beginRound` zeroes the step count: zero here is the round's first step.
+        let isFirstStep = state.roundDraftSteps == 0
         state.roundRoots.append(contentsOf: [lastHidden, draft])
         state.roundDraftSteps += 1
 
@@ -1010,7 +1311,6 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // cache generation before constructing a deeper draft step.
             state.roundValidHistoryOffset = state.cacheOffset
         }
-        return (draft, lastHidden)
     }
 
     private func beginRound(
@@ -1044,8 +1344,126 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return (feedTokens, feedHidden)
     }
 
+    /// Bounded first draft: all but the final `historyFlushRows + 1` feed rows
+    /// enter head K/V in fixed blocks from the start of the feed, so the
+    /// remaining last-hidden rectangle never exceeds one block plus its
+    /// proposal row. The original feed roots stay retained by the round.
+    private func flushLeadingHistory(
+        _ feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1 else {
+            return feed
+        }
+        let count = feed.tokens.dim(1)
+        var start = 0
+        while count - start > rows + 1 {
+            appendFlushedHistory(
+                tokens: feed.tokens[0..., start ..< (start + rows)],
+                hidden: feed.hidden[0..., start ..< (start + rows), 0...], state: state)
+            start += rows
+        }
+        guard start > 0 else { return feed }
+        return (feed.tokens[0..., start...], feed.hidden[0..., start..., 0...])
+    }
+
+    private func appendFlushedHistory(tokens: MLXArray, hidden: MLXArray, state: RequestState) {
+        let appended = mtp.appendHistoryKV(
+            hidden: hidden, nextTokenIds: tokens, embedTokens: target.model.embedTokens,
+            cache: state.caches)
+        precondition(appended, "inline Qwen MTP history flush requires its single-layer head")
+        eval(state.caches.flatMap { $0.innerState() })
+    }
+
+    /// Trusted rows queued for head K/V (inspection: what a request holds
+    /// between flushes).
+    public func trustedBacklogRows(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else { return 0 }
+        return state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+    }
+
+    /// Move the trusted backlog's leading complete `historyFlushRows` blocks
+    /// into head K/V while more than one block of rows stays queued behind
+    /// them. These are exactly the blocks the next round's first draft would
+    /// flush first (`flushLeadingHistory` cuts blocks from the start of its
+    /// feed, which begins with this backlog, and flushes every block more
+    /// than `historyFlushRows + 1` rows from the feed's end): same rows, same
+    /// shapes, same order, so head history and every later proposal are
+    /// unchanged. A long prompt then holds at most about one block plus one
+    /// prompt frame of trusted rows, not its whole history, until its first
+    /// round. The remaining rows are copied out of the flushed backing. Call
+    /// only between rounds, and never before a prompt prefix checkpoint the
+    /// caller still has to take. Returns the number of rows moved.
+    @discardableResult
+    public func flushCompleteHistoryBlocks(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP flushed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP flushed history during a round")
+        precondition(
+            state.backlogHidden.count == state.backlogTokens.count,
+            "inline Qwen MTP trusted backlog diverged")
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1
+        else { return 0 }
+        let count = state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+        // A block [s, s + rows) is flushed by the first draft whenever the
+        // feed (this backlog, any later rows, then the carry) holds more than
+        // rows + 1 rows from s on; `count - s > rows` guarantees that.
+        guard count > rows else { return 0 }
+        let tokens = concatenated(state.backlogTokens, axis: 1)
+        let hidden = concatenated(state.backlogHidden, axis: 1)
+        var start = 0
+        while count - start > rows {
+            appendFlushedHistory(
+                tokens: tokens[0..., start ..< (start + rows)],
+                hidden: hidden[0..., start ..< (start + rows), 0...], state: state)
+            start += rows
+        }
+        let restTokens = contiguous(tokens[0..., start...])
+        let restHidden = contiguous(hidden[0..., start..., 0...])
+        eval(restTokens, restHidden)
+        state.backlogTokens = [restTokens]
+        state.backlogHidden = [restHidden]
+        return start
+    }
+
+    /// Move the complete trusted backlog into head K/V once it holds at least
+    /// `historyFlushRows` rows, one evaluated block at a time, so an ordinary
+    /// decode stretch cannot accumulate one root per committed token. The
+    /// carried frontier stays queued. Call only between rounds, never before a
+    /// prompt prefix checkpoint (it carries unflushed history). Returns the
+    /// number of rows moved.
+    @discardableResult
+    public func flushTrustedHistory(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP flushed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP flushed history during a round")
+        precondition(
+            state.backlogHidden.count == state.backlogTokens.count,
+            "inline Qwen MTP trusted backlog diverged")
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1
+        else { return 0 }
+        let count = state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+        guard count >= rows else { return 0 }
+        let tokens = concatenated(state.backlogTokens, axis: 1)
+        let hidden = concatenated(state.backlogHidden, axis: 1)
+        var start = 0
+        while start < count {
+            let end = min(count, start + rows)
+            appendFlushedHistory(
+                tokens: tokens[0..., start ..< end], hidden: hidden[0..., start ..< end, 0...],
+                state: state)
+            start = end
+        }
+        state.backlogHidden.removeAll(keepingCapacity: true)
+        state.backlogTokens.removeAll(keepingCapacity: true)
+        return count
+    }
+
     private func draftToken(hidden: MLXArray, shortlist: MLXArray?) -> MLXArray {
-        if let shortlist {
+        if allowsShortlist, let shortlist {
             let logits = shortlistLogits(hidden: hidden, ids: shortlist)
             return shortlist[argMax(logits[0..., -1, 0...], axis: -1)]
                 .asType(.int32)
@@ -1158,5 +1576,299 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return
         }
         state.clearAll()
+    }
+}
+
+final class Qwen35MTPPredictor: Module {
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding?
+    @ModuleInfo(key: "fc") var fc: Linear
+    @ModuleInfo(key: "layers") var layers: [Qwen35DecoderLayer]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    @ModuleInfo(key: "pre_fc_norm_embedding") var preFCNormEmbedding: RMSNorm
+    @ModuleInfo(key: "pre_fc_norm_hidden") var preFCNormHidden: RMSNorm
+
+    init(_ args: Qwen35TextConfiguration) {
+        var mtpArgs = args
+        mtpArgs.hiddenLayers = max(args.mtpNumHiddenLayers, 1)
+        mtpArgs.fullAttentionInterval = 1
+        let layerTypes = Array(
+            repeating: HybridAttentionSchedule.fullAttention, count: mtpArgs.hiddenLayers)
+        mtpArgs.layerTypes = layerTypes
+        mtpArgs.resolvedLayerTypes = layerTypes
+
+        if args.mtpUseDedicatedEmbeddings {
+            _embedTokens.wrappedValue = Embedding(
+                embeddingCount: args.vocabularySize,
+                dimensions: args.hiddenSize
+            )
+        }
+        _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
+        // `Qwen35CheckpointPolicy` stacks MTP experts into split
+        // `switch_mlp.{gate,up}_proj` tensors, so the experts stay unfused.
+        _layers.wrappedValue = (0 ..< mtpArgs.hiddenLayers).map {
+            Qwen35DecoderLayer(
+                mtpArgs, layerIdx: $0, forceFullAttention: true, fuseGateUp: false)
+        }
+        _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _preFCNormEmbedding.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _preFCNormHidden.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        super.init()
+    }
+
+    func newCache() -> [KVCache] {
+        layers.map { _ in KVCacheSimple() }
+    }
+
+    func callAsFunction(
+        inputsEmbeds: MLXArray,
+        hiddenStates previousHidden: MLXArray,
+        cache: [KVCache],
+        positionOffset: Int
+    ) -> MLXArray {
+        var hiddenStates = concatenated(
+            [preFCNormEmbedding(inputsEmbeds), preFCNormHidden(previousHidden)], axis: -1)
+        hiddenStates = fc(hiddenStates)
+
+        precondition(cache.count == layers.count, "Qwen MTP cache/layer count mismatch")
+        for (layer, layerCache) in zip(layers, cache) {
+            let faMask = createAttentionMask(h: hiddenStates, cache: layerCache)
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: faMask,
+                ssmMask: nil,
+                cache: layerCache,
+                positionOffset: positionOffset)
+        }
+
+        return norm(hiddenStates)
+    }
+}
+
+public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
+    public let configuration: Qwen35TextConfiguration
+    public let maximumBlockSize: Int? = 2
+    public let requiresSharedTargetKV = false
+    public let requiresPromptPrefill = true
+    public let requiresGreedySampling = true
+    private let checkpointPolicy: Qwen35CheckpointPolicy
+
+    @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
+
+    public convenience init(
+        _ configuration: Qwen35TextConfiguration,
+        preconvertedNorms: Bool = false
+    ) {
+        self.init(
+            configuration,
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms))
+    }
+
+    private init(
+        _ configuration: Qwen35TextConfiguration, checkpointPolicy: Qwen35CheckpointPolicy
+    ) {
+        self.configuration = configuration
+        self.checkpointPolicy = checkpointPolicy
+        _mtp.wrappedValue = Qwen35MTPPredictor(configuration)
+        super.init()
+    }
+
+    public convenience init(
+        _ configuration: Qwen35Configuration,
+        preconvertedNorms: Bool = false
+    ) {
+        self.init(
+            configuration.textConfig,
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms))
+    }
+
+    public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
+        MTPDrafterState(cache: mtp.newCache())
+    }
+
+    public func isCompatible(with target: any LanguageModel) -> Bool {
+        target is Qwen35Model || target is Qwen35TextModel
+    }
+
+    public func prepareDrafterState(
+        target: any LanguageModel,
+        promptTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let prompt = normalizedMTPTokenBatch(promptTokens)
+        let bonus = normalizedMTPColumn(firstBonus)
+        guard prompt.dim(-1) > 0 else { return }
+
+        let shifted = concatenated([prompt[0..., 1...], bonus], axis: 1)
+        let hidden = targetHidden[0..., ..<shifted.dim(1), 0...]
+        state.nextPosition = 0
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(shifted),
+            hiddenStates: hidden,
+            cache: state.cache,
+            positionOffset: 0)
+        state.nextPosition = shifted.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead, sampler: sampler)
+        state.proposalAppended = 0
+    }
+
+    public func draftBlock(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        sampler: any LogitSampler
+    ) -> MLXArray {
+        var state = makeState(parameters: nil)
+        return draftBlock(
+            target: target,
+            lastToken: lastToken,
+            lastHidden: lastHidden,
+            sharedKV: sharedKV,
+            positionDeltas: positionDeltas,
+            queryOffset: queryOffset,
+            blockSize: blockSize,
+            state: &state,
+            sampler: sampler)
+    }
+
+    public func draftBlock(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MLXArray {
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+
+        if let seed = state.seedToken {
+            state.seedToken = nil
+            state.seedHidden = nil
+            state.proposalAppended = 0
+            return seed
+        }
+
+        state.proposalAppended = blockSize - 1
+        let proposed = draftMTPTokenBlock(
+            targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead,
+            inputEmbedding: inputEmbedding,
+            lastToken: lastToken,
+            lastHidden: lastHidden,
+            queryOffset: queryOffset,
+            blockSize: blockSize,
+            sampler: sampler,
+            cache: state.cache
+        ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+            mtp(
+                inputsEmbeds: inputsEmbeds,
+                hiddenStates: hiddenStates,
+                cache: cache,
+                positionOffset: positionOffset)
+        }
+        state.nextPosition += state.proposalAppended
+        return proposed
+    }
+
+    public func commitDrafterState(
+        target: any LanguageModel,
+        targetHidden: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        let keepAppended = Swift.min(acceptedCount, state.proposalAppended)
+        let trim = state.proposalAppended - keepAppended
+        if trim > 0 {
+            trimPromptCache(state.cache, numTokens: trim)
+            state.nextPosition -= trim
+        }
+
+        var tokens = [MLXArray]()
+        var hiddens = [MLXArray]()
+        for index in keepAppended ..< acceptedCount {
+            tokens.append(draftTokens[0..., index ..< (index + 1)])
+            hiddens.append(targetHidden[0..., index ..< (index + 1), 0...])
+        }
+        tokens.append(normalizedMTPColumn(finalToken))
+        hiddens.append(targetHidden[0..., acceptedCount ..< (acceptedCount + 1), 0...])
+
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let committedTokens = concatenated(tokens, axis: 1)
+        let committedHidden = concatenated(hiddens, axis: 1)
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(committedTokens),
+            hiddenStates: committedHidden,
+            cache: state.cache,
+            positionOffset: state.nextPosition)
+        state.nextPosition += committedTokens.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead, sampler: sampler)
+        state.proposalAppended = 0
+    }
+
+    public var excludedCheckpointNamespaces: [String] {
+        checkpointPolicy.excludedCheckpointNamespaces
+    }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        try checkpointPolicy.prepare(
+            checkpoint, mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try sanitize(weights: weights, metadata: [:])
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
+    {
+        try prepareCheckpoint(.init(weights: weights, metadata: metadata)).weights
+    }
+
+    private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
+        if let model = target as? Qwen35Model {
+            return (model.languageModel.model.embedTokens, model.languageModel.lmHead)
+        }
+        if let model = target as? Qwen35TextModel {
+            return (model.model.embedTokens, model.lmHead)
+        }
+        fatalError(
+            "Qwen35MTPDraftModel requires a Qwen35 target, got \(type(of: target))")
+    }
+}
+
+extension Qwen35MTPDraftModel: ModelConversionMetadataProvider {
+    public var modelConversionMetadata: [String: String] {
+        [Qwen35CheckpointPolicy.normMetadataKey: "scale"]
     }
 }

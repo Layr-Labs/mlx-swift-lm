@@ -130,6 +130,36 @@ public final class DiffusionGemmaTextDecoder: Module {
                 length: length, history: history,
                 window: sliding ? configuration.slidingWindow : nil,
                 visualBlockIds: visualBlockIds)
+            if let paged = row as? PagedSequenceKV, paged.usesQuantizedStorage {
+                var committed: (MLXArray, MLXArray)?
+                hidden = try block.callWithAttention(
+                    hidden, position: position, encoderScalar: encoderParameters.layers[index].value
+                ) { queries, keys, values in
+                    guard
+                        let attended = try paged.attendQuantizedReadOnly(
+                            queries: queries, currentKeys: keys, currentValues: values,
+                            scale: 1, mask: mask, prefixCount: history)
+                    else {
+                        throw DiffusionGemmaModelError.invalidInput(
+                            "missing packed encoder attention")
+                    }
+                    committed = (keys, values)
+                    return attended
+                }
+                // A window append may overwrite physical slots that the read
+                // graph still needs. Fence its real output before the append.
+                try MLX.withError { errors in
+                    eval(hidden)
+                    try errors.check()
+                    StreamOrDevice.default.stream.synchronize()
+                    try errors.check()
+                }
+                guard let committed else {
+                    throw DiffusionGemmaModelError.invalidInput("missing committed encoder K/V")
+                }
+                try paged.appendQuantizedCommitted(keys: committed.0, values: committed.1)
+                continue
+            }
             hidden = block(
                 hidden, position: position, mask: mask,
                 encoderScalar: encoderParameters.layers[index].value
@@ -225,6 +255,24 @@ public final class DiffusionGemmaTextDecoder: Module {
         var hidden = selfConditioning(embeddings, softEmbeddings: soft)
         for (index, block) in layers.enumerated() {
             let row = cache.rows[index]
+            if let paged = row as? PagedSequenceKV, paged.usesQuantizedStorage {
+                let history =
+                    configuration.layerTypes[index] == "sliding_attention"
+                    ? min(row.retainedCount, configuration.slidingWindow - 1) : row.retainedCount
+                hidden = try block.callWithAttention(hidden, position: cache.position) {
+                    queries, keys, values in
+                    guard
+                        let attended = try paged.attendQuantizedReadOnly(
+                            queries: queries, currentKeys: keys, currentValues: values,
+                            scale: 1, mask: .none, prefixCount: history)
+                    else {
+                        throw DiffusionGemmaModelError.invalidInput(
+                            "missing packed canvas attention")
+                    }
+                    return attended
+                }
+                continue
+            }
             var prefix: (MLXArray, MLXArray)?
             if row.retainedCount > 0 {
                 let snapshot = row.snapshot()

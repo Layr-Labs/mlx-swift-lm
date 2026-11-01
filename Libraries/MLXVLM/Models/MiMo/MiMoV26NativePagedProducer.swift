@@ -280,16 +280,16 @@ extension MiMoV26LoadedModel {
         }
         let maximumBuffer: Int
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            guard Device.defaultDevice().deviceType == .gpu,
-                StreamOrDevice.default.stream == MLX.Stream.gpu
-            else {
-                throw CBv2KVError.backendIneligible(
-                    reason: "native paged target requires actual default GPU stream")
-            }
-            maximumBuffer = GPU.deviceInfo().maxBufferSize
-            guard maximumBuffer > 0 else { throw MiMoV26MultimodalError.incompatibleOwner }
+        guard Device.defaultDevice().deviceType == .gpu,
+            MLXProcessStreams.isDefaultGPU(.default)
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native paged target requires actual default GPU stream")
+        }
+        maximumBuffer = GPU.deviceInfo().maxBufferSize
+        guard maximumBuffer > 0 else { throw MiMoV26MultimodalError.incompatibleOwner }
         #else
-            throw CBv2KVError.backendIneligible(reason: "native paged target requires Metal")
+        throw CBv2KVError.backendIneligible(reason: "native paged target requires Metal")
         #endif
         let limits = try CBv2PagedGatheredAttentionLimits(
             maximumBatchSize: maximumConcurrentRequests, maximumQueryTokens: maximumQueryTokens,

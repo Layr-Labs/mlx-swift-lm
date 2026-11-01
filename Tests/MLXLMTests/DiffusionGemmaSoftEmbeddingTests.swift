@@ -82,7 +82,8 @@ struct DiffusionGemmaSoftEmbeddingTests {
                 return x * x
             }
             #expect(DiffusionGemmaSoftEmbedding.outsideTransform([input]))
-            eval(compile { (x: MLXArray) in observed(x, "compile") }(input))
+            eval(
+                compile(inputs: [], outputs: []) { (x: MLXArray) in observed(x, "compile") }(input))
             eval(grad { (x: MLXArray) in observed(x, "grad").sum() }(input))
             eval(vmap { (x: MLXArray) in observed(x, "vmap") }(input.reshaped(2, 2)))
             let (_, tangent) = jvp(
@@ -99,7 +100,8 @@ struct DiffusionGemmaSoftEmbeddingTests {
         let w = MLXArray((0 ..< 2048).map { UInt32($0 * 37 + 1) }).reshaped(64, 32)
         let s = MLXArray.full([64, 2], values: MLXArray(Float(0.125)), dtype: .bfloat16)
         let b = MLXArray.full([64, 2], values: MLXArray(Float(-0.5)), dtype: .bfloat16)
-        let reference = quantizedMM(x, w, scales: s, biases: b, transpose: false, groupSize: 64, bits: 8)
+        let reference = quantizedMM(
+            x, w, scales: s, biases: b, transpose: false, groupSize: 64, bits: 8)
         for (inference, enabled) in [(true, true), (true, false), (false, true)] {
             let actual = DiffusionGemmaSoftEmbedding.project(
                 x, weight: w, scales: s, biases: b, groupSize: 64, bits: 8, mode: .affine,

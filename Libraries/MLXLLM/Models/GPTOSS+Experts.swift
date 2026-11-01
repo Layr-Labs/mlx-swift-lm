@@ -8,8 +8,9 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
 {
     var xLinear = xLinear
     var xGlu = xGlu
-    xGlu = clip(xGlu, max: MLXArray(limit))
-    xLinear = clip(xLinear, min: MLXArray(-limit), max: MLXArray(limit))
+    // Scalar bounds take the input dtype; float32 `MLXArray` bounds would promote bf16 to float32.
+    xGlu = clip(xGlu, max: limit)
+    xLinear = clip(xLinear, min: -limit, max: limit)
 
     let gluScaled = alpha * xGlu
     let sig = sigmoid(gluScaled)
@@ -33,7 +34,8 @@ class SwiGLUSwitchGLU: Module {
         modulePath: [String] = []
     ) throws -> Self {
         defer { compiledExpertCache.clear() }
-        return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     @discardableResult
@@ -42,7 +44,8 @@ class SwiGLUSwitchGLU: Module {
         modulePath: [String] = []
     ) throws -> Self {
         defer { compiledExpertCache.clear() }
-        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
@@ -71,15 +74,18 @@ class SwiGLUSwitchGLU: Module {
 
         if fusedGateUp {
             _gateUpProj.wrappedValue = SwitchLinear(
-                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts, bias: bias)
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts, bias: bias
+            )
         } else {
             _gateProj.wrappedValue = SwitchLinear(
                 inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
             _upProj.wrappedValue = SwitchLinear(
                 inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
         }
-        _downProj.wrappedValue = downProjection ?? SwitchLinear(
-            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+        _downProj.wrappedValue =
+            downProjection
+            ?? SwitchLinear(
+                inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
         super.init()
     }
@@ -87,16 +93,18 @@ class SwiGLUSwitchGLU: Module {
     /// Structural replacement used only during checkpoint sanitization.
     /// Strict weight loading fills the new gate/up modules immediately after.
     func withGateUpLayout(fused: Bool) -> SwiGLUSwitchGLU {
-        SwiGLUSwitchGLU(inputDims: inputDims, hiddenDims: hiddenDims,
-                       numExperts: numExperts, bias: hasBias, fusedGateUp: fused,
-                       downProjection: downProj)
+        SwiGLUSwitchGLU(
+            inputDims: inputDims, hiddenDims: hiddenDims,
+            numExperts: numExperts, bias: hasBias, fusedGateUp: fused,
+            downProjection: downProj)
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         if GPTOSSCompiledExpertsPolicy.enabled,
-           GPTOSSCompiledExpertsPolicy.eligible(
-               inputDims: inputDims, hiddenDims: hiddenDims, experts: numExperts,
-               shape: x.shape, indicesShape: indices.shape, dtype: x.dtype) {
+            GPTOSSCompiledExpertsPolicy.eligible(
+                inputDims: inputDims, hiddenDims: hiddenDims, experts: numExperts,
+                shape: x.shape, indicesShape: indices.shape, dtype: x.dtype)
+        {
             return compiledExpertForward(x, indices)
         }
         return uncompiledExpertForward(x, indices)

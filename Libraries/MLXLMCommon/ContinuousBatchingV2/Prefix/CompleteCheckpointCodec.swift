@@ -17,18 +17,51 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let admission: AdmissionV2
     /// Copied immutable layout only. Planning/staging never reads live pool maps.
     let pagedConfig: PagedKVPoolConfig?
+    /// Lossy durable encoding, independent of the physical serving layout.
+    let checkpointQuantization: PagedKVQuantizationConfig?
     let historicalLayout: CBv2HistoricalAttentionLayout?
     let contiguousLayout: CBv2HistoricalAttentionLayout?
+    let glm5NextLayout: CBv2GLM5NextCompleteCheckpointLayout?
     /// Present only after the actual package-issued bank/store/assistant tuple
     /// validates. Untracked asymmetric page codecs remain refused.
     let nativePagedBinding: CBv2NativePagedModelBinding?
     var isNativePagedHistorical: Bool { nativePagedBinding != nil && historicalLayout != nil }
+    var isNativePagedGLM5Next: Bool {
+        nativePagedBinding?.isGLM5Next == true && glm5NextLayout != nil
+    }
+    var isNativePagedComplete: Bool { isNativePagedHistorical || isNativePagedGLM5Next }
     var targetTensorCount: Int {
         (contiguousLayout?.owningIndices.count ?? historicalLayout?.owningIndices.count
             ?? layerKinds.count) * 2
     }
     var backendLayout: String {
+        if let glm5NextLayout {
+            return glm5NextLayout.latentQuantization == nil
+                ? CBv2CompleteCheckpointManifest.glm5NextPagedLayout
+                : CBv2CompleteCheckpointManifest.glm5NextQuantizedPagedLayout
+        }
+        if checkpointQuantization != nil {
+            if pagedConfig != nil {
+                guard recurrentSpec != nil else {
+                    return CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout
+                }
+                return assistant == nil
+                    ? CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout
+                    : CBv2CompleteCheckpointManifest.nativeQuantizedPagedMTPLayout
+            }
+            return contiguousLayout == nil
+                ? CBv2CompleteCheckpointManifest.nativeQuantizedContiguousLayout
+                : CBv2CompleteCheckpointManifest.nativeQuantizedContiguousHistoricalLayout
+        }
+        if usesQuantizedCheckpoint {
+            return recurrentSpec == nil
+                ? CBv2CompleteCheckpointManifest.quantizedHistoricalLayout
+                : CBv2CompleteCheckpointManifest.quantizedPagedLayout
+        }
         if contiguousLayout != nil {
+            if !unsupportedAsymmetricGeometry {
+                return CBv2CompleteCheckpointManifest.nativeContiguousHistoricalLayout
+            }
             return assistant == nil
                 ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
                 : CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout
@@ -53,8 +86,11 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         recurrentSpec: CBv2RecurrentStateSpec?, kvDTypes: [DType],
         assistant: (any CBv2MTPPrefixCheckpointCoding)?, admission: AdmissionV2,
         pagedConfig: PagedKVPoolConfig? = nil,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
         qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = [],
-        nativePagedBinding: CBv2NativePagedModelBinding? = nil
+        nativePagedBinding: CBv2NativePagedModelBinding? = nil,
+        contiguousHistorical: Bool = false,
+        glm5NextBackend: PagedKVBackend? = nil
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
@@ -66,6 +102,41 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
+        if let glm5NextBackend, let recurrentSpec, let pagedConfig,
+            qwen4Geometries.isEmpty,
+            assistant == nil
+                || assistant?.mtpTargetIdentity
+                    == glm5NextBackend.glm5NextModelBinding?.targetIdentity,
+            glm5NextBackend.nativeModelBinding == nil
+                || (nativePagedBinding === glm5NextBackend.nativeModelBinding
+                    && nativePagedBinding?.validatesCompletePrefixCodec(
+                        identity: identity,
+                        layerKinds: layerKinds, layerDTypes: kvDTypes,
+                        assistant: assistant.map { $0 as AnyObject }) == true)
+        {
+            glm5NextLayout = try? .init(
+                backend: glm5NextBackend, admission: admission, layerKinds: layerKinds,
+                recurrentSpec: recurrentSpec, dtypes: kvDTypes, config: pagedConfig,
+                latentQuantization: CBv2CompleteCheckpointStorageQuantization.resolveGLM5Next(
+                    checkpointQuantization, layerKinds: layerKinds, pagedConfig: pagedConfig,
+                    assistant: assistant))
+        } else {
+            glm5NextLayout = nil
+        }
+        // EngineV2 offers every paged backend as a GLM candidate; only an
+        // actual GLM layout resolves through its latent-only rule. Elsewhere an
+        // exact-history assistant's tensors ride beside lossy rows only in the
+        // paged recurrent MTP layout; every other assistant keeps native.
+        if let glm5NextLayout {
+            self.checkpointQuantization = glm5NextLayout.latentQuantization
+        } else {
+            self.checkpointQuantization = CBv2CompleteCheckpointStorageQuantization.resolve(
+                checkpointQuantization, layerKinds: layerKinds, layerDTypes: kvDTypes,
+                pagedConfig: pagedConfig,
+                hasAssistantState: !CBv2CompleteCheckpointStorageQuantization.permitsLossyTarget(
+                    besideAssistant: assistant,
+                    pagedRecurrent: pagedConfig != nil && recurrentSpec != nil))
+        }
         let historicalAssistant =
             assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
         let issuedPaged =
@@ -75,14 +146,21 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 identity: identity,
                 layerKinds: layerKinds, layerDTypes: kvDTypes,
                 assistant: assistant.map { $0 as AnyObject }) == true
-        self.nativePagedBinding = issuedPaged ? nativePagedBinding : nil
+        let issuedGLM =
+            glm5NextLayout != nil && nativePagedBinding?.isGLM5Next == true
+            && nativePagedBinding?.validatesCompletePrefixCodec(
+                identity: identity,
+                layerKinds: layerKinds, layerDTypes: kvDTypes,
+                assistant: assistant.map { $0 as AnyObject }) == true
+        self.nativePagedBinding = issuedPaged || issuedGLM ? nativePagedBinding : nil
         self.historicalLayout =
             issuedPaged
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true)
             : (!asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
                 ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil)
         self.contiguousLayout =
-            asymmetric && recurrentSpec == nil && pagedConfig == nil && historicalAssistant
+            (asymmetric || contiguousHistorical) && recurrentSpec == nil
+                && pagedConfig == nil && historicalAssistant
                 && qwen4Geometries.isEmpty
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true) : nil
     }
@@ -91,13 +169,30 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         position: Int, qwen4: [CBv2CheckpointTensorDescriptor] = [],
         mediaTargetOnly: Bool = false
     ) throws -> [CBv2CheckpointTensorDescriptor] {
+        if let glm5NextLayout {
+            guard identity.isValid, position > 1, qwen4.isEmpty else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            var result = try glm5NextLayout.descriptors(position: position)
+            if let assistant, !mediaTargetOnly {
+                guard
+                    let auxiliary = assistant.prefixCheckpointTensorDescriptors(
+                        targetInputCount: position), !auxiliary.isEmpty
+                else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                result.append(contentsOf: auxiliary)
+            }
+            return result
+        }
         if let completeLayout = contiguousLayout
             ?? (isNativePagedHistorical ? historicalLayout : nil)
         {
             guard identity.isValid, position > 1, qwen4.isEmpty, !mediaTargetOnly else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            var descriptors = try completeLayout.tensorDescriptors(position: position)
+            var descriptors =
+                try checkpointQuantization == nil
+                ? completeLayout.tensorDescriptors(position: position)
+                : checkpointTargetDescriptors(position: position)
             if let assistant {
                 guard assistant is any CBv2HistoricalMTPPrefixCheckpointCoding,
                     let auxiliary = assistant.prefixCheckpointTensorDescriptors(
@@ -119,13 +214,18 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1 else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            return try historicalLayout.tensorDescriptors(position: position)
+            return try usesQuantizedCheckpoint
+                ? checkpointTargetDescriptors(position: position)
+                : historicalLayout.tensorDescriptors(position: position)
         }
         guard kvDTypes.count == layerKinds.count, recurrentSpec?.layers.isEmpty == false,
             identity.isValid, position > 1
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        var result: [CBv2CheckpointTensorDescriptor] = []
+        var result: [CBv2CheckpointTensorDescriptor] =
+            usesQuantizedCheckpoint
+            ? try checkpointTargetDescriptors(position: position) : []
         for (index, kind) in layerKinds.enumerated() {
+            if usesQuantizedCheckpoint { continue }
             guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
                 kind.kvHeads > 0, kind.headDim > 0,
                 let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType.isFloatingPoint
@@ -164,16 +264,20 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     func plan(
         manifest: CBv2CompleteCheckpointManifest, request: CBv2Request
     ) throws -> CBv2CompleteCheckpointImportPlan {
-        guard !unsupportedAsymmetricGeometry || contiguousLayout != nil || isNativePagedHistorical
+        guard
+            !unsupportedAsymmetricGeometry || contiguousLayout != nil || isNativePagedHistorical
+                || glm5NextLayout != nil
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(
             max(1, request.maxTokens))
-        guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
+        guard !overflow, request.permitsDurableHybridCheckpoint(layerKinds: layerKinds),
             manifest.identity == identity,
             manifest.backendLayout == backendLayout,
+            manifest.checkpointQuantization == checkpointQuantization,
+            manifest.checkpointNativeDTypes == checkpointNativeDTypes,
             manifest.cacheSalt == request.checkpointCacheSalt,
             manifest.mediaIdentity == request.hybridPrefixIdentity,
             manifest.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
@@ -185,7 +289,10 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             // engine must be able to schedule.
             manifest.assistantCodecID
                 == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
-            manifest.attentionLayers == (contiguousLayout?.layers ?? historicalLayout?.layers),
+            manifest.attentionLayers
+                == (glm5NextLayout?.attention.layers ?? contiguousLayout?.layers
+                    ?? historicalLayout?.layers),
+            manifest.glm5NextState == glm5NextLayout?.state(position: manifest.position),
             manifest.tensors
                 == (try tensorDescriptors(
                     position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
@@ -249,10 +356,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         } else if checkpoint.assistant != nil {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        guard arrays.count == descriptors.count,
-            zip(arrays, descriptors).allSatisfy({ pair in
-                pair.0.shape == pair.1.shape && pair.0.dtype == pair.1.dtype.mlxDType
-            })
+        let sources = try checkpointSources(arrays: arrays, position: checkpoint.position)
+        guard sources.count == descriptors.count,
+            zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) })
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let manifest = CBv2CompleteCheckpointManifest(
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
@@ -261,12 +367,14 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             cacheSalt: cacheSalt,
             assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(
-            manifest: manifest, arrays: arrays,
+            manifest: manifest, sources: sources,
             usesProcessMemoryOwner: admission.hasProcessMemoryOwner)
     }
 
@@ -280,6 +388,11 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 checkpoint: checkpoint, kv: state.map { $0?.snapshot() },
                 tokens: tokens, cacheSalt: cacheSalt,
                 retainedOwners: state.compactMap { $0.map { $0 as AnyObject } })
+        }
+        if glm5NextLayout != nil {
+            return try exportPaged(
+                checkpoint: checkpoint, state: state,
+                tokens: tokens, cacheSalt: cacheSalt)
         }
         guard !unsupportedAsymmetricGeometry else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -338,7 +451,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        let descriptors = Array(manifest.tensors.dropFirst(targetTensorCount))
+        // Destinations: GLM roles stored narrower were widened back to FP32.
+        let descriptors = Array(try nativeDescriptors(for: manifest).dropFirst(targetTensorCount))
         guard
             manifest.tensors
                 == (try tensorDescriptors(
@@ -392,6 +506,7 @@ final class CBv2PreparedCompleteCheckpoint {
     var pagedFrame: CBv2PagedCheckpointFrame?
     var historicalAssistantRestoration: CBv2PreparedHistoricalAssistant?
     var nativePagedPreparation: CBv2PreparedNativePagedCheckpoint?
+    var glm5NextAssistantPreparation: CBv2GLM5NextPreparedAssistant?
 
     init(state: [CBv2SequenceKV?], checkpoint: CBv2RecurrentCheckpoint) {
         self.state = state
@@ -404,6 +519,9 @@ final class CBv2PreparedCompleteCheckpoint {
     }
 
     func clear() {
+        // GLM preparation is explicitly closed by the native import retirement
+        // callback, where a failed release can preserve the loan and charges.
+        glm5NextAssistantPreparation = nil
         historicalAssistantRestoration?.closeAfterNativeCompletion()
         historicalAssistantRestoration = nil
         state.removeAll()

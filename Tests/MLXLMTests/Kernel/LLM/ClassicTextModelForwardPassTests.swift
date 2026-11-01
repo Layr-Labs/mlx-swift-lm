@@ -552,13 +552,13 @@ extension KernelTests {
                 Exaone4Configuration.self, Self.exaone4,
                 ["sliding_window": 4, "sliding_window_pattern": "GL"], seed: 1
             ) { Exaone4Model($0) }
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             #expect(cache.count == 2)
             #expect(cache[0] is KVCacheSimple)
             #expect((cache[1] as? RotatingKVCache)?.maxSize == 4)
 
             let row = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 1)
-            _ = ForwardPassChecks.checkCacheConsistency(
+            _ = try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [row], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
                 cache: cache)
         }
@@ -570,19 +570,19 @@ extension KernelTests {
             let model = try Self.build(Olmo3Configuration.self, Self.olmo3, seed: 1) {
                 Olmo3Model($0)
             }
-            let own = model.newCache(parameters: GenerateParameters())
+            let own = try model.newCache(parameters: GenerateParameters())
             #expect((own[0] as? RotatingKVCache)?.maxSize == 4)
             #expect(own[1] is KVCacheSimple)
 
             let rows = [1, 2].map { SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: $0) }
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [rows[0]], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
-                cache: model.newCache(parameters: GenerateParameters()))
-            ForwardPassChecks.checkCacheConsistency(
+                cache: try model.newCache(parameters: GenerateParameters()))
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
-                cache: model.newCache(parameters: GenerateParameters()))
+                cache: try model.newCache(parameters: GenerateParameters()))
 
-            let generic = (model as any LanguageModel).newCache(parameters: nil)
+            let generic = try (model as any LanguageModel).newCache(parameters: nil)
             #expect(generic[0] is RotatingKVCache, "sliding layer cache")
         }
 

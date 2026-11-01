@@ -28,6 +28,7 @@ extension EngineV2 {
             !completeCheckpointCodec.unsupportedAsymmetricGeometry
                 || completeCheckpointCodec.contiguousLayout != nil
                 || completeCheckpointCodec.isNativePagedHistorical
+                || completeCheckpointCodec.glm5NextLayout != nil
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -83,7 +84,7 @@ extension EngineV2 {
     }
 
     func completeCheckpointLookup(for request: CBv2Request) -> CBv2PrefixLookup {
-        guard request.permitsHybridCheckpoint(layerKinds: layerKinds),
+        guard request.permitsDurableHybridCheckpoint(layerKinds: layerKinds),
             let receiptID = request.prefixCacheReceiptID, let completePrefixCache
         else { return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0) }
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(
@@ -119,14 +120,27 @@ extension EngineV2 {
                     // create a second public deferred-plan loan just to check it.
                     _ = try codec.plan(manifest: staged.manifest, request: request)
                     let matched = staged.manifest.position
-                    var plan =
-                        codec.isNativePagedHistorical
-                        ? try codec.historicalReusePlan(
+                    var plan: CBv2PrefixReusePlan
+                    if codec.isNativePagedGLM5Next {
+                        // GLM captures under the chunk-agnostic recurrent rule
+                        // (`captureRecurrentCheckpoints`), so its adopter
+                        // resumes under ordinary chunking like the other
+                        // recurrent complete adopters. A forced chunk would
+                        // wait whenever decode rows shorten the step budget
+                        // and cold-restart the hit after three waits.
+                        plan = try codec.glm5NextReusePlan(
                             position: matched, maximumSequenceLength: maximumLength)
-                        : try codec.contiguousReusePlan(
-                            position: matched, maximumSequenceLength: maximumLength)
-                    plan.recurrentChunkSize = staged.manifest.chunkSize
-                    plan.recurrentPromptLength = request.promptTokens.count
+                    } else {
+                        if codec.isNativePagedHistorical {
+                            plan = try codec.historicalReusePlan(
+                                position: matched, maximumSequenceLength: maximumLength)
+                        } else {
+                            plan = try codec.contiguousReusePlan(
+                                position: matched, maximumSequenceLength: maximumLength)
+                        }
+                        plan.recurrentChunkSize = staged.manifest.chunkSize
+                        plan.recurrentPromptLength = request.promptTokens.count
+                    }
                     return .init(
                         adoption: .init(
                             requestID: receiptID, tokens: request.promptTokens,
@@ -155,7 +169,11 @@ extension EngineV2 {
                 plan = try staged.codec.historicalReusePlan(
                     position: matched, maximumSequenceLength: maximumLength)
             } else {
-                let exactKVBytes = staged.manifest.tensors.reduce(0) { total, tensor in
+                let servingDescriptors =
+                    try staged.codec.checkpointQuantization == nil
+                    ? staged.manifest.tensors
+                    : staged.codec.nativeTargetDescriptors(position: staged.manifest.position)
+                let exactKVBytes = servingDescriptors.reduce(0) { total, tensor in
                     total
                         + ((tensor.role == .keys || tensor.role == .values) ? tensor.byteCount : 0)
                 }

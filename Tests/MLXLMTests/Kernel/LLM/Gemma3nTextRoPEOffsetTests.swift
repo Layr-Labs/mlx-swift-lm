@@ -22,7 +22,7 @@ struct Gemma3nTextRoPEOffsetTests {
         let model = try Tiny.make(["num_kv_shared_layers": 0])
         let rows = [Tiny.row(1)]
         let full = Tiny.logits(model, rows)
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         var start = 0
         for chunk in [5, 3, 1, 1, 1] {
             let stepped = Tiny.logits(
@@ -43,8 +43,8 @@ struct Gemma3nTextRoPEOffsetTests {
         let model = try Tiny.make()
         let rows = [Tiny.row(1)]
         let difference = Tiny.maxAbsDifference(
-            Tiny.chunkedLogits(model, rows, chunks: [5, 3, 1, 1, 1]),
-            Tiny.chunkedLogits(model, rows, chunks: [11]))
+            try Tiny.chunkedLogits(model, rows, chunks: [5, 3, 1, 1, 1]),
+            try Tiny.chunkedLogits(model, rows, chunks: [11]))
         #expect(difference <= Tiny.tolerance, "differs by \(difference)")
     }
 }

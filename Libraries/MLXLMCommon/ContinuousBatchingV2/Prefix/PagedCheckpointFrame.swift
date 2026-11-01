@@ -13,13 +13,13 @@ final class CBv2PagedCheckpointFrame: @unchecked Sendable {
         lease: CBv2CheckpointStageLease, hostBytes: Int = 0
     ) throws {
         let bytes = try CBv2CheckpointAllocationFootprint.freshBytes(auxiliary)
-        guard hostBytes >= 0, storage.plan.nativeBytes == lease.targetBytes,
+        guard hostBytes >= 0, storage.plan.pageNativeBytes == lease.targetBytes,
             try CBv2CheckpointAllocationFootprint.add(bytes.bound, hostBytes)
                 == lease.auxiliaryBytes,
             storage.allocatedBytes <= storage.plan.nativeBytes
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         try lease.settleDestinationAfterEvaluation(
-            targetBytes: storage.allocatedBytes,
+            targetBytes: storage.pageAllocatedBytes,
             auxiliaryBytes: CBv2CheckpointAllocationFootprint.add(bytes.actual, hostBytes))
         owner = CBv2PagedCheckpointOwner(storage: storage, auxiliary: auxiliary, lease: lease)
     }

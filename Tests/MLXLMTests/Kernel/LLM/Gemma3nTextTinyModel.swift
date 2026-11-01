@@ -105,9 +105,9 @@ enum Gemma3nTextTinyModel {
     /// all positions.
     static func chunkedLogits(
         _ model: Gemma3nTextModel, _ rows: [[Int]], chunks: [Int]
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         precondition(chunks.reduce(0, +) == rows[0].count, "the chunks must cover the rows")
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         var start = 0
         var parts: [MLXArray] = []
         for chunk in chunks {

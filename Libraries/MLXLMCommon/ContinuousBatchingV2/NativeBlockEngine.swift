@@ -96,6 +96,12 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
     private var pagedBackingBytes = 0
     public var usesPagedStorage: Bool { pagedMemory != nil }
     public var usesProcessMemoryOwner: Bool { pagedMemory?.usesProcessMemoryOwner == true }
+    /// Worst-case native recent-owner feasibility, not a fixed allocation.
+    /// Capacity reporters may budget this once per request; actual owners
+    /// retain their existing dynamic reservations and request-sized checks.
+    public var maximumNativeRecentFeasibilityBytes: Int {
+        pagedMemory?.maximumNativeRecentFeasibilityBytes ?? 0
+    }
     public let completeNativePrefixCache: (any CBv2NativeBlockPrefixCache)?
     private let checkpointPlanner: CBv2NativeBlockCheckpointPlanner?
     private var sharedRetainedBytes = 0

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Test scripts/run-nested-suite.sh and scripts/run-paged-kernel-tests.sh with
-# a fake swift command, and scripts/check-unit-test-files.sh with small file
-# trees.
+# Test scripts/run-nested-suite.sh with a fake swift command, and
+# scripts/check-unit-test-files.sh with small file trees.
 #
 # The fake swift prints a given output and exits with a given code. Each case
 # sets them, runs one of the scripts, and checks its exit code. Some cases
@@ -121,37 +120,6 @@ expect_suite 0 "Test output that contains the word skipped" 0 \
     '◇ Test "scaled tensors on explicitly skipped paths are rejected" started.'$'\n''[cbv2-query-block] window=1024 dVsAbsolute=skipped'$'\n'"$testing_pass"
 expect_suite 3 "swift test fails" 3 \
     '✘ Test run with 4 tests in 1 suite failed after 0.001 seconds with 1 issue.'
-
-# run-paged-kernel-tests.sh
-
-kernel_pass='✔ Test run with 14 tests in 1 suite passed after 0.001 seconds.'
-kernel_fail='✘ Test run with 14 tests in 1 suite failed after 0.001 seconds with 1 issue.'
-single_pass='✔ Test run with 1 test in 1 suite passed after 0.001 seconds.'
-single_fail='✘ Test run with 1 test in 1 suite failed after 0.001 seconds with 1 issue.'
-kernel_calls="test --skip-build --filter CBv2PagedKernelTests --no-parallel --skip decodeBatchCompositionInvariance | DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=unset
-test --skip-build --filter decodeBatchCompositionInvariance --no-parallel | DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1"
-
-give CBv2PagedKernelTests 0 "$kernel_pass"
-give decodeBatchCompositionInvariance 0 "$single_pass"
-check 0 "Paged kernel tests pass" \
-    env DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 "$script_directory/run-paged-kernel-tests.sh"
-expect_calls "The first process runs without the variable, the second with it" "$kernel_calls"
-
-give CBv2PagedKernelTests 1 "$kernel_fail"
-give decodeBatchCompositionInvariance 0 "$single_pass"
-check 1 "Paged kernel tests fail when the first process fails" \
-    "$script_directory/run-paged-kernel-tests.sh"
-expect_calls "The second process runs after the first process fails" "$kernel_calls"
-
-give CBv2PagedKernelTests 0 "$kernel_pass"
-give decodeBatchCompositionInvariance 1 "$single_fail"
-check 1 "Paged kernel tests fail when the second process fails" \
-    "$script_directory/run-paged-kernel-tests.sh"
-
-give CBv2PagedKernelTests 0 "$xctest_none"$'\n'"$testing_none"
-give decodeBatchCompositionInvariance 0 "$single_pass"
-check 1 "Paged kernel tests fail when the first process executes zero tests" \
-    "$script_directory/run-paged-kernel-tests.sh"
 
 # check-unit-test-files.sh
 

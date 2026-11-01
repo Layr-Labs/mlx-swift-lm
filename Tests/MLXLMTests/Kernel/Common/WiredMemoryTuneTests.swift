@@ -44,7 +44,10 @@ private struct ModuloProcessor: UserInputProcessor {
 /// A model with no parameters whose `prepare` gives logits, as a model
 /// that embeds media in `prepare` does. It makes no cache.
 private final class LogitsOnlyModel: Module, LanguageModel {
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         .logits(LMOutput(logits: MLXArray.zeros([1, 1, 8])))
     }
 

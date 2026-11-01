@@ -158,8 +158,9 @@ class LFM2MoEAttention: Module {
         keys = kLayerNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -230,7 +231,8 @@ class LFM2MoEShortConv: Module {
         Bx = concatenated([state!, Bx], axis: -2)
         if let cache {
             let start = Bx.dim(1) - (lCache - 1)
-            cache[0] = Bx[0..., start..., 0...]
+            cache[0] = contiguous(Bx[0..., start..., 0...])
+            cache.advance(x.dim(1))
         }
 
         let convOut = conv(Bx)
@@ -289,11 +291,8 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         }
     }
 
-    /// Returns top-k experts and unbiased sigmoid routing weights. LFM2-MoE is
-    /// sigmoid-gated: `expert_bias` steers top-k SELECTION only; the combination
-    /// weights come from the unbiased sigmoid scaled by routed_scaling_factor.
-    /// (The old code softmaxed the gate and folded the bias into the weights.)
-    /// Upstream e3cb1e1.
+    /// Returns top-k experts and unbiased sigmoid routing weights.
+    /// `expert_bias` affects selection only.
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
         let routingWeights = MLX.sigmoid(gate(x).asType(.float32))
 
@@ -492,10 +491,10 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
         return sanitized
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { layerIdx in
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try (0 ..< configuration.hiddenLayers).map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
+                try makeAttentionKVCache(parameters: parameters)
             } else {
                 MambaCache()
             }
@@ -507,4 +506,10 @@ extension LFM2MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension LFM2MoEModel {
+    public var toolCallFormat: ToolCallFormat? { .lfm2 }
 }
