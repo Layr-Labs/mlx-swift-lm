@@ -603,7 +603,7 @@ open class SwitchGLU: Module {
 
     /// The expert down projection, for an owning block that packs another
     /// projection's partial into its collective
-    /// (`Qwen35TensorParallelSwitchLinear.carrying`).
+    /// (`TensorParallelSwitchLinear.carrying`).
     public var downProjection: SwitchLinear { downProj }
 
     /// Structural twin with the requested gate/up topology: same
@@ -887,10 +887,13 @@ open class SwitchGLU: Module {
         case .generic, .mimoV26FP32:
             return false
         case .gemma4ProductionGeGLU:
+            // A down projection that sums partials (tensor parallel or its
+            // split-sum oracle) keeps the unsort and weighted sum below.
             return inputDims == 2816
                 && hiddenDims == 704
                 && numExperts == 128
                 && gateUpProj == nil
+                && !(downProj is any SwitchLinearPartialSum)
                 && activationProduct == nil
                 && isGeluActivation
                 && x.ndim == 2
