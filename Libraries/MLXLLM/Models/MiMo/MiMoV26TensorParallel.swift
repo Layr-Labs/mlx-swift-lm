@@ -178,10 +178,11 @@ final class MiMoV26TensorParallelContext {
         self.vocabularyRows = vocabularyRows
     }
 
-    /// A partial stored in the activation dtype, widened exactly, summed in
-    /// FP32 and rounded once.
-    func sum(_ partial: MLXArray) -> MLXArray {
-        reduce(partial.asType(.float32)).asType(partial.dtype)
+    /// A partial stored as FP32 (never rounded per rank), summed across ranks
+    /// in FP32 and rounded once to `dtype`.
+    func sum(_ partial: MLXArray, as dtype: DType) -> MLXArray {
+        precondition(partial.dtype == .float32, "a tensor-parallel partial is stored as FP32")
+        return reduce(partial).asType(dtype)
     }
 }
 
@@ -192,26 +193,49 @@ extension MiMoV26MoE {
         (experts * weights[.ellipsis, .newAxis]).sum(axis: -2)
     }
 
-    /// This rank's FP32 partial: one combined row, not `TensorParallelSwitchLinear`'s per-expert
-    /// rows, so the MXFP4 kernels run; each expert's half-width row is rounded to BF16 first.
+    /// This rank's FP32 partial: its half-width expert rows stored as FP32 (the down projection
+    /// takes an exact FP32 widening of its input), then one combined row per token.
     func tensorParallelPartial(_ x: MLXArray, rowLocalRouter: Bool = false) -> MLXArray {
         let routed = gate(x, rowLocal: rowLocalRouter)
-        return Self.combinePartial(switchMLP(x, routed.indices), weights: routed.weights)
+        return Self.combinePartial(
+            switchMLP.float32ExpertRows(x, routed.indices), weights: routed.weights)
+    }
+}
+
+extension MiMoV26DenseMLP {
+    /// This rank's FP32 `down_proj` partial: the activation product widened exactly.
+    func tensorParallelPartial(_ x: MLXArray) -> MLXArray {
+        downProj((silu(gateProj(x)) * upProj(x)).asType(.float32))
     }
 }
 
 extension MiMoV26DecoderLayer {
-    /// The feed-forward of a tensor-parallel rank, summed across ranks and
+    /// The attention output. A tensor-parallel rank widens the attended rows exactly, so its
+    /// `o_proj` partial is FP32, then sums it across ranks and rounds once.
+    func attentionOutput(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        guard let tensorParallel else { return selfAttention(x, mask: mask, cache: cache) }
+        let rows = selfAttention.attend(x, mask: mask, cache: cache)
+        return tensorParallel.sum(selfAttention.oProj(rows.asType(.float32)), as: x.dtype)
+    }
+
+    /// The feed-forward of a tensor-parallel rank: an FP32 partial, summed across ranks and
     /// rounded once to the activation dtype.
     func tensorParallelFeedForward(
         _ x: MLXArray, _ context: MiMoV26TensorParallelContext, rowLocal: Bool = false
     ) -> MLXArray {
         if let moe = mlp as? MiMoV26MoE {
-            return context.reduce(moe.tensorParallelPartial(x, rowLocalRouter: rowLocal))
-                .asType(x.dtype)
+            return context.sum(moe.tensorParallelPartial(x, rowLocalRouter: rowLocal), as: x.dtype)
         }
-        return context.sum(
-            rowLocal ? MiMoV26RectangularDense.mlp(mlp, x, enabled: true) : mlp(x))
+        guard let dense = mlp as? MiMoV26DenseMLP else {
+            preconditionFailure("a MiMo layer holds a routed or a dense MLP")
+        }
+        let partial =
+            rowLocal
+            ? MiMoV26RectangularDense.tensorParallelPartial(dense, x)
+            : dense.tensorParallelPartial(x)
+        return context.sum(partial, as: x.dtype)
     }
 
     /// The feed-forward output: summed across ranks when tensor parallel is installed.
