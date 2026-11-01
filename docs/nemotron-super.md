@@ -547,6 +547,27 @@ holds MTP state, and that cancelling the image request mid-decode leaves the
 text output unchanged and refunds every byte. Both verification modes are
 tested.
 
+## Sampled and controlled requests on the speculating owner
+
+The assistant opts into target-prefix acceptance
+(`supportsTargetPrefixAcceptance`). Its proposals are greedy, and the verifier
+pre-samples every window position with the request's own sampler and RNG
+stream, so a draft is kept only where it equals that sample. This is exact
+speculative sampling: a sampled request draws the same tokens as on the plain
+owner with the same seed and request id, and it speculates instead of decoding
+one token per step.
+
+A request the engine cannot draft for (a stop string, a repetition, frequency
+or presence penalty, a logit bias or logprobs) decodes one ordinary target
+token per step beside requests that speculate. The row-exact recurrent
+fallback (`ineligibleRowsDecodeBesideSpeculation`) removes it from the draft
+cohort as it removes an image request; on other targets one such row still
+keeps every row of the step target-only. `NemotronSuperMTPRequestControlsTests`
+checks with synthetic weights that a sampled request speculates and equals
+target-only sampling (both verification modes), and that a text request beside
+a stop-string, penalty or logit-bias request still speculates while both
+outputs equal their plain-owner tokens.
+
 ## Batched text decode
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:)` accepts
@@ -668,6 +689,41 @@ a full refund when a restored request is cancelled, and a target-only image
 turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
 bound image turn restores the cold tokens and full-vocabulary log-softmax bit
 for bit, and that another identity, an unbound image and text restore nothing.
+
+### Complete checkpoints
+
+The same chunk-aligned checkpoints can be complete checkpoints
+(`CBv2CompleteCheckpointCodec`) that a host stores durably, for example
+encrypted on SSD, instead of keeping them in the resident bank. The engine
+builds the codec for a recurrent paged model only when the model declares its
+attention KV types (`CBv2CompleteCheckpointKVTypeProviding`) and those types
+equal the paged pool's observed layer types, and when a persistent assistant
+can encode its history (`CBv2MTPPrefixCheckpointCoding`). The adapter and the
+MTP target declare `NemotronHModel.observedAttentionKVDTypes()`, resolved once
+like the recurrent spec. The host chooses complete checkpoints or the bank:
+with a complete store the engine keeps the store's checkpoints, not the bank's.
+
+`NemotronSuperMTPAssistant` encodes a checkpoint at `n` target inputs as its K
+and V history codes for the `(n - 1) / historyChunkRows` whole chunks, the
+queued pairs and tokens of the partial chunk, and the frontier hidden. The
+split depends only on `n`, so the layout does too. The generic recurrent
+manifest admits floating assistant tensors only, so the codes are stored
+widened to float16 integers in 0...255. The widening is exact and costs a
+second byte per code: 1,024 bytes per token for the pinned configuration
+(two KV heads of 128, K and V), beside 8 KiB of KV. Decode reads the imported
+host buffers without GPU work. It refuses a value that is not an integer
+byte, a queued token that is not the prompt's own and a layout of another
+`n`, then narrows the codes back. Restore therefore writes the same codes, and
+the mirror decoded from them, as the request the checkpoint was taken from.
+`NemotronSuperMTPCompleteCheckpointTests` carries encoded checkpoints through
+host bytes and checks that a restored request drafts exactly as the cold one.
+The assistant declares `CBv2MTPExactHistoryPrefixCheckpointCoding`, so under a
+checkpoint profile the codec writes
+`native-paged-affine-checkpoint-full-recurrent-mtp-v1`: older attention rows
+are coded, while this history, the recurrent state and the recent band stay exact
+([runtime KV quantization](runtime-kv-quantization.md#native-execution-with-compressed-checkpoints),
+`NemotronSuperLossyCompleteCheckpointTests`).
+Image checkpoints have no durable layout and stay resident-only.
 
 ## Paged attention KV
 
@@ -797,6 +853,7 @@ establish tokenizer or chat-template parity (the host renders prompts),
 production discovery, image-format or video-container coverage (the host
 decodes media) or full-model video quality; the video golden checks the vision
 features of one clip. Whole-document recall degrades beyond 32K tokens. Prefix
-reuse on the full checkpoint is unmeasured: neither its speedup nor paged-bank
-restores. Codec agreement is not fused CUDA attention parity. The components
-stay unregistered and opt-in; serving qualification belongs to the host.
+reuse on the full checkpoint is measured by the host (the provider's managed
+slot), not by this repository. Codec agreement is not fused CUDA attention
+parity. The components stay unregistered and opt-in; serving qualification
+belongs to the host.

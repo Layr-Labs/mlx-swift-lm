@@ -113,10 +113,12 @@ extension UnitTests {
             #expect(chunks == [16, 16])
         }
 
-        /// First-token projection does not model either limit, so it refuses
-        /// to forecast rather than promise an optimistic step count.
-        @Test func firstTokenProjectionRefusesUnderEitherLimit() throws {
-            for (rows, decodeSteps) in [(Int?.some(1), 0), (nil, 2), (nil, 0)] {
+        /// First-token projection replays the decode-only interleave
+        /// (CBv2DecodeInterleaveProjectionTests) but does not model the
+        /// prompt-row ceiling, so it refuses to forecast under the ceiling
+        /// rather than promise an optimistic step count.
+        @Test func firstTokenProjectionRefusesOnlyUnderTheRowCeiling() throws {
+            for (rows, decodeSteps) in [(Int?.some(1), 0), (Int?.some(1), 2), (nil, 2), (nil, 0)] {
                 let scheduler = Self.scheduler(rows: rows, decodeSteps: decodeSteps)
                 var config = scheduler.config
                 config.maxConcurrentPartialPrefills = 1
@@ -126,7 +128,7 @@ extension UnitTests {
                 let projection = serialized.firstTokenWorkProjection(for: request.id)
                 var refused = false
                 if case .unbounded(reason: .unsupportedScheduler) = projection { refused = true }
-                #expect(refused == (rows != nil || decodeSteps > 0))
+                #expect(refused == (rows != nil))
             }
         }
 

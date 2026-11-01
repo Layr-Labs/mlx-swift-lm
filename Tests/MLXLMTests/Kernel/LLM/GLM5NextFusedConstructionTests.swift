@@ -10,7 +10,7 @@ extension KernelTests {
     @Suite(.serialized)
     struct GLM5NextFusedConstructionTests {
         enum Family: CaseIterable, Sendable { case dense, shared, dsa, kda }
-        enum Entry: CaseIterable, Sendable { case model, modelMTP }
+        enum Entry: CaseIterable, Sendable { case model, stage, modelMTP, stageMTP }
         private enum Refusal: Error { case injected }
         private final class Witness {
             weak var array: MLXArray?
@@ -101,7 +101,8 @@ extension KernelTests {
         @Test(arguments: Entry.allCases, [false, true])
         func artifactOwnsFusedGroupsAcrossPartialFailure(entry: Entry, packed: Bool) throws {
             let fixture = try GLM5NextLocalArtifactFixture(q4: packed)
-            let isMTP = entry == .modelMTP
+            let c = fixture.configuration.textConfig
+            let isMTP = entry == .modelMTP || entry == .stageMTP
             let refuseAt = isMTP ? 1 : 2
             var armed = false
             var groups: [[Witness]] = []
@@ -124,13 +125,18 @@ extension KernelTests {
             let loader = try GLM5NextArtifactLoader(
                 directory: fixture.directory, expectedIdentity: fixture.identity(),
                 storage: fixture.storage, constructionRoots: roots, executionPolicy: .serving)
+            let plan = try GLM5NextTextStagePlan(
+                configuration: c, layers: 3 ..< c.hiddenLayers, loadMTPEmbedding: true)
             let model = entry == .modelMTP ? try loader.loadTextModel() : nil
+            let stage = entry == .stageMTP ? try loader.loadTextStage(plan: plan) : nil
             let baselineOwners = roots.retainedOwnerCount
             armed = true
             #expect(throws: Refusal.self) {
                 switch entry {
                 case .model: _ = try loader.loadTextModel()
+                case .stage: _ = try loader.loadTextStage(plan: plan)
                 case .modelMTP: _ = try loader.loadMTP(target: #require(model))
+                case .stageMTP: _ = try loader.loadMTP(stage: #require(stage))
                 }
             }
             try #require(groups.count == refuseAt)

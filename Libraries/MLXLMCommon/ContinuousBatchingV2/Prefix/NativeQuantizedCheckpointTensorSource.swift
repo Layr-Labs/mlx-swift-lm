@@ -94,9 +94,14 @@ extension CBv2CompleteCheckpointCodec {
         guard checkpointQuantization != nil else { return source }
         let role = try checkpointRole(layer: index, position: position, values: values)
         guard role.isQuantized else { return source }
+        // The rows the encoder reads: the role's own dtype, which is the
+        // pool's, or GLM's narrower latent wire dtype.
+        let key = role.key
         let native = try CBv2CheckpointPagedRoleLayout(
-            key: checkpointGroupKey(layer: index), position: position,
-            tokenStart: role.tokenStart, values: values
+            key: PagedKVGroupKey(
+                kvHeads: key.kvHeads, headDim: key.headDim, dtype: key.dtype,
+                windowSize: key.windowSize, valueHeadDim: key.valueHeadDim),
+            position: position, tokenStart: role.tokenStart, values: values
         ).descriptor(layer: layerKinds[index].modelLayerIndex ?? index)
         return .nativeQuantized(
             try .init(

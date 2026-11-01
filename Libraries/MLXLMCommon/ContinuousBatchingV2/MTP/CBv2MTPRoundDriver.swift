@@ -280,6 +280,11 @@ final class CBv2MTPRoundDriver {
     /// Media requests run target-only beside speculating text. Fixed by the
     /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
     let supportsRequestScopedMediaFallback: Bool
+    /// Any MTP-ineligible row (stop strings, penalties, logit bias, logprobs)
+    /// decodes one ordinary target token per step beside speculating rows
+    /// instead of keeping every row target-only. Only the recurrent fallback
+    /// qualifies: its decode is row-exact, so the mixed step changes no row.
+    let ineligibleRowsDecodeBesideSpeculation: Bool
     /// True when acceptance may use target-prefix pre-sampling (drafter
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
@@ -399,8 +404,11 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        self.supportsRequestScopedMediaFallback = Self.requestScopedMediaFallback(
-            model: model, drafter: drafter)
+        let requestScopedFallback = Self.requestScopedMediaFallback(model: model, drafter: drafter)
+        self.supportsRequestScopedMediaFallback = requestScopedFallback
+        self.ineligibleRowsDecodeBesideSpeculation =
+            requestScopedFallback
+            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
             fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,

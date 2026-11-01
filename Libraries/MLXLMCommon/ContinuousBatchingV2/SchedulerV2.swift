@@ -291,8 +291,9 @@ public final class SchedulerV2 {
     /// deadline and it never progresses.
     private var deferredBlockRequestID: CBv2RequestID?
     /// Decode-only plans still owed before the next prompt chunk
-    /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`).
-    private var decodeOnlyStepsOwed = 0
+    /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`). The
+    /// first-token projection starts from it.
+    private(set) var decodeOnlyStepsOwed = 0
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config

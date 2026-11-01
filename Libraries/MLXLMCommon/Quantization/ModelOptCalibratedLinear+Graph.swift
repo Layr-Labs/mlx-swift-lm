@@ -98,7 +98,8 @@ extension ModelOptCalibratedLinear {
     /// NVFP4 a packed product on the producer bytes and one rounding by the
     /// weight scale, for FP8 the eager per-weight decode on the device. Never
     /// reads device values; throws only on static errors. NVFP4 `.rowwise` and
-    /// FP8 are bit-identical to `checkedForward`.
+    /// FP8 are bit-identical to `checkedForward`, except FP8 calls near its
+    /// 64 MiB bound that take 32 Mi-element slices.
     /// `squaredReLU` returns NemotronH's `relu2` of the result (fused into the
     /// final NVFP4 rounding kernel; bit-identical to applying it afterwards).
     public func graphForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {
@@ -184,7 +185,9 @@ extension ModelOptCalibratedLinear {
 
     /// The eager reference's product without its host synchronization: the
     /// same per-weight rounding and output-row tiles (row-count dependent below
-    /// its 64 MiB bound), so the result is bit-identical; one row runs the
+    /// its 64 MiB bound), regrouped into fewer products that keep MLX's
+    /// arithmetic (``fp8ProductPlan(rows:eager:)``), so the result is
+    /// bit-identical except where that plan takes slices; one row runs the
     /// fused vector kernel instead of decoding a slice, with the activation
     /// cast inside it. Tiled prefill chunks may run ``ModelOptNAXDenseLinear``
     /// instead, which decodes inside its matrix kernel (same bits wherever it
@@ -193,7 +196,7 @@ extension ModelOptCalibratedLinear {
         _ input: MLXArray, multipliers: MLXArray, overflowBound: MLXArray, rows: Int,
         scale: MLXArray, accumulation: ModelOptAccumulation
     ) -> MLXArray {
-        var tiles = fp8EagerTiles(rows: rows)
+        let tiles = fp8EagerTiles(rows: rows)
         if accumulation == .tiled,
             ModelOptNAXDenseLinear.takesFP8(
                 rows: rows, inputs: inputDimensions, outputs: outputDimensions,
@@ -211,19 +214,54 @@ extension ModelOptCalibratedLinear {
                     splitsK: run.splitsK,
                     activation: (multipliers: multipliers, overflowBound: overflowBound))
             }
-        } else {
+        } else if rows == 1 {
             let activation = ModelOptActivationKernels.fp8(
                 input, multipliers: multipliers, overflowBound: overflowBound)
-            if rows == 1 { tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions) }
-            pieces = tiles.map { tile in
+            pieces = Self.mergedVectorTiles(tiles, inputs: inputDimensions).map { tile in
                 matmul(
                     activation,
                     ModelOptActivationKernels.fp8DenseWeight(
                         weight[tile, 0...], scale: scale, dtype: weightDType
                     ).transposed())
             }
+        } else {
+            let activation = ModelOptActivationKernels.fp8(
+                input, multipliers: multipliers, overflowBound: overflowBound)
+            pieces = fp8ProductPlan(rows: rows, eager: tiles).map { piece in
+                let decoded = ModelOptActivationKernels.fp8DenseWeight(
+                    weight[piece.columns, 0...], scale: scale, dtype: weightDType)
+                if piece.vectors {
+                    // [1, R, K] x [n, K, 1]: MLX's batched single-column products.
+                    return matmul(
+                        activation.expandedDimensions(axis: 0),
+                        decoded.expandedDimensions(axis: -1)
+                    ).squeezed(axis: -1).transposed()
+                }
+                let products = piece.rowBlocks.map { matmul(activation[$0], decoded.transposed()) }
+                return products.count == 1 ? products[0] : concatenated(products, axis: 0)
+            }
         }
         return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
+    }
+
+    /// The multi-row products for `eager` (``fp8EagerTiles(rows:)``) on the
+    /// default stream's GPU.
+    func fp8ProductPlan(rows: Int, eager: [Range<Int>]) -> [ModelOptFP8ProductPiece] {
+        Self.fp8ProductPlan(
+            rows: rows, inputs: inputDimensions, outputs: outputDimensions, eager: eager,
+            routing: weightDType == .float32 ? nil : .current)
+    }
+
+    /// See ``ModelOptFP8ProductPiece/plan(rows:inputs:eager:oneRowTiles:slices:routing:)``.
+    static func fp8ProductPlan(
+        rows: Int, inputs: Int, outputs: Int, eager: [Range<Int>]? = nil,
+        routing: @autoclosure () -> ModelOptMLXProductRouting?
+    ) -> [ModelOptFP8ProductPiece] {
+        ModelOptFP8ProductPiece.plan(
+            rows: rows, inputs: inputs,
+            eager: eager ?? fp8EagerTiles(rows: rows, inputs: inputs, outputs: outputs),
+            oneRowTiles: fp8EagerTiles(rows: 1, inputs: inputs, outputs: outputs).count,
+            slices: fp8Slices(inputs: inputs, outputs: outputs), routing: routing())
     }
 
     /// One dispatch per run of eager one-row tiles that share MLX's K split.
@@ -244,16 +282,29 @@ extension ModelOptCalibratedLinear {
     private var oneRowTiles: [Range<Int>] { fp8EagerTiles(rows: 1) }
 
     /// The eager reference's output-row tiles of a `rows`-row call:
-    /// `(64 MiB / 32 - rows * (K + N)) / K` output rows. Beyond the eager
-    /// bound there is no reference tiling to reproduce; larger slices (at most
-    /// 32 Mi decoded elements) keep products efficient.
+    /// `(64 MiB / 32 - rows * (K + N)) / K` output rows. Where the eager
+    /// reference refuses (not one row fits) there is no tiling to reproduce;
+    /// larger slices (at most 32 Mi decoded elements) keep products efficient.
     func fp8EagerTiles(rows: Int) -> [Range<Int>] {
+        Self.fp8EagerTiles(rows: rows, inputs: inputDimensions, outputs: outputDimensions)
+    }
+
+    static func fp8EagerTiles(rows: Int, inputs: Int, outputs: Int) -> [Range<Int>] {
         let limit = (64 << 20) / 32
-        let live = rows * inputDimensions + rows * outputDimensions
-        let tileElements = live <= limit ? limit - live : 1 << 25
-        let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
-        return stride(from: 0, to: outputDimensions, by: tileRows).map {
-            $0 ..< min(outputDimensions, $0 + tileRows)
+        let live = rows * inputs + rows * outputs
+        guard limit - live >= inputs else { return fp8Slices(inputs: inputs, outputs: outputs) }
+        return outputTiles((limit - live) / inputs, outputs: outputs)
+    }
+
+    /// Output-row slices of at most 32 Mi decoded elements.
+    static func fp8Slices(inputs: Int, outputs: Int) -> [Range<Int>] {
+        outputTiles((1 << 25) / inputs, outputs: outputs)
+    }
+
+    private static func outputTiles(_ tileRows: Int, outputs: Int) -> [Range<Int>] {
+        let tileRows = max(1, min(outputs, tileRows))
+        return stride(from: 0, to: outputs, by: tileRows).map {
+            $0 ..< min(outputs, $0 + tileRows)
         }
     }
 

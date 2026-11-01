@@ -30,14 +30,15 @@ struct NemotronSuperMTPEngineTests {
     static func engine(
         _ model: any CBv2SteppableModel, kinds: [CBv2LayerKind],
         caches: [any CBv2AttendingLayerCache],
-        drafter: NemotronSuperMTPAssistant? = nil, depth: Int = 1, kvDType: DType = .float32
+        drafter: NemotronSuperMTPAssistant? = nil, depth: Int = 1, kvDType: DType = .float32,
+        sampler: any CBv2StepSampler = CBv2GreedySampler()
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
         let engine = EngineV2(
             model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: caches),
-            sampler: CBv2GreedySampler(),
+            sampler: sampler,
             schedulerConfig: .init(
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
                 prefillChunkSize: 8, maxWaiting: 4),
@@ -50,14 +51,15 @@ struct NemotronSuperMTPEngineTests {
         return (engine, backend)
     }
 
-    static func plainEngine(_ model: NemotronSuperModel, kvDType: DType = .float32)
-        -> (EngineV2, CBv2ContiguousKVBackend)
-    {
+    static func plainEngine(
+        _ model: NemotronSuperModel, kvDType: DType = .float32,
+        sampler: any CBv2StepSampler = CBv2GreedySampler()
+    ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let adapter = NemotronSuperRecurrentAdapter(model)
         return engine(
             CBv2SteppableLanguageModelAdapter(adapter), kinds: adapter.cbv2LayerKinds,
             caches: adapter.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) },
-            kvDType: kvDType)
+            kvDType: kvDType, sampler: sampler)
     }
 
     static func speculativeEngine(

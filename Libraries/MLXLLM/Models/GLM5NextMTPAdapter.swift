@@ -147,7 +147,7 @@ public protocol GLM5NextMTPAdmittedExecutionFactory: GLM5NextMTPExecutionFactory
 }
 
 public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
-    CBv2MTPPrefixCheckpointCoding, CBv2MTPBoundedAllocationProviding,
+    CBv2MTPExactHistoryPrefixCheckpointCoding, CBv2MTPBoundedAllocationProviding,
     CBv2AdmittedMTPRequestStatefulDrafter, CBv2NativeMTPCompletionSplitting,
     GLM5NextNativeAssistantValidating
 {
@@ -280,8 +280,15 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         }
     }
 
+    /// Every draft step is submitted as soon as it is built (the engine's
+    /// `submitsEveryDraftStepEarly`), so continuations draft on the GPU while
+    /// the verification forward is still being built. `false` submits only
+    /// step 0 early, as before; both evaluate the same graphs.
+    public let submitsEveryDraftStepEarly: Bool
+
     public init(
-        target: GLM5NextTextModel, predictor: GLM5NextMTP, factory: any GLM5NextMTPExecutionFactory
+        target: GLM5NextTextModel, predictor: GLM5NextMTP, factory: any GLM5NextMTPExecutionFactory,
+        submitsEveryDraftStepEarly: Bool = true
     ) throws {
         guard predictor.targetIdentity == ObjectIdentifier(target),
             factory.targetIdentity == predictor.targetIdentity,
@@ -292,6 +299,7 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         self.predictor = predictor
         self.factory = factory
         verification = factory.verification
+        self.submitsEveryDraftStepEarly = submitsEveryDraftStepEarly
         try (factory as? any GLM5NextMTPAdmittedExecutionFactory)?.bind(drafter: self)
     }
 
@@ -786,6 +794,9 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         }
     }
 
+    /// The prefix checkpoint is the predictor's own cache, frontier hidden and
+    /// frontiers, so it stays exact beside lossy latent rows
+    /// (`CBv2MTPExactHistoryPrefixCheckpointCoding`).
     public var prefixCheckpointCodecID: String { GLM5NextMTPExecution.prefixCodecID }
 
     public func prefixCheckpointTensorDescriptors(targetInputCount: Int)

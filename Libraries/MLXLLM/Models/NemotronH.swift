@@ -434,12 +434,15 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (output, nextConvState, nextSSMState) = recurrentMix(
             hiddenStates, convState: convState, ssmState: ssmState)
 
+        var retained: [MLXArray] = []
         for (row, evaluation) in recurrentState.enumerated() {
+            let conv = Nemotron35BatchDecode.ownedRow(nextConvState, row: row)
+            let ssm = Nemotron35BatchDecode.ownedRow(nextSSMState, row: row)
+            retained += [conv, ssm]
             do {
                 try evaluation.stage(
                     modelLayerIndex: modelLayerIndex,
-                    conv: nextConvState[row ..< row + 1],
-                    ssm: nextSSMState[row ..< row + 1])
+                    conv: conv, ssm: ssm)
             } catch {
                 preconditionFailure(
                     "NemotronH CBv2 recurrent stage failed at layer "
@@ -453,7 +456,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
         // they are computed, and their inputs released, within the layer.
         // Values are unchanged.
-        return depends(input: output, dependencies: [nextConvState, nextSSMState])
+        return depends(
+            input: output,
+            dependencies: Nemotron35BatchDecode.active
+                ? retained : [nextConvState, nextSSMState])
     }
 
     /// The CBv2 mixer from gathered states: `(output, next conv state, next
@@ -470,7 +476,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let projected = NemotronSuperPrefillProfile.stage(
             "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
         ) {
-            inProj(hiddenStates)
+            Nemotron35BatchDecode.linear(inProj, hiddenStates)
         }
         let splits = split(
             projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
@@ -492,7 +498,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             let output = NemotronSuperPrefillProfile.stage(
                 "Mamba out_proj", layer: self, active: profile, inputs: [normed]
             ) {
-                outProj(normed)
+                Nemotron35BatchDecode.linear(outProj, normed)
             }
             return (output, prefill.conv, prefill.ssm)
         }
@@ -558,7 +564,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let output = NemotronSuperPrefillProfile.stage(
             "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
-            outProj(normed)
+            Nemotron35BatchDecode.linear(outProj, normed)
         }
         return (output, nextConvState, nextSSMState)
     }
@@ -721,9 +727,9 @@ class NemotronHAttention: Module, NemotronHMixer {
             "attention q/k/v", layer: self, active: profile, inputs: [x]
         ) {
             [
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x),
+                captureMTP ? nemotronMTPLinearRows(x, wq) : Nemotron35BatchDecode.linear(wq, x),
+                captureMTP ? nemotronMTPLinearRows(x, wk) : Nemotron35BatchDecode.linear(wk, x),
+                captureMTP ? nemotronMTPLinearRows(x, wv) : Nemotron35BatchDecode.linear(wv, x),
             ]
         }
         let (q, k, v) = (qkv[0], qkv[1], qkv[2])
@@ -754,7 +760,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         return NemotronSuperPrefillProfile.stage(
             "attention o_proj", layer: self, active: profile, inputs: [merged]
         ) {
-            captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
+            captureMTP
+                ? nemotronMTPLinearRows(merged, wo) : Nemotron35BatchDecode.linear(wo, merged)
         }
     }
 
@@ -1351,13 +1358,19 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MLP layer received attention KV")
             let mlp = mixer as! NemotronHMLP
-            output = captureMTP ? mlp.mtpForwardRows(hidden) : mlp(hidden)
+            output =
+                captureMTP
+                ? mlp.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, mlp.callAsFunction)
         case .moe:
             precondition(
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
+            output =
+                captureMTP
+                ? moe.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, moe.callAsFunction)
         }
         return output
     }
@@ -1468,12 +1481,16 @@ private class NemotronHBackbone: Module {
         return normF(hidden)
     }
 
+    /// `inputEmbedding` replaces the token lookup with a residual another
+    /// stage produced, and `appliesFinalNorm: false` returns the residual
+    /// before `norm_f`. Both defaults are the complete model's forward.
     func cbv2Forward(
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         inputEmbedding: MLXArray? = nil,
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        appliesFinalNorm: Bool = true
     ) -> MLXArray {
         let observation =
             CBv2ForwardShapeObservation.isActive
@@ -1519,6 +1536,7 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
+        guard appliesFinalNorm else { return hidden }
         if let normed { return normed }
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
     }
@@ -1693,7 +1711,7 @@ public class NemotronHModel:
     /// caches. This performs no eval and never installs probe state in a
     /// serving request. Packed integer embedding weights are not activation
     /// dtypes, and Mamba's fp32 path can promote later attention layers.
-    func observedAttentionKVDTypes() -> [DType]? {
+    public func observedAttentionKVDTypes() -> [DType]? {
         // Default caches (no parameters) cannot fail validation.
         guard let caches = try? newCache(parameters: nil) else { return nil }
         _ = backbone(MLXArray([0]).reshaped(1, 1), cache: caches)
@@ -1727,7 +1745,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         inputEmbedding: MLXArray? = nil,
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        appliesFinalNorm: Bool = true
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -1737,14 +1756,15 @@ public class NemotronHModel:
         }
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState,
-            inputEmbedding: inputEmbedding, captureMTP: captureMTP)
+            inputEmbedding: inputEmbedding, captureMTP: captureMTP,
+            appliesFinalNorm: appliesFinalNorm)
     }
 
     func logits(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
-            return lmHead(hidden)
+            return Nemotron35BatchDecode.linear(lmHead, hidden)
         }
-        return backbone.embeddings.asLinear(hidden)
+        return Nemotron35BatchDecode.embedding(backbone.embeddings, hidden)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
@@ -1917,6 +1937,63 @@ extension NemotronHModel: CBv2RecurrentLanguageModelPrefillForwardable {
         case .lastPositionLogits:
             return logits(hidden[0..., -1, 0...])
         }
+    }
+}
+
+// MARK: - Layer-stage seam
+
+/// A model constructed over a contiguous range of the block pattern is one
+/// stage of a layer pipeline: every block is `x + mixer(norm(x))`, so the only
+/// value that crosses a cut is the residual before the next block. These two
+/// entry points start and stop inside the trunk. The serving entry points
+/// above are unchanged: they keep the token lookup, `norm_f` and the head.
+extension NemotronHModel {
+    /// This model's blocks without `norm_f`: the residual `[B, L, hidden]` the
+    /// next stage's first block consumes. With `inputEmbedding == nil` the
+    /// tokens enter through the embedding; otherwise `inputEmbedding` is an
+    /// earlier stage's residual and the embedding is not consulted.
+    public func cbv2StageResidual(
+        _ tokens: MLXArray,
+        inputEmbedding: MLXArray?,
+        caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        if let inputEmbedding { requireStageResidual(inputEmbedding, tokens: tokens) }
+        return cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding, appliesFinalNorm: false)
+    }
+
+    /// The last stage: an earlier stage's residual through this model's
+    /// blocks, `norm_f` and the head. `requirement == nil` returns the logits
+    /// of every position `[B, L, vocabulary]`, as `cbv2Forward` does; a
+    /// requirement narrows the output exactly as `cbv2RecurrentPrefill` does.
+    public func cbv2StageLogits(
+        _ tokens: MLXArray,
+        inputEmbedding: MLXArray,
+        caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        requirement: CBv2PrefillRequirement?
+    ) -> MLXArray {
+        requireStageResidual(inputEmbedding, tokens: tokens)
+        let hidden = cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding)
+        switch requirement {
+        case nil:
+            return logits(hidden)
+        case .evaluationOnly:
+            return hidden[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            return logits(hidden[0..., -1, 0...])
+        }
+    }
+
+    private func requireStageResidual(_ residual: MLXArray, tokens: MLXArray) {
+        precondition(
+            tokens.ndim == 2 && residual.ndim == 3 && residual.dim(0) == tokens.dim(0)
+                && residual.dim(1) == tokens.dim(1) && residual.dim(2) == configuration.hiddenSize,
+            "NemotronH stage residual must be [batch, tokens, hidden] for its token rows")
     }
 }
 

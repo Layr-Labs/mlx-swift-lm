@@ -8,17 +8,23 @@ public struct OpenAIChatCompletionResponse: Codable, Sendable, Equatable {
         public var index: Int
         public var message: OpenAIChatMessage
         public var finishReason: String?
+        public var logprobs: OpenAIChatLogprobs?
 
         private enum CodingKeys: String, CodingKey {
             case index
             case message
             case finishReason = "finish_reason"
+            case logprobs
         }
 
-        public init(index: Int, message: OpenAIChatMessage, finishReason: String?) {
+        public init(
+            index: Int, message: OpenAIChatMessage, finishReason: String?,
+            logprobs: OpenAIChatLogprobs? = nil
+        ) {
             self.index = index
             self.message = message
             self.finishReason = finishReason
+            self.logprobs = logprobs
         }
     }
 
@@ -65,7 +71,9 @@ public struct OpenAIErrorResponse: Codable, Sendable, Equatable {
 
     public var error: Payload
 
-    public init(message: String, type: String = "server_error", param: String? = nil, code: String? = nil) {
+    public init(
+        message: String, type: String = "server_error", param: String? = nil, code: String? = nil
+    ) {
         self.error = .init(message: message, type: type, param: param, code: code)
     }
 }

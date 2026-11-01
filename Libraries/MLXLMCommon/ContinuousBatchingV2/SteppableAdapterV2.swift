@@ -31,6 +31,10 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
         (model as? CBv2DecodeCommandBufferLimitsProviding)?.decodeCommandBufferLimits
     }
 
+    public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+        (model as? CBv2DecodeCommandBufferLimitsProviding)?.speculativeCommandBufferLimits
+    }
+
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         precondition(
             !(model is any CBv2RecurrentLanguageModelForwardable),

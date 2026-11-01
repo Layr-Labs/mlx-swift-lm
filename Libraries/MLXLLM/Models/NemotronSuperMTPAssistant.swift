@@ -145,6 +145,11 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     /// row's arithmetic never depends on its neighbors or on the next step's
     /// batch shape. Serial verification serves one request.
     public var commitsAcceptedPrefixPerRow: Bool { settings.verification == .rectangularExact }
+    /// Drafts are deterministic greedy proposals. Accepting one iff it equals
+    /// the token pre-sampled from the target's own distribution, and otherwise
+    /// emitting that sample, is exact speculative sampling, so sampled rows
+    /// speculate too.
+    public var supportsTargetPrefixAcceptance: Bool { true }
     public var requiresCommittedObservationFence: Bool { true }
     // History, the partial-block backlog and round workspace are the bounded
     // fixed charge plus its sequence-scaled per-token declaration; no legacy

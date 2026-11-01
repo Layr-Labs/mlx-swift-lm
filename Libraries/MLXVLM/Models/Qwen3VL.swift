@@ -53,100 +53,18 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         self.checkpointImageBounds = checkpointImageBounds
     }
 
-    private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
-        image
-            .toSRGB()
-            .resampled(to: resizedSize, method: .bicubic)
-            .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+    private var mediaProcessor: Qwen3VLMediaProcessor {
+        Qwen3VLMediaProcessor(config, checkpointImageBounds: checkpointImageBounds)
     }
 
-    /// Pixels for the default 1,280 vision-token budget (`1280 * factor²`),
-    /// clamped to `ceiling`. Overflow-safe: a pathological config (an absurd
-    /// `patch_size`/`merge_size`) yields `ceiling` instead of trapping on the
-    /// unchecked multiply, so bad model metadata degrades to the config ceiling
-    /// rather than crashing preprocess.
     static func defaultVisionTokenBudgetPixels(factor: Int, ceiling: Int) -> Int {
-        let (squared, squaredOverflow) = factor.multipliedReportingOverflow(by: factor)
-        guard !squaredOverflow else { return ceiling }
-        let (budget, budgetOverflow) = squared.multipliedReportingOverflow(by: 1280)
-        guard !budgetOverflow else { return ceiling }
-        return min(ceiling, budget)
+        Qwen3VLMediaProcessor.defaultVisionTokenBudgetPixels(factor: factor, ceiling: ceiling)
     }
 
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         MLXArray, THW
     ) {
-        let processed = images.map { MediaProcessing.apply($0, processing: processing) }
-
-        guard let first = processed.first else {
-            throw VLMError.imageProcessingFailure("No image provided")
-        }
-
-        let extent = first.extent.size
-        // The qwen3_5 ViT runs *global* O(patches²) attention with no windowing,
-        // so an uncapped full-resolution image can allocate a tens-of-GB score
-        // matrix, and published configs ship a ~12.8 MP max_pixels that never
-        // clamps. Default each image to a 1,280 vision-token budget
-        // (1280 * factor² pixels ⇒ 1,280 tokens after the spatial merge, since
-        // tokens = pixels / factor²), matching the video path's philosophy and
-        // the sibling Qwen2.5-VL. An explicit `processing.maxPixels` overrides it.
-        let factor = config.patchSize * config.mergeSize
-        let maxPixels =
-            processing?.maxPixels
-            ?? checkpointImageBounds?.max
-            ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.size.maxPixels)
-        let resizedHeight: Int
-        let resizedWidth: Int
-        if let bounds = checkpointImageBounds {
-            guard extent.height.isFinite, extent.width.isFinite,
-                extent.height > 0, extent.width > 0,
-                extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max)
-            else {
-                throw VLMError.imageProcessingFailure(
-                    "Qwen checkpoint image has invalid dimensions")
-            }
-            let size = try Qwen4ExpMediaGeometry.image(
-                height: Int(extent.height), width: Int(extent.width),
-                factor: factor, minPixels: processing?.minPixels ?? bounds.min, maxPixels: maxPixels
-            )
-            (resizedHeight, resizedWidth) = (size.height, size.width)
-        } else {
-            (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-                height: Int(extent.height), width: Int(extent.width), factor: factor,
-                minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels),
-                maxPixels: maxPixels)
-        }
-
-        let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
-
-        // The sRGB tone-curve step must precede resample/normalize: CoreImage
-        // filters run in a *linear-light* working space and `asMLXArray`
-        // renders with a nil colorSpace (raw working-space values), so without
-        // it the model receives linearized values instead of the gamma-encoded
-        // bytes the HF reference preprocesses — crushing dark-region contrast
-        // ~12× (near-black text becomes invisible to the model). The sibling
-        // Qwen25VL/Qwen2VL image paths and this file's own video path apply
-        // the same step.
-        let resampled = processed.map {
-            MediaProcessing.resampleBicubic(
-                MediaProcessing.inSRGBToneCurveSpace($0), to: targetSize)
-        }
-
-        let normalized =
-            resampled
-            .map {
-                MediaProcessing.normalize(
-                    $0,
-                    mean: config.imageMeanTuple,
-                    std: config.imageStdTuple)
-            }
-            .map { MediaProcessing.asMLXArray($0) }
-
-        return try QwenVL.patchify(
-            images: normalized,
-            mergeSize: config.mergeSize,
-            patchSize: config.patchSize,
-            temporalPatchSize: config.temporalPatchSize)
+        try mediaProcessor.preprocess(images: images, processing: processing)
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
@@ -186,36 +104,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             var accumulatedFrames: [[MLXArray]] = []
 
             for video in input.videos {
-                var resizedSize: CGSize = .zero
-                let sequence = try await MediaProcessing.asProcessedSequence(
-                    video,
-                    processing: input.processing.video,
-                    targetFPS: { _ in Double(2) },
-                    maxFrames: Qwen3VLProcessor.maxVideoFrames
-                ) { frame in
-                    let processed = MediaProcessing.apply(
-                        try frame.image.asCIImage(), processing: input.processing)
-                    if resizedSize == .zero {
-                        let size = processed.extent.size
-                        // An explicit `processing.maxPixels` narrows the frame
-                        // budget but never exceeds the video-tower bound above.
-                        let factor = config.patchSize * config.mergeSize
-                        let maxPixels = min(
-                            input.processing.maxPixels ?? config.maxPixels,
-                            Self.maxVideoFramePixels)
-                        let (height, width) = try QwenVL.targetSize(
-                            height: Int(size.height),
-                            width: Int(size.width),
-                            factor: factor,
-                            minPixels: min(
-                                input.processing.minPixels ?? config.minPixels, maxPixels),
-                            maxPixels: maxPixels)
-                        resizedSize = CGSize(width: width, height: height)
-                    }
-                    let finalImage = preprocess(image: processed, resizedSize: resizedSize)
-                    return VideoFrame(image: .ciImage(finalImage), timeStamp: frame.timeStamp)
-                }
-                accumulatedFrames.append(sequence.frames)
+                accumulatedFrames.append(
+                    try await mediaProcessor.videoFrames(video, processing: input.processing))
             }
 
             let videoFrames = try accumulatedFrames.map {

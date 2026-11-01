@@ -46,8 +46,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// Ring capacity in pages for windowed layers (nil for full).
     let ringPages: Int?
     /// Worst-case pages this sequence may allocate (reserved at admission;
-    /// the pool guarantees allocations up to this count cannot fail).
-    let reservedPages: Int
+    /// the pool guarantees allocations up to this count cannot fail). A row
+    /// created for its first tokens only grows it between steps
+    /// (`PagedKVBackend.extendReservation`), never past `maxLength`'s pages.
+    private(set) var reservedPages: Int
     /// Hard bound on `absoluteOffset` (from the request's maxLength).
     public let maxLength: Int
 
@@ -120,6 +122,24 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     deinit {
         assert(released, "[PagedSequenceKV] leaked without release — pages still allocated")
+    }
+
+    /// Pages this row holds at most at its bound, `maxLength` (a windowed
+    /// row's ring at most): what `PagedKVPool.pageDemand` charges for it.
+    var pagesAtMaximumLength: Int {
+        let pages = (maxLength + pool.config.pageSize - 1) / pool.config.pageSize
+        return ringPages.map { min(pages, $0) } ?? pages
+    }
+
+    /// Raises the reservation once the pool reserved and backed the added
+    /// pages (`PagedKVBackend.extendReservation`); never lowers it, never
+    /// past the row's bound. Pages already allocated keep their places.
+    func raiseReservedPages(to pages: Int) {
+        precondition(
+            !released && pages >= reservedPages && pages <= pagesAtMaximumLength,
+            "[PagedSequenceKV] reservation of \(pages) pages outside \(reservedPages)...\(pagesAtMaximumLength)"
+        )
+        reservedPages = pages
     }
 
     // MARK: - CBv2SequenceKV

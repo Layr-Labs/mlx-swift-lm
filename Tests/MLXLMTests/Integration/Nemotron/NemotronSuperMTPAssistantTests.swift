@@ -66,7 +66,7 @@ struct NemotronSuperMTPAssistantTests {
         let assistant = stack.assistant
         #expect(assistant.requiredVerificationMode == .serialTarget)
         #expect(assistant.maximumDraftTokens == 1 && assistant.maximumSpeculativeBatch == 1)
-        #expect(!assistant.supportsTargetPrefixAcceptance)
+        #expect(assistant.supportsTargetPrefixAcceptance)
         #expect(assistant.requiresCommittedObservationFence)
         #expect(assistant.requestStateBytesPerToken == 0)
         #expect(assistant.mtpTargetIdentity == stack.target.cbv2MTPTargetIdentity)
