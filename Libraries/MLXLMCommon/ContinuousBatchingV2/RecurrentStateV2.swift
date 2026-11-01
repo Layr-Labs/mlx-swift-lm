@@ -25,6 +25,16 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     /// and can reconstruct a strict accepted prefix without retaining one
     /// full recurrent state per verify position.
     public var supportsCompactRecurrentMTPReplay: Bool
+    /// Prefill output depends on the chunk partition, so a recurrent
+    /// checkpoint reproduces a cold prefill only where the cold run also has
+    /// a boundary: the engine captures only at multiples of its fixed
+    /// prefill chunk reached by whole chunks (`CBv2RecurrentCheckpointGeometry`).
+    public var alignsRecurrentCheckpointsToPrefillChunks: Bool
+    /// Causal media embeddings substituted at scalar positions are the only
+    /// out-of-band input, so a media request bound to an identity of its
+    /// evaluated embeddings and spans may capture and restore recurrent
+    /// checkpoints in that identity's scope (`permitsHybridCheckpoint`).
+    public var supportsCausalMediaCheckpointReuse: Bool
 
     public init(
         supportsPrefixReuse: Bool = true,
@@ -34,7 +44,9 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsCompiledDecode: Bool = true,
         supportsPackedPrefill: Bool = true,
         supportsMTP: Bool = true,
-        supportsCompactRecurrentMTPReplay: Bool = false
+        supportsCompactRecurrentMTPReplay: Bool = false,
+        alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
+        supportsCausalMediaCheckpointReuse: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -44,6 +56,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.supportsPackedPrefill = supportsPackedPrefill
         self.supportsMTP = supportsMTP
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
+        self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
+        self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()
@@ -318,6 +332,11 @@ public final class CBv2RecurrentRequestState {
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
+
+    /// What a settled verify window still holds beside the committed state
+    /// (its replay inputs, or the kept window's backing) until the next
+    /// committed generation or release. Inspection only (allocation checks).
+    public var retainedTransitionArrays: [MLXArray] { committedTransitionRetainedRoots }
     private var pending: [Generation] = []
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false

@@ -4,6 +4,8 @@ import MLX
 extension EngineLoopV2 {
     func captureRecurrentCheckpoints(_ step: CBv2InFlightStep) {
         guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
+        var nativeCaptureWork: CBv2NativeCompletePrefixWork?
+        defer { nativeCaptureWork?.finishAfterDroppingConsumers() }
         var roots: [MLXArray] = []
         for (id, range) in step.computedRanges {
             recurrentGeometryObserverForTesting?(
@@ -11,17 +13,20 @@ extension EngineLoopV2 {
                 step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
-                rec.request.permitsHybridCheckpoint(layerKinds: layerKinds),
+                rec.request.permitsHybridCheckpoint(
+                    layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
                 rec.preemptionCount == 0,
                 let cap = step.recurrentCheckpointChunkSizes[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             let wasArmed = geometry.isArmed
             // The cap is provenance for the manifest; the boundary rule is
-            // position alignment alone, whatever chunk produced the range.
+            // position alignment alone, whatever chunk produced the range,
+            // unless the model's prefill output depends on the partition.
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
-                packed: step.packedPrefixRows.contains(id))
+                packed: step.packedPrefixRows.contains(id),
+                chunkGrid: recurrentCheckpointChunkGrid)
             recurrentCheckpointGeometry[id] = geometry
             if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             recurrentGeometryObserverForTesting?(
@@ -43,8 +48,23 @@ extension EngineLoopV2 {
                 // token after it), so a terminal capture could only be
                 // staged but never written. The
                 // historical path filters `< promptTokens.count` the same
-                // way; the resident bank below keeps the endpoint.
-                guard range.upperBound < rec.request.promptTokens.count else { continue }
+                // way; the resident bank below keeps the endpoint. Only what
+                // the durable load accepts is captured.
+                guard range.upperBound < rec.request.promptTokens.count,
+                    rec.request.permitsDurableHybridCheckpoint(layerKinds: layerKinds)
+                else { continue }
+                if completeCheckpointCapture.codec.isNativePagedGLM5Next, nativeCaptureWork == nil {
+                    do {
+                        nativeCaptureWork = try completeCheckpointCapture.nativeWorkFactory?(nil)
+                        guard nativeCaptureWork != nil else {
+                            throw CBv2NativeShutdownError.unsupportedConsumer
+                        }
+                        try nativeCaptureWork?.captureCurrentStreams()
+                    } catch {
+                        failNativeCompletion(.nativeWorkFailed)
+                        return
+                    }
+                }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: {
                     $0.id == id
                 })?.assistantState
@@ -56,7 +76,8 @@ extension EngineLoopV2 {
                         mediaIdentity: rec.request.hybridPrefixIdentity,
                         mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
                         hintTokens: rec.request.prefixCheckpointTargetTokens,
-                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
+                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0,
+                        nativeWork: nativeCaptureWork))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.
@@ -88,13 +109,18 @@ extension EngineLoopV2 {
                     requestID: id, position: range.upperBound, chunkSize: cap,
                     spec: spec, layers: layers, assistant: assistant, qwen4: qwen4,
                     mediaIdentity: rec.request.hybridPrefixIdentity,
-                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
+                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                    mediaSideStateRequired: !causalMediaCheckpoints))
         }
         // Detach on the sole evaluator of the live graph. Publication/drop
         // may then wait for these events on another queue without a graph race.
         if !roots.isEmpty {
             if completeCheckpointCapture != nil {
-                do { try withError { asyncEval(roots) } } catch {
+                do {
+                    try nativeCaptureWork?.retain(arrays: roots)
+                    try withError { asyncEval(roots) }
+                } catch {
+                    nativeCaptureWork?.requiredCompletionFailed()
                     for id in step.computedRanges.keys { discardHybridCheckpoints(id) }
                 }
             } else {
@@ -109,7 +135,8 @@ extension EngineLoopV2 {
         guard let request = scheduler.record(for: requestID)?.request,
             checkpoint.mediaIdentity == request.hybridPrefixIdentity,
             checkpoint.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
-            request.permitsHybridCheckpoint(layerKinds: layerKinds),
+            request.permitsHybridCheckpoint(
+                layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
             let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
             recurrentStates[requestID] == nil
         else { throw CBv2KVError.backendIneligible(reason: "invalid recurrent checkpoint target") }
@@ -159,7 +186,8 @@ extension EngineLoopV2 {
             return intent
         }
         guard hybridPrefixCache?.hasStagedCheckpoints(requestID: rec.id) == true,
-            rec.request.permitsHybridCheckpoint(layerKinds: layerKinds),
+            rec.request.permitsHybridCheckpoint(
+                layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
             rec.generatedTokenCount > 0
         else { return nil }
         switch reason {

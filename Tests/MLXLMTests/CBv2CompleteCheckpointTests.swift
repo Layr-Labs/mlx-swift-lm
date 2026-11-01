@@ -71,6 +71,7 @@ final class CBv2CompleteCheckpointTests: XCTestCase {
             let kvBound = try Memory.allocationFootprintUpperBound(byteCount: (chunk + 7) * 2 * 3 * 4)
             let recurrentBound = try Memory.allocationFootprintUpperBound(byteCount: 16)
             XCTAssertEqual(plan.nativeDestinationBytes, 2 * kvBound + 2 * recurrentBound)
+            XCTAssertGreaterThanOrEqual(plan.scratchBytes, kvBound, "largest host-zero source")
             let counter = CheckpointCounter()
             let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
             let sink = try plan.allocate { counter.increment() }

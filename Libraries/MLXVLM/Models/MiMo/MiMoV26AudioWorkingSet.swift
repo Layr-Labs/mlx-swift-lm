@@ -1,5 +1,6 @@
 import MLX
 import MLXLLM
+import MLXLMCommon
 
 /// Scratch for the owned PCM -> bounded encoder -> bounded RVQ path. Each
 /// encoder block and quantizer step completes before the next is constructed.
@@ -15,9 +16,9 @@ enum MiMoV26AudioWorkingSet {
         }
         let fused: Bool
         #if os(macOS)
-            fused = StreamOrDevice.default == .gpu && c.headDim == 64
+        fused = MLXProcessStreams.isDefaultGPU(.default) && c.headDim == 64
         #else
-            fused = false
+        fused = false
         #endif
         let melFrames = try plan.melFrameCounts.reduce(0, add)
         let codeFrames = plan.totalCodeFrames

@@ -673,4 +673,46 @@ extension PagedKVPool {
         writeValidation.refuse("step-owned paging does not permit " + operation, expected: dtype)
         return true
     }
+
+    /// The admission reservation of a step's transient scratch. Every caller
+    /// reaches it before any row cursor, page table or fence changes, so its
+    /// capacity refusal is a typed, deferrable `CBv2StepScratchRefusal`.
+    /// `requests` is built only for the test observer.
+    func reserveStepScratch(
+        bytes: Int, requests: @autoclosure () -> Set<CBv2RequestID>, admission: AdmissionV2,
+        site: CBv2StepScratchSite = .attention
+    ) throws -> CBv2CheckpointReservation {
+        if let observer = stepScratchReservationObserverForTesting {
+            observer(site, requests(), bytes)
+        }
+        return try CBv2StepScratchRefusal.typing { try admission.reserveTransient(bytes: bytes) }
+    }
+}
+
+/// The pre-mutation step scratch reservations, in the order a native MTP
+/// round makes them: its host tables, the ordinary attention work, then its
+/// rectangular verification window. Ordinary steps reserve `attention` only.
+enum CBv2StepScratchSite: Sendable {
+    case roundHost
+    case attention
+    case window
+}
+
+/// Admission bytes already held for one exact attention-work price. The
+/// `prepareAttentionWork` call that receives it spends it instead of
+/// reserving again; any mismatch releases it and reserves afresh.
+struct CBv2StepScratchPrepayment {
+    let bytes: Int
+    let reservation: CBv2CheckpointReservation
+}
+
+extension CBv2StepScratchRefusal {
+    /// Run one pre-mutation reservation, typing only its capacity refusal.
+    static func typing<Result>(_ body: () throws -> Result) throws -> Result {
+        do {
+            return try body()
+        } catch CBv2KVError.capacityExhausted(let needed, let available) {
+            throw CBv2StepScratchRefusal(needed: needed, available: available)
+        }
+    }
 }

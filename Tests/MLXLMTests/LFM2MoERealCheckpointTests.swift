@@ -109,7 +109,7 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
         let model = try await LLMTypeRegistry.shared.createModel(
             configuration: data, modelType: base.modelType)
-        try loadWeights(
+        try await loadWeights(
             modelDirectory: directory, model: model, perLayerQuantization: base.perLayerQuantization
         )
         return try XCTUnwrap(model as? LFM2MoEModel)
@@ -153,7 +153,7 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
 
             // 1. Native serial: prompt positions, final full vector, teacher-
             //    forced decode, free-running greedy.
-            let caches = model.newCache(parameters: nil)
+            let caches = try model.newCache(parameters: nil)
             let promptLogits = model(
                 MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count), cache: caches)[0]
             eval(promptLogits)
@@ -180,7 +180,7 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
                     row, ids: reference.greedy_step_topk[step].ids,
                     logits: reference.greedy_step_topk[step].logits, index: step)
             }
-            let greedyCaches = model.newCache(parameters: nil)
+            let greedyCaches = try model.newCache(parameters: nil)
             var logits = model(
                 MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count), cache: greedyCaches)
             var greedy: [Int] = []
@@ -330,7 +330,7 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
         // 4. Discriminating power on the real router weights: the legacy
         //    softmax + bias-in-weights router (mlx-lm <= 0.31.3) selects a
         //    different expert set for many token/layer pairs.
-        let study = routerStudy(model, prompt: references[2].prompt_tokens)
+        let study = try routerStudy(model, prompt: references[2].prompt_tokens)
         evidence["router_legacy_vs_reference"] = study
         XCTAssertGreaterThan(study["pairs_with_different_expert_set"] ?? 0, 0)
 
@@ -434,9 +434,9 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
 
     /// Runs the serial layers by hand to observe each MoE block's input, and
     /// compares the production route with the legacy router on it.
-    private func routerStudy(_ model: LFM2MoEModel, prompt: [Int]) -> [String: Double] {
+    private func routerStudy(_ model: LFM2MoEModel, prompt: [Int]) throws -> [String: Double] {
         let inner = model.model
-        let caches = model.newCache(parameters: nil)
+        let caches = try model.newCache(parameters: nil)
         var hidden = inner.embedTokens(MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count))
         let mask = createAttentionMask(h: hidden, cache: caches[inner.firstAttentionIndex!])
         var differing = 0

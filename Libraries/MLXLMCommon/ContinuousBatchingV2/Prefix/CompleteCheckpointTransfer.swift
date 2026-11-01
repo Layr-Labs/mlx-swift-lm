@@ -114,7 +114,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         let codec = try codecOwner.borrow()
         guard
             (codec.contiguousLayout != nil && plan.pagedStoragePlan == nil)
-                || (codec.isNativePagedHistorical && plan.pagedStoragePlan != nil)
+                || (codec.isNativePagedComplete && plan.pagedStoragePlan != nil)
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -133,7 +133,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         do {
             try withError { fault in
                 if let storagePlan = plan.pagedStoragePlan {
-                    guard stream.stream == MLX.Stream.gpu else {
+                    guard MLXProcessStreams.isDefaultGPU(stream) else {
                         throw CBv2NativeShutdownError.unsupportedConsumer
                     }
                     pagedStorage = try .init(
@@ -201,6 +201,8 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         guard data.count % size == 0, data.count <= descriptor.byteCount - byteOffset else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
+        try CBv2GLM5NextCheckpointPayload.validate(
+            manifest: plan.manifest, tensorIndex: tensorIndex, byteOffset: byteOffset, data: data)
         let codec = try codecOwner.borrow()
         if try plan.appendQuantizedTarget(
             codec: codec, decoder: quantizedDecoder, tensorIndex: tensorIndex,
@@ -218,7 +220,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         if let pagedStorage, isTarget {
             try pagedStorage.append(
                 layerIndex: tensorIndex / 2, values: descriptor.role == .values,
-                byteOffset: byteOffset, data: data)
+                byteOffset: byteOffset, data: data, wire: descriptor.dtype)
             self.byteOffset += data.count
             if self.byteOffset == descriptor.byteCount {
                 self.tensorIndex += 1
@@ -240,7 +242,11 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
             } : nil
         let destination = UnsafeMutableRawPointer(mutating: pointer)
         let strides = CBv2CheckpointByteLayout.contiguousStrides(plan.destinationShapes[arrayIndex])
-        data.withUnsafeBytes { source in
+        let destinationDType = arrays[arrayIndex].dtype
+        guard ring == nil || destinationDType == descriptor.dtype.mlxDType else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        try data.withUnsafeBytes { source in
             if let ring, let window = ring.window {
                 CBv2CheckpointByteLayout.copyRing(
                     shape: descriptor.shape, window: window,
@@ -251,13 +257,10 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
                         from: source.baseAddress!.advanced(by: packed), byteCount: length)
                 }
             } else {
-                CBv2CheckpointByteLayout.copy(
-                    shape: descriptor.shape, strides: strides, itemSize: size,
-                    byteOffset: byteOffset, count: data.count
-                ) { physical, packed, length in
-                    destination.advanced(by: physical).copyMemory(
-                        from: source.baseAddress!.advanced(by: packed), byteCount: length)
-                }
+                try CBv2CheckpointByteLayout.copy(
+                    shape: descriptor.shape, strides: strides, wire: descriptor.dtype,
+                    destinationDType: destinationDType, byteOffset: byteOffset, source: source,
+                    destination: destination)
             }
         }
         self.byteOffset += data.count
@@ -282,7 +285,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
                         storage: pagedStorage, auxiliary: arrays,
                         lease: stageLease, hostBytes: plan.checkpointHostBytes)
                     prepared = .init(pagedFrame: frame)
-                    if codec.assistant == nil {
+                    if codec.assistant == nil && codec.recurrentSpec == nil {
                         prepared?.checkpoint = .init(
                             position: plan.manifest.position,
                             chunkSize: plan.manifest.chunkSize, layers: [:], byteCount: 0)
@@ -313,6 +316,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         // The paged suffix operation has its own actual loan/coverage roots.
         // Failure here keeps this whole callback/owner retained by prefix work.
         try prepared?.nativePagedPreparation?.retireAfterCompletion()
+        try prepared?.glm5NextAssistantPreparation?.closeAfterNativeCompletion()
         arrays.removeAll(keepingCapacity: false)
         quantizedDecoder?.close()
         pagedStorage?.close()
@@ -383,30 +387,31 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         if let storagePlan = plan.pagedStoragePlan {
             pagedStorage = try CBv2PagedCheckpointStorage(
                 plan: storagePlan, evaluate: { try plan.evaluateDestinations([$0]) },
-                admission: plan.codec.admission)
+                admission: plan.codec.admission, hostMaterialized: true)
         }
         let destinationDescriptors =
             plan.pagedStoragePlan == nil
             ? plan.destinationDescriptors
             : Array(plan.destinationDescriptors.dropFirst(plan.codec.targetTensorCount))
-        let allocationStream = StreamOrDevice.default
+        // The provider stages this import off the engine queue. Destinations are
+        // host-materialized: they are available on creation and schedule no
+        // device work, so staging needs neither an eval nor a stream fence and
+        // never waits for the process-wide MLX eval lock held by an unrelated
+        // prefill chunk.
         let destinations = try withError { fault in
-            let values = zip(plan.destinationShapes, destinationDescriptors).map { shape, tensor in
-                MLXArray.zeros(shape, dtype: tensor.dtype.mlxDType, stream: allocationStream)
+            let values = try zip(plan.destinationShapes, destinationDescriptors).map {
+                shape, tensor in
+                try MLXArray.cbv2HostZeros(shape, dtype: tensor.dtype.mlxDType)
             }
             do {
                 try fault.check()
                 try plan.evaluateDestinations(values)
             } catch {
-                // Drain partial work before its stage charge can be returned.
-                allocationStream.stream.synchronize()
+                // A recorded MLX fault keeps priority over a later thrown error.
                 if error is MLXError { throw error }
                 try fault.check()
                 throw error
             }
-            // Evaluation can signal before Metal completion drops temporary
-            // Data references. Fence once before checking exclusive ownership.
-            allocationStream.stream.synchronize()
             try fault.check()
             return values
         }
@@ -446,6 +451,8 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         guard data.count % itemSize == 0, data.count <= descriptor.byteCount - byteOffset else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
+        try CBv2GLM5NextCheckpointPayload.validate(
+            manifest: plan.manifest, tensorIndex: tensorIndex, byteOffset: byteOffset, data: data)
         let kvTensorCount = plan.codec.targetTensorCount
         if try plan.appendQuantizedTarget(
             codec: plan.codec, decoder: quantizedDecoder, tensorIndex: tensorIndex,
@@ -461,7 +468,7 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         if let pagedStorage, tensorIndex < kvTensorCount {
             try pagedStorage.append(
                 layerIndex: tensorIndex / 2, values: tensorIndex % 2 == 1,
-                byteOffset: byteOffset, data: data)
+                byteOffset: byteOffset, data: data, wire: descriptor.dtype)
         } else {
             let index = pagedStorage == nil ? tensorIndex : tensorIndex - kvTensorCount
             guard let pointer = mlx_array_data_uint8(arrays[index].ctx) else {
@@ -477,7 +484,11 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
                 ? plan.codec.contiguousLayout?.layers.first {
                     $0.modelLayer == descriptor.layer && $0.window != nil
                 } : nil
-            data.withUnsafeBytes { source in
+            let destinationDType = arrays[index].dtype
+            guard ring == nil || destinationDType == descriptor.dtype.mlxDType else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            try data.withUnsafeBytes { source in
                 if let ring, let window = ring.window {
                     CBv2CheckpointByteLayout.copyRing(
                         shape: descriptor.shape, window: window,
@@ -490,13 +501,10 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
                     }
                     return
                 }
-                CBv2CheckpointByteLayout.copy(
-                    shape: descriptor.shape, strides: strides, itemSize: itemSize,
-                    byteOffset: byteOffset, count: data.count
-                ) { physicalOffset, packedOffset, length in
-                    destination.advanced(by: physicalOffset).copyMemory(
-                        from: source.baseAddress!.advanced(by: packedOffset), byteCount: length)
-                }
+                try CBv2CheckpointByteLayout.copy(
+                    shape: descriptor.shape, strides: strides, wire: descriptor.dtype,
+                    destinationDType: destinationDType, byteOffset: byteOffset, source: source,
+                    destination: destination)
             }
         }
         self.byteOffset += data.count
@@ -526,7 +534,9 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         let prepared: CBv2PreparedCompleteCheckpoint
         if let pagedStorage, let stageLease {
             prepared = .init(
-                pagedFrame: try .init(storage: pagedStorage, auxiliary: arrays, lease: stageLease))
+                pagedFrame: try .init(
+                    storage: pagedStorage, auxiliary: arrays, lease: stageLease,
+                    hostBytes: plan.checkpointHostBytes))
         } else {
             prepared = try plan.codec.preparedState(
                 manifest: plan.manifest, arrays: arrays,
@@ -644,6 +654,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             }
             try nativeWork.validate(
                 store: store, codec: codec, request: request, engineID: engineID)
+            if codec.isNativePagedGLM5Next { return }  // its admitted copies require the final request generation
             // No restoration or extra fence for target-only imports.
             guard codec.assistant != nil else { return }
             if prepared.historicalAssistantRestoration?.settled == true { return }
@@ -686,7 +697,8 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
     func prepareNativePagedTargets(
         store: any CBv2CompletePrefixCache,
         request: CBv2Request, engineID: UUID, expectedCodec: CBv2CompleteCheckpointCodec,
-        backend: PagedKVBackend, streamGeneration: UInt64
+        backend: PagedKVBackend, streamGeneration: UInt64,
+        mtpIssuer: CBv2MTPAdmissionIssuer? = nil
     ) throws -> CBv2PreparedNativePagedCheckpoint {
         try lock.withLock {
             guard hasNativeTracking, usesPagedBacking, let nativeOwner, let nativeWork,
@@ -696,7 +708,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
                 throw CBv2CompleteCheckpointError.closed
             }
             let codec = try nativeOwner.codecOwner.borrow()
-            guard codec === expectedCodec, codec.isNativePagedHistorical else {
+            guard codec === expectedCodec, codec.isNativePagedComplete else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             try nativeWork.validate(
@@ -704,10 +716,29 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             let candidate = try CBv2PreparedNativePagedCheckpoint(
                 backend: backend, codec: codec,
                 work: nativeWork, request: request, streamGeneration: streamGeneration,
-                maximumTokens: maximumSequenceLength)
+                maximumTokens: maximumSequenceLength, manifest: manifest)
             prepared.nativePagedPreparation = candidate  // owns failed/late partial preparation
             try nativeWork.retain(owners: [candidate])
-            try candidate.prepare(frame: frame, admission: codec.admission)
+            if codec.isNativePagedGLM5Next {
+                guard let mtpIssuer, let assistant = codec.assistant,
+                    let checkpoint = prepared.checkpoint, let spec = codec.recurrentSpec,
+                    mtpIssuer.admission === codec.admission
+                else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                try candidate.prepare(
+                    frame: frame, admission: codec.admission,
+                    mtpPrepaidBytes: mtpIssuer.resolved.bytes(forTokens: maximumSequenceLength)
+                        ?? Int.max)
+                let proof = try candidate.makeMTPImportProof(issuer: mtpIssuer)
+                let restoration = CBv2GLM5NextPreparedAssistant(assistant: assistant, proof: proof)
+                prepared.glm5NextAssistantPreparation = restoration
+                try nativeWork.retain(owners: [restoration])
+                try restoration.prepare(
+                    checkpoint: checkpoint, spec: spec, issuer: mtpIssuer, work: nativeWork)
+            } else {
+                try candidate.prepare(frame: frame, admission: codec.admission)
+            }
             prepared.pagedFrame = nil  // consumed frame has no arrays/lease to refund
             return candidate
         }
@@ -861,6 +892,37 @@ enum CBv2CheckpointByteLayout {
             result[index] = result[index + 1] * shape[index + 1]
         }
         return result
+    }
+
+    /// Copies one wire segment into strided native storage, widening a
+    /// half-precision wire dtype into an FP32 destination exactly.
+    static func copy(
+        shape: [Int], strides: [Int], wire: CBv2CheckpointDType, destinationDType: DType,
+        byteOffset: Int, source: UnsafeRawBufferPointer, destination: UnsafeMutableRawPointer
+    ) throws {
+        let size = wire.mlxDType.size
+        guard wire.mlxDType != destinationDType else {
+            copy(
+                shape: shape, strides: strides, itemSize: size, byteOffset: byteOffset,
+                count: source.count
+            ) { physical, packed, length in
+                destination.advanced(by: physical).copyMemory(
+                    from: source.baseAddress!.advanced(by: packed), byteCount: length)
+            }
+            return
+        }
+        guard CBv2CheckpointHalfPrecision.isHalf(wire), destinationDType == .float32 else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        let native = destinationDType.size
+        copy(
+            shape: shape, strides: strides, itemSize: native,
+            byteOffset: byteOffset / size * native, count: source.count / size * native
+        ) { physical, packed, length in
+            CBv2CheckpointHalfPrecision.widen(
+                wire, source: source.baseAddress!.advanced(by: packed / native * size),
+                count: length / native, float32: destination.advanced(by: physical))
+        }
     }
 
     static func copy(

@@ -224,7 +224,7 @@ extension LFM2MoEModel {
     /// over private caches. Nothing is evaluated and no serving state is
     /// touched; quantized storage types are never mistaken for activations.
     func nativeStateProbe() -> (convolution: [Int: DType], attentionKV: [DType]?) {
-        let caches = newCache(parameters: nil)
+        guard let caches = try? newCache(parameters: nil) else { return ([:], nil) }
         _ = model(MLXArray([0]).reshaped(1, 1), cache: caches)
         var convolution: [Int: DType] = [:]
         var kv: [DType] = []

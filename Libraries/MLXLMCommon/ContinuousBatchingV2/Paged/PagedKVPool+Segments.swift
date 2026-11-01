@@ -181,10 +181,14 @@ extension PagedKVPool {
             throw CBv2KVError.capacityExhausted(needed: physical, available: grant.bytes)
         }
         let previousPhysicalBytes = bytesMaterialized
+        let retainedBefore = retainedSegmentBytes
         // The plan contains all old backing plus every private new segment.
         // Admission charges the peak before the first native allocation.
         do { try physicalLease?.resize(to: physical) } catch {
             PagedKVStorageTelemetry.increment(&storageTelemetry.admissionRefusals)
+            // Retained backing is allocator memory in process headroom: free it
+            // before the refused admission retries.
+            releaseRetainedSegments()
             throw error
         }
         var prepared: [(PagedKVGroup, PagedKVGroup.PreparedGrowth)] = []
@@ -195,7 +199,8 @@ extension PagedKVPool {
                     (
                         item.group,
                         try item.group.prepareGrowth(
-                            item.plan, evaluate: slabEval, admission: memoryAdmission)
+                            item.plan, evaluate: slabEval, admission: memoryAdmission,
+                            hostZeroed: config.hostZeroedSegments)
                     ))
             }
             preparing = false
@@ -213,12 +218,16 @@ extension PagedKVPool {
             }
             physicalLease?.release(to: actual)
             storageTelemetry.recordSettlement(bound: physical, actual: actual)
+            if retainedSegmentBytes != retainedBefore {
+                retainedSegmentsTouchedNanos = Self.uptimeNanos()
+            }
         } catch {
             if preparing { PagedKVStorageTelemetry.increment(&storageTelemetry.allocationFailures) }
             // Failed preparation has already destroyed its local arrays. Drop
             // all earlier groups before refunding the private-allocation peak.
             prepared.removeAll()
             physicalLease?.release(to: previousPhysicalBytes)
+            if preparing { releaseRetainedSegments() }
             throw error
         }
     }

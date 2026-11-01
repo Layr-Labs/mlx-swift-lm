@@ -27,6 +27,7 @@ public struct Parameters: Sendable {
     public var validationBatches: Int = 10   // 0 = full validation set
     public var saveEvery: Int = 100          // Checkpoint frequency
     public var adapterURL: URL?              // Save location
+    public var completedIterations: Int = 0  // Resume progress offset
 
     public init(
         batchSize: Int = 4,
@@ -35,29 +36,50 @@ public struct Parameters: Sendable {
         stepsPerEval: Int = 100,
         validationBatches: Int = 10,
         saveEvery: Int = 100,
-        adapterURL: URL? = nil
+        adapterURL: URL? = nil,
+        completedIterations: Int = 0
     )
 }
 ```
+
+When resuming, apply matching LoRA layers, load the saved weights, and set the number of
+iterations already completed. `iterations` remains the desired total:
+
+```swift
+try LoRATrain.loadLoRAWeights(model: model, url: adapterURL)
+
+let parameters = LoRATrain.Parameters(
+    iterations: 1000,
+    completedIterations: 400
+)
+```
+
+This reloads adapter parameters only. Persist and restore optimizer state separately when exact
+optimizer continuation is required. The saved file must contain only keys present in the model's
+adapter structure.
 
 ## Training Workflow
 
 ### 1. Load Model
 
 ```swift
+import Foundation
 import MLXLLM
 import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
-// Load base model
-let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+// Load base model. Training needs direct access to the model, so use
+// load(...), which returns a ModelContext, instead of loadContainer(...).
+let context = try await LLMModelFactory.shared.load(
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: .init(id: "mlx-community/Llama-3.2-3B-Instruct-4bit")
 )
 
-// Extract model and tokenizer for training
-let model = await container.perform { $0.model }
-let tokenizer = await container.tokenizer
+let model = context.model
+let tokenizer = context.tokenizer
 ```
 
 ### 2. Apply LoRA Layers
@@ -342,22 +364,25 @@ Not currently implemented in Swift - use smaller models or reduce batch size.
 import Foundation
 import MLXLLM
 import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 import MLXOptimizers
 
 func trainAdapter() async throws {
     // Load model
-    let container = try await LLMModelFactory.shared.loadContainer(
-        from: HubClient.default,
-        using: TokenizersLoader(),
+    let context = try await LLMModelFactory.shared.load(
+        from: #hubDownloader(),
+        using: #huggingFaceTokenizerLoader(),
         configuration: .init(id: "mlx-community/Llama-3.2-1B-Instruct-4bit")
     )
 
-    let model = await container.perform { SendableBox($0.model) }.consume()
-    let tokenizer = await container.tokenizer
+    let model = context.model
+    let tokenizer = context.tokenizer
 
     // Apply LoRA
     let adapter = try LoRAContainer.from(
-        model: model as! LanguageModel,
+        model: model,
         configuration: LoRAConfiguration(
             numLayers: 8,
             loraParameters: .init(rank: 8)
@@ -365,8 +390,9 @@ func trainAdapter() async throws {
     )
 
     // Load data
-    let trainData = try loadData(name: "train")
-    let validData = try loadData(name: "valid")
+    let dataDirectory = URL(filePath: "data")
+    let trainData = try loadLoRAData(directory: dataDirectory, name: "train")
+    let validData = try loadLoRAData(directory: dataDirectory, name: "valid")
 
     // Train
     let optimizer = Adam(learningRate: 1e-5)

@@ -45,7 +45,7 @@ struct Gemma3nTextSlidingMaskTests {
         let model = try Tiny.make(["sliding_window": 4, "num_kv_shared_layers": 0])
         let rows = [Tiny.row(1)]
         let difference = Tiny.maxAbsDifference(
-            Tiny.chunkedLogits(model, rows, chunks: [5, 3, 1, 1, 1]),
+            try Tiny.chunkedLogits(model, rows, chunks: [5, 3, 1, 1, 1]),
             Tiny.logits(model, rows))
         #expect(difference <= Tiny.tolerance, "differs by \(difference)")
     }

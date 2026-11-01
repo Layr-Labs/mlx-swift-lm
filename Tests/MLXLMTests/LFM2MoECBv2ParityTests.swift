@@ -101,7 +101,7 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         let model = try LFM2MoEFixture.model(precision)
         let prompt = LFM2MoEFixture.prompt(LFM2MoEFixture.chunk + 45)
         let decode = [5, 77, 13, 42, 8]
-        let oracle = LFM2MoEFixture.serial(model, prompt: prompt, decode: decode)
+        let oracle = try LFM2MoEFixture.serial(model, prompt: prompt, decode: decode)
         let tol = tolerance(precision)
         for paged in [false, true] {
             var firstRun: MLXArray?
@@ -110,7 +110,7 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                     // Token-by-token prompt on a short prefix is enough to
                     // cover chunk < L-1 and keeps the suite fast.
                     let short = Array(prompt.prefix(9))
-                    let shortOracle = LFM2MoEFixture.serial(
+                    let shortOracle = try LFM2MoEFixture.serial(
                         model, prompt: short, decode: [],
                         prefillChunk: precision == .float32 ? nil : 1)
                     let storage = try LFM2MoECBv2Storage(
@@ -148,7 +148,7 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                 // in a random tiny model, so the oracle is the serial path
                 // with the SAME chunk boundaries.
                 let chunkOracle =
-                    precision == .float32 || chunk == prompt.count
+                    try precision == .float32 || chunk == prompt.count
                     ? oracle
                     : LFM2MoEFixture.serial(
                         model, prompt: prompt, decode: decode, prefillChunk: chunk)
@@ -254,8 +254,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
             for (step, rows) in schedule.enumerated() {
                 for row in rows { forced[row].append(1 + (step * 13 + row * 29) % 90) }
             }
-            let oracles = (0 ..< 4).map {
-                LFM2MoEFixture.serial(model, prompt: prompts[$0], decode: forced[$0])
+            let oracles = try (0 ..< 4).map {
+                try LFM2MoEFixture.serial(model, prompt: prompts[$0], decode: forced[$0])
             }
             for paged in [false, true] {
                 let storage = try LFM2MoECBv2Storage(model: model, paged: paged, maximumLength: 128)

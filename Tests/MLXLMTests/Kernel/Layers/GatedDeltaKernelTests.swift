@@ -3,6 +3,7 @@ import MLX
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 /// Deterministic values for the gated delta tests. A plain LCG keeps the
 /// data the same on each run and does not touch the MLX random state.

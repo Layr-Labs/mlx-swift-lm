@@ -7,12 +7,13 @@ extension CBv2CompleteCheckpointCodec {
         checkpoint: CBv2RecurrentCheckpoint, state: [CBv2SequenceKV?],
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
-        guard !unsupportedAsymmetricGeometry else {
+        guard !unsupportedAsymmetricGeometry || glm5NextLayout != nil else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         guard checkpoint.position < tokens.count, state.count == layerKinds.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
+        if glm5NextLayout != nil { try validateGLM5NextDonor(checkpoint: checkpoint, state: state) }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
             admission: admission, position: checkpoint.position)
         return try withExtendedLifetime(metadataPermit) {
@@ -30,6 +31,9 @@ extension CBv2CompleteCheckpointCodec {
         let descriptors = try tensorDescriptors(
             position: checkpoint.position, qwen4: qwen4Descriptors(checkpoint),
             mediaTargetOnly: checkpoint.mediaTargetOnly)
+        // GLM payload roles may be written narrower than their FP32 pages
+        // and state; every other layout writes its native dtype.
+        let storage = glm5NextLayout?.storage
         var sources: [CBv2CompleteCheckpointTensorSource] = []
         for (index, entry) in state.enumerated() {
             guard let row = entry as? PagedSequenceKV,
@@ -49,21 +53,22 @@ extension CBv2CompleteCheckpointCodec {
                     .paged(
                         try .init(
                             pageMap: pageMap, values: false,
-                            recent: recent)), layer: index, position: checkpoint.position,
-                    values: false))
+                            recent: recent, wire: storage?.latent)), layer: index,
+                    position: checkpoint.position, values: false))
             sources.append(
                 try checkpointSource(
                     .paged(
                         try .init(
                             pageMap: pageMap, values: true,
-                            recent: recent)), layer: index, position: checkpoint.position,
-                    values: true))
+                            recent: recent, wire: storage?.index)), layer: index,
+                    position: checkpoint.position, values: true))
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,
                 spec.admitsSSM(layer.ssm)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            sources.append(.array(conv))
+            sources.append(
+                storage.map { .exported(conv, wire: $0.convolution) } ?? .array(conv))
             if let ssm = layer.ssm { sources.append(.array(ssm)) }
         }
         sources.append(contentsOf: try qwen4Arrays(checkpoint).map { .array($0) })
@@ -85,10 +90,12 @@ extension CBv2CompleteCheckpointCodec {
             cacheSalt: cacheSalt,
             assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
+            glm5NextState: glm5NextLayout?.state(position: checkpoint.position),
             checkpointQuantization: checkpointQuantization,
             checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
+                attentionLayers: glm5NextLayout?.attention.layers,
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(

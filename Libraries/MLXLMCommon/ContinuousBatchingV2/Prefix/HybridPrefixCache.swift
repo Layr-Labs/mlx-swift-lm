@@ -97,13 +97,19 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         spec: CBv2RecurrentStateSpec, layers: [Int: CBv2RecurrentLayerState],
         assistant: (any CBv2MTPPrefixCheckpoint)? = nil,
         qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:],
-        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+        mediaSideStateRequired: Bool = true
     ) -> [MLXArray] {
         guard position > 0, chunkSize > 1,
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize)
         else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
-        guard !mediaTargetOnly || (mediaIdentity != nil && assistant == nil && !qwen4.isEmpty)
+        // Bound, target-only media; QSA side state unless the model's only
+        // out-of-band input is causal media (`supportsCausalMediaCheckpointReuse`).
+        guard
+            !mediaTargetOnly
+                || (mediaIdentity != nil && assistant == nil
+                    && (!qwen4.isEmpty || !mediaSideStateRequired))
         else { return [] }
         var bytes = assistant?.materializedBytes ?? 0
         for snapshot in qwen4.values {
@@ -276,15 +282,33 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         return staged[requestID]?.isEmpty == false
     }
 
-    /// Called after engine asyncEval detached every captured root. KV belongs
-    /// to a retired request, so the publication queue is its sole evaluator.
-    /// Completion runs after insertion or refusal; the engine must keep source
-    /// KV reserved until then, including while an oversized donor is compacted.
+    /// `publish` with rows that already exist, such as views of contiguous
+    /// storage.
     func publish(
         requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
         receiptID: CBv2RequestID? = nil,
         kv: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         backingBytes: Int,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        publish(
+            requestID: requestID, tokens: tokens, cacheSalt: cacheSalt, receiptID: receiptID,
+            backingBytes: backingBytes, kv: { kv }, completion: completion)
+    }
+
+    /// Called after engine asyncEval detached every captured root. KV belongs
+    /// to a retired request, so the publication queue is its sole evaluator.
+    /// Completion runs after insertion or refusal; the engine must keep source
+    /// KV reserved until then, including while an oversized donor is compacted.
+    ///
+    /// The bank decides before any KV copy exists: a refreshed or ineligible
+    /// donor never calls `kv`. Otherwise `kv` runs once, on the caller's
+    /// thread outside the lock, after `backingBytes` is reserved or left to
+    /// compaction; nil refuses the publication and returns its reservation.
+    func publish(
+        requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
+        receiptID: CBv2RequestID? = nil, backingBytes: Int,
+        kv: () -> [(keys: MLXArray, values: MLXArray, offset: Int)?]?,
         completion: @escaping @Sendable () -> Void
     ) {
         lock.lock()
@@ -307,13 +331,25 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         let eligible = !closed && highest > 0 && highest <= tokens.count && backingBytes > 0
         let accepted = eligible && reserveLocked(backingBytes, recordRefusal: false)
         if accepted { counters.publishingBytes += backingBytes }
-        let handoff = CBv2HybridHandoff(
-            value: CBv2HybridPrefixPublication(
-                checkpoints: checkpoints, kv: eligible ? kv : [],
-                kvBytes: accepted ? backingBytes : 0, mayCompact: eligible && !accepted))
+        let publication = CBv2HybridPrefixPublication(
+            checkpoints: checkpoints, kv: [],
+            kvBytes: accepted ? backingBytes : 0, mayCompact: eligible && !accepted)
         checkpoints.removeAll(keepingCapacity: false)
         lock.unlock()
 
+        if eligible {
+            if let rows = kv() {
+                publication.kv = rows
+            } else {
+                lock.lock()
+                counters.publishingBytes -= publication.kvBytes
+                counters.capacityRefusals += 1
+                publication.kvBytes = 0
+                publication.mayCompact = false
+                lock.unlock()
+            }
+        }
+        let handoff = CBv2HybridHandoff(value: publication)
         publicationQueue.async { [self] in
             let (publishedPositions, handler) = handoff.consume { publication in
                 // Captured roots were already detached on the engine thread;

@@ -16,10 +16,14 @@ let modelFactory: ModelFactory
 // e.g. LLMRegistry.llama3_8B_4bit
 let modelConfiguration: ModelConfiguration
 
-// e.g. TokenizersLoader() from MLXLMTokenizers
+// e.g. #hubDownloader() from MLXHuggingFace
+let downloader: any Downloader
+
+// e.g. #huggingFaceTokenizerLoader() from MLXHuggingFace
 let tokenizerLoader: any TokenizerLoader
 
 let container = try await modelFactory.loadContainer(
+    from: downloader,
     using: tokenizerLoader,
     configuration: modelConfiguration
 )
@@ -55,6 +59,27 @@ public class LLMModelFactory: ModelFactory {
 
 Callers with specialized requirements can use these individual components to manually
 load models, if needed.
+
+### Inspecting LoRA Metadata
+
+Use ``LLMModelFactory/loraMetadata(configurationData:)`` to discover the model's LoRA
+layer count and default runtime module paths without loading checkpoint weights:
+
+```swift
+let configurationURL = modelDirectory.appending(component: "config.json")
+let configurationData = try Data(contentsOf: configurationURL)
+
+if let metadata = try await LLMModelFactory.shared.loraMetadata(
+    configurationData: configurationData
+) {
+    print(metadata.layerCount)
+    print(metadata.defaultKeys)
+}
+```
+
+The returned `LoRAModelMetadata.defaultKeys` come from the registered model architecture,
+not from safetensors names. This accounts for models that rename or reshape checkpoint weights
+while loading.
 
 ## Evaluation Flow
 
@@ -97,10 +122,17 @@ let result = try await modelContainer.perform { [input] context in
 Given that `input` we can call `generate()` to produce a stream
 of tokens. In this example we use a `NaiveStreamingDetokenizer`
 to assist in converting a stream of tokens into text and print it.
-The stream is stopped after we hit a maximum number of tokens:
+The stream is stopped after we hit a maximum number of tokens.
+Call `finish()` on a manually managed detokenizer when generation ends to flush remaining text:
 
 ```
     var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+    defer {
+        if let text = detokenizer.finish() {
+            print(text, terminator: "")
+            fflush(stdout)
+        }
+    }
 
     return try MLXLMCommon.generate(
         input: input, parameters: generateParameters, context: context

@@ -51,7 +51,7 @@ enum PagedAsymmetricTransfers {
             const int r = int(thread_position_in_grid.z);
             const int token = records[r * 3], page = records[r * 3 + 1], slot = records[r * 3 + 2];
             const size_t row = ((size_t)page * H + h) * S + slot;
-            const size_t target = (size_t)h * N + token;
+            const size_t target = (size_t)h * keys_shape[2] + token;
             if (d < DK) { device T* dst = keys; dst[target * DK + d] = storage[row * DK + d]; }
             if (d < DV) { device T* dst = values; dst[target * DV + d] = storage[VBASE + row * DV + d]; }
             if (d == 0 && h == 0 && r == 0) fence[0] = previous[0] + 1;
@@ -67,6 +67,14 @@ enum PagedAsymmetricTransfers {
             ("T", group.dtype), ("H", group.key.kvHeads), ("DK", group.key.headDim),
             ("DV", group.key.valueHeadDim), ("S", group.pageSize),
         ]
+    }
+
+    /// No transfer length: MLX compiles one Metal library per distinct
+    /// template tuple. Reads take the token extent from `keys_shape`.
+    static func segmentTemplate(_ group: PagedKVGroup, _ segment: PagedKVSegment) -> [(
+        String, any KernelTemplateArg
+    )] {
+        arguments(group) + [("VBASE", segment.valueOffset)]
     }
 
     private static func validate(
@@ -114,7 +122,7 @@ enum PagedAsymmetricTransfers {
             group.writeFence =
                 segmentWrite(
                     [keys, values, segment.storage, records, group.writeFence],
-                    template: arguments(group) + [("VBASE", segment.valueOffset)],
+                    template: segmentTemplate(group, segment),
                     grid: (width, group.key.kvHeads, triples.count / 3),
                     threadGroup: (min(256, width), 1, 1),
                     outputShapes: [[1]], outputDTypes: [.int32])[0]
@@ -151,7 +159,7 @@ enum PagedAsymmetricTransfers {
             fence =
                 segmentRead(
                     [segment.storage, records, keys, values, fence],
-                    template: arguments(group) + [("VBASE", segment.valueOffset), ("N", count)],
+                    template: segmentTemplate(group, segment),
                     grid: (width, h, triples.count / 3), threadGroup: (min(256, width), 1, 1),
                     outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
             work?.retainRoots([segment.storage, records, fence])

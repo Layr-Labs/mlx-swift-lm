@@ -156,12 +156,13 @@ struct LFM2ToolCallParserTests {
         #expect(processor.toolCalls.map(\.function.name) == ["a", "b"])
     }
 
-    @Test func llama3InlinePythonicKeepsItsHistoricalParser() throws {
-        // `.lfm2` moved to LFM2ToolCallParser; Llama 3 still uses the legacy
-        // PythonicToolCallParser (unquoted scalars stay strings there).
+    @Test func llama3InlinePythonicKeepsItsOwnParser() throws {
+        // `.lfm2` uses LFM2ToolCallParser. Llama 3 falls back to
+        // PythonicToolCallParser, which reads an unquoted number as a number.
         let call = try #require(
             ToolCallFormat.llama3.createParser().parse(
                 content: "<|python_tag|>calculate(expression=\"2 + 2\", precision=4)", tools: nil))
-        #expect(call.function.arguments["precision"] == .string("4"))
+        #expect(call.function.arguments["expression"] == .string("2 + 2"))
+        #expect(call.function.arguments["precision"] == .int(4))
     }
 }

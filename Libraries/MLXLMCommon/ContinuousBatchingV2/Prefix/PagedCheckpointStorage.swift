@@ -168,7 +168,8 @@ final class CBv2PagedCheckpointStorage {
 
     init(
         plan: CBv2PagedCheckpointStoragePlan, evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil
+        admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil,
+        hostMaterialized: Bool = false
     ) throws {
         self.plan = plan
         for group in plan.groups {
@@ -180,7 +181,7 @@ final class CBv2PagedCheckpointStorage {
                 let segment = try PagedKVSegment(
                     index: index, layout: prepared.layout, key: group.key,
                     pageSize: plan.pageSize, dtype: group.key.dtype, evaluate: evaluate,
-                    admission: admission)
+                    admission: admission, hostMaterialized: hostMaterialized)
                 // The evaluator already retained the raw root before native
                 // execution. Keep its actual coverage/backing owner as well,
                 // including a late result after a concurrent native veto.
@@ -200,8 +201,11 @@ final class CBv2PagedCheckpointStorage {
             guard role.nativeCount > 0 else { continue }
             var arrays: [MLXArray] = []
             for width in [layer.key.headDim, layer.key.valueHeadDim] {
-                let value = MLXArray.zeros(
-                    [layer.key.kvHeads, role.nativeCount, width], dtype: layer.key.dtype)
+                let shape = [layer.key.kvHeads, role.nativeCount, width]
+                let value =
+                    try hostMaterialized
+                    ? MLXArray.cbv2HostZeros(shape, dtype: layer.key.dtype)
+                    : MLXArray.zeros(shape, dtype: layer.key.dtype)
                 try nativeWork?.retain(arrays: [value])
                 try evaluate(value)
                 guard let info = try value.evaluatedBufferInfo(), info.isRowContiguous,
@@ -220,7 +224,12 @@ final class CBv2PagedCheckpointStorage {
 
     /// Ordered-transfer validation belongs to the enclosing import owner.
     /// This sink validates its native addressing independently before writing.
-    func append(layerIndex: Int, values: Bool, byteOffset: Int, data: Data) throws {
+    /// A half-precision `wire` widens into FP32 pages; `byteOffset` and `data`
+    /// are then wire bytes.
+    func append(
+        layerIndex: Int, values: Bool, byteOffset: Int, data: Data,
+        wire: CBv2CheckpointDType? = nil
+    ) throws {
         guard plan.layers.indices.contains(layerIndex) else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
@@ -231,19 +240,29 @@ final class CBv2PagedCheckpointStorage {
                 layerIndex: layerIndex, values: values, byteOffset: byteOffset, data: data)
             return
         }
+        // A wire dtype equal to the page dtype is the native layout.
+        let widened = wire.flatMap { $0.mlxDType == layer.key.dtype ? nil : $0 }
+        if let widened {
+            guard CBv2CheckpointHalfPrecision.isHalf(widened), layer.key.dtype == .float32 else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+        }
         let roleWidth = values ? layer.key.valueHeadDim : layer.key.headDim
         let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
             shape: [1, layer.key.kvHeads, layer.tokenCount, roleWidth], dtype: layer.key.dtype)
         let width = layer.key.dtype.size
-        guard byteOffset >= 0, byteOffset < bytes, byteOffset % width == 0,
+        let wireSize = widened?.mlxDType.size ?? width
+        let nativeOffset = byteOffset / wireSize * width
+        let nativeCount = data.count / wireSize * width
+        guard byteOffset >= 0, byteOffset % wireSize == 0, nativeOffset < bytes,
             !data.isEmpty, data.count <= CBv2CompleteCheckpointManifest.maximumSegmentBytes,
-            data.count % width == 0, data.count <= bytes - byteOffset
+            data.count % wireSize == 0, nativeCount <= bytes - nativeOffset
         else { throw CBv2CompleteCheckpointError.invalidSegment }
         try data.withUnsafeBytes { source in
             try CBv2PagedCheckpointByteLayout.runs(
                 headDim: roleWidth, position: layer.tokenCount, pageSize: plan.pageSize,
                 tokenStart: layer.tokenStart, ringPages: layer.ringPages, itemSize: width,
-                byteOffset: byteOffset, count: data.count
+                byteOffset: nativeOffset, count: nativeCount
             ) { logicalPage, head, slot, feature, packedOffset, count in
                 let page = group.pages[layer.firstPage + logicalPage]
                 let segment = group.segments[group.layout.segmentIndex(page: page)]!
@@ -254,8 +273,17 @@ final class CBv2PagedCheckpointStorage {
                 let element =
                     ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot)
                     * roleWidth + feature + (values ? segment.valueOffset : 0)
-                UnsafeMutableRawPointer(mutating: pointer).advanced(by: element * width).copyMemory(
-                    from: source.baseAddress!.advanced(by: packedOffset), byteCount: count)
+                let target = UnsafeMutableRawPointer(mutating: pointer).advanced(
+                    by: element * width)
+                if let widened {
+                    CBv2CheckpointHalfPrecision.widen(
+                        widened,
+                        source: source.baseAddress!.advanced(by: packedOffset / width * wireSize),
+                        count: count / width, float32: target)
+                } else {
+                    target.copyMemory(
+                        from: source.baseAddress!.advanced(by: packedOffset), byteCount: count)
+                }
             }
         }
     }

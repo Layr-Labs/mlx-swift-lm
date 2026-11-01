@@ -9,8 +9,8 @@ struct PagedSegmentDispatchPlan {
     static let bindingClasses = [1, 4, 8, 17]
 
     struct Row {
-        /// Only layer-bound full-attention rows supply an identity. Direct
-        /// kernel probes and windowed rows keep using fresh dispatch plans.
+        /// Layer-bound rows (full and sliding) supply an identity. Direct
+        /// kernel probes keep using fresh dispatch plans.
         struct Identity: Equatable {
             let serial: UInt64
             let tableVersion: Int
@@ -19,8 +19,10 @@ struct PagedSegmentDispatchPlan {
         let info: PagedAttentionKernel.SeqInfoRow
         let identity: Identity?
 
-        init(pages: [Int32], info: PagedAttentionKernel.SeqInfoRow,
-             identity: Identity? = nil) {
+        init(
+            pages: [Int32], info: PagedAttentionKernel.SeqInfoRow,
+            identity: Identity? = nil
+        ) {
             self.pages = pages
             self.info = info
             self.identity = identity
@@ -47,14 +49,17 @@ struct PagedSegmentDispatchPlan {
         return min(proposed / pageSize, maximumBindings - 1) * pageSize
     }
 
-    init(rows: [Row], layout: PagedKVSegmentLayout, pageSize: Int,
-         partitionTokens: Int, hasWrite: Bool) {
+    init(
+        rows: [Row], layout: PagedKVSegmentLayout, pageSize: Int,
+        partitionTokens: Int, hasWrite: Bool
+    ) {
         precondition(!rows.isEmpty)
         precondition(partitionTokens > 0 && partitionTokens % pageSize == 0)
         precondition(partitionTokens / pageSize + 1 <= Self.maximumBindings)
         self.partitionTokens = partitionTokens
         let maxPartitions = rows.map {
-            $0.info.attendLength / partitionTokens + ($0.info.attendLength % partitionTokens == 0 ? 0 : 1)
+            $0.info.attendLength / partitionTokens
+                + ($0.info.attendLength % partitionTokens == 0 ? 0 : 1)
         }.max()!
         self.maxPartitions = maxPartitions
 
@@ -75,11 +80,14 @@ struct PagedSegmentDispatchPlan {
             var records: [Int32] = []
             records.reserveCapacity(pending.count * Self.recordStride)
             for item in pending {
-                let writer = item.write.map { (binding[layout.segmentIndex(page: $0)]!, layout.localPage($0)) }
+                let writer = item.write.map {
+                    (binding[layout.segmentIndex(page: $0)]!, layout.localPage($0))
+                }
                 var record: [Int32] = [
                     Int32(item.row), Int32(item.partition), Int32(item.firstPage),
                     Int32(item.pages.count), Int32(writer?.0 ?? 0), Int32(writer?.1 ?? 0),
-                    Int32(maxPartitions), 0]
+                    Int32(maxPartitions), 0,
+                ]
                 for page in item.pages {
                     record.append(Int32(binding[layout.segmentIndex(page: page)]!))
                     record.append(Int32(layout.localPage(page)))
@@ -94,10 +102,13 @@ struct PagedSegmentDispatchPlan {
         for (rowIndex, row) in rows.enumerated() {
             let info = row.info
             precondition(info.attendStart >= 0 && info.attendLength > 0 && info.tableLength > 0)
-            let partitions = info.attendLength / partitionTokens + (info.attendLength % partitionTokens == 0 ? 0 : 1)
+            let partitions =
+                info.attendLength / partitionTokens
+                + (info.attendLength % partitionTokens == 0 ? 0 : 1)
             for partition in 0 ..< partitions {
                 let start = info.attendStart + partition * partitionTokens
-                let end = info.attendStart + min(info.attendLength, (partition + 1) * partitionTokens)
+                let end =
+                    info.attendStart + min(info.attendLength, (partition + 1) * partitionTokens)
                 let first = start / pageSize
                 let last = (end - 1) / pageSize
                 let pages = (first ... last).map { logical -> Int32 in
@@ -109,14 +120,17 @@ struct PagedSegmentDispatchPlan {
                 }
                 let writer: Int32? = hasWrite && partition == partitions - 1 ? info.writePage : nil
                 if let writer {
-                    precondition(writer == pages.last, "fused write must target the newest attended page")
+                    precondition(
+                        writer == pages.last, "fused write must target the newest attended page")
                 }
                 let needed = Set(pages.map { layout.segmentIndex(page: $0) })
                 precondition(needed.count <= Self.maximumBindings)
                 if segments.union(needed).count > Self.maximumBindings { flush() }
                 segments.formUnion(needed)
-                pending.append(Item(row: rowIndex, partition: partition, firstPage: first,
-                                    pages: pages, write: writer))
+                pending.append(
+                    Item(
+                        row: rowIndex, partition: partition, firstPage: first,
+                        pages: pages, write: writer))
             }
         }
         flush()

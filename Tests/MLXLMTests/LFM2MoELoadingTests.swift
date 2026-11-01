@@ -72,7 +72,7 @@ final class LFM2MoELoadingTests: XCTestCase {
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
         let model = try await LLMTypeRegistry.shared.createModel(
             configuration: data, modelType: base.modelType)
-        try loadWeights(
+        try await loadWeights(
             modelDirectory: directory, model: model, perLayerQuantization: base.perLayerQuantization
         )
         return try XCTUnwrap(model as? LFM2MoEModel)

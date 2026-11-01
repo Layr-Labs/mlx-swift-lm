@@ -484,20 +484,39 @@ final class CBv2NativeRequestRetirementTests: XCTestCase {
         let gate = OneShotGate(
             expectation(description: "plain completion before genuine MTP verify finalization"))
         defer { gate.release() }
+        let seedSubmitted = expectation(description: "single MTP row has submitted its real seed")
+        var heldAfterSeedSubmission = false
         var plainOutput: CBv2OutputStream?
         weak var plainRow: AnyObject?
         actual.loopForTesting.onEngineQueueSync {
             tracking.afterSubmissionForTesting = {
+                // Hold the next step only after the genuine seed was submitted.
+                // That next step finalizes its carry before planning the newly
+                // admitted plain prefill beside the ready MTP verification.
+                if !heldAfterSeedSubmission, actual.mtpMetricsSnapshot()?.seedSteps == 1 {
+                    heldAfterSeedSubmission = true
+                    actual.loopForTesting.suspendStepExecutionAtCountForTesting =
+                        actual.loopForTesting.stepCount + 1
+                    seedSubmitted.fulfill()
+                }
                 if plainRow == nil {
                     plainRow = actual.loopForTesting.kvStates[.init(1)]?.compactMap { $0 }.first
                 }
             }
             actual.loopForTesting.nativeRetirementBoundaryForTesting = { name, step in
-                guard name == "beforeMTPFinalization", step?.mtpRound?.verify != nil,
+                guard name == "beforeMTPFinalization", let step,
+                    let verify = step.mtpRound?.verify,
                     actual.loopForTesting.nativePendingRetirementCountForTesting > 0
                 else { return }
                 gate.holdOnce {
-                    XCTAssertTrue(step?.sampledRows.contains(.init(1)) ?? false)
+                    XCTAssertTrue(step.sampledRows.contains(.init(1)))
+                    XCTAssertEqual(step.sampledRows, [.init(1)])
+                    XCTAssertEqual(step.participants, Set([.init(1), .init(2)]))
+                    XCTAssertEqual(verify.rows.map(\.id), [.init(2)])
+                    XCTAssertEqual(verify.k, 3)
+                    XCTAssertEqual(step.computedRanges[.init(1)], 0 ..< 3)
+                    XCTAssertNil(actual.loopForTesting.scheduler.record(for: .init(1)))
+                    XCTAssertNotNil(actual.loopForTesting.scheduler.record(for: .init(2)))
                     XCTAssertFalse(plainOutput?.isEngineOwnershipReleased ?? true)
                     XCTAssertNotNil(plainRow)
                     XCTAssertGreaterThan(actual.loopForTesting.backend.bytesReserved, 0)
@@ -505,17 +524,36 @@ final class CBv2NativeRequestRetirementTests: XCTestCase {
                 }
             }
         }
+        // Two decode-ready rows cannot verify together: MiMo's speculative
+        // batch cap is one, and the stop-string row is deliberately ineligible.
+        // A final-prefill neighbor is supported and finishes in the very same
+        // native group as the already-seeded MTP row's verification.
         let plainRequest = CBv2Request(
             id: .init(1), promptTokens: [1, 2, 4],
-            sampling: .init(temperature: 0), maxTokens: 3,
+            sampling: .init(temperature: 0), maxTokens: 1,
             stopStrings: ["never-produced-by-null-detokenizer"])
         let mtpRequest = CBv2Request(
             id: .init(2), promptTokens: [1, 2, 4],
             sampling: .init(temperature: 0), maxTokens: 12)
-        let plain = try actual.submitWithNativeRetirement(plainRequest)
         let speculative = try actual.submitWithNativeRetirement(mtpRequest)
-        plainOutput = try output(actual, 1)
         let mtpOutput = try output(actual, 2)
+        resumePlanning(actual)
+        await fulfillment(of: [seedSubmitted], timeout: 10)
+        try actual.loopForTesting.onEngineQueueSync {
+            guard heldAfterSeedSubmission else { throw Failure.missingReceipt }
+            let row = try XCTUnwrap(actual.loopForTesting.scheduler.record(for: .init(2)))
+            XCTAssertEqual(row.generatedTokenCount, 1)
+            XCTAssertEqual(row.pendingSamples, 1)
+            XCTAssertEqual(actual.mtpMetricsSnapshot()?.seedSteps, 1)
+            XCTAssertEqual(actual.mtpMetricsSnapshot()?.rounds, 0)
+            XCTAssertNil(actual.loopForTesting.scheduler.record(for: .init(1)))
+            XCTAssertFalse(mtpOutput.isEngineOwnershipReleased)
+        }
+        let plain = try actual.submitWithNativeRetirement(plainRequest)
+        plainOutput = try output(actual, 1)
+        actual.loopForTesting.onEngineQueueSync {
+            XCTAssertEqual(actual.loopForTesting.scheduler.waiting.map(\.id), [.init(1)])
+        }
         resumePlanning(actual)
         await fulfillment(of: [gate.entered], timeout: 20)
         let result = await actual.shutdownReportingNativeCompletion()

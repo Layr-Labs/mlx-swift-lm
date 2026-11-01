@@ -1,9 +1,9 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class Qwen4ExpQSATests: XCTestCase {
     func testTextPositionsAcceptAbsentIds() {
@@ -20,8 +20,11 @@ final class Qwen4ExpQSATests: XCTestCase {
             Qwen4ExpWeightSanitizer.shouldDrop(
                 "language_model.model.layers.1.ple.ple_embedding.layer_multipliers",
                 mmapPLE: true))
-        XCTAssertTrue(Qwen4ExpWeightSanitizer.shouldDrop("mtp.layers.0.self_attn.q_proj.weight", mmapPLE: true))
-        XCTAssertTrue(Qwen4ExpWeightSanitizer.shouldDrop("vision_tower.pos_embed.weight", mmapPLE: true))
+        XCTAssertTrue(
+            Qwen4ExpWeightSanitizer.shouldDrop(
+                "mtp.layers.0.self_attn.q_proj.weight", mmapPLE: true))
+        XCTAssertTrue(
+            Qwen4ExpWeightSanitizer.shouldDrop("vision_tower.pos_embed.weight", mmapPLE: true))
         XCTAssertFalse(
             Qwen4ExpWeightSanitizer.shouldDrop(
                 "vision_tower.pos_embed.weight", mmapPLE: true, keepVisionTower: true))
@@ -36,7 +39,9 @@ final class Qwen4ExpQSATests: XCTestCase {
             Qwen4ExpWeightSanitizer.shouldDrop(
                 "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight",
                 mmapPLE: true))
-        XCTAssertTrue(Qwen4ExpWeightSanitizer.shouldDrop("mtp.hyper_connection_mixer.hc_norm.weight", mmapPLE: true))
+        XCTAssertTrue(
+            Qwen4ExpWeightSanitizer.shouldDrop(
+                "mtp.hyper_connection_mixer.hc_norm.weight", mmapPLE: true))
         XCTAssertFalse(
             Qwen4ExpWeightSanitizer.shouldDrop(
                 "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
@@ -270,15 +275,20 @@ final class Qwen4ExpQSATests: XCTestCase {
     func testDecodeCrossesBudgetAtFusionBoundary() {
         // 512 blocks of 4 = 2048 visible tokens is not yet sparse; 2052 is.
         XCTAssertFalse(
-            Qwen4ExpGatheredQSA.decodeCrossesBudget(offset: 2047, compressRatio: 4, tokenBudget: 2048))
+            Qwen4ExpGatheredQSA.decodeCrossesBudget(
+                offset: 2047, compressRatio: 4, tokenBudget: 2048))
         XCTAssertFalse(
-            Qwen4ExpGatheredQSA.decodeCrossesBudget(offset: 2050, compressRatio: 4, tokenBudget: 2048))
+            Qwen4ExpGatheredQSA.decodeCrossesBudget(
+                offset: 2050, compressRatio: 4, tokenBudget: 2048))
         XCTAssertTrue(
-            Qwen4ExpGatheredQSA.decodeCrossesBudget(offset: 2051, compressRatio: 4, tokenBudget: 2048))
+            Qwen4ExpGatheredQSA.decodeCrossesBudget(
+                offset: 2051, compressRatio: 4, tokenBudget: 2048))
         XCTAssertTrue(
-            Qwen4ExpGatheredQSA.decodeCrossesBudget(offset: 50_000, compressRatio: 4, tokenBudget: 2048))
+            Qwen4ExpGatheredQSA.decodeCrossesBudget(
+                offset: 50_000, compressRatio: 4, tokenBudget: 2048))
         XCTAssertFalse(
-            Qwen4ExpGatheredQSA.decodeCrossesBudget(offset: 50_000, compressRatio: 0, tokenBudget: 2048))
+            Qwen4ExpGatheredQSA.decodeCrossesBudget(
+                offset: 50_000, compressRatio: 0, tokenBudget: 2048))
     }
 
     /// Fusion `contiguous_causal_gathered_qsa_decode` vs the official masked
@@ -331,7 +341,8 @@ final class Qwen4ExpQSATests: XCTestCase {
 
         eval(gathered, reference)
         XCTAssertEqual(gathered.shape, [1, 1, queryHeads, headDim])
-        let diff = abs(gathered.asType(.float32) - reference.asType(.float32)).max().item(Float.self)
+        let diff = abs(gathered.asType(.float32) - reference.asType(.float32)).max().item(
+            Float.self)
         XCTAssertLessThan(diff, 2e-3, "gathered decode diverged from masked dense reference")
     }
 
@@ -427,9 +438,10 @@ final class Qwen4ExpQSATests: XCTestCase {
             let dense = Qwen4ExpGatheredQSA.verifyDenseMask(
                 blocks: blocks, queryTokens: c.s, blockBudget: c.kb,
                 keyTokens: c.kv, compressRatio: c.ratio)
-            guard let plan = Qwen4ExpGatheredQSA.verifyHostPlan(
-                blocks: blocks, queryTokens: c.s, blockBudget: c.kb,
-                keyTokens: c.kv, compressRatio: c.ratio)
+            guard
+                let plan = Qwen4ExpGatheredQSA.verifyHostPlan(
+                    blocks: blocks, queryTokens: c.s, blockBudget: c.kb,
+                    keyTokens: c.kv, compressRatio: c.ratio)
             else {
                 XCTFail("verify plan declined S=\(c.s) kv=\(c.kv)")
                 continue
@@ -485,8 +497,9 @@ final class Qwen4ExpQSATests: XCTestCase {
                 w += 1
             }
         }
-        guard let geom = Qwen4ExpGatheredQSA.verifyGeometry(
-            queryTokens: s, keyTokens: kv, compressRatio: ratio, blockBudget: kb),
+        guard
+            let geom = Qwen4ExpGatheredQSA.verifyGeometry(
+                queryTokens: s, keyTokens: kv, compressRatio: ratio, blockBudget: kb),
             let plan = Qwen4ExpGatheredQSA.verifyHostPlan(
                 blocks: blocks, queryTokens: s, blockBudget: kb,
                 keyTokens: kv, compressRatio: ratio)
@@ -525,9 +538,10 @@ final class Qwen4ExpQSATests: XCTestCase {
         let keyTokens = 200
         let blockBudget = 2
         let nb = keyTokens / ratio
-        guard let geom = Qwen4ExpGatheredQSA.verifyGeometry(
-            queryTokens: queryTokens, keyTokens: keyTokens,
-            compressRatio: ratio, blockBudget: blockBudget)
+        guard
+            let geom = Qwen4ExpGatheredQSA.verifyGeometry(
+                queryTokens: queryTokens, keyTokens: keyTokens,
+                compressRatio: ratio, blockBudget: blockBudget)
         else {
             XCTFail("verify geometry declined")
             return
@@ -602,7 +616,8 @@ final class Qwen4ExpQSATests: XCTestCase {
 
         eval(gathered, reference)
         XCTAssertEqual(gathered.shape, [1, queryTokens, queryHeads, headDim])
-        let diff = abs(gathered.asType(.float32) - reference.asType(.float32)).max().item(Float.self)
+        let diff = abs(gathered.asType(.float32) - reference.asType(.float32)).max().item(
+            Float.self)
         XCTAssertLessThan(diff, 2e-3, "gathered verify diverged from masked dense reference")
     }
 
@@ -689,9 +704,10 @@ final class Qwen4ExpQSATests: XCTestCase {
 
     func testPooledIndexExtendMatchesFullRecompute() {
         let ratio = 4
-        let keys = MLXArray(
-            (0 ..< 24 * 8).map { Float(($0 % 17) - 8) * 0.05 }
-        ).reshaped([1, 24, 8]).asType(.float16)
+        let keyValues: [Float] = (0 ..< 24 * 8).map { (i: Int) -> Float in
+            Float((i % 17) - 8) * 0.05
+        }
+        let keys = MLXArray(keyValues).reshaped([1, 24, 8]).asType(.float16)
         let pos = MLXArray((10 ..< 34).map(Int32.init)).reshaped([1, 24])
         let identity: (MLXArray) -> MLXArray = { $0 }
         let rope: (MLXArray, MLXArray) -> MLXArray = { states, _ in states }
@@ -728,9 +744,10 @@ final class Qwen4ExpQSATests: XCTestCase {
 
     func testPooledIndexUpdateDefersEvaluationToFinalConsumer() throws {
         let ratio = 4
-        let keys = MLXArray(
-            (0 ..< 24 * 8).map { Float(($0 % 23) - 11) * 0.03125 }
-        ).reshaped([1, 24, 8]).asType(.float16)
+        let keyValues: [Float] = (0 ..< 24 * 8).map { (i: Int) -> Float in
+            Float((i % 23) - 11) * 0.03125
+        }
+        let keys = MLXArray(keyValues).reshaped([1, 24, 8]).asType(.float16)
         let positions = MLXArray((40 ..< 64).map(Int32.init)).reshaped([1, 24])
         let identity: (MLXArray) -> MLXArray = { $0 }
         let rope: (MLXArray, MLXArray) -> MLXArray = { values, _ in values }
@@ -741,15 +758,17 @@ final class Qwen4ExpQSATests: XCTestCase {
         cache.qwen4IndexKeys = keys
         cache.qwen4IndexPositionIds = positions
 
-        let first = try XCTUnwrap(Qwen4ExpPooledIndex.update(
-            cache: cache, compressRatio: ratio, logicalTokens: 16,
-            indexKeyNorm: identity, applyIndexRope: rope,
-            environment: [Qwen4ExpPooledIndex.envFlag: "1"]))
+        let first = try XCTUnwrap(
+            Qwen4ExpPooledIndex.update(
+                cache: cache, compressRatio: ratio, logicalTokens: 16,
+                indexKeyNorm: identity, applyIndexRope: rope,
+                environment: [Qwen4ExpPooledIndex.envFlag: "1"]))
         XCTAssertNil(try cache.qwen4PooledIndexKeys?.evaluatedBufferInfo())
-        let second = try XCTUnwrap(Qwen4ExpPooledIndex.update(
-            cache: cache, compressRatio: ratio, logicalTokens: 24,
-            indexKeyNorm: identity, applyIndexRope: rope,
-            environment: [Qwen4ExpPooledIndex.envFlag: "1"]))
+        let second = try XCTUnwrap(
+            Qwen4ExpPooledIndex.update(
+                cache: cache, compressRatio: ratio, logicalTokens: 24,
+                indexKeyNorm: identity, applyIndexRope: rope,
+                environment: [Qwen4ExpPooledIndex.envFlag: "1"]))
         XCTAssertNil(try cache.qwen4PooledIndexKeys?.evaluatedBufferInfo())
 
         let expectedFirst = Qwen4ExpGatheredQSA.poolCompletedIndexKeys(
@@ -863,22 +882,29 @@ final class Qwen4ExpQSATests: XCTestCase {
 
     func testIndexCapacityBoundsLongContextSlackWithoutExtraGrowthEvents() {
         let step = Qwen4ExpPooledIndex.tokenStep
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 0, needed: 8_000, step: step), 8_192)
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 8_192, needed: 16_000, step: step), 16_384)
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 16_384, needed: 24_000, step: step), 32_768)
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 32_768, needed: 40_000, step: step), 49_152)
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 49_152, needed: 56_000, step: step), 65_536)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 0, needed: 8_000, step: step), 8_192)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 8_192, needed: 16_000, step: step), 16_384)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 16_384, needed: 24_000, step: step), 32_768)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 32_768, needed: 40_000, step: step), 49_152)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 49_152, needed: 56_000, step: step), 65_536)
 
         // The old pure-doubling path allocated 131,072 slots here.
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 65_536, needed: 72_000, step: step), 81_920)
-        XCTAssertEqual(Qwen4ExpIndexCapacity.growthCapacity(
-            current: 81_920, needed: 80_073, step: step), 81_920)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 65_536, needed: 72_000, step: step), 81_920)
+        XCTAssertEqual(
+            Qwen4ExpIndexCapacity.growthCapacity(
+                current: 81_920, needed: 80_073, step: step), 81_920)
         XCTAssertLessThan(
             Qwen4ExpIndexCapacity.growthCapacity(
                 current: 65_536, needed: 80_073, step: step),

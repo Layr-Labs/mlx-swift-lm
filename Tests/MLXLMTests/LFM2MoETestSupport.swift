@@ -85,8 +85,8 @@ enum LFM2MoEFixture {
     /// Returns per-position prompt logits [L, V] and one [V] row per decode step.
     static func serial(
         _ model: LFM2MoEModel, prompt: [Int], decode: [Int], prefillChunk: Int? = nil
-    ) -> (prompt: MLXArray, decode: [MLXArray]) {
-        let cache = model.newCache(parameters: nil)
+    ) throws -> (prompt: MLXArray, decode: [MLXArray]) {
+        let cache = try model.newCache(parameters: nil)
         var promptRows: [MLXArray] = []
         let step = prefillChunk ?? prompt.count
         for start in stride(from: 0, to: prompt.count, by: step) {

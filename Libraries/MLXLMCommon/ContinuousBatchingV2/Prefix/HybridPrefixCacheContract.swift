@@ -10,11 +10,19 @@ public struct CBv2HybridPrefixCacheConfig: Sendable, Equatable {
     public var modelID: String
     public var promptContractID: String
     public var buildID: String
+    /// Opt-in for an unquantized segmented paged backend without step-owned
+    /// attention, a native binding or a resident page-sharing index
+    /// (`EngineV2.hostsPagedHybridBank`). The bank then keeps an owned gather
+    /// of the prompt KV of each donor it keeps, taken before its pages return
+    /// to the pool, and adoption writes the prefix into fresh pages. Off keeps
+    /// the contiguous-only rule.
+    public var permitsPagedStorage: Bool
 
     public init(
         maximumBytes: Int, maximumEntries: Int = 32,
         maximumCheckpointsPerRequest: Int = 2,
-        modelID: String, promptContractID: String, buildID: String
+        modelID: String, promptContractID: String, buildID: String,
+        permitsPagedStorage: Bool = false
     ) {
         self.maximumBytes = maximumBytes
         self.maximumEntries = maximumEntries
@@ -22,6 +30,7 @@ public struct CBv2HybridPrefixCacheConfig: Sendable, Equatable {
         self.modelID = modelID
         self.promptContractID = promptContractID
         self.buildID = buildID
+        self.permitsPagedStorage = permitsPagedStorage
     }
 
     var isValid: Bool {
@@ -153,15 +162,33 @@ struct CBv2RecurrentCheckpointGeometry {
     /// export requires a token after the checkpoint. The cap is recorded as
     /// provenance, never compared with earlier
     /// ranges.
+    ///
+    /// A `chunkGrid` (a model whose prefill output depends on the chunk
+    /// partition, `alignsRecurrentCheckpointsToPrefillChunks`) replaces the
+    /// stride rule: every range must be one whole grid chunk starting on the
+    /// grid (the prompt's last range may be shorter, never longer), and only
+    /// grid multiples are boundaries. A cold run under the same fixed chunking
+    /// has the same partition below and above such a boundary, so a restore
+    /// continues it exactly; any other range, a solo stripe included, disarms
+    /// the request.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
-        stride: Int = Self.recurrentCheckpointStrideTokens
+        stride: Int = Self.recurrentCheckpointStrideTokens, chunkGrid: Int? = nil
     ) -> Bool {
         guard isArmed else { return false }
         guard !packed else { return disarm(.packed) }
         guard cap > 0, stride > 0, !range.isEmpty, range.lowerBound == position,
             range.upperBound <= promptLength
         else { return disarm(.geometry) }
+        if let chunkGrid {
+            guard chunkGrid > 0, range.lowerBound.isMultiple(of: chunkGrid),
+                range.count == chunkGrid
+                    || (range.count < chunkGrid && range.upperBound == promptLength)
+            else { return disarm(.geometry) }
+            position = range.upperBound
+            chunkSize = cap
+            return position.isMultiple(of: chunkGrid)
+        }
         position = range.upperBound
         chunkSize = cap
         return Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)

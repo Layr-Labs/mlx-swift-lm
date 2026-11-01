@@ -3,6 +3,7 @@ import MLX
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 extension KernelTests {
 

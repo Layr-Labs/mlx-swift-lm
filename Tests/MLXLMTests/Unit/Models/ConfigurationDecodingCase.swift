@@ -3,6 +3,20 @@ import MLXLMCommon
 import Testing
 
 extension UnitTests {
+    /// The `path[i]=…` lines of a Qwen hybrid layer schedule with `count`
+    /// layers, where each `fullAttentionInterval`-th layer is full attention,
+    /// in the order that `UnitTests.storedFields(of:)` gives.
+    static func hybridLayerTypeFields(
+        _ path: String, count: Int, fullAttentionInterval: Int
+    ) -> [String] {
+        (0 ..< count).map { index in
+            let type =
+                (index + 1).isMultiple(of: fullAttentionInterval)
+                ? "full_attention" : "linear_attention"
+            return "\(path)[\(index)]=\(type)"
+        }.sorted()
+    }
+
     /// A model configuration type with a `config.json` and the stored fields
     /// that decoding it must give.
     ///

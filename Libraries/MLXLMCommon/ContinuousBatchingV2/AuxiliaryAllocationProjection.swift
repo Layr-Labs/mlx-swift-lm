@@ -9,8 +9,10 @@ public struct CBv2AuxiliaryAllocationSpec: Sendable {
     /// History can consist of many immutable chunks with independent padding.
     public let partitioned: Bool
 
-    public init(bytesPerToken: Int, allocationCount: Int = 1,
-                tokenGranularity: Int = 1, tokenPadding: Int = 0, partitioned: Bool = false) {
+    public init(
+        bytesPerToken: Int, allocationCount: Int = 1,
+        tokenGranularity: Int = 1, tokenPadding: Int = 0, partitioned: Bool = false
+    ) {
         self.bytesPerToken = bytesPerToken
         self.allocationCount = allocationCount
         self.tokenGranularity = tokenGranularity
@@ -29,33 +31,62 @@ public struct CBv2AuxiliaryAllocationProjection: Sendable {
     private let policy: AllocationFootprintPolicy
     private let buffers: [Buffer]
     let maximumGrowthBytes: Int
+    /// `bytes(forTokens: n) <= n * linearBytesPerToken + linearSlackBytes` for
+    /// every n: each buffer rounds at most `granularity - 1 + padding` rows up
+    /// and its allocator adds at most the policy's maximum extra. nil when the
+    /// bound is not representable.
+    let linearBytesPerToken: Int?
+    let linearSlackBytes: Int?
 
     public init?(policy: AllocationFootprintPolicy, buffers specs: [CBv2AuxiliaryAllocationSpec]) {
         guard let overhead = policy.maximumExtraBytes else { return nil }
-        var buffers: [Buffer] = [], growth = 0
+        var buffers: [Buffer] = []
+        var growth = 0
+        var rate: Int? = 0
+        var slack: Int? = 0
         for spec in specs {
             guard spec.bytesPerToken > 0, spec.allocationCount > 0,
-                  spec.tokenGranularity > 0, spec.tokenPadding >= 0 else { return nil }
+                spec.tokenGranularity > 0, spec.tokenPadding >= 0
+            else { return nil }
             let partitioned: Int?
             if spec.partitioned {
-                guard let bytes = Self.maximumBytesPerUnit(spec.bytesPerToken, policy: policy) else { return nil }
+                guard let bytes = Self.maximumBytesPerUnit(spec.bytesPerToken, policy: policy)
+                else { return nil }
                 partitioned = bytes
-            } else { partitioned = nil }
+            } else {
+                partitioned = nil
+            }
             // Include the initial 0 -> 1 transition as well as later block
             // crossings; padding is request-local and appears only once.
             guard let firstPadded = Self.add(1, spec.tokenPadding),
-                  let firstRounding = Self.add(firstPadded, spec.tokenGranularity - 1),
-                  let firstRows = Self.multiply(firstRounding / spec.tokenGranularity, spec.tokenGranularity),
-                  let block = Self.multiply(partitioned ?? spec.bytesPerToken, firstRows),
-                  let bound = Self.add(block, partitioned == nil ? overhead : 0),
-                  let all = Self.multiply(bound, spec.allocationCount),
-                  let next = Self.add(growth, all) else { return nil }
+                let firstRounding = Self.add(firstPadded, spec.tokenGranularity - 1),
+                let firstRows = Self.multiply(
+                    firstRounding / spec.tokenGranularity, spec.tokenGranularity),
+                let block = Self.multiply(partitioned ?? spec.bytesPerToken, firstRows),
+                let bound = Self.add(block, partitioned == nil ? overhead : 0),
+                let all = Self.multiply(bound, spec.allocationCount),
+                let next = Self.add(growth, all)
+            else { return nil }
             growth = next
             buffers.append(.init(spec: spec, partitionedBytesPerToken: partitioned))
+            let unit = partitioned ?? spec.bytesPerToken
+            let rows = Self.add(spec.tokenPadding, spec.tokenGranularity - 1)
+            let rounding = rows.flatMap { Self.multiply($0, unit) }
+            let extra = rounding.flatMap { Self.add($0, partitioned == nil ? overhead : 0) }
+            rate = rate.flatMap { total in
+                Self.multiply(unit, spec.allocationCount).flatMap { Self.add(total, $0) }
+            }
+            slack = slack.flatMap { total in
+                extra.flatMap { Self.multiply($0, spec.allocationCount) }.flatMap {
+                    Self.add(total, $0)
+                }
+            }
         }
         self.policy = policy
         self.buffers = buffers
         self.maximumGrowthBytes = growth
+        self.linearBytesPerToken = rate
+        self.linearSlackBytes = slack
     }
 
     func bytes(forTokens tokens: Int) -> Int? {
@@ -65,12 +96,15 @@ public struct CBv2AuxiliaryAllocationProjection: Sendable {
         for buffer in buffers {
             let spec = buffer.spec
             guard let padded = Self.add(tokens, spec.tokenPadding),
-                  let rounding = Self.add(padded, spec.tokenGranularity - 1),
-                  let rows = Self.multiply(rounding / spec.tokenGranularity, spec.tokenGranularity),
-                  let logical = Self.multiply(rows, buffer.partitionedBytesPerToken ?? spec.bytesPerToken),
-                  let physical = buffer.partitionedBytesPerToken == nil ? policy.upperBound(byteCount: logical) : logical,
-                  let all = Self.multiply(physical, spec.allocationCount),
-                  let next = Self.add(total, all) else { return nil }
+                let rounding = Self.add(padded, spec.tokenGranularity - 1),
+                let rows = Self.multiply(rounding / spec.tokenGranularity, spec.tokenGranularity),
+                let logical = Self.multiply(
+                    rows, buffer.partitionedBytesPerToken ?? spec.bytesPerToken),
+                let physical = buffer.partitionedBytesPerToken == nil
+                    ? policy.upperBound(byteCount: logical) : logical,
+                let all = Self.multiply(physical, spec.allocationCount),
+                let next = Self.add(total, all)
+            else { return nil }
             total = next
         }
         return total
@@ -82,11 +116,13 @@ public struct CBv2AuxiliaryAllocationProjection: Sendable {
     /// Initialization only; token admission never performs this scan.
     static func maximumBytesPerUnit(_ unit: Int, policy: AllocationFootprintPolicy) -> Int? {
         guard unit > 0, let extra = policy.maximumExtraBytes else { return nil }
-        var count = 1, best = unit
+        var count = 1
+        var best = unit
         while best == unit || count <= extra / (best - unit) {
             guard let logical = multiply(count, unit),
-                  let bytes = policy.upperBound(byteCount: logical),
-                  let rounded = add(bytes / count, bytes % count == 0 ? 0 : 1) else { return nil }
+                let bytes = policy.upperBound(byteCount: logical),
+                let rounded = add(bytes / count, bytes % count == 0 ? 0 : 1)
+            else { return nil }
             best = max(best, rounded)
             if extra == 0 { return best }
             guard let next = add(count, 1) else { return nil }

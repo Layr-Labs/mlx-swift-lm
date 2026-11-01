@@ -56,11 +56,22 @@ extension EngineLoopV2 {
     }
 
     /// Only the explicit native fallback may remove media/ineligible rows from
-    /// the head batch count, and only in a cohort actually containing media.
+    /// the head batch count, and only in a cohort actually containing media, a
+    /// logprob row or, on a row-exact recurrent fallback target, any other
+    /// ineligible row (stop strings, penalties, logit bias). Such a row never
+    /// drafts; its one-token decode beside verifying rows is exact (row-exact
+    /// decode, ordinary sampler), so the other rows keep speculating.
     /// All-row target costs, token/KV headroom and reservations stay unchanged.
-    /// With no opt-in/media, return the historical cohort verbatim.
+    /// With no opt-in or such row, return the historical cohort verbatim.
     private func mtpDraftBatchRows(_ rows: [CBv2ScheduledRequest]) -> [CBv2ScheduledRequest] {
-        guard let mtp, rows.contains(where: { mtp.requiresTargetOnlyMedia($0.request) }) else {
+        guard let mtp,
+            rows.contains(where: {
+                mtp.requiresTargetOnlyMedia($0.request)
+                    || (mtp.supportsRequestScopedMediaFallback
+                        && $0.request.sampling.topLogprobs != 0)
+                    || (mtp.ineligibleRowsDecodeBesideSpeculation && !mtpBasicEligible($0))
+            })
+        else {
             return rows
         }
         return rows.filter { rec in
@@ -159,8 +170,12 @@ extension EngineLoopV2 {
         // history, including fixed-depth requests temporarily forced to k=0
         // by batch/headroom pressure. Route those target-only steps through
         // the hidden-returning MTP path. Explicit fixed k=0 has no history
-        // ownership and remains on ordinary chained decode.
-        if mtp.tracksPersistentHistory { return true }
+        // ownership and remains on ordinary chained decode. A drafter that
+        // takes ordinary-decode history keeps chaining while no row can
+        // speculate; the chained launch captures hidden for finalize.
+        if mtp.tracksPersistentHistory {
+            return canSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+        }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
                 mtp.maximumAutomaticDepth(plannedDecodeRows: ids.count) == 0
@@ -199,12 +214,16 @@ extension EngineLoopV2 {
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
-        let batchRows = mtpDraftBatchRows(rows)
+        let batchRows = CBv2StepProfiler.time("v2.plan.mtp.batchRows") { mtpDraftBatchRows(rows) }
         let withinBatchGate = batchRows.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(batchRows)
-        mtp.beginPlan(
-            plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
-            rowIDs: rows.map(\.id))
+        let canSpeculate = CBv2StepProfiler.time("v2.plan.mtp.canSpeculate") {
+            withinBatchGate && mtpRowsCanSpeculate(batchRows)
+        }
+        CBv2StepProfiler.time("v2.plan.mtp.begin") {
+            mtp.beginPlan(
+                plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
+                rowIDs: rows.map(\.id))
+        }
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
@@ -289,6 +308,7 @@ extension EngineLoopV2 {
     /// True when this scheduler plan carries seed or verify work.
     func mtpRoundNeeded(_ plan: CBv2StepPlan) -> Bool {
         guard let mtp else { return false }
+        if mtpPlanFeedsHistoryFromOrdinaryDecode(plan) { return false }
         if mtp.planHasMTPWork {
             return plan.assignments.contains {
                 mtp.roundMark(for: $0.id) != nil || mtp.isSeedMarked($0.id)
@@ -304,6 +324,24 @@ extension EngineLoopV2 {
             // MTP prefill path so persistent history starts at prompt position 0.
             guard let state = kvStates[assignment.id] else { return true }
             return Self.mtpStorageEligible(state)
+        }
+    }
+
+    /// A plan that cannot speculate, whose history-owning rows are all plain
+    /// decode rows, needs no MTP step: `executeMixed` captures their hidden
+    /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
+    /// so persistent history starts at prompt position 0.
+    private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
+        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp, !mtp.planCanSpeculate else {
+            return false
+        }
+        return plan.assignments.allSatisfy { assignment in
+            guard let rec = scheduler.record(for: assignment.id), mtpBasicEligible(rec)
+            else { return true }
+            guard let state = kvStates[assignment.id] else { return false }
+            return !Self.mtpStorageEligible(state)
+                || (assignment.numTokens == 1 && rec.generatedTokenCount > 0
+                    && rec.numComputedTokens == rec.tokens.count)
         }
     }
 }

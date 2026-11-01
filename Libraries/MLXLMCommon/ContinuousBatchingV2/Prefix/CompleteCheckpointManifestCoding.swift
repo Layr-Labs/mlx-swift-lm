@@ -6,6 +6,7 @@ extension CBv2CompleteCheckpointManifest {
         case prefixTokens, cacheSalt, assistantCodecID, tensors, attentionLayers
         case mediaIdentity, mediaTargetOnly, nativeBlockState, packedPrefixTokens
         case checkpointQuantization, checkpointNativeDTypes
+        case glm5NextState
     }
 
     public init(from decoder: any Decoder) throws {
@@ -41,6 +42,8 @@ extension CBv2CompleteCheckpointManifest {
                 ?? false,
             nativeBlockState: try values.decodeIfPresent(
                 CBv2NativeBlockCheckpointState.self, forKey: .nativeBlockState),
+            glm5NextState: try values.decodeIfPresent(
+                CBv2GLM5NextCheckpointState.self, forKey: .glm5NextState),
             checkpointQuantization: try values.decodeIfPresent(
                 PagedKVQuantizationConfig.self, forKey: .checkpointQuantization),
             checkpointNativeDTypes: try values.decodeIfPresent(
@@ -70,6 +73,7 @@ extension CBv2CompleteCheckpointManifest {
         try values.encodeIfPresent(mediaIdentity, forKey: .mediaIdentity)
         if mediaTargetOnly { try values.encode(true, forKey: .mediaTargetOnly) }
         try values.encodeIfPresent(nativeBlockState, forKey: .nativeBlockState)
+        try values.encodeIfPresent(glm5NextState, forKey: .glm5NextState)
         try values.encodeIfPresent(checkpointQuantization, forKey: .checkpointQuantization)
         try values.encodeIfPresent(checkpointNativeDTypes, forKey: .checkpointNativeDTypes)
         try values.encode(tensors, forKey: .tensors)
@@ -83,6 +87,7 @@ extension CBv2CompleteCheckpointManifest {
             && lhs.cacheSalt == rhs.cacheSalt && lhs.assistantCodecID == rhs.assistantCodecID
             && lhs.mediaIdentity == rhs.mediaIdentity && lhs.mediaTargetOnly == rhs.mediaTargetOnly
             && lhs.nativeBlockState == rhs.nativeBlockState
+            && lhs.glm5NextState == rhs.glm5NextState
             && lhs.checkpointQuantization == rhs.checkpointQuantization
             && lhs.checkpointNativeDTypes == rhs.checkpointNativeDTypes
             && lhs.tensors == rhs.tensors && lhs.attentionLayers == rhs.attentionLayers
