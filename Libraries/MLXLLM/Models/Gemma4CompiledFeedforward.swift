@@ -70,6 +70,9 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
             invalidate()
             return nil
         }
+        // A trace keeps the projection route it was built with. A scoped frame
+        // picks its route per call, so it stays on the eager path.
+        let projectionScoped = Gemma4BatchDecodeProjection.active || Gemma4PrefillProjection.active
         let canCompile =
             Device.defaultDevice().deviceType == .gpu
             && !isExpertPrefill && input.ndim == 3 && (1 ... 2).contains(input.dim(1))
@@ -78,6 +81,7 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
             && state.topK > 0 && input.dim(0) * input.dim(1) * state.topK < 64
             // Preserve existing per-invocation component receipts.
             && !CBv2ForwardShapeObservation.isActive
+            && !projectionScoped
 
         let result: (forward: ((MLXArray) -> MLXArray)?, retired: Entry?) = lock.withLock {
             var retired: Entry?

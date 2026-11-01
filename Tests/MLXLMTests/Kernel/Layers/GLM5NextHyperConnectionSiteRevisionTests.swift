@@ -344,8 +344,8 @@ extension KernelTests {
             }
         }
 
-        // F1's kernels (e7a5f18d), verbatim:
-        // `GLM5NextHyperConnectionNormFusion.oneLaunchSource` as it was.
+        // F1's kernels (e7a5f18d plus the live tree's fenced-input wait),
+        // verbatim: `GLM5NextHyperConnectionNormFusion.oneLaunchSource` as it was.
         private static let oldSource = """
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
@@ -375,6 +375,11 @@ extension KernelTests {
                 reinterpret_cast<device atomic_uint*>(counters) + (1u - slot) * uint(MaxRows) + row;
             device atomic_float* row_partials =
                 reinterpret_cast<device atomic_float*>(partials) + size_t(row) * Sums * Groups;
+            #if GLM5_HC_SITE_EXPAND
+            // `output` can be a CPU-stream sum: wait for it here, not in a
+            // separate MLX fence-wait launch (a no-op unless MLX enables it).
+            MLX_FENCED_INPUT_WAIT(output);
+            #endif
 
             // Phase 1. SIMD group `stream` < 4 stages that stream's values of
             // the split form's threads 32 * tile + lane.
@@ -587,6 +592,6 @@ extension KernelTests {
             outputNames: ["normalized", "expanded", "post_out", "comb_out"],
             source: "#define GLM5_HC_SITE_EXPAND 1\n" + oldSource,
             header: Kernel.coefficientHeader, ensureRowContiguous: true,
-            mutableInputs: ["counters", "partials"])
+            mutableInputs: ["counters", "partials"], fencedInputs: ["output"])
     }
 }

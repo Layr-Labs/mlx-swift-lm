@@ -197,6 +197,19 @@ struct Gemma4CompiledFeedforwardTests {
         }
     }
 
+    /// A trace keeps the route it was built with, and these scopes pick a route
+    /// per call, so scoped frames neither build nor replay a trace.
+    @Test func projectionScopesKeepEagerExecution() throws {
+        let layer = try layer()
+        Gemma4BatchDecodeProjection.$active.withValue(true) {
+            compare(layer, input(rows: 2))
+        }
+        Gemma4PrefillProjection.$active.withValue(true) {
+            compare(layer, input(sequenceWidth: 2))
+        }
+        #expect(!layer.feedforwardTraceIsCompiled)
+    }
+
     @Test func unsupportedReplacementDoesNotReuseAnOldTrace() throws {
         let layer = try layer()
         let x = input()

@@ -418,6 +418,40 @@ public final class MiMoV26VisionTower: Module {
         validatedWeightDType = expectedDType
     }
 
+    /// Caller retains verified file descriptors and owns the native LOAD gate.
+    /// No whole-component dictionary or second unbudgeted payload copy.
+    public func loadNativeWeightsSerial(
+        expectedDType: DType = .bfloat16, flattenedPatchStorage: Bool = false,
+        read: (String, [Int]) throws -> MLXArray, checkpoint: ([MLXArray]) throws -> Void
+    ) throws {
+        validatedWeightDType = nil
+        guard [.bfloat16, .float16, .float32].contains(expectedDType) else {
+            throw MiMoV26VisionError.invalidWeights("unsupported dtype")
+        }
+        var expected = shape.sourceShapes()
+        if flattenedPatchStorage {
+            expected["visual.patch_embed.proj.weight"] = [
+                configuration.hiddenSize, shape.patchWidth,
+            ]
+        }
+        for (name, dimensions) in expected.sorted(by: { $0.key < $1.key }) {
+            let value = try read(name, dimensions)
+            guard value.shape == dimensions, value.dtype == expectedDType else {
+                throw MiMoV26VisionError.invalidWeights(name)
+            }
+            let tensor =
+                name == "visual.patch_embed.proj.weight"
+                ? value.reshaped(configuration.hiddenSize, shape.patchWidth) : value
+            try update(
+                parameters: ModuleParameters.unflattened([
+                    String(name.dropFirst("visual.".count)): tensor
+                ]), verify: [.noUnusedKeys, .shapeMismatch])
+            try checkpoint([tensor])
+        }
+        freeze()
+        validatedWeightDType = expectedDType
+    }
+
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate,
