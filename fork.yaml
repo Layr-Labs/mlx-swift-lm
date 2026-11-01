@@ -336,10 +336,14 @@ def:
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
             Explicit cluster decode scopes preserve singleton packed projection, expert and
             unscaled normalization arithmetic independently for each request row.
+            The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
+            dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
