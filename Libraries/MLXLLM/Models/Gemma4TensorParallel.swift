@@ -153,6 +153,12 @@ public struct Gemma4TensorShard: Sendable, Equatable {
     }
 }
 
+/// Submits a CBv2 forward's hidden rows every `stride` decoder layers (0: never).
+/// Evaluation order only: every value is the one the whole forward computes.
+public enum Gemma4LayerSubmission {
+    @TaskLocal public static var stride = 0
+}
+
 /// Unrounded FP32 partials of a row-parallel projection.
 public enum Gemma4TensorParallelProjection {
     /// This rank's FP32 partial of `linear` over `x`: the input widened
