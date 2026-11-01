@@ -51,6 +51,11 @@ public protocol ToolCallParser: Sendable {
     /// The default implementation splits on `startTag` (if present) and parses
     /// each segment individually.
     func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+
+    /// Parse one complete start/end frame into every call it carries.
+    /// Formats whose frame holds a single call use the default (`parse`);
+    /// LFM2 lists all calls of a turn inside one frame.
+    func parseFrame(content: String, tools: [[String: any Sendable]]?) -> [ToolCall]
 }
 
 extension ToolCallParser {
@@ -68,6 +73,10 @@ extension ToolCallParser {
 
     public var supportsBareJSON: Bool { false }
     public var supportsMarkerlessNamedJSON: Bool { false }
+
+    public func parseFrame(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        parse(content: content, tools: tools).map { [$0] } ?? []
+    }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         let startTags = acceptedStartTags
@@ -105,8 +114,9 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json
 
-    /// LFM2/LFM2.5 Pythonic format with model-specific tags.
-    /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
+    /// LFM2/LFM2.5 Pythonic format with model-specific tags; one frame may
+    /// carry several calls (`LFM2ToolCallParser`).
+    /// Example: `<|tool_call_start|>[func(arg='value'), other()]<|tool_call_end|>`
     case lfm2
 
     /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
@@ -194,8 +204,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return JSONToolCallParser(
                 startTag: "<tool_call>", endTag: "</tool_call>", supportsBareJSON: true)
         case .lfm2:
-            return PythonicToolCallParser(
-                startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+            return LFM2ToolCallParser()
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .nemotron:

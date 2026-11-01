@@ -48,6 +48,10 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
         let count = min(maximumBytes, bytes - byteOffset)
         let packedBytes = role.packedCount * role.packedRowBytes
         let tokenCount = role.position - role.tokenStart
+        // Prepared once per segment (inside the reserved scratch); a packed
+        // row is encoded straight into the result unless the segment splits it.
+        var encoder: CBv2PreparedNativeCheckpointRowEncoder?
+        var partial = Data()
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             var copied = 0
@@ -64,15 +68,40 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
                     descriptor: nativeDescriptor,
                     byteOffset: (head * tokenCount + token) * role.nativeRowBytes,
                     maximumBytes: role.nativeRowBytes, nativeWork: nativeWork)
-                let row =
-                    packed ? try CBv2NativeCheckpointRowCodec.encode(native, role: role) : native
-                guard row.count == rowBytes else {
+                let length = min(count - copied, rowBytes - inRow)
+                guard packed else {
+                    guard native.count == rowBytes else {
+                        throw CBv2CompleteCheckpointError.incompleteTransfer
+                    }
+                    native.withUnsafeBytes { source in
+                        destination.baseAddress!.advanced(by: copied).copyMemory(
+                            from: source.baseAddress!.advanced(by: inRow), byteCount: length)
+                    }
+                    copied += length
+                    continue
+                }
+                if encoder == nil {
+                    encoder = try CBv2PreparedNativeCheckpointRowEncoder(role: role)
+                }
+                guard let encoder, encoder.encodedRowBytes == rowBytes,
+                    native.count == role.nativeRowBytes
+                else {
                     throw CBv2CompleteCheckpointError.incompleteTransfer
                 }
-                let length = min(count - copied, rowBytes - inRow)
-                row.withUnsafeBytes { source in
-                    destination.baseAddress!.advanced(by: copied).copyMemory(
-                        from: source.baseAddress!.advanced(by: inRow), byteCount: length)
+                try native.withUnsafeBytes { source in
+                    if inRow == 0 && length == rowBytes {
+                        try encoder.encode(
+                            source,
+                            into: UnsafeMutableRawBufferPointer(
+                                rebasing: destination[copied ..< copied + rowBytes]))
+                    } else {
+                        if partial.count != rowBytes { partial = Data(count: rowBytes) }
+                        try partial.withUnsafeMutableBytes { try encoder.encode(source, into: $0) }
+                        partial.withUnsafeBytes { row in
+                            destination.baseAddress!.advanced(by: copied).copyMemory(
+                                from: row.baseAddress!.advanced(by: inRow), byteCount: length)
+                        }
+                    }
                 }
                 copied += length
             }

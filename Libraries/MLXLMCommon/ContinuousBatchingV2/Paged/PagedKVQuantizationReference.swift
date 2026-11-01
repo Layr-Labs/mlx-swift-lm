@@ -140,7 +140,9 @@ public enum PagedKVQuantizationReference {
         return values
     }
 
-    private static func sign(_ index: Int) -> Float {
+    /// The forward rotation's per-lane sign; shared with the prepared
+    /// checkpoint row encoder so both produce identical bytes.
+    static func sign(_ index: Int) -> Float {
         var x = UInt32(index) &+ 0x9e37_79b9
         x = (x ^ (x >> 16)) &* 0x7feb_352d
         x = (x ^ (x >> 15)) &* 0x846c_a68b

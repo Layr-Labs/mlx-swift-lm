@@ -217,9 +217,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             let stateDescriptors = descriptors.filter { $0.role != .keys && $0.role != .values }
             for spec in codec.recurrentSpec?.layers ?? [] {
                 guard let state = layers[spec.modelLayerIndex],
-                    let conv = state.conv, let ssm = state.ssm,
+                    let conv = state.conv,
                     conv.shape == spec.convShape, conv.dtype == spec.convDType,
-                    ssm.shape == spec.ssmShape, ssm.dtype == spec.ssmDType
+                    spec.admitsSSM(state.ssm)
                 else { return [] }
             }
             // GLM's immutable assistant checkpoint retains its actual admitted
@@ -247,7 +247,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 for spec in codec.recurrentSpec?.layers ?? [] {
                     let layer = layers[spec.modelLayerIndex]!
                     let conv = MLX.where(MLXArray(true), layer.conv!, layer.conv!)
-                    try nativeWork?.retain(arrays: [conv, layer.ssm!])
+                    try nativeWork?.retain(arrays: [conv, layer.ssm].compactMap { $0 })
                     copies[spec.modelLayerIndex] = .init(
                         conv: conv, ssm: layer.ssm)
                 }
