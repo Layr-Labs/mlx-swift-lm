@@ -769,8 +769,10 @@ open class SwitchGLU: Module {
         return projection(x, indices, sortedIndices: sortedIndices)
     }
 
+    /// `sortsAssignments: false` keeps every assignment in token order, as a
+    /// call with fewer than 64 assignments always does.
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, sortsAssignments: Bool = true
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         if admitsFusedRoutes,
             let result = MiMoV26DecodeExperts.tryProject(
@@ -782,7 +784,7 @@ open class SwitchGLU: Module {
         // #4029: same route sort/inverse as gatherSort, without materializing
         // repeated activation rows. Fallback below retains the original graph.
         if admitsFusedRoutes, mimoV26NAXGather, MiMoV26NAXGateUp.rowMapRequested,
-            MiMoV26NAXGateUp.activationRequested, indices.size >= 64,
+            MiMoV26NAXGateUp.activationRequested, sortsAssignments, indices.size >= 64,
             isSiluActivation, activationProduct != nil, gateUpProj == nil,
             let gateProj, let upProj
         {
@@ -804,7 +806,7 @@ open class SwitchGLU: Module {
 
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         x = transformInput(x)
-        let doSort = indices.size >= 64
+        let doSort = sortsAssignments && indices.size >= 64
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -1176,6 +1178,20 @@ open class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// Expert projection and weighted reduction for `[rows, hidden]` in which
+    /// each row gets the arithmetic of its own one-row ``callAndWeightedReduce``
+    /// call (fewer than 64 assignments: no sort, no direct reduction).
+    ///
+    /// Assignments stay in row order, so every (row, expert) pair is still a
+    /// native M=1 gathered product and the top-K reduction keeps its one-row
+    /// kernel; all rows share one dispatch per projection instead of one each.
+    public func callAndWeightedReduceRows(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
+    ) -> MLXArray {
+        let projected = projectExperts(x, indices, sortsAssignments: false)
+        return weightedExpertSum(MLX.squeezed(projected.output, axis: -2), weights)
     }
 }
 
