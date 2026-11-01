@@ -24,6 +24,100 @@ Transformers adaptations retain Apache-2.0 licensing and attribution; the full
 license is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0). This notice does not
 relicense unrelated SDK code or model artifacts.
 
+## Artifact read cache policy
+
+`GLM5NextArtifactLoader` requests descriptor-local `F_NOCACHE=1` and
+`F_RDAHEAD=0` on every safetensors open, before integrity verification, header
+reads or selected tensor reads. If either request fails, it closes that descriptor
+and refuses the load. These OS hints request reduced file-cache pressure; they
+do not guarantee the absence of caching or replace memory admission guards.
+SHA-256, file identity checks, read limits and payload ownership remain required.
+The no-GPU `UnitTests.GLM5NextArtifactCachePolicyTests` exercise real filesystem
+hashing and descriptor cleanup; only descriptor-control syscall failures are injected.
+
+Full-artifact SHA-256 verification uses up to eight workers, each holding one
+8 MiB page-aligned chunk. `verificationHostBytes` prices these chunks; no file
+or shard is omitted from verification. Tensor payload reads use bounded aligned
+anonymous scratch and copy only the requested bytes into owned `Data`.
+`payloadReadScratchAllowanceBytes` prices that scratch in addition to the returned
+payload and its MLX copy. File-stamp checks surround each aligned payload read;
+unexpected short reads, mutation and cancellation refuse the load. Unit coverage
+includes aligned windows, EOF tails, read failures, cancellation and scratch bounds.
+
+The native `KernelTests.GLM5NextThreadgroupContractTests` exercise the production
+hyper-connection kernels for three dtypes and seven geometries, including split,
+prefill, tail and folded-expand paths. They compare the existing numerical
+references and represented folded-stream bits. They require the exact native
+MLX/Metal dependency composition; adding the tests does not qualify that runtime.
+
+## Cluster still-image preparation helpers
+
+`GLM5NextClusterImagePlan` inspects and decodes a single bounded PNG for the
+cluster owner: at most 96 KiB encoded, 1,048,576 source pixels and 1,024 feature
+tokens. Animated, multiframe and oriented inputs refuse. The image-only
+`GLM5NextProcessor` initializer shares the existing resize/patchify path and
+accepts a caller-owned checkpoint; prompt preparation still requires a tokenizer.
+`CBv2Request.clusterStillImages` and `mimoClusterImages` carry host payloads for
+their distributed owners. Local `EngineV2` rejects either envelope before native
+allocation. These helpers do not register a modality or qualify a serving route;
+cluster admission, native parity, cancellation and bilateral retirement remain
+consumer qualification gates. Existing stage and final-stage MTP ownership APIs
+remain intact.
+
+## Adaptation scope
+
+| Native file | Reference scope and local adaptation |
+|---|---|
+| [GLM5NextConfiguration.swift](../../Libraries/MLXLLM/Models/GLM5NextConfiguration.swift) | Official checkpoint schema, Transformers configuration and SGLang geometry/NextN references; explicit Swift decoding and validation, not model registration. |
+| [GLM5NextHyperConnection.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnection.swift) | Transformers `Glm5NextTextHyperConnection.forward` and decoder residual mixing; Swift/MLX collapse and expansion with explicit dtype and epsilon boundaries. |
+| [GLM5NextLinearAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearAttention.swift) | Transformers causal convolution, forget gate, recurrent Kimi delta attention and gated RMSNorm; projected inputs and caller-owned state, sequential reference recurrence. |
+| [GLM5NextLinearKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearKernel.swift), [GLM5NextLinearChunkedRecurrence.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearChunkedRecurrence.swift) | Transformers recurrent KDA, with MLX-VLM's vector kernel and flash-linear-attention's chunk form as execution references; whole-step FP32 recurrence and chunk-parallel prefill (`.serving` uses the chunked form). |
+| [GLM5NextMoE.swift](../../Libraries/MLXLLM/Models/GLM5NextMoE.swift) | Transformers clipped MLP, experts, sigmoid router and shared-expert composition; native split projection banks and validation. |
+| [GLM5NextSparseAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseAttention.swift) | Transformers learned pool selection and attention, with MLX-VLM as the absorbed-MLA reference; stateless explicit-history selection and selected-latent execution, not an owned serving cache. |
+| [GLM5NextTextModel.swift](../../Libraries/MLXLLM/Models/GLM5NextTextModel.swift), [GLM5NextAttentionLayers.swift](../../Libraries/MLXLLM/Models/GLM5NextAttentionLayers.swift) | Transformers layer/backbone composition and final hidden boundary, using the separately tested native math. |
+| [GLM5NextAbsorbedAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextAbsorbedAttention.swift) | Transformers DSA attention equations, with MLX-VLM as the absorbed-MLA reference; the serving form (`.absorbedDenseHistory` in `.serving`) on views of the packed kv_b; the reference graph remains the member default. |
+| [GLM5NextExecutionPolicy.swift](../../Libraries/MLXLLM/Models/GLM5NextExecutionPolicy.swift), [GLM5NextHyperConnectionKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionKernel.swift), [GLM5NextHyperConnectionFusion.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionFusion.swift), [GLM5NextMoEKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEKernel.swift), [GLM5NextSparseSelection.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseSelection.swift) | The same Transformers mHC, expert-combine and pool-selection equations; one load-time execution policy whose `.serving` preset is the provider configuration (fused Metal mHC collapse/expand, fused expert combine, parallel threshold pool selection). |
+| [GLM5NextMoEPrefillKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEPrefillKernel.swift) | Adapted from oMLX (Apache-2.0, Copyright oMLX contributors; [notice](../mimo-v26/LICENSE-OMLX)) PRs #3995, #3993, #4022 and #4029 through the pinned MiMo port in `MiMoV26NAXMetalSources` (Apple MLX MIT primitives, notice retained there): segmented single-expert NAX tiles, joint gate/up, SwiGLU epilogue and row-map reads. Modified for affine 4-bit group dequantization with activation-dtype scales and offsets, the clamped-GLU epilogue, token rows read through the sort order and inverse by scatter. |
+| [GLM5NextMTP.swift](../../Libraries/MLXLLM/Models/GLM5NextMTP.swift) | SGLang and vLLM trained NextN normalization, shifted input, residual DSA/MoE and shared head; no random assistant fallback. |
+| [GLM5NextVision.swift](../../Libraries/MLXVLM/Models/GLM5NextVision.swift), [GLM5NextProcessor.swift](../../Libraries/MLXVLM/Models/GLM5NextProcessor.swift) | Transformers vision equations and image/video geometry, one frame at a time with checked evaluation and an explicit sampling policy. `GLM5NextVisionAttentionKernel.automatic` uses MLX fused attention only on the default GPU stream for head dimensions 64/80/128 and the query-tiled reference graph elsewhere; explicit `.fused` refuses off that stream. |
+| [GLM5NextArtifactLoader.swift](../../Libraries/MLXLLM/Models/GLM5NextArtifactLoader.swift), [GLM5NextWeightInventory.swift](../../Libraries/MLXLLM/Models/GLM5NextWeightInventory.swift) | Local closed-inventory validation and bounded source-range loading; no download or publication client. |
+| [GLM5NextCBv2.swift](../../Libraries/MLXLLM/Models/GLM5NextCBv2.swift), [GLM5Next state owners](../../Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/) | Native request ownership, transfer accounting, paged history reads, step pricing, complete-prefix checkpoints and embedding-spliced media prefill. |
+
+The NextN adaptations retain the trained equations and checkpoint mapping, not
+the upstream schedulers, CUDA/Triton kernels or dependencies. The implementation does
+not claim cross-backend bit identity; source snapshots and numerical tests are
+separate evidence.
+
+### Pipeline stage boundary
+
+`GLM5NextTextStagePlan` selects a nonempty contiguous range of **global** text
+layer indices from the validated full inventory. `loadTextStage` retains the
+artifact reader's complete hash/header checks but reads only the selected
+payloads. It calls the supplied admission hook before each tensor allocation;
+packed expert banks retain the ordinary bounded materialization and source
+retirement contract. No full-model construction precedes stage selection.
+
+With `GLM5NextArtifactLoadRoots`, fused input projections also retain their
+concatenated buffers and member views before the admission callback and native
+evaluation. This applies to dense/shared MLP, DSA, KDA and NextN construction.
+A refusal or a throw after evaluation leaves those arrays with the construction
+owner until explicit fenced cleanup; successful model adoption retires the
+temporary aliases. Direct constructors keep checked local evaluation when no
+materializer is supplied.
+
+The first stage embeds tokens (or accepts prepared embeddings). Every
+intermediate stage emits the complete `[B,T,hc_mult,hidden_size]` residual
+streams. For the published four-stream, 4096-wide BF16 configuration, this is
+32 KiB per token. Only the final stage takes the stream mean, applies the
+trained final norm and reads logits. Global indices preserve the original
+KDA/DSA mapping and sparse-attention layer identity.
+
+Stage caches belong to their stage instance. A prepared candidate builds on a
+copy, and publishes only after the caller's evaluation/join/fault-check and
+downstream acknowledgement fence succeeds. Discard, a throwing fence and a
+changed destination cannot publish that candidate. Copies retain recurrent
+checkpoints; unsupported KDA truncation requires saved-boundary replay.
+
 ### Compact recurrent cache ownership
 
 `GLM5NextKDACache` compacts incoming convolution and FP32 recurrent arrays
@@ -31,7 +125,7 @@ with `contiguous()` at advance and serialized-state import. Copy, adoption
 and rollback preserve value semantics through independent wrappers; they do
 not mutate the source checkpoint. Serialized `state` still contains only
 current state. `innerState()` additionally exposes rollback roots for
-evaluation. Full-model transaction commits pass those roots
+evaluation. Both full-model and stage transaction commits pass those roots
 to the existing evaluation/join/fault-check fence before publishing.
 
 Compaction is lazy. Until that fence completes, its input history and other
@@ -59,63 +153,12 @@ candidate does not permit memory credit before pending device work is joined.
 Physical-allocation/cache regression tests and stage numerical/lifecycle tests
 are distinct from full-artifact peak and distributed-serving qualification.
 
-## Artifact read cache policy
-
-`GLM5NextArtifactLoader` requests descriptor-local `F_NOCACHE=1` and
-`F_RDAHEAD=0` on every safetensors open, before integrity verification, header
-reads or selected tensor reads. If either request fails, it closes that descriptor
-and refuses the load. These OS hints request reduced file-cache pressure; they
-do not guarantee the absence of caching or replace memory admission guards.
-SHA-256, file identity checks, read limits and payload ownership remain required.
-The no-GPU `UnitTests.GLM5NextArtifactCachePolicyTests` exercise real filesystem
-hashing and descriptor cleanup; only descriptor-control syscall failures are injected.
-
-Full-artifact SHA-256 verification uses up to eight workers, each holding one
-8 MiB page-aligned chunk. `verificationHostBytes` prices these chunks; no file
-or shard is omitted from verification. Tensor payload reads use bounded aligned
-anonymous scratch and copy only the requested bytes into owned `Data`.
-`payloadReadScratchAllowanceBytes` prices that scratch in addition to the returned
-payload and its MLX copy. File-stamp checks surround each aligned payload read;
-unexpected short reads, mutation and cancellation refuse the load. Unit coverage
-includes aligned windows, EOF tails, read failures, cancellation and scratch bounds.
-
-The native `KernelTests.GLM5NextThreadgroupContractTests` exercise the production
-hyper-connection kernels for three dtypes and seven geometries, including split,
-prefill, tail and folded-expand paths. They compare the existing numerical
-references and represented folded-stream bits. They require the exact native
-MLX/Metal dependency composition; adding the tests does not qualify that runtime.
-
-## Adaptation scope
-
-| Native file | Reference scope and local adaptation |
-|---|---|
-| [GLM5NextConfiguration.swift](../../Libraries/MLXLLM/Models/GLM5NextConfiguration.swift) | Official checkpoint schema, Transformers configuration and SGLang geometry/NextN references; explicit Swift decoding and validation, not model registration. |
-| [GLM5NextHyperConnection.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnection.swift) | Transformers `Glm5NextTextHyperConnection.forward` and decoder residual mixing; Swift/MLX collapse and expansion with explicit dtype and epsilon boundaries. |
-| [GLM5NextLinearAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearAttention.swift) | Transformers causal convolution, forget gate, recurrent Kimi delta attention and gated RMSNorm; projected inputs and caller-owned state, sequential reference recurrence. |
-| [GLM5NextLinearKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearKernel.swift), [GLM5NextLinearChunkedRecurrence.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearChunkedRecurrence.swift) | Transformers recurrent KDA, with MLX-VLM's vector kernel and flash-linear-attention's chunk form as execution references; whole-step FP32 recurrence and chunk-parallel prefill (`.serving` uses the chunked form). |
-| [GLM5NextMoE.swift](../../Libraries/MLXLLM/Models/GLM5NextMoE.swift) | Transformers clipped MLP, experts, sigmoid router and shared-expert composition; native split projection banks and validation. |
-| [GLM5NextSparseAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseAttention.swift) | Transformers learned pool selection and attention, with MLX-VLM as the absorbed-MLA reference; stateless explicit-history selection and selected-latent execution, not an owned serving cache. |
-| [GLM5NextTextModel.swift](../../Libraries/MLXLLM/Models/GLM5NextTextModel.swift), [GLM5NextAttentionLayers.swift](../../Libraries/MLXLLM/Models/GLM5NextAttentionLayers.swift) | Transformers layer/backbone composition and final hidden boundary, using the separately tested native math. |
-| [GLM5NextAbsorbedAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextAbsorbedAttention.swift) | Transformers DSA attention equations, with MLX-VLM as the absorbed-MLA reference; the serving form (`.absorbedDenseHistory` in `.serving`) on views of the packed kv_b; the reference graph remains the member default. |
-| [GLM5NextExecutionPolicy.swift](../../Libraries/MLXLLM/Models/GLM5NextExecutionPolicy.swift), [GLM5NextHyperConnectionKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionKernel.swift), [GLM5NextHyperConnectionFusion.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionFusion.swift), [GLM5NextMoEKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEKernel.swift), [GLM5NextSparseSelection.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseSelection.swift) | The same Transformers mHC, expert-combine and pool-selection equations; one load-time execution policy whose `.serving` preset is the provider configuration (fused Metal mHC collapse/expand, fused expert combine, parallel threshold pool selection). |
-| [GLM5NextMoEPrefillKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEPrefillKernel.swift) | Adapted from oMLX (Apache-2.0, Copyright oMLX contributors; [notice](../mimo-v26/LICENSE-OMLX)) PRs #3995, #3993, #4022 and #4029 through the pinned MiMo port in `MiMoV26NAXMetalSources` (Apple MLX MIT primitives, notice retained there): segmented single-expert NAX tiles, joint gate/up, SwiGLU epilogue and row-map reads. Modified for affine 4-bit group dequantization with activation-dtype scales and offsets, the clamped-GLU epilogue, token rows read through the sort order and inverse by scatter. |
-| [GLM5NextMTP.swift](../../Libraries/MLXLLM/Models/GLM5NextMTP.swift) | SGLang and vLLM trained NextN normalization, shifted input, residual DSA/MoE and shared head; no random assistant fallback. |
-| [GLM5NextVision.swift](../../Libraries/MLXVLM/Models/GLM5NextVision.swift), [GLM5NextProcessor.swift](../../Libraries/MLXVLM/Models/GLM5NextProcessor.swift) | Transformers vision equations and image/video geometry, one frame at a time with checked evaluation and an explicit sampling policy. `GLM5NextVisionAttentionKernel.automatic` uses MLX fused attention only on the default GPU stream for head dimensions 64/80/128 and the query-tiled reference graph elsewhere; explicit `.fused` refuses off that stream. |
-| [GLM5NextArtifactLoader.swift](../../Libraries/MLXLLM/Models/GLM5NextArtifactLoader.swift), [GLM5NextWeightInventory.swift](../../Libraries/MLXLLM/Models/GLM5NextWeightInventory.swift) | Local closed-inventory validation and bounded source-range loading; no download or publication client. |
-| [GLM5NextCBv2.swift](../../Libraries/MLXLLM/Models/GLM5NextCBv2.swift), [GLM5Next state owners](../../Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/) | Native request ownership, transfer accounting, paged history reads, step pricing, complete-prefix checkpoints and embedding-spliced media prefill. |
-
-The NextN adaptations retain the trained equations and checkpoint mapping, not
-the upstream schedulers, CUDA/Triton kernels or dependencies. The implementation does
-not claim cross-backend bit identity; source snapshots and numerical tests are
-separate evidence.
-
-With `GLM5NextArtifactLoadRoots`, fused input projections also retain their
-concatenated buffers and member views before the admission callback and native
-evaluation. This applies to dense/shared MLP, DSA, KDA and NextN construction.
-A refusal or a throw after evaluation leaves those arrays with the construction
-owner until explicit fenced cleanup; successful model adoption retires the
-temporary aliases. Direct constructors keep checked local evaluation when no
-materializer is supplied.
+The final stage can explicitly load the trained embedding for NextN. The plan
+charges that duplicate embedding in addition to its own layers and readout;
+MTP tensors remain a separate partition. Stage ownership does not itself
+provide a distributed scheduler, RDMA transport, paged cache integration,
+model admission or a cluster-serving qualification claim. Those consumer
+boundaries require their own tests and full-artifact runs.
 
 ### Execution policy
 
@@ -421,3 +464,68 @@ source. No model-weight redistribution permission, publication, deployment
 approval or qualification is implied by this provenance record.
 Source-code licensing and the artifact's own license, bytes and prompt contract
 must remain separately identified.
+
+
+### Final-stage readout selection
+
+`GLM5NextTextStage.prepareForward` defaults to `.allTokens`, preserving complete
+logits and hidden states for existing callers. Explicit `.lastToken` projects
+only the last physical column and retains a singleton time axis `[B,1,V]`;
+padded callers must decide whether that column is their intended row. Explicit
+`.none` returns all normalized hidden states without building a vocabulary-head
+graph. Intermediate stages still return all residual streams for every policy.
+The candidate evaluation fence and cache adoption/rollback remain mandatory.
+
+`GLM5NextTextStageTests` adds full/default-vs-selected output, hidden/cache,
+masked-column and failed-acknowledgement coverage across prefill and decode.
+These CPU/GPU model tests require the parent native lane; numerical/GPU parity
+and cold-prefill timing are pending. No throughput gain or MTP qualification is
+claimed by this source preparation. Cluster runtime callers must handle the
+additive `.hidden` output and select the admitted readout explicitly.
+
+### Speculative verification on a whole-model stage
+
+A whole-model stage (a single device, or a tensor-parallel rank holding every
+layer's shard) verifies MTP proposals without CBv2:
+
+- `GLM5NextTextStage.prepareVerification(tokens:cache:)` runs a `[1, T]`
+  window (`T` at most `maximumVerificationTokens`, 8) with the `.allTokens`
+  readout. Each KDA layer also captures its state after every window token
+  (the fused step's capture variant), held in its cache until the commit.
+- `GLM5NextTextStageCandidate.commit(afterEvaluating:keeping:)` publishes only
+  the first `keeping(output)` tokens, decided after the fence: each KDA layer
+  adopts the captured state of the last kept token (`GLM5NextKDACache`
+  truncation into a captured window) and each DSA history drops the rest. A
+  throwing `keeping` leaves the cache intact; a plain `commit` keeps every
+  token and also releases the captured states.
+- `GLM5NextMTP.primeHistory` appends the NextN history of verified pairs
+  without the query (`prepareHistory`: prompt rows whose proposal is unused),
+  and `GLM5NextMTP.primeAndPropose` primes verified pairs as `prime` does and
+  proposes `depth` tokens (1 through `maximumProposalDepth`, 3): the last
+  primed row's greedy token, then index-shared continuations that append
+  nothing (`index_share_for_mtp_iteration`).
+- `GLM5NextMTPCheckpoint.arrays` exposes a checkpoint's history for a
+  caller's fence and byte accounting.
+
+The window's arithmetic is the ordinary `[1, T]` step's, not a one-row
+step's: MLX runs a one-row quantized projection (affine or NVFP4, including
+the head) as `qmv` and a multi-row one below the `qmm` threshold as
+`qmv_wide` (`backend/metal/quantized.cpp`; affine on GPU generation 15 and
+later, NVFP4 everywhere), which reduces K in a different order. Every
+projection of a window therefore rounds differently from one-token steps, and
+the histories it writes (KDA state, DSA latents) carry that forward, so a long
+speculative decode drifts from one-token greedy decode and can pick a
+different token after tens to hundreds of tokens even where the top-2 gap is
+several bf16 ulps (MoE routing near-ties amplify it). Greedy acceptance
+against the window's own argmax is exact for the window's arithmetic, and a
+one-token window is bitwise an ordinary step. `GLM5NextStageVerificationTests`
+covers prefix keeping against a forward of the same prefix, rounds that reject
+proposals against one-token steps over the kept tokens (every KDA convolution
+window and recurrent state, DSA history and the next logits), one-token
+windows against ordinary steps (bitwise), truncation into a captured window
+(the kept token's exact state), refusal and rollback of invalid counts, and
+history priming and proposals against `prime` (CPU device, reference policy).
+The GPU capture path is checked end to end instead: on two M5 Ultra (GLM tensor parallel, sealed,
+3,931-token prompt, 256 tokens), one-token windows equal plain greedy decode
+token for token, and windows that keep only the target's first token equal
+each other at depths 1 and 2 and the accepting runs at the same depth.

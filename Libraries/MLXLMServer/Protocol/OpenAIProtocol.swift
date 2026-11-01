@@ -142,6 +142,19 @@ public enum OpenAIMessageContent: Codable, Sendable, Equatable {
         }
     }
 
+    /// The `type` of the first part this server does not serve
+    /// (``OpenAIContentPart/unsupported(type:)``), nil when it serves every
+    /// part. ``text`` keeps only text parts, so request preparation refuses
+    /// such content instead of answering from what is left of it
+    /// (`OpenAIRequestValidation`).
+    public var unsupportedPartType: String? {
+        guard case .parts(let parts) = self else { return nil }
+        for part in parts {
+            if case .unsupported(let type) = part { return type }
+        }
+        return nil
+    }
+
     /// True if any content part carries image, video or audio media (which the
     /// text-only ``MLXModelContainerEngine`` cannot serve). ``text`` flattens
     /// content to its text parts only, so media would otherwise be silently
@@ -577,6 +590,12 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.streamOptions = streamOptions
     }
 
+    /// The first unsupported content part type across the messages
+    /// (``OpenAIMessageContent/unsupportedPartType``), in message order.
+    public var unsupportedContentPartType: String? {
+        messages.lazy.compactMap(\.content.unsupportedPartType).first
+    }
+
     public var generationParameters: GenerateParameters {
         GenerateParameters(
             maxTokens: maxTokens,
@@ -644,17 +663,22 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         public var index: Int
         public var delta: Delta
         public var finishReason: String?
+        public var logprobs: OpenAIChatLogprobs?
 
         private enum CodingKeys: String, CodingKey {
             case index
             case delta
             case finishReason = "finish_reason"
+            case logprobs
         }
 
-        public init(index: Int, delta: Delta, finishReason: String?) {
+        public init(
+            index: Int, delta: Delta, finishReason: String?, logprobs: OpenAIChatLogprobs? = nil
+        ) {
             self.index = index
             self.delta = delta
             self.finishReason = finishReason
+            self.logprobs = logprobs
         }
     }
 
