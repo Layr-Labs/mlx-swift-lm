@@ -1257,7 +1257,7 @@ private class Gemma4Experts: Module {
     ) -> MLXArray {
         // The registered prompt policy keeps every token's complete expert
         // projection, activation and weighted reduction at one token. The
-        // tokens share each dispatch but are never sorted together.
+        // tokens share each dispatch; grouping them by expert orders the work only.
         if Gemma4PrefillProjection.appliesExperts(
             x, indices: topKIndices,
             weights: topKWeights, isExpertPrefill: isExpertPrefill)

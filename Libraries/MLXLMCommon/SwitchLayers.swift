@@ -769,10 +769,10 @@ open class SwitchGLU: Module {
         return projection(x, indices, sortedIndices: sortedIndices)
     }
 
-    /// `sortsAssignments: false` keeps every assignment in token order, as a
-    /// call with fewer than 64 assignments always does.
+    /// `hintsSorted: false` still sorts 64 or more assignments, but only for
+    /// weight locality: the gathers keep their unsorted M=1 route.
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray, sortsAssignments: Bool = true
+        _ x: MLXArray, _ indices: MLXArray, hintsSorted: Bool = true
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         if admitsFusedRoutes,
             let result = MiMoV26DecodeExperts.tryProject(
@@ -784,7 +784,7 @@ open class SwitchGLU: Module {
         // #4029: same route sort/inverse as gatherSort, without materializing
         // repeated activation rows. Fallback below retains the original graph.
         if admitsFusedRoutes, mimoV26NAXGather, MiMoV26NAXGateUp.rowMapRequested,
-            MiMoV26NAXGateUp.activationRequested, sortsAssignments, indices.size >= 64,
+            MiMoV26NAXGateUp.activationRequested, hintsSorted, indices.size >= 64,
             isSiluActivation, activationProduct != nil, gateUpProj == nil,
             let gateProj, let upProj
         {
@@ -806,7 +806,8 @@ open class SwitchGLU: Module {
 
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         x = transformInput(x)
-        let doSort = sortsAssignments && indices.size >= 64
+        let doSort = indices.size >= 64
+        let hint = doSort && hintsSorted
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -816,8 +817,8 @@ open class SwitchGLU: Module {
 
         // Native MiMo's known default SiLU only. Custom activations, fused
         // stored projections and all non-NAX/unsupported layouts fall through.
-        if admitsFusedRoutes, mimoV26NAXGather, isSiluActivation, activationProduct != nil,
-            gateUpProj == nil, let gateProj, let upProj,
+        if admitsFusedRoutes, mimoV26NAXGather, hintsSorted, isSiluActivation,
+            activationProduct != nil, gateUpProj == nil, let gateProj, let upProj,
             let activated = MiMoV26NAXGateUp.tryActivation(
                 x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
         {
@@ -832,14 +833,14 @@ open class SwitchGLU: Module {
         let hostRows = !doSort && suppliesHostRowIndices
         if let gateUpProj {
             let xGateUp = projectExpert(
-                gateUpProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                gateUpProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            if mimoV26NAXGather,
+            if mimoV26NAXGather, hintsSorted,
                 let pair = MiMoV26NAXGateUp.tryProjection(
                     x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
             {
@@ -847,9 +848,9 @@ open class SwitchGLU: Module {
                 xUp = pair.up
             } else {
                 xUp = projectExpert(
-                    upProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                    upProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
                 xGate = projectExpert(
-                    gateProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                    gateProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
             }
         }
 
@@ -866,7 +867,7 @@ open class SwitchGLU: Module {
         activated = transformHidden(activated)
 
         x = projectExpert(
-            downProj, activated, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+            downProj, activated, idx, sortedIndices: hint, hostRowIndices: hostRows)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -1184,13 +1185,19 @@ open class SwitchGLU: Module {
     /// each row gets the arithmetic of its own one-row ``callAndWeightedReduce``
     /// call (fewer than 64 assignments: no sort, no direct reduction).
     ///
-    /// Assignments stay in row order, so every (row, expert) pair is still a
-    /// native M=1 gathered product and the top-K reduction keeps its one-row
-    /// kernel; all rows share one dispatch per projection instead of one each.
+    /// Assignments are grouped by expert for weight locality, but the gathers
+    /// are not told so: every (row, expert) pair is still a native M=1
+    /// gathered product. Rows return to their order before the top-K
+    /// reduction, which keeps its one-row kernel. All rows share one dispatch
+    /// per projection instead of one each.
     public func callAndWeightedReduceRows(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> MLXArray {
-        let projected = projectExperts(x, indices, sortsAssignments: false)
+        var projected = projectExperts(x, indices, hintsSorted: false)
+        if let inverseOrder = projected.inverseOrder {
+            projected.output = scatterUnsort(
+                x: projected.output, invOrder: inverseOrder, shape: indices.shape)
+        }
         return weightedExpertSum(MLX.squeezed(projected.output, axis: -2), weights)
     }
 }

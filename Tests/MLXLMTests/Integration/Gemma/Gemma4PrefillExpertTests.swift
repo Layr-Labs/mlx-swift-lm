@@ -130,8 +130,10 @@ struct Gemma4PrefillExpertTests {
                     let actual = Gemma4PrefillProjectionScope.withPrefillFrame(
                         tokens: MLXArray.zeros([1, count], dtype: .int32), enabled: true
                     ) { layer(input, isExpertPrefill: true).0 }
-                    // One unsorted gather carries every token's own routes in order.
-                    #expect(gate.calls == [referenceCalls.flatMap { $0 }])
+                    // One gather, never hinted as sorted, carries every token's own
+                    // routes; 64 or more assignments arrive grouped by expert.
+                    let routes = referenceCalls.flatMap { $0 }
+                    #expect(gate.calls == [routes.count >= 64 ? routes.sorted() : routes])
                     #expect(gate.sorted == [false])
                     #expect(bytes(actual) == bytes(expected), "bits=\(bits) tokens=\(count)")
                     let finite = actual.asType(.float32).asArray(Float.self).allSatisfy(\.isFinite)
@@ -168,9 +170,9 @@ struct Gemma4PrefillExpertTests {
         }
     }
 
-    /// Independent decode rows share one unsorted expert gather and keep
-    /// each row's one-row bytes.
-    @Test func batchDecodeRowsShareOneUnsortedExpertCall() throws {
+    /// Independent decode rows share one expert gather, never hinted as
+    /// sorted, and keep each row's one-row bytes.
+    @Test func batchDecodeRowsShareOneExpertCall() throws {
         try Device.withDefaultDevice(.cpu) {
             for bits in [4, 8] {
                 let (layer, gate) = try fixture(bits: bits, zeroShared: true)
