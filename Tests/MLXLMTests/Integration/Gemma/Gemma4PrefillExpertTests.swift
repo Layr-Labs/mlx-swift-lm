@@ -215,23 +215,35 @@ struct Gemma4PrefillExpertTests {
                     let counts =
                         geometry.experts == 128
                         ? [1, 9, 64, 513] : [1, 7, 8, 9, 63, 64, 65, 511, 512, 513, 2048]
-                    for count in counts {
+                    for (count, tied) in counts.map({ ($0, false) }) + [(9, true), (513, true)] {
                         let (x, indices, weights) = routedRows(
-                            count: count, hidden: geometry.hidden, experts: geometry.experts)
+                            count: count, hidden: geometry.hidden, experts: geometry.experts,
+                            tied: tied)
                         let actual = glu.callAndWeightedReduceRows(x, indices, weights: weights)
-                        let expected = concatenated(
-                            (0 ..< count).map {
-                                glu.callAndWeightedReduce(
-                                    x[$0 ..< $0 + 1], indices[$0 ..< $0 + 1],
-                                    weights: weights[$0 ..< $0 + 1],
-                                    fuseSortedReduction: true, isProductionPrefill: true)
-                            }, axis: 0)
                         #expect(
-                            bytes(actual) == bytes(expected),
-                            "hidden=\(geometry.hidden) bits=\(bits) rows=\(count)")
+                            bytes(actual) == bytes(glu.oneRowCalls(x, indices, weights: weights)),
+                            "hidden=\(geometry.hidden) bits=\(bits) rows=\(count) tied=\(tied)")
                         let values = actual.asType(.float32).asArray(Float.self)
                         #expect(values.allSatisfy(\.isFinite) && values.contains { $0 != 0 })
                     }
+                }
+            }
+        }
+    }
+
+    /// A single row, and rows that all route to the same experts (every sort
+    /// key tied), keep the bytes of their own one-row calls.
+    @Test func expertRowsMatchOneRowCallsWithTiedRoutes() throws {
+        try Device.withDefaultDevice(.cpu) {
+            for bits in [4, 8] {
+                let glu = try packedGemmaExperts(hidden: 128, width: 64, experts: 16, bits: bits)
+                for (count, tied) in [(1, false), (7, true), (8, true), (64, true), (64, false)] {
+                    let (x, indices, weights) = routedRows(
+                        count: count, hidden: 128, experts: 16, tied: tied)
+                    #expect(
+                        bytes(glu.callAndWeightedReduceRows(x, indices, weights: weights))
+                            == bytes(glu.oneRowCalls(x, indices, weights: weights)),
+                        "bits=\(bits) rows=\(count) tied=\(tied)")
                 }
             }
         }
@@ -277,12 +289,17 @@ struct Gemma4PrefillExpertTests {
         return glu
     }
 
-    private func routedRows(count: Int, hidden: Int, experts: Int) -> (MLXArray, MLXArray, MLXArray)
+    /// `tied`: every row routes to experts 0, 2, ..., 14.
+    private func routedRows(count: Int, hidden: Int, experts: Int, tied: Bool = false)
+        -> (MLXArray, MLXArray, MLXArray)
     {
         let x = MLXRandom.normal([count, hidden]).asType(.bfloat16)
-        let indices = MLX.argPartition(
-            MLXRandom.uniform(low: 0, high: 1, [count, experts]), kth: experts - 8, axis: -1
-        )[0..., (experts - 8)...].asType(.uint32)
+        let indices =
+            tied
+            ? MLXArray((0 ..< count * 8).map { UInt32($0 % 8 * 2) }, [count, 8])
+            : MLX.argPartition(
+                MLXRandom.uniform(low: 0, high: 1, [count, experts]), kth: experts - 8, axis: -1
+            )[0..., (experts - 8)...].asType(.uint32)
         let weights = MLX.softmax(MLXRandom.normal([count, 8]), axis: -1).asType(.bfloat16)
         eval(x, indices, weights)
         return (x, indices, weights)
@@ -349,6 +366,19 @@ struct Gemma4PrefillExpertTests {
                 !Gemma4PrefillProjection.appliesExperts(
                     input, indices: indices, weights: weights, isExpertPrefill: true))
         }
+    }
+}
+
+extension SwitchGLU {
+    /// The reference: one `callAndWeightedReduce` per row.
+    fileprivate func oneRowCalls(_ x: MLXArray, _ indices: MLXArray, weights: MLXArray) -> MLXArray
+    {
+        concatenated(
+            (0 ..< x.dim(0)).map {
+                callAndWeightedReduce(
+                    x[$0 ..< $0 + 1], indices[$0 ..< $0 + 1], weights: weights[$0 ..< $0 + 1],
+                    fuseSortedReduction: true, isProductionPrefill: true)
+            }, axis: 0)
     }
 }
 

@@ -1255,18 +1255,13 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> MLXArray {
-        // The registered prompt policy keeps every token's complete expert
-        // projection, activation and weighted reduction at one token. The
-        // tokens share each dispatch; grouping them by expert orders the work only.
+        // Registered prompt frames and independent decode rows keep each row's
+        // whole expert block at one-row arithmetic; the rows share each dispatch.
         if Gemma4PrefillProjection.appliesExperts(
             x, indices: topKIndices,
             weights: topKWeights, isExpertPrefill: isExpertPrefill)
+            || Gemma4BatchDecodeProjection.applies(x)
         {
-            return reduceRows(x, topKIndices: topKIndices, topKWeights: topKWeights)
-        }
-        // Routing, expert sorting, and the weighted reduction retain their
-        // singleton arithmetic too: preserving dense QMV alone is insufficient.
-        if Gemma4BatchDecodeProjection.applies(x) {
             return reduceRows(x, topKIndices: topKIndices, topKWeights: topKWeights)
         }
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
@@ -1285,7 +1280,7 @@ private class Gemma4Experts: Module {
         return y.reshaped(B, S, H)
     }
 
-    /// Every token row with the bytes of its own one-row call.
+    /// One shared expert call in which every row keeps its own one-row bytes.
     private func reduceRows(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
     ) -> MLXArray {

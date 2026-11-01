@@ -1181,16 +1181,16 @@ open class SwitchGLU: Module {
             weights: weights)
     }
 
-    /// Expert projection and weighted reduction for `[rows, hidden]` in which
-    /// each row gets the arithmetic of its own one-row ``callAndWeightedReduce``
-    /// call (fewer than 64 assignments: no sort, no direct reduction).
+    /// `callAndWeightedReduce` for `[rows, hidden]` in which every row keeps the
+    /// bytes of its own one-row call, while all rows share one dispatch per
+    /// projection.
     ///
     /// Assignments are grouped by expert for weight locality, but the gathers
-    /// are not told so: every (row, expert) pair is still a native M=1
-    /// gathered product. Rows return to their order before the top-K
-    /// reduction, which keeps its one-row kernel. All rows share one dispatch
-    /// per projection instead of one each.
-    public func callAndWeightedReduceRows(
+    /// are not told so: each (row, expert) pair stays a native M=1 gathered
+    /// product. Rows return to their order before the top-K reduction. The
+    /// Qwen4 profile's tiled expert kernels pick a route by assignment count,
+    /// so this guarantee does not cover them.
+    package func callAndWeightedReduceRows(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> MLXArray {
         var projected = projectExperts(x, indices, hintsSorted: false)
