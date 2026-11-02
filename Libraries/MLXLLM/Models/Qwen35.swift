@@ -1039,8 +1039,6 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        precondition(
-            recurrentState.count == inputs.dim(0), "Qwen35 CBv2 recurrent row count mismatch")
         let (output, rows) = cbv2Recurrent(
             inputs, states: recurrentState.map { $0.inputState(modelLayerIndex: modelLayerIndex) })
         for (row, evaluation) in recurrentState.enumerated() {

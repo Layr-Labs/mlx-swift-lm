@@ -2,14 +2,9 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-/// Consecutive prompt chunks of one request built as one graph, layer by layer: every
-/// chunk's mixer phase, then every chunk's MLP phase, each chunk with its own shapes.
+/// Consecutive prompt chunks of one request built as one graph, layer by layer: every chunk's
+/// mixer phase, then every chunk's MLP phase (`phaseBuilt` after each), each with its own shapes.
 public enum Qwen35PromptWavefront {
-    public enum Phase: Sendable {
-        case mixer
-        case feedForward
-    }
-
     /// Whether `model` builds wavefronts: dense MLPs and a plain token embedding.
     public static func supports(_ model: Qwen35TextModel) -> Bool {
         !(model.model.embedTokens is HadamardQuantizedEmbedding)
@@ -21,8 +16,7 @@ public enum Qwen35PromptWavefront {
     /// `prefill` on the wrapped text model.
     public static func prefill(
         _ model: Qwen35Model, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
-        recurrentState: CBv2RecurrentStateEvaluation,
-        phaseBuilt: (_ phase: Phase, _ layer: Int, _ chunk: Int) -> Void
+        recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
     ) -> [MLXArray] {
         prefill(
             model.languageModel, chunks: chunks, finalChunk: finalChunk, caches: caches,
@@ -33,8 +27,7 @@ public enum Qwen35PromptWavefront {
     /// returns what its own forward returns (`cbv2RecurrentPrefill`, or the last chunk's logits).
     public static func prefill(
         _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
-        recurrentState: CBv2RecurrentStateEvaluation,
-        phaseBuilt: (_ phase: Phase, _ layer: Int, _ chunk: Int) -> Void
+        recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
     ) -> [MLXArray] {
         let inner = model.model
         precondition(
@@ -76,7 +69,7 @@ public enum Qwen35PromptWavefront {
                 }
                 streams[chunk] = stream
                 mixed.append(output)
-                phaseBuilt(.mixer, index, chunk)
+                phaseBuilt()
             }
             if layer.isLinear, let carry, let conv = carry.conv, let ssm = carry.ssm {
                 do {
@@ -90,7 +83,7 @@ public enum Qwen35PromptWavefront {
                 streams[chunk] = scoped(fused(chunk), chunks[chunk]) {
                     layer.promptFeedForward(streams[chunk], mixed: mixed[chunk])
                 }
-                phaseBuilt(.feedForward, index, chunk)
+                phaseBuilt()
             }
         }
         return chunks.indices.map { chunk in
