@@ -64,6 +64,11 @@ extension MiMoV26TextModel {
             throw MiMoV26ExecutionError.invalidInput(
                 "independent decode requires 1...8 one-token rows")
         }
+        // The batched layer loop below takes no cross-rank sums.
+        guard tensorParallel == nil || dimensions.batch == 1 else {
+            throw MiMoV26ExecutionError.invalidInput(
+                "a tensor-parallel rank decodes one independent row at a time")
+        }
         try validateIndependentCaches(caches, length: 1)
         if dimensions.batch == 1 {
             return [
@@ -157,7 +162,9 @@ extension MiMoV26TextModel {
         inputIDs: MLXArray?, embeddings: MLXArray?,
         captureLayers: Set<Int>
     ) throws -> (batch: Int, length: Int) {
-        guard activationDType == .bfloat16, hasLoadedReadoutPrecision,
+        // A tensor-parallel rank's head holds its own vocabulary rows.
+        guard activationDType == .bfloat16,
+            hasLoadedReadoutPrecision(rows: headVocabularyRange.count),
             (inputIDs != nil) != (embeddings != nil),
             captureLayers.allSatisfy({ model.layers.indices.contains($0) })
         else {

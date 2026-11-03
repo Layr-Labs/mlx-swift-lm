@@ -769,16 +769,22 @@ open class SwitchGLU: Module {
         return projection(x, indices, sortedIndices: sortedIndices)
     }
 
+    /// `float32Rows` gives the down projection an exact FP32 widening of its input, so its rows
+    /// are stored as FP32 and never rounded.
     /// `hintsSorted: false` still sorts 64 or more assignments, but only for
     /// weight locality: the gathers keep their unsorted M=1 route.
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray, hintsSorted: Bool = true
+        _ x: MLXArray, _ indices: MLXArray, float32Rows: Bool = false, hintsSorted: Bool = true
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         if admitsFusedRoutes,
             let result = MiMoV26DecodeExperts.tryProject(
-                x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested)
+                x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested,
+                float32Rows: float32Rows)
         {
             return (MLX.expandedDimensions(result.output, axis: -2), nil, false)
+        }
+        func downInput(_ activated: MLXArray) -> MLXArray {
+            float32Rows ? activated.asType(.float32) : activated
         }
 
         // #4029: same route sort/inverse as gatherSort, without materializing
@@ -798,7 +804,7 @@ open class SwitchGLU: Module {
                 sorted: true, rowMap: rowMap)
             {
                 return (
-                    projectExpert(downProj, activated, sorted, sortedIndices: true),
+                    projectExpert(downProj, downInput(activated), sorted, sortedIndices: true),
                     argSort(order), true
                 )
             }
@@ -823,7 +829,7 @@ open class SwitchGLU: Module {
                 x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
         {
             return (
-                projectExpert(downProj, activated, idx, sortedIndices: doSort),
+                projectExpert(downProj, downInput(activated), idx, sortedIndices: doSort),
                 doSort ? inverseOrder : nil, doSort
             )
         }
@@ -867,7 +873,8 @@ open class SwitchGLU: Module {
         activated = transformHidden(activated)
 
         x = projectExpert(
-            downProj, activated, idx, sortedIndices: hint, hostRowIndices: hostRows)
+            downProj, downInput(activated), idx, sortedIndices: hint,
+            hostRowIndices: hostRows)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -978,7 +985,17 @@ open class SwitchGLU: Module {
     }
 
     open func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var projected = projectExperts(x, indices)
+        expertRows(x, indices, float32Rows: false)
+    }
+
+    /// The expert rows `[..., K, H]` stored as FP32: a tensor-parallel rank's half-width rows,
+    /// summed across ranks before their one rounding.
+    package func float32ExpertRows(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        expertRows(x, indices, float32Rows: true)
+    }
+
+    private func expertRows(_ x: MLXArray, _ indices: MLXArray, float32Rows: Bool) -> MLXArray {
+        var projected = projectExperts(x, indices, float32Rows: float32Rows)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
