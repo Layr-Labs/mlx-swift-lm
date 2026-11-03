@@ -1255,31 +1255,14 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> MLXArray {
-        // The registered prompt policy keeps the complete expert projection,
-        // activation and weighted reduction at one token. Routes and weights
-        // are sliced together; recursive singleton calls take the original path.
+        // Registered prompt frames and independent decode rows keep each row's
+        // whole expert block at one-row arithmetic; the rows share each dispatch.
         if Gemma4PrefillProjection.appliesExperts(
             x, indices: topKIndices,
             weights: topKWeights, isExpertPrefill: isExpertPrefill)
+            || Gemma4BatchDecodeProjection.applies(x)
         {
-            return concatenated(
-                (0 ..< x.dim(1)).map { token in
-                    callAsFunction(
-                        x[0..., token ..< token + 1, 0...],
-                        topKIndices: topKIndices[0..., token ..< token + 1, 0...],
-                        topKWeights: topKWeights[0..., token ..< token + 1, 0...],
-                        isExpertPrefill: true)
-                }, axis: 1)
-        }
-        // Routing, expert sorting, and the weighted reduction retain their
-        // singleton shapes too: preserving dense QMV alone is insufficient.
-        if Gemma4BatchDecodeProjection.applies(x) {
-            return concatenated(
-                (0 ..< x.dim(0)).map { row in
-                    callAsFunction(
-                        x[row ..< row + 1], topKIndices: topKIndices[row ..< row + 1],
-                        topKWeights: topKWeights[row ..< row + 1], isExpertPrefill: false)
-                }, axis: 0)
+            return reduceRows(x, topKIndices: topKIndices, topKWeights: topKWeights)
         }
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -1295,6 +1278,18 @@ private class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
+    }
+
+    /// One shared expert call in which every row keeps its own one-row bytes.
+    private func reduceRows(
+        _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
+    ) -> MLXArray {
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        return switchGLU.callAndWeightedReduceRows(
+            x.reshaped(B * S, H), topKIndices.reshaped(B * S, K),
+            weights: topKWeights.reshaped(B * S, K)
+        ).reshaped(B, S, H)
     }
 }
 
