@@ -512,13 +512,14 @@ public enum AffineQuantizedVectors {
         inputNames: ["w", "scales", "biases", "w2", "scales2", "biases2", "x", "count"],
         outputNames: ["y"], source: swigluSource, header: header + swigluHeader)
 
-    // MLX's `Sigmoid` functor (mlx/backend/metal/kernels/unary_ops.h).
+    // MLX's `Sigmoid` functor (mlx/backend/metal/kernels/unary_ops.h), with its precise `exp`:
+    // the default fast `exp` rounds some gates to other bits (bf16 -6.84375).
     private static let swigluHeader = """
 
         struct AqvSigmoid {
           template <typename U>
           U operator()(U x) thread {
-            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
             return (x < 0) ? y : 1 - y;
           }
         };
