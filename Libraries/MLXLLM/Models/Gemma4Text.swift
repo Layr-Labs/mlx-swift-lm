@@ -660,7 +660,7 @@ extension Gemma4TextConfiguration {
 
 // MARK: - Helper Modules
 
-private class RMSNormNoScale: Module {
+class RMSNormNoScale: Module {
     let eps: Float
 
     init(eps: Float = 1e-6) {
@@ -784,7 +784,7 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
-private class Gemma4Attention: Module {
+class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
     let layerType: String
@@ -795,6 +795,9 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    /// Tensor parallel: `o_proj` holds this rank's heads' input columns, and
+    /// its FP32 partial is summed across ranks before rounding.
+    var tensorParallel: Gemma4TensorParallelContext?
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1028,7 +1031,9 @@ private class Gemma4Attention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-        return (oProj(output), kvState, activePositionOffset)
+        return (
+            tensorParallel?.reduce(oProj, output) ?? oProj(output), kvState, activePositionOffset
+        )
     }
 
     /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
@@ -1104,7 +1109,7 @@ private class Gemma4Attention: Module {
             if output.dtype != outputDType {
                 output = output.asType(outputDType)
             }
-            return (Gemma4BatchDecodeProjection.linear(oProj, output), sharedKV, positionOffset)
+            return (projectV2Output(output), sharedKV, positionOffset)
         }
 
         guard let kProj, let kNorm, let vNorm else {
@@ -1172,10 +1177,11 @@ private class Gemma4Attention: Module {
         if output.dtype != outputDType {
             output = output.asType(outputDType)
         }
-        return (
-            Gemma4BatchDecodeProjection.linear(oProj, output), .regular(keys: k, values: v),
-            captured
-        )
+        return (projectV2Output(output), .regular(keys: k, values: v), captured)
+    }
+
+    private func projectV2Output(_ output: MLXArray) -> MLXArray {
+        tensorParallel?.reduce(oProj, output) ?? Gemma4BatchDecodeProjection.linear(oProj, output)
     }
 }
 
@@ -1184,7 +1190,7 @@ private class Gemma4Attention: Module {
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
-private class Gemma4Router: Module {
+class Gemma4Router: Module {
     @ModuleInfo(key: "proj") var proj: Linear
     @ModuleInfo(key: "scale") var scale: MLXArray
     @ModuleInfo(key: "per_expert_scale") var perExpertScale: MLXArray
@@ -1226,7 +1232,7 @@ private class Gemma4Router: Module {
 }
 
 /// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
-private class Gemma4Experts: Module {
+class Gemma4Experts: Module {
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
     let fuseWeightedUnsort: Bool
 
@@ -1295,7 +1301,7 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
-private class Gemma4MLP: Module {
+class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1313,10 +1319,18 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        Gemma4BatchDecodeProjection.linear(
-            downProj,
-            gemma4SafeGeluApproximate(Gemma4BatchDecodeProjection.linear(gateProj, x))
-                * Gemma4BatchDecodeProjection.linear(upProj, x))
+        Gemma4BatchDecodeProjection.linear(downProj, activated(x))
+    }
+
+    private func activated(_ x: MLXArray) -> MLXArray {
+        gemma4SafeGeluApproximate(Gemma4BatchDecodeProjection.linear(gateProj, x))
+            * Gemma4BatchDecodeProjection.linear(upProj, x)
+    }
+
+    /// Tensor parallel: this rank's unrounded FP32 partial of the down
+    /// projection, without a collective (its zero-padded channels add zero).
+    func tensorParallelPartial(_ x: MLXArray) -> MLXArray {
+        Gemma4TensorParallelProjection.partial(downProj, activated(x))
     }
 }
 
@@ -1333,16 +1347,16 @@ public class Gemma4DecoderLayer: Module {
     let layerType: String
     let hiddenSizePerLayerInput: Int
 
-    @ModuleInfo(key: "self_attn") fileprivate var selfAttn: Gemma4Attention
-    @ModuleInfo fileprivate var mlp: Gemma4MLP
+    @ModuleInfo(key: "self_attn") var selfAttn: Gemma4Attention
+    @ModuleInfo var mlp: Gemma4MLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayernorm: RMSNorm
     @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayernorm: RMSNorm
     @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayernorm: RMSNorm
 
     // MoE-only modules (26B-A4B); nil on dense variants.
-    @ModuleInfo(key: "router") fileprivate var router: Gemma4Router?
-    @ModuleInfo(key: "experts") fileprivate var experts: Gemma4Experts?
+    @ModuleInfo(key: "router") var router: Gemma4Router?
+    @ModuleInfo(key: "experts") var experts: Gemma4Experts?
     @ModuleInfo(key: "post_feedforward_layernorm_1") var postFeedforwardLayernorm1: RMSNorm?
     @ModuleInfo(key: "pre_feedforward_layernorm_2") var preFeedforwardLayernorm2: RMSNorm?
     @ModuleInfo(key: "post_feedforward_layernorm_2") var postFeedforwardLayernorm2: RMSNorm?
@@ -1356,6 +1370,9 @@ public class Gemma4DecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     let isMoE: Bool
+    /// Tensor parallel: the dense and expert branches' FP32 partials are
+    /// summed across ranks before their separate post-norms.
+    var tensorParallel: Gemma4TensorParallelContext?
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -1483,6 +1500,20 @@ public class Gemma4DecoderLayer: Module {
         let residual2 = out
 
         if isMoE,
+            let router,
+            let experts,
+            let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm2,
+            let tensorParallel
+        {
+            out = tensorParallelFeedForward(
+                out, router: router, experts: experts,
+                postFeedforwardLayernorm1: postFeedforwardLayernorm1,
+                preFeedforwardLayernorm2: preFeedforwardLayernorm2,
+                postFeedforwardLayernorm2: postFeedforwardLayernorm2,
+                context: tensorParallel, isExpertPrefill: isExpertPrefill)
+        } else if isMoE,
             let router,
             let experts,
             let postFeedforwardLayernorm1,
@@ -1822,6 +1853,7 @@ public class Gemma4TextModelInner: Module {
         // Forward through layers, tracking intermediate KV pairs for sharing
         var intermediates = [(kv: Gemma4SharedKVState?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
+        let submissionStride = Gemma4LayerSubmission.stride
 
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
@@ -1886,6 +1918,10 @@ public class Gemma4TextModelInner: Module {
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
+            } else if isCBv2, submissionStride > 0, layerNumber < layers.count,
+                layerNumber.isMultiple(of: submissionStride)
+            {
+                asyncEval(h)
             }
         }
 
@@ -2015,6 +2051,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// Tensor parallel: the tied head projects this rank's vocabulary rows only.
+    var tensorParallelHead: Gemma4TensorParallelHead?
+
     public init(_ config: Gemma4TextConfiguration) {
         let fuseWeightedUnsort = gemma4ShouldFuseWeightedUnsort(config)
         self.config = config
@@ -2088,7 +2127,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
-        if let lmHead {
+        if let tensorParallelHead {
+            out = tensorParallelHead.project(model.embedTokens, hidden)
+        } else if let lmHead {
             out = Gemma4BatchDecodeProjection.linear(lmHead, hidden)
         } else {
             out = Gemma4BatchDecodeProjection.embedding(model.embedTokens, hidden)
