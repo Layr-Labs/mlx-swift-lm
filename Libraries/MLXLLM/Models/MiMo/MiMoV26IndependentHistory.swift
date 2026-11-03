@@ -160,9 +160,14 @@ extension MiMoV26TextModel {
 
     /// A `[1, 2...4]` verify window on one request's histories. Every row takes one-row
     /// decode's projections, RoPE, cache order and attention, so its logits are that step's bits.
+    /// Only a tensor-parallel rank (`installTensorParallel`) takes a window; a whole model refuses.
     public func forwardVerifyWindow(
         inputIDs: MLXArray, caches: [MiMoV26IndependentHistoryCache]
     ) throws -> MiMoV26VerifyWindow {
+        guard model.layers.allSatisfy({ $0.tensorParallel != nil }) else {
+            throw MiMoV26ExecutionError.unsupportedConfiguration(
+                "a verify window runs only on a tensor-parallel rank")
+        }
         let dimensions = try validateIndependentInputs(
             inputIDs: inputIDs, embeddings: nil, captureLayers: [])
         let rows = dimensions.length

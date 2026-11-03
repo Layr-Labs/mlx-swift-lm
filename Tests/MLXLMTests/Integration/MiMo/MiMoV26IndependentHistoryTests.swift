@@ -182,6 +182,20 @@ struct MiMoV26IndependentHistoryTests {
         }
     }
 
+    @Test func wholeModelRefusesAVerifyWindow() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let target = try model(tied: false)
+            let pages = try target.makeIndependentHistoryCaches()
+            #expect(
+                throws: MiMoV26ExecutionError.unsupportedConfiguration(
+                    "a verify window runs only on a tensor-parallel rank")
+            ) {
+                try target.forwardVerifyWindow(inputIDs: tokens([3, 4]), caches: pages)
+            }
+            #expect(pages.allSatisfy { $0.offset == 0 })
+        }
+    }
+
     @Test func wrappedVerifyRollbackMatchesOriginalWindowAndNextForward() throws {
         try Device.withDefaultDevice(.cpu) {
             for keeping in 1 ... 4 {
