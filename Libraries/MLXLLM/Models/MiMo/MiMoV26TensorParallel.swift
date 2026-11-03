@@ -184,6 +184,30 @@ final class MiMoV26TensorParallelContext {
         precondition(partial.dtype == .float32, "a tensor-parallel partial is stored as FP32")
         return reduce(partial).asType(dtype)
     }
+
+    /// The whole row's argmax `[1]` int32 from this rank's rows `[1, rows]`, in one sum:
+    /// the strictly greater maximum wins, ties to the lower rank (the lower IDs).
+    func splitArgMax(_ logits: MLXArray, vocabularySize: Int) -> MLXArray {
+        let width = vocabularyRows.count
+        let size = vocabularySize / width
+        let rank = vocabularyRows.lowerBound / width
+        let values = logits.asType(.float32).reshaped(1, -1)
+        let mine = concatenated(
+            [
+                values.max(axis: -1),
+                argMax(values, axis: -1).asType(.float32) + Float(vocabularyRows.lowerBound),
+            ], axis: 0)
+        let empty = MLXArray.zeros([2], dtype: .float32)
+        let all = reduce(concatenated((0 ..< size).map { $0 == rank ? mine : empty }, axis: 0))
+        var best = all[0 ..< 1]
+        var token = all[1 ..< 2]
+        for other in 1 ..< size {
+            let better = all[(2 * other) ..< (2 * other + 1)] .> best
+            best = which(better, all[(2 * other) ..< (2 * other + 1)], best)
+            token = which(better, all[(2 * other + 1) ..< (2 * other + 2)], token)
+        }
+        return token.asType(.int32)
+    }
 }
 
 extension MiMoV26MoE {
@@ -197,8 +221,16 @@ extension MiMoV26MoE {
     /// takes an exact FP32 widening of its input), then one combined row per token.
     func tensorParallelPartial(_ x: MLXArray, rowLocalRouter: Bool = false) -> MLXArray {
         let routed = gate(x, rowLocal: rowLocalRouter)
-        return Self.combinePartial(
-            switchMLP.float32ExpertRows(x, routed.indices), weights: routed.weights)
+        let experts = switchMLP.float32ExpertRows(x, routed.indices)
+        guard rowLocalRouter, x.dim(1) > 1 else {
+            return Self.combinePartial(experts, weights: routed.weights)
+        }
+        // A verify window combines each row as its one-row step does.
+        return concatenated(
+            (0 ..< x.dim(1)).map { j in
+                Self.combinePartial(
+                    experts[0..., j ..< (j + 1)], weights: routed.weights[0..., j ..< (j + 1)])
+            }, axis: 1)
     }
 }
 
@@ -254,9 +286,15 @@ extension MiMoV26TextModel {
         tensorParallel?.vocabularyRows ?? 0 ..< configuration.vocabularySize
     }
 
+    /// The greedy token `[1]` int32 of a readout row `[1, rows]`; a rank chooses with its peer.
+    func readoutArgMax(_ logits: MLXArray) -> MLXArray {
+        guard let tensorParallel else { return argMax(logits, axis: -1).asType(.int32) }
+        return tensorParallel.splitArgMax(logits, vocabularySize: configuration.vocabularySize)
+    }
+
     /// Makes this model, built from `MiMoV26TensorShard.localConfiguration`, one rank before its
     /// weights load: each layer's two partials sum through the lazy `reduce`, and `lm_head` holds
-    /// `vocabularyRows`. CBv2 and MTP owners refuse the rank.
+    /// `vocabularyRows`. CBv2 owners refuse the rank; MTP drafts choose through `readoutArgMax`.
     public func installTensorParallel(
         reduce: @escaping (MLXArray) -> MLXArray, vocabularyRows: Range<Int>
     ) throws {

@@ -572,7 +572,7 @@ public final class MiMoV26MTP: Module {
             throw MiMoV26MTPError.invalidInput(
                 "aligned IDs and loaded-precision normalized features required")
         }
-        guard target.hasLoadedReadoutPrecision else {
+        guard target.hasLoadedReadoutPrecision(rows: target.headVocabularyRange.count) else {
             throw MiMoV26MTPError.invalidInput(
                 "target readout must match the loaded native storage policy")
         }

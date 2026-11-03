@@ -11,7 +11,7 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
     let requestIdentity: UUID
     let layerIndex: Int
     let maximumContext: Int
-    private struct Page {
+    fileprivate struct Page {
         let keys: MLXArray
         let values: MLXArray
     }
@@ -217,6 +217,25 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
                     / MiMoV26PagedKVLayout.pageTokens))
         // A settled window cannot be rolled back a second time.
         lastAppendTokens = 0
+    }
+
+    /// The layout and page handles before a verify window. Pages are immutable
+    /// arrays, so a checkpoint shares them and later writes never change it.
+    public struct Checkpoint {
+        fileprivate let pages: [Page]
+        fileprivate let layout: MiMoV26PagedKVLayout
+        fileprivate let lastAppendTokens: Int
+    }
+
+    public func checkpoint() -> Checkpoint {
+        Checkpoint(pages: pages, layout: layout, lastAppendTokens: lastAppendTokens)
+    }
+
+    /// Returns to `checkpoint` exactly; the caller replays the rows it keeps.
+    public func restore(_ checkpoint: Checkpoint) {
+        pages = checkpoint.pages
+        layout = checkpoint.layout
+        lastAppendTokens = checkpoint.lastAppendTokens
     }
 
     /// Checked phase transfer into a fresh owner. The source physical order

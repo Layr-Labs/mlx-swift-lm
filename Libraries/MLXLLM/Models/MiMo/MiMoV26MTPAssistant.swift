@@ -102,7 +102,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
     /// completed fence's two retained context banks during their replacement.
     /// Working buffers cover lazy graph dependencies until the successor fence;
     /// they are not an assertion that kernel-internal workspace is zero.
-    static func boundedRequestAllocation(
+    public static func boundedRequestAllocation(
         configuration c: MiMoV26Configuration,
         limits: CBv2MTPAllocationLimits,
         historyStorage: MiMoV26MTPHistoryStorage = .contiguous
@@ -407,7 +407,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
                 inputIDs: tokenHistory[0..., (depth + 1 - length)...],
                 target: target, cache: round.cache)
             round.cache.compactRetainedHistory(depth: depth)
-            let proposed = argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32)
+            let proposed = target.readoutArgMax(output.logits[0..., -1, 0...])
             // Proposal output belongs to the engine. Keeping a second native
             // view here would make the state claim an engine-owned allocation.
             state.headProposalCounts[depth] += 1
