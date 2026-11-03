@@ -1039,9 +1039,27 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
+        let (output, rows) = cbv2Recurrent(
+            inputs, states: recurrentState.map { $0.inputState(modelLayerIndex: modelLayerIndex) })
+        for (row, evaluation) in recurrentState.enumerated() {
+            do {
+                try evaluation.stage(
+                    modelLayerIndex: modelLayerIndex, conv: rows[row].conv!, ssm: rows[row].ssm!)
+            } catch {
+                preconditionFailure(
+                    "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
+            }
+        }
+        return output
+    }
+
+    /// `cbv2Forward` for given input states (nil: zeros); the caller stages the new states.
+    func cbv2Recurrent(_ inputs: MLXArray, states: [CBv2RecurrentLayerState?]) -> (
+        output: MLXArray, states: [CBv2RecurrentLayerState]
+    ) {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
-        precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
+        precondition(states.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
         let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
@@ -1049,8 +1067,7 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         var ssmRows: [MLXArray] = []
         convRows.reserveCapacity(B)
         ssmRows.reserveCapacity(B)
-        for evaluation in recurrentState {
-            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+        for state in states {
             convRows.append(
                 state?.conv
                     ?? MLXArray.zeros(
@@ -1066,21 +1083,13 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         let (out, newConvState, newSsmState) = processChunk(
             qkv: qkv, a: a, b: b,
             convState: convState, ssmState: ssmState, mask: nil)
-
-        for (row, evaluation) in recurrentState.enumerated() {
-            do {
-                try evaluation.stage(
-                    modelLayerIndex: modelLayerIndex,
-                    conv: newConvState[row ..< row + 1],
-                    ssm: newSsmState[row ..< row + 1])
-            } catch {
-                preconditionFailure(
-                    "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
-            }
+        let rows = (0 ..< B).map { row in
+            CBv2RecurrentLayerState(
+                conv: newConvState[row ..< row + 1], ssm: newSsmState[row ..< row + 1])
         }
 
         let normedOut = gatedOutputNorm(out, gate: z)
-        return qwen4Linear(outProj, normedOut.reshaped(B, S, -1))
+        return (qwen4Linear(outProj, normedOut.reshaped(B, S, -1)), rows)
     }
 
     /// CBv2 MTP rectangular verify path. Widths one and two retain the
@@ -2112,6 +2121,62 @@ final class Qwen35DecoderLayer: Module {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
         return (h, feedForward)
+    }
+
+    /// A prompt chunk's stream between layer phases (`cbv2Forward` or `cbv2ForwardResidual`).
+    enum PromptStream {
+        case plain(MLXArray)
+        case fused(residual: MLXArray, pending: MLXArray?)
+    }
+
+    /// Phase one of that forward: the input norm and the mixer through its output projection.
+    /// A recurrent layer reads `carry` and replaces it.
+    func promptMixer(
+        _ stream: PromptStream, modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?, carry: inout CBv2RecurrentLayerState?
+    ) -> (stream: PromptStream, mixed: MLXArray) {
+        let normalizedInput: MLXArray
+        let next: PromptStream
+        switch stream {
+        case .plain(let x):
+            normalizedInput = inputLayerNorm(x)
+            next = stream
+        case .fused(let residual, let pending):
+            let (x, normalized) = Self.residualNorm(residual, pending, inputLayerNorm)
+            normalizedInput = normalized
+            next = .fused(residual: x, pending: nil)
+        }
+        if isLinear {
+            precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
+            let (output, states) = linearAttn!.cbv2Recurrent(normalizedInput, states: [carry])
+            carry = states[0]
+            return (next, output)
+        }
+        guard let attentionCache else {
+            preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
+        }
+        return (next, selfAttn!.cbv2Forward(normalizedInput, cache: attentionCache))
+    }
+
+    /// Phase two: the residual sum, the post-attention norm and the MLP.
+    func promptFeedForward(_ stream: PromptStream, mixed: MLXArray) -> PromptStream {
+        switch stream {
+        case .plain(let x):
+            let h = x + mixed
+            return .plain(h + promptMLP(postAttentionLayerNorm(h)))
+        case .fused(let x, _):
+            let (h, normalized) = Self.residualNorm(x, mixed, postAttentionLayerNorm)
+            return .fused(residual: h, pending: promptMLP(normalized))
+        }
+    }
+
+    private func promptMLP(_ normalized: MLXArray) -> MLXArray {
+        if let sparse = mlp as? Qwen35SparseMoeBlock {
+            return sparse(normalized, exactTargetVerify: false)
+        } else if let dense = mlp as? Qwen3NextMLP {
+            return dense.qwen35TargetVerify(normalized, exact: false)
+        }
+        preconditionFailure("Qwen35 decoder has an unsupported MLP module")
     }
 }
 
