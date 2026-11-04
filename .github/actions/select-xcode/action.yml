@@ -1,12 +1,15 @@
 name: Select Xcode
 description: >-
-  Selects the newest release of Xcode 26 and checks that it has Swift 6.3 or
-  newer. Beta and release candidate apps are left out, so a new beta on the
-  runner image cannot change CI without a pull request. mlx-swift declares
-  swift-tools-version 6.3.
+  Selects Xcode 27.2, release build 27B52 (macOS SDK 27.2, Apple Swift 6.4.2),
+  and checks that it has Swift 6.3 or newer. When no installed Xcode is 27.2
+  (27B52), it selects another 27.2 build, for example a release candidate, and
+  prints a warning that names it. It fails when no installed Xcode is 27.2. A
+  new Xcode on the runner image cannot change CI without a pull request.
+  mlx-swift declares swift-tools-version 6.3. The step also prints the Metal
+  toolchain of the selected Xcode.
 outputs:
   version:
-    description: The Xcode version and build, for example 26.6-17F113. Cache keys use it.
+    description: The Xcode version and build, for example 27.2-27B52. Cache keys use it.
     value: ${{ steps.select.outputs.version }}
 runs:
   using: composite
@@ -14,23 +17,39 @@ runs:
     - id: select
       shell: bash
       run: |
-        version=$(for app in /Applications/Xcode_26.*.app; do
-          name=${app#/Applications/Xcode_}
-          name=${name%.app}
-          if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
-            echo "$name"
+        want_version="27.2"
+        want_build="27B52"
+        exact=""
+        other=""
+        for app in /Applications/Xcode*.app; do
+          [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] || continue
+          version=""
+          build=""
+          read -r version build < <(DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version 2>/dev/null \
+            | awk 'NR == 1 { v = $2 } /^Build version/ { b = $3 } END { print v, b }') || true
+          echo "  $app: Xcode ${version:-unknown} (${build:-unknown})"
+          if [ "$version" = "$want_version" ] && [ "$build" = "$want_build" ] && [ -z "$exact" ]; then
+            exact="$app"
+          elif [ "$version" = "$want_version" ] && [ -z "$other" ]; then
+            other="$app"
           fi
-        done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
-        if [ -z "$version" ]; then
-          echo "::error::No release of Xcode 26 is on this runner."
+        done
+        if [ -n "$exact" ]; then
+          selected="$exact"
+        elif [ -n "$other" ]; then
+          selected="$other"
+          echo "::warning title=Xcode $want_build not installed::No installed Xcode reports Xcode $want_version ($want_build). This job uses $selected."
+        else
+          echo "::error::No installed Xcode reports Xcode $want_version."
           exit 1
         fi
-        sudo xcode-select -s "/Applications/Xcode_$version.app"
+        sudo xcode-select -s "$selected/Contents/Developer"
         xcodebuild -version
         swift --version
+        xcodebuild -showComponent MetalToolchain || echo "xcodebuild -showComponent MetalToolchain failed"
         read -r major minor <<< "$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p')"
         if ! (( major > 6 || (major == 6 && minor >= 3) )); then
-          echo "::error::Xcode $version has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
+          echo "::error::$selected has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
           exit 1
         fi
         echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
