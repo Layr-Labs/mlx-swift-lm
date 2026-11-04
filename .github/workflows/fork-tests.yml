@@ -138,7 +138,9 @@ jobs:
           printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
           chmod +x "$wrapper"
           start=$(date +%s)
-          CC=$wrapper swift build --build-tests --enable-code-coverage --disable-index-store \
+          # Swift 6.4 defaults to Swift Build; every SwiftPM call here uses the native
+          # build system, so --skip-build and --show-bin-path find these products.
+          CC=$wrapper swift build --build-system native --build-tests --enable-code-coverage --disable-index-store \
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
@@ -158,7 +160,7 @@ jobs:
         run: |
           set -o pipefail
           start=$(date +%s)
-          swift test list --skip-build > .build/fork-tests-list.txt
+          swift test list --build-system native --skip-build > .build/fork-tests-list.txt
           echo "swift test list took $(( $(date +%s) - start )) s and listed $(wc -l < .build/fork-tests-list.txt) lines"
           cp .build/fork-tests-list.txt "$RUNNER_TEMP/tests.txt"
 
@@ -405,7 +407,7 @@ jobs:
         # line coverage. It is reported, not enforced.
         timeout-minutes: 15
         run: |
-          bin=$(swift build --show-bin-path)
+          bin=$(swift build --build-system native --show-bin-path)
           binary="$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests"
           profile="$RUNNER_TEMP/default.profdata"
           find "$RUNNER_TEMP/artifacts" -name coverage.profdata -print0 \
