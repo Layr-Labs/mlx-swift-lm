@@ -52,6 +52,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAP = ROOT / ".github" / "test-shards.json"
+# The Fork Tests build uses the native build system; --skip-build must match it.
+BUILD_SYSTEM = ["--build-system", "native"]
 SPECIAL = set(".^$*+?()[]{}|\\")
 
 
@@ -292,7 +294,7 @@ def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None) 
     else:
         patterns = [f for part in run["parts"] for f in part["filters"]]
     filters = [a for pattern in patterns for a in ("--filter", pattern)]
-    return ["swift", "test", "--skip-build", "--no-parallel", *filters, *outputs]
+    return ["swift", "test", *BUILD_SYSTEM, "--skip-build", "--no-parallel", *filters, *outputs]
 
 
 def needs_exact(run: dict) -> bool:
@@ -369,7 +371,7 @@ def command_run(args: argparse.Namespace) -> int:
     ordered = [run for run in runs if not run["metallib"]] + [run for run in runs if run["metallib"]]
     for run in ordered:
         if run["metallib"] and not staged:
-            bin_path = subprocess.run(["swift", "build", "--show-bin-path"], cwd=ROOT, check=True,
+            bin_path = subprocess.run(["swift", "build", *BUILD_SYSTEM, "--show-bin-path"], cwd=ROOT, check=True,
                                       capture_output=True, text=True).stdout.strip()
             subprocess.run([str(ROOT / "scripts" / "stage-test-metallib.sh"), str(args.metallib), bin_path],
                            cwd=ROOT, check=True)
