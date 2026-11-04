@@ -1,4 +1,5 @@
 import MLX
+import MLXLMCommon
 
 /// Super MoE kernels that replace short op chains bit for bit.
 ///
@@ -88,7 +89,7 @@ enum NemotronSuperMoEKernels {
         let outputs = selectKernel(
             [
                 gates.reshaped(rows, experts), bias.asType(.float32),
-                MLXArray([scalingFactor]),
+                HostConstantArrays.float32([scalingFactor]),
             ],
             template: [
                 ("E", experts), ("K", topK), ("NORMALIZE", normalize && topK > 1),

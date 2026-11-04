@@ -173,7 +173,7 @@ extension ModelOptNVFP4SwitchLinear {
                 squaredReLU: squaredReLU)
             return ModelOptGraphOutput(
                 value: value.reshaped(shape + [m, outputDims]),
-                validIndices: indicesInRange ? MLXArray(true) : validity(experts))
+                validIndices: indicesInRange ? HostConstantArrays.trueScalar : validity(experts))
         }
         if tiled, ModelOptNVFP4GroupedGEMM.isEnabled,
             ModelOptNVFP4GroupedGEMM.supports(inputs: inputDims, experts: numExperts)
@@ -184,7 +184,7 @@ extension ModelOptNVFP4SwitchLinear {
                 squaredReLU: squaredReLU)
             return ModelOptGraphOutput(
                 value: value.reshaped(shape + [m, outputDims]),
-                validIndices: indicesInRange ? MLXArray(true) : validity(experts))
+                validIndices: indicesInRange ? HostConstantArrays.trueScalar : validity(experts))
         }
         // MLX takes its sorted (matrix) route only without explicit row indices.
         let sums = gatherQuantizedMM(
@@ -198,7 +198,7 @@ extension ModelOptNVFP4SwitchLinear {
             squaredReLU: squaredReLU)
         return ModelOptGraphOutput(
             value: value.reshaped(shape + [m, outputDims]),
-            validIndices: indicesInRange ? MLXArray(true) : validity(experts))
+            validIndices: indicesInRange ? HostConstantArrays.trueScalar : validity(experts))
     }
 
     /// Whether every ID is in `0 ..< numExperts` (uint32 IDs that wrap
