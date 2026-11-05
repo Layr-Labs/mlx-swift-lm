@@ -21,6 +21,15 @@ import XCTest
 // the VLM cases keep upstream's segment assertions.
 private final class UnfusableQuantizedLinear: QuantizedLinear {}
 
+/// Counts how often a module tree walk (`items()`) visits the layer's convolution.
+private final class CountingConv1d: Conv1d {
+    var visits = 0
+    override func items() -> ModuleItems {
+        visits += 1
+        return super.items()
+    }
+}
+
 final class Qwen35FusedGDNProjectionTests: XCTestCase {
 
     private let configurationJSON = """
@@ -310,6 +319,44 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertFalse(layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
         XCTAssertTrue(layer.inProjQKV is QLoRALinear)
+    }
+
+    /// Every decode forward re-checks that the four input projections are
+    /// still frozen before it uses the fused one. The check reads only those
+    /// projections (and this layer's own frozen keys), never the rest of the
+    /// layer's module tree: walking and flattening it cost the Qwen 3.8 27B
+    /// tensor-parallel decode about 6 % of its host thread (48 layers a token,
+    /// M5 Ultra profile). Freezing semantics are unchanged.
+    func testPreparedFusionCheckReadsOnlyTheInputProjections() throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        let conv = CountingConv1d(
+            inputChannels: layer.convDim, outputChannels: layer.convDim,
+            kernelSize: layer.convKernelSize, groups: layer.convDim, bias: false)
+        conv.freeze()
+        try layer.update(modules: ModuleChildren(values: ["conv1d": .value(conv)]), verify: [])
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+
+        conv.visits = 0
+        for _ in 0 ..< 3 { XCTAssertTrue(layer.prepareFusedInputProjection()) }
+        XCTAssertEqual(conv.visits, 0, "the per-forward check walked the layer's whole module tree")
+
+        // A trainable projection still disables the fused path, and freezing it again restores it.
+        // `QuantizedLinear.unfreeze` re-freezes itself, so the projection is made trainable by an
+        // unfreeze from the layer, which reaches it as a child.
+        layer.unfreeze()
+        for projection in [layer.inProjQKV, layer.inProjB, layer.inProjA] { projection.freeze() }
+        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        layer.inProjZ.freeze()
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        // A projection key this layer freezes is frozen whatever the projection says.
+        layer.unfreeze()
+        for projection in [layer.inProjQKV, layer.inProjZ, layer.inProjA] { projection.freeze() }
+        layer.freeze(recursive: false, keys: ["in_proj_b"])
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        layer.unfreeze(recursive: false, keys: ["in_proj_b"])
+        XCTAssertFalse(layer.prepareFusedInputProjection())
     }
 
     func testCheckpointTopologyIsPreserved() throws {

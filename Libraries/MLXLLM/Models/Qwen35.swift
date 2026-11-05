@@ -442,10 +442,18 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             fusedInputPermanentlyIneligible = true
             return nil
         }
-        let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
+        // A projection is trainable when this module does not freeze its key
+        // and the projection itself holds a trainable parameter: the
+        // `in_proj_*` keys of `trainableParameters()`, without filtering and
+        // flattening this module's whole tree (convolution, norm, output
+        // projection) on every decode forward of every linear-attention layer.
+        let projections: [(String, QuantizedLinear)] = [
+            ("in_proj_qkv", qkv), ("in_proj_z", z), ("in_proj_b", b), ("in_proj_a", a),
+        ]
+        let frozen = noGrad()
         guard
-            !trainableParameters().flattened().contains(where: { key, _ in
-                prefixes.contains(where: key.hasPrefix)
+            !projections.contains(where: { key, projection in
+                !frozen.contains(key) && !projection.trainableParameters().flattened().isEmpty
             })
         else { return nil }
         return (qkv, z, b, a)
