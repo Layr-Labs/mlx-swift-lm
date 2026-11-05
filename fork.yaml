@@ -429,6 +429,9 @@ def:
             update runs. Parameter updates that start at a decoder layer or a model reach the GDN layers through
             `ParameterUpdateObserving`, because mlx-swift 9bd73fc7 no longer calls a nested module's
             `update(parameters:)` override.
+            Each forward re-checks that the four input projections are frozen from those projections and the
+            layer's own frozen keys only (the same `in_proj_*` keys `trainableParameters()` holds), not by
+            filtering and flattening the layer's whole module tree on every decode step.
             Fork keeps its numerics over upstream c4084528: MLXLLM Qwen 3.5, MLXLLM Qwen3-Next and MLXVLM Qwen 3.5
             normalize GDN q/k with rmsNorm eps 1e-6 as mlx-lm does (one eps across the fork's Qwen family); the
             transformers-style eps 1e-6/D changes outputs only for near-zero q/k and would move the fork's validated
