@@ -342,13 +342,17 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertEqual(conv.visits, 0, "the per-forward check walked the layer's whole module tree")
 
         // A trainable projection still disables the fused path, and freezing it again restores it.
-        layer.inProjZ.unfreeze()
+        // `QuantizedLinear.unfreeze` re-freezes itself, so the projection is made trainable by an
+        // unfreeze from the layer, which reaches it as a child.
+        layer.unfreeze()
+        for projection in [layer.inProjQKV, layer.inProjB, layer.inProjA] { projection.freeze() }
         XCTAssertFalse(layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
         layer.inProjZ.freeze()
         XCTAssertTrue(layer.prepareFusedInputProjection())
         // A projection key this layer freezes is frozen whatever the projection says.
-        layer.inProjB.unfreeze()
+        layer.unfreeze()
+        for projection in [layer.inProjQKV, layer.inProjZ, layer.inProjA] { projection.freeze() }
         layer.freeze(recursive: false, keys: ["in_proj_b"])
         XCTAssertTrue(layer.prepareFusedInputProjection())
         layer.unfreeze(recursive: false, keys: ["in_proj_b"])
