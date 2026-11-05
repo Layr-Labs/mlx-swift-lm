@@ -93,4 +93,5 @@
 - Each Gated DeltaNet decode forward checks that its four input projections
   are still frozen from those projections and the layer's own frozen keys
   only, instead of walking the layer's whole module tree. Outputs and freezing
-  behaviour are unchanged.
+  behaviour are unchanged. A cleanup: a Qwen 3.8 27B tensor-parallel step is
+  under 1 % faster (the removed host work mostly overlapped GPU time).
