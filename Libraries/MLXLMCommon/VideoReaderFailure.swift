@@ -121,13 +121,16 @@ public final class VideoDataRequestFault: @unchecked Sendable {
     private let offset: Int
     private let error: any Error & Sendable
     private let lock = NSLock()
+    private var skipping: Int
     private var remaining: Int
     private var count = 0
 
-    /// Fails the first `failures` data requests whose range holds byte `offset`,
-    /// after serving the bytes before it.
-    public init(offset: Int, failures: Int, error: any Error & Sendable) {
+    /// Lets the first `skipping` data requests whose range holds byte `offset`
+    /// through, then fails the next `failures` of them after serving the bytes
+    /// before `offset`.
+    public init(offset: Int, failures: Int, skipping: Int = 0, error: any Error & Sendable) {
         self.offset = offset
+        self.skipping = skipping
         self.remaining = failures
         self.error = error
     }
@@ -140,6 +143,10 @@ public final class VideoDataRequestFault: @unchecked Sendable {
     public func intercept(_ range: Range<Int>) -> (served: Range<Int>, error: any Error)? {
         guard range.contains(offset) else { return nil }
         return lock.withLock {
+            guard skipping == 0 else {
+                skipping -= 1
+                return nil
+            }
             guard remaining > 0 else { return nil }
             remaining -= 1
             count += 1

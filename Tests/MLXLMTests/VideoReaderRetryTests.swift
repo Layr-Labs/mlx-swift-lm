@@ -173,6 +173,19 @@ final class VideoReaderRetryTests: XCTestCase {
         XCTAssertEqual(passes.retrying, [false])
     }
 
+    /// The fault serves the bytes before its offset, then fails the request.
+    func testFaultSkipsThenFailsOnlyRequestsHoldingItsOffset() {
+        let fault = VideoDataRequestFault(
+            offset: 10, failures: 1, skipping: 1, error: MemoryBackedVideoAssetError.invalidRange)
+        XCTAssertNil(fault.intercept(0 ..< 10))
+        XCTAssertNil(fault.intercept(0 ..< 20))
+        let injected = fault.intercept(4 ..< 20)
+        XCTAssertEqual(injected?.served, 4 ..< 10)
+        XCTAssertEqual(injected?.error as? MemoryBackedVideoAssetError, .invalidRange)
+        XCTAssertNil(fault.intercept(4 ..< 20))
+        XCTAssertEqual(fault.injected, 1)
+    }
+
     // MARK: - GLM
 
     private func glmProcessor() throws -> GLM5NextProcessor {
