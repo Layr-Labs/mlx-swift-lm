@@ -90,3 +90,10 @@
   `AffineQuantizedVectors` with one vector per row; each row's attention reads
   its own pages, so every row proposes what it proposes alone. Standalone
   drafting (`draftStep`, `draftHidden`) is unchanged.
+- A Gemma 4 tensor-parallel rank's registered prompt chunk computes every
+  token's expert rows in one shared dispatch per projection
+  (`SwitchGLU.expertRowsByRow`) instead of one expert forward per token, then
+  sums them in the same single collective. Every row's bytes are unchanged.
+  On two M5 Ultras over JACCL, prefill of a 9,651-token prompt went from 569
+  to 1,066 tok/s with identical tokens. `TensorParallelSwitchLinear.forwards`
+  counts the projection's forwards for tests.

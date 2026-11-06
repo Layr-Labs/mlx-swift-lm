@@ -279,6 +279,20 @@ extension Gemma4Experts {
             }
             return (packed.output.reshaped(B, S, H), packed.rowsSum)
         }
+        if byToken {
+            // A registered prompt chunk: every token's expert rows in one shared dispatch per
+            // projection, each (token, expert) pair the native M=1 product its own call computes.
+            let rows = down.withoutCollective {
+                switchGLU.expertRowsByRow(x.reshaped(S, H), topKIndices.reshaped(S, K))
+            }
+            .reshaped([S * K, H])
+            let summed = down.sum(concatenated([rows, densePartial.reshaped([-1, H])], axis: 0))
+            let experts = summed[..<(S * K)].reshaped([S, K, H]).asType(x.dtype)
+            return (
+                weightedExpertSum(experts, topKWeights.reshaped(S, K)).reshaped(x.shape),
+                summed[(S * K)...].reshaped(densePartial.shape)
+            )
+        }
         let count = byToken ? S : B
         func slice(_ value: MLXArray, _ index: Int) -> MLXArray {
             byToken ? value[0..., index ..< index + 1, 0...] : value[index ..< index + 1]
