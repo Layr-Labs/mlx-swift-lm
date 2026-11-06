@@ -344,46 +344,10 @@ public enum MiMoV26EncodedVisualDecoder {
                 pixels = max(pixels, try product(Int(dimensions.width), Int(dimensions.height)))
             }
             guard pixels > 0, pixels <= limits.maximumPixels else { throw Failure.limit }
-            let reader = try AVAssetReader(asset: asset)
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            // Samples are only read, never modified in place.
-            output.alwaysCopiesSampleData = false
-            guard reader.canAdd(output) else { throw Failure.invalidVideo }
-            reader.add(output)
-            guard reader.startReading() else { throw Failure.invalidVideo }
-            // Apple's cancelReading contract stops background reads. This
-            // codec cleanup is not a fabricated MLX/native-shutdown receipt.
-            defer { reader.cancelReading() }
-            var count = 0
-            var markerCount = 0
-            var duration = CMTime.zero
-            while try autoreleasepool(invoking: { () throws -> Bool in
-                guard let sample = output.copyNextSampleBuffer() else { return false }
-                try Task.checkCancellation()
-                if try consumeEmptyMarker(
-                    sample, count: &markerCount, limit: limits.maximumControlMarkers)
-                {
-                    return true
-                }
-                let amount = CMSampleBufferGetNumSamples(sample)
-                let (next, overflow) = count.addingReportingOverflow(amount)
-                guard amount > 0, !overflow, next <= limits.maximumSourceFrames else {
-                    throw Failure.limit
-                }
-                let span = CMSampleBufferGetDuration(sample)
-                guard span.isNumeric, span.seconds.isFinite, span > .zero else {
-                    throw Failure.invalidVideo
-                }
-                duration = CMTimeAdd(duration, span)
-                count = next
-                guard duration.isNumeric, duration.seconds.isFinite else {
-                    throw Failure.invalidVideo
-                }
-                return true
-            }) {}
-            guard reader.status == .completed, count >= 2, duration > .zero else {
-                throw Failure.invalidVideo
+            let (count, duration) = try await VideoReaderRetry.run {
+                try compressedSamples(asset, track: track, limits: limits)
             }
+            guard count >= 2, duration > .zero else { throw Failure.invalidVideo }
             let fps = Double(count) / duration.seconds
             let indices = try sampling.indices(
                 totalFrames: count, averageFPS: fps,
@@ -392,6 +356,54 @@ public enum MiMoV26EncodedVisualDecoder {
                 owner: owner, count: count, fps: fps, indices: indices, pixels: pixels,
                 audio: !audio.isEmpty, maximumControlMarkers: limits.maximumControlMarkers)
         }
+    }
+
+    /// One compressed-sample pass: the media sample count and summed duration.
+    /// A reader that does not complete throws `VideoReaderFailure`.
+    private static func compressedSamples(
+        _ asset: AVAsset, track: AVAssetTrack, limits: Limits
+    ) throws -> (count: Int, duration: CMTime) {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        // Samples are only read, never modified in place.
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw Failure.invalidVideo }
+        reader.add(output)
+        guard reader.startReading() else { throw Failure.invalidVideo }
+        // Apple's cancelReading contract stops background reads. This
+        // codec cleanup is not a fabricated MLX/native-shutdown receipt.
+        defer { reader.cancelReading() }
+        var count = 0
+        var markerCount = 0
+        var duration = CMTime.zero
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let sample = VideoReaderRetry.nextSample(output, of: reader) else {
+                return false
+            }
+            try Task.checkCancellation()
+            if try consumeEmptyMarker(
+                sample, count: &markerCount, limit: limits.maximumControlMarkers)
+            {
+                return true
+            }
+            let amount = CMSampleBufferGetNumSamples(sample)
+            let (next, overflow) = count.addingReportingOverflow(amount)
+            guard amount > 0, !overflow, next <= limits.maximumSourceFrames else {
+                throw Failure.limit
+            }
+            let span = CMSampleBufferGetDuration(sample)
+            guard span.isNumeric, span.seconds.isFinite, span > .zero else {
+                throw Failure.invalidVideo
+            }
+            duration = CMTimeAdd(duration, span)
+            count = next
+            guard duration.isNumeric, duration.seconds.isFinite else {
+                throw Failure.invalidVideo
+            }
+            return true
+        }) {}
+        guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }
+        return (count, duration)
     }
 
     /// A silent input remains distinct from VideoAudioInput. Sound is never
@@ -428,55 +440,72 @@ public enum MiMoV26EncodedVisualDecoder {
             let tracks = try await asset.loadTracks(withMediaType: .video)
             guard tracks.count == 1, let track = tracks.first else { throw Failure.invalidVideo }
             let transform = try await track.load(.preferredTransform)
-            let reader = try AVAssetReader(asset: asset)
-            let output = AVAssetReaderTrackOutput(
-                track: track,
-                outputSettings: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-                ])
-            // Samples are only read, never modified in place.
-            output.alwaysCopiesSampleData = false
-            guard reader.canAdd(output) else { throw Failure.invalidVideo }
-            reader.add(output)
-            guard reader.startReading() else { throw Failure.invalidVideo }
-            defer { reader.cancelReading() }
-            var index = 0
-            var selected = 0
-            var markerCount = 0
-            var frames: [MiMoV26Pixels.DecodedRGB] = []
-            var lastPTS: CMTime?
-            while try autoreleasepool(invoking: { () throws -> Bool in
-                guard let sample = output.copyNextSampleBuffer() else { return false }
-                try Task.checkCancellation()
-                if try consumeEmptyMarker(sample, count: &markerCount, limit: markerLimit) {
-                    return true
-                }
-                guard index < plan.sourceFrameCount, CMSampleBufferGetNumSamples(sample) == 1 else {
-                    throw Failure.inconsistentFrames
-                }
-                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                guard pts.isNumeric, lastPTS.map({ pts > $0 }) ?? true else {
-                    throw Failure.inconsistentFrames
-                }
-                lastPTS = pts
-                guard let pixel = CMSampleBufferGetImageBuffer(sample) else {
-                    throw Failure.invalidVideo
-                }
-                try validateFrame(pixel, plannedPixels: plan.codedPixels, limits: limits)
-                if selected < plan.sampledIndices.count, index == plan.sampledIndices[selected] {
-                    frames.append(try frame(pixel, transform: transform, limits: limits))
-                    selected += 1
-                }
-                index += 1
-                return true
-            }) {}
-            guard reader.status == .completed, index == plan.sourceFrameCount,
-                selected == plan.sampledIndices.count, frames.count == plan.timestamps.count
-            else {
-                throw Failure.inconsistentFrames
+            let frames = try await VideoReaderRetry.run {
+                try sampledFrames(
+                    asset, track: track, transform: transform, plan: plan, limits: limits,
+                    markerLimit: markerLimit)
             }
             return .init(frames: frames, timestamps: plan.timestamps)
         }
+    }
+
+    /// One decoded pass that keeps the plan's sampled frames. A reader that does
+    /// not complete throws `VideoReaderFailure`.
+    private static func sampledFrames(
+        _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform, plan: VideoPlan,
+        limits: Limits, markerLimit: Int
+    ) throws -> [MiMoV26Pixels.DecodedRGB] {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ])
+        // Samples are only read, never modified in place.
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw Failure.invalidVideo }
+        reader.add(output)
+        guard reader.startReading() else { throw Failure.invalidVideo }
+        defer { reader.cancelReading() }
+        var index = 0
+        var selected = 0
+        var markerCount = 0
+        var frames: [MiMoV26Pixels.DecodedRGB] = []
+        var lastPTS: CMTime?
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let sample = VideoReaderRetry.nextSample(output, of: reader) else {
+                return false
+            }
+            try Task.checkCancellation()
+            if try consumeEmptyMarker(sample, count: &markerCount, limit: markerLimit) {
+                return true
+            }
+            guard index < plan.sourceFrameCount, CMSampleBufferGetNumSamples(sample) == 1 else {
+                throw Failure.inconsistentFrames
+            }
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            guard pts.isNumeric, lastPTS.map({ pts > $0 }) ?? true else {
+                throw Failure.inconsistentFrames
+            }
+            lastPTS = pts
+            guard let pixel = CMSampleBufferGetImageBuffer(sample) else {
+                throw Failure.invalidVideo
+            }
+            try validateFrame(pixel, plannedPixels: plan.codedPixels, limits: limits)
+            if selected < plan.sampledIndices.count, index == plan.sampledIndices[selected] {
+                frames.append(try frame(pixel, transform: transform, limits: limits))
+                selected += 1
+            }
+            index += 1
+            return true
+        }) {}
+        guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }
+        guard index == plan.sourceFrameCount, selected == plan.sampledIndices.count,
+            frames.count == plan.timestamps.count
+        else {
+            throw Failure.inconsistentFrames
+        }
+        return frames
     }
 
 }

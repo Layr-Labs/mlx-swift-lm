@@ -242,8 +242,14 @@ def:
         Prompt-cache loading recovers unpopulated layers from existing class metadata and rejects
         malformed state/metadata before nonthrowing setters; `PromptCacheValidationTests` covers
         empty, mixed and nested states, legacy files, malformed input and continuation boundaries.
+        A video reader pass that does not complete throws `VideoReaderFailure`, which keeps the reader
+        status and the domain and code of its error chain, and runs once more with a new reader over the
+        same asset (`VideoReaderRetry`). The GLM 5.3, MiMo V2.6 and Qwen4 video decoders use it.
+        `VideoReaderRetryTests` fails data requests of the in-memory resource loader partway through a clip
+        until a reader pass fails, and ends readers partway through `VideoReaderRetry.nextSample`'s test hook.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
+        - "Tests/MLXLMTests/VideoReaderRetryTests.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
         - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"

@@ -76,17 +76,35 @@ enum Qwen4ExpVideoSampler {
         guard range.duration.seconds.isFinite, range.duration.seconds > 0 else {
             throw Failure.invalidMetadata
         }
+        let totalFrames = try await VideoReaderRetry.run {
+            try compressedFrameCount(asset, track: track)
+        }
+        guard totalFrames > 0 else { throw Failure.decodeFailed }
+        let fps = Double(totalFrames) / range.duration.seconds
+        let indices = try Qwen4ExpMediaGeometry.sampleIndices(
+            totalFrames: totalFrames, sourceFPS: fps,
+            targetFPS: config.fps, minFrames: config.minFrames, maxFrames: config.maxFrames)
+        let transform = try await track.load(.preferredTransform)
+        let frames = try await VideoReaderRetry.run {
+            try selectedFrames(
+                asset, track: track, transform: transform, indices: indices,
+                totalFrames: totalFrames, process: process)
+        }
+        return .init(frames: frames, indices: indices, sourceFPS: fps)
+    }
+
+    /// Counts compressed samples without retaining full-resolution frames.
+    /// Do not seek using their PTS: MP4 edit lists can place compressed
+    /// sample timestamps in a different clock from displayed frame times.
+    private static func compressedFrameCount(_ asset: AVAsset, track: AVAssetTrack) throws -> Int {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         guard reader.canAdd(output) else { throw Failure.decodeFailed }
         reader.add(output)
         guard reader.startReading() else { throw Failure.decodeFailed }
         defer { reader.cancelReading() }
-        // Count compressed samples without retaining full-resolution frames.
-        // Do not seek using their PTS: MP4 edit lists can place compressed
-        // sample timestamps in a different clock from displayed frame times.
         var totalFrames = 0
-        while let buffer = output.copyNextSampleBuffer() {
+        while let buffer = VideoReaderRetry.nextSample(output, of: reader) {
             try Task.checkCancellation()
             let count = CMSampleBufferGetNumSamples(buffer)
             guard count >= 0, count <= maxIndexedFrames - totalFrames else {
@@ -94,15 +112,17 @@ enum Qwen4ExpVideoSampler {
             }
             totalFrames += count
         }
-        guard reader.status == .completed, totalFrames > 0 else { throw Failure.decodeFailed }
-        reader.cancelReading()
-        let fps = Double(totalFrames) / range.duration.seconds
-        let indices = try Qwen4ExpMediaGeometry.sampleIndices(
-            totalFrames: totalFrames, sourceFPS: fps,
-            targetFPS: config.fps, minFrames: config.minFrames, maxFrames: config.maxFrames)
-        // Decode in presentation order and select the exact frame ordinals,
-        // matching the reference's frame-index contract. Only selected,
-        // resized frames survive each iteration; no full clip is retained.
+        guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }
+        return totalFrames
+    }
+
+    /// Decodes in presentation order and selects the exact frame ordinals,
+    /// matching the reference's frame-index contract. Only selected, resized
+    /// frames survive each iteration; no full clip is retained.
+    private static func selectedFrames(
+        _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform, indices: [Int],
+        totalFrames: Int, process: (CIImage, Int) throws -> CIImage
+    ) throws -> [MLXArray] {
         let decodedReader = try AVAssetReader(asset: asset)
         let decoded = AVAssetReaderTrackOutput(
             track: track,
@@ -112,12 +132,11 @@ enum Qwen4ExpVideoSampler {
         decodedReader.add(decoded)
         guard decodedReader.startReading() else { throw Failure.decodeFailed }
         defer { decodedReader.cancelReading() }
-        let transform = try await track.load(.preferredTransform)
         var frames: [MLXArray] = []
         frames.reserveCapacity(indices.count)
         var ordinal = 0
         var selected = 0
-        while let buffer = decoded.copyNextSampleBuffer() {
+        while let buffer = VideoReaderRetry.nextSample(decoded, of: decodedReader) {
             try Task.checkCancellation()
             guard ordinal < totalFrames, let pixel = CMSampleBufferGetImageBuffer(buffer) else {
                 throw Failure.invalidMetadata
@@ -136,9 +155,12 @@ enum Qwen4ExpVideoSampler {
             ordinal += 1
         }
         try Task.checkCancellation()
-        guard decodedReader.status == .completed, ordinal == totalFrames,
-            frames.count == indices.count
-        else { throw Failure.missingFrame }
-        return .init(frames: frames, indices: indices, sourceFPS: fps)
+        guard decodedReader.status == .completed else {
+            throw VideoReaderFailure(reader: decodedReader)
+        }
+        guard ordinal == totalFrames, frames.count == indices.count else {
+            throw Failure.missingFrame
+        }
+        return frames
     }
 }
