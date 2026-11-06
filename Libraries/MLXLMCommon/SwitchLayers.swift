@@ -994,6 +994,19 @@ open class SwitchGLU: Module {
         expertRows(x, indices, float32Rows: true)
     }
 
+    /// `callAsFunction`'s expert rows `[rows, K, H]` for `[rows, hidden]` in which every row keeps
+    /// the bytes of its own one-row call, while all rows share one dispatch per projection (as
+    /// `callAndWeightedReduceRows`, without the top-K reduction): a tensor-parallel rank's
+    /// registered prompt chunk, whose rows' partials are summed across ranks before weighting.
+    package func expertRowsByRow(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        var projected = projectExperts(x, indices, hintsSorted: false)
+        if let inverseOrder = projected.inverseOrder {
+            projected.output = scatterUnsort(
+                x: projected.output, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return MLX.squeezed(projected.output, axis: -2)
+    }
+
     private func expertRows(_ x: MLXArray, _ indices: MLXArray, float32Rows: Bool) -> MLXArray {
         var projected = projectExperts(x, indices, float32Rows: float32Rows)
         if let inverseOrder = projected.inverseOrder {
@@ -1213,12 +1226,7 @@ open class SwitchGLU: Module {
     package func callAndWeightedReduceRows(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> MLXArray {
-        var projected = projectExperts(x, indices, hintsSorted: false)
-        if let inverseOrder = projected.inverseOrder {
-            projected.output = scatterUnsort(
-                x: projected.output, invOrder: inverseOrder, shape: indices.shape)
-        }
-        return weightedExpertSum(MLX.squeezed(projected.output, axis: -2), weights)
+        weightedExpertSum(expertRowsByRow(x, indices), weights)
     }
 }
 
