@@ -61,7 +61,8 @@ final class ReaderEnder: @unchecked Sendable {
 /// Runs `body` with `passes` observing every failed reader pass, and with `ender`
 /// ending readers partway when one is given.
 func withReaderFaults<Output>(
-    _ passes: FailedPasses, ending ender: ReaderEnder? = nil, _ body: () async throws -> Output
+    _ passes: FailedPasses, ending ender: ReaderEnder? = nil,
+    isolation: isolated (any Actor)? = #isolation, _ body: () async throws -> Output
 ) async throws -> Output {
     try await VideoReaderRetry.$failedPassObserver.withValue(passes.observer) {
         try await VideoReaderRetry.$beforeReadForTesting.withValue(ender?.hook, operation: body)
