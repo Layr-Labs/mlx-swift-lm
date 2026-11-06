@@ -42,14 +42,19 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
         self.init(status: reader.status.rawValue, error: reader.error)
     }
 
+    /// `AVErrorMediaServicesWereReset` and `AVErrorOperationInterrupted`. `AVError.Code`
+    /// declares them on iOS only; the codes mean the same in any SDK.
+    static let mediaServicesWereReset = -11819
+    static let operationInterrupted = -11847
+
     /// Decoder, hardware and interruption faults of the decoding machine. Another
     /// provider can decode the same bytes, so these refuse as retryable.
     static let transientCodes: [String: Set<Int>] = [
         AVFoundationErrorDomain: [
             AVError.Code.outOfMemory.rawValue,
-            AVError.Code.mediaServicesWereReset.rawValue,
             AVError.Code.decoderTemporarilyUnavailable.rawValue,
-            AVError.Code.operationInterrupted.rawValue,
+            mediaServicesWereReset,
+            operationInterrupted,
         ],
         NSOSStatusErrorDomain: [
             Int(kVTInvalidSessionErr),

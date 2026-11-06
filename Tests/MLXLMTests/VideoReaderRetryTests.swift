@@ -4,10 +4,10 @@
 import CoreImage
 import Foundation
 import MLX
-import MLXLMCommon
 import VideoToolbox
 import XCTest
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 /// Every failed reader pass, in order.
@@ -57,13 +57,14 @@ final class VideoReaderRetryTests: XCTestCase {
         try await VideoReaderRetry.$failedPassObserver.withValue(passes.observer, operation: body)
     }
 
-    private let interrupted = NSError(
-        domain: AVFoundationErrorDomain, code: AVError.Code.operationInterrupted.rawValue)
+    private let decoderUnavailable = NSError(
+        domain: AVFoundationErrorDomain,
+        code: AVError.Code.decoderTemporarilyUnavailable.rawValue)
 
     // MARK: - Failure and retry
 
     func testFailureKeepsStatusAndTheErrorChainCodesOnly() {
-        func chain(_ codes: [(domain: String, code: Int)]) -> NSError? {
+        func chain(_ codes: [(String, Int)]) -> NSError? {
             var error: NSError?
             for (domain, code) in codes.reversed() {
                 var info: [String: Any] = [NSLocalizedDescriptionKey: "frame of a private clip"]
@@ -97,13 +98,49 @@ final class VideoReaderRetryTests: XCTestCase {
             error: chain((0 ..< 6).map { ("D\($0)", $0) }))
         XCTAssertEqual(deep.codes.map(\.domain), ["D0", "D1", "D2", "D3"])
 
+        // Every table entry, as the reader's error or under AVFoundation's -11800.
+        let transient: [(String, Int)] = [
+            (AVFoundationErrorDomain, AVError.Code.outOfMemory.rawValue),
+            (AVFoundationErrorDomain, -11819),
+            (AVFoundationErrorDomain, AVError.Code.decoderTemporarilyUnavailable.rawValue),
+            (AVFoundationErrorDomain, -11847),
+            (NSOSStatusErrorDomain, Int(kVTInvalidSessionErr)),
+            (NSOSStatusErrorDomain, Int(kVTAllocationFailedErr)),
+            (NSOSStatusErrorDomain, Int(kVTVideoDecoderMalfunctionErr)),
+            (NSOSStatusErrorDomain, Int(kVTVideoDecoderNotAvailableNowErr)),
+            (NSOSStatusErrorDomain, Int(kVTVideoDecoderRemovedErr)),
+        ]
+        XCTAssertEqual(
+            Set(transient.map { "\($0.0) \($0.1)" }),
+            Set(
+                VideoReaderFailure.transientCodes.flatMap { domain, codes in
+                    codes.map { "\(domain) \($0)" }
+                }))
+        for (domain, code) in transient {
+            for codes in [[(domain, code)], [(AVFoundationErrorDomain, -11800), (domain, code)]] {
+                XCTAssertTrue(
+                    VideoReaderFailure(status: 3, error: chain(codes)).isTransient,
+                    "\(codes)")
+            }
+        }
+        for (domain, code) in [
+            (AVFoundationErrorDomain, AVError.Code.unknown.rawValue),
+            (AVFoundationErrorDomain, AVError.Code.decodeFailed.rawValue),
+            (NSOSStatusErrorDomain, -11847),
+            ("MLXLMCommon.MemoryBackedVideoAssetError", 2),
+        ] {
+            XCTAssertFalse(
+                VideoReaderFailure(status: 3, error: chain([(domain, code)])).isTransient,
+                "\(domain) \(code)")
+        }
+
         let silent = VideoReaderFailure(status: AVAssetReader.Status.reading.rawValue, error: nil)
         XCTAssertFalse(silent.isTransient)
         XCTAssertEqual(silent.description, "video reader status 1: no error")
     }
 
     func testRetryRunsOneSecondPassAndReportsEachFailedPass() async throws {
-        let first = VideoReaderFailure(status: 3, error: interrupted)
+        let first = VideoReaderFailure(status: 3, error: decoderUnavailable)
         let second = VideoReaderFailure(status: 4, error: nil)
         var calls = 0
         func run(_ passes: FailedPasses, _ pass: () throws -> Int) async throws -> Int {
@@ -209,14 +246,14 @@ final class VideoReaderRetryTests: XCTestCase {
         XCTAssertEqual(retried.frames.map(\.pixels), baseline.frames.map(\.pixels))
     }
 
-    /// A resource that ends partway is a fault of the media; an interrupted
+    /// A resource that ends partway is a fault of the media; an unavailable
     /// decoder is a fault of the machine.
     func testGLMRefusesWithTheReaderFailureWhenBothPassesFail() async throws {
         let data = try clip("input-video-url.mp4")
         let processor = try glmProcessor()
         for (error, transient) in [
             (MemoryBackedVideoAssetError.invalidRange as any Error & Sendable, false),
-            (interrupted, true),
+            (decoderUnavailable, true),
         ] {
             let fault = midClipFault(data, failures: .max, error: error)
             let passes = FailedPasses()
