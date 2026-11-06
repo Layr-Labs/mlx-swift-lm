@@ -107,3 +107,8 @@
   depends on its size), and nothing enforces it, so it stays off. On two M5
   Ultras, 4 parts measured best: 9,651-token prefill 1,064 -> 1,196-1,208 tok/s
   (+13 %), identical tokens.
+- `Qwen35PromptWavefront.prefillWithHidden` returns, beside `prefill`'s
+  outputs, each prompt chunk's last decoder layer rows (before the final norm)
+  from the same graph, so an assisted tensor-parallel lane can merge prompt
+  frames and still give its assistant every frame's rows. `prefill` builds the
+  same operations as before.

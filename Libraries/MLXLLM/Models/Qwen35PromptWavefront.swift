@@ -29,6 +29,76 @@ public enum Qwen35PromptWavefront {
         _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
         recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
     ) -> [MLXArray] {
+        // The hidden rows add no operation: a chunk's evaluation handle is a view of its rows,
+        // and the prompt's last chunk's rows are the sum its final norm reads.
+        prefillWithHidden(
+            model, chunks: chunks, finalChunk: finalChunk, caches: caches,
+            recurrentState: recurrentState, phaseBuilt: phaseBuilt
+        ).outputs
+    }
+
+    /// `prefillWithHidden` on the wrapped text model.
+    public static func prefillWithHidden(
+        _ model: Qwen35Model, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
+        recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
+    ) -> (outputs: [MLXArray], hidden: [MLXArray]) {
+        prefillWithHidden(
+            model.languageModel, chunks: chunks, finalChunk: finalChunk, caches: caches,
+            recurrentState: recurrentState, phaseBuilt: phaseBuilt)
+    }
+
+    /// `prefill`'s outputs and each chunk's last decoder layer rows (`[1, L, H]`, before the
+    /// final norm), the target hidden an MTP assistant's history takes. They are the rows
+    /// `Qwen35TextModel.cbv2ForwardWithHidden` returns for the chunk alone: every chunk but the
+    /// prompt's last runs the unfused ops here, which that forward may fuse
+    /// (`cbv2ForwardNormalized`, the same values).
+    ///
+    /// Only this graph can give the rows: building it appends each chunk's K/V rows and stages
+    /// the recurrent state the chunks leave, so a second forward would write both again. Each
+    /// chunk's rows are their own array, so a view of them keeps no other chunk's rows alive.
+    public static func prefillWithHidden(
+        _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
+        recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
+    ) -> (outputs: [MLXArray], hidden: [MLXArray]) {
+        let streams = layered(
+            model, chunks: chunks, finalChunk: finalChunk, caches: caches,
+            recurrentState: recurrentState, phaseBuilt: phaseBuilt)
+        var outputs: [MLXArray] = []
+        var hidden: [MLXArray] = []
+        for chunk in chunks.indices {
+            switch streams[chunk] {
+            case .plain(let rows):
+                outputs.append(rows[0..., -1, 0 ..< 1])
+                hidden.append(rows)
+            case .fused(let residual, let pending):
+                let (rows, logits) = head(model, residual, pending, tokens: chunks[chunk])
+                outputs.append(logits)
+                hidden.append(rows)
+            }
+        }
+        return (outputs, hidden)
+    }
+
+    /// The final norm and head of the prompt's last chunk: its hidden rows and logits.
+    private static func head(
+        _ model: Qwen35TextModel, _ residual: MLXArray, _ pending: MLXArray?, tokens: MLXArray
+    ) -> (hidden: MLXArray, logits: MLXArray) {
+        let inner = model.model
+        let (hidden, normalized) = scoped(true, tokens) {
+            Qwen35DecoderLayer.residualNorm(residual, pending, inner.norm)
+        }
+        let logits = Qwen35BatchDecodeProjection.withModel(tokens) {
+            model.lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(inner.embedTokens, normalized)
+        }
+        return (hidden, logits)
+    }
+
+    /// Every chunk's stream after the last decoder layer.
+    private static func layered(
+        _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
+        recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
+    ) -> [Qwen35DecoderLayer.PromptStream] {
         let inner = model.model
         precondition(
             supports(model) && !chunks.isEmpty
@@ -86,20 +156,7 @@ public enum Qwen35PromptWavefront {
                 phaseBuilt()
             }
         }
-        return chunks.indices.map { chunk in
-            switch streams[chunk] {
-            case .plain(let hidden):
-                return hidden[0..., -1, 0 ..< 1]
-            case .fused(let residual, let pending):
-                let normalized = scoped(true, chunks[chunk]) {
-                    Qwen35DecoderLayer.residualNorm(residual, pending, inner.norm).1
-                }
-                return Qwen35BatchDecodeProjection.withModel(chunks[chunk]) {
-                    model.lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
-                        ?? Qwen35BatchDecodeProjection.embedding(inner.embedTokens, normalized)
-                }
-            }
-        }
+        return streams
     }
 
     /// The prompt's last chunk builds under `Qwen35TextModel.cbv2Forward`'s scopes.

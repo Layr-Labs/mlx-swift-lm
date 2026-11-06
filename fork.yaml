@@ -454,7 +454,9 @@ def:
             A CBv2 forward may be submitted every few layers as it is built (`Qwen35LayerSubmission.stride`:
             cluster decode steps and tensor-parallel prompt frames), and a bench may observe each layer as
             it is built (`Qwen35LayerSubmission.observer`, diagnostic): evaluation order only, every value
-            unchanged.
+            unchanged. A prompt wavefront (`Qwen35PromptWavefront`) builds consecutive prompt chunks of one
+            request as one graph; `prefillWithHidden` also returns each chunk's last decoder layer rows from
+            that graph, for an MTP assistant's history.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
