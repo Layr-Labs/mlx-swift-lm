@@ -47,7 +47,8 @@ public final class MemoryBackedVideoAsset: @unchecked Sendable {
         let loader = MemoryAssetResourceLoader(
             data: data,
             resourceURL: resourceURL,
-            contentType: contentType)
+            contentType: contentType,
+            fault: VideoDataRequestFault.current)
         let queue = DispatchQueue(
             label: "ai.darkbloom.memory-video.\(token)",
             qos: .userInitiated)
@@ -221,14 +222,16 @@ private final class MemoryAssetResourceLoader: NSObject,
     private let data: Data
     private let resourceURL: URL
     private let contentType: String
+    private let fault: VideoDataRequestFault?
     private let stateLock = NSLock()
     private var _resourceRequestCount = 0
 
-    init(data: Data, resourceURL: URL, contentType: String) {
+    init(data: Data, resourceURL: URL, contentType: String, fault: VideoDataRequestFault?) {
         self.data = data
         self.byteCount = data.count
         self.resourceURL = resourceURL
         self.contentType = contentType
+        self.fault = fault
         super.init()
     }
 
@@ -262,16 +265,24 @@ private final class MemoryAssetResourceLoader: NSObject,
                 requestedLength: request.requestedLength,
                 currentOffset: request.currentOffset,
                 requestsAllDataToEnd: request.requestsAllDataToEndOfResource)
-            if !range.isEmpty {
-                let lowerBound = data.index(data.startIndex, offsetBy: range.lowerBound)
-                let upperBound = data.index(data.startIndex, offsetBy: range.upperBound)
-                request.respond(with: data[lowerBound ..< upperBound])
+            if let injected = fault?.intercept(range) {
+                respond(request, with: injected.served)
+                loadingRequest.finishLoading(with: injected.error)
+                return true
             }
+            respond(request, with: range)
             loadingRequest.finishLoading()
         } catch {
             loadingRequest.finishLoading(with: error)
         }
         return true
+    }
+
+    private func respond(_ request: AVAssetResourceLoadingDataRequest, with range: Range<Int>) {
+        guard !range.isEmpty else { return }
+        let lowerBound = data.index(data.startIndex, offsetBy: range.lowerBound)
+        let upperBound = data.index(data.startIndex, offsetBy: range.upperBound)
+        request.respond(with: data[lowerBound ..< upperBound])
     }
 
     func resourceLoader(

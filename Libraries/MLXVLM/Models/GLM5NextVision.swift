@@ -25,6 +25,8 @@ public enum GLM5NextVisionError: Error, Equatable, Sendable {
     case weightsNotLoaded
     case budgetExceeded(String)
     case unsupported(String)
+    /// Both reader passes over a video that passed its metadata checks failed.
+    case videoReader(VideoReaderFailure)
 }
 
 /// Vision attention kernel. `.tiled` is the eager reference-ordered graph:

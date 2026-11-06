@@ -1148,7 +1148,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
     }
 
-    private func decode(_ video: UserInput.Video) async throws -> GLM5NextDecodedVideo {
+    func decode(_ video: UserInput.Video) async throws -> GLM5NextDecodedVideo {
         switch video.source {
         case .frames(let frames):
             guard frames.count >= 2, frames.count <= 100_000 else {
@@ -1198,8 +1198,20 @@ public struct GLM5NextProcessor: UserInputProcessor {
         guard fps.isFinite, fps > 0, duration.isFinite, duration > 0,
             duration * fps <= 100_000
         else { throw GLM5NextVisionError.invalidInput("video track metadata") }
+        // A failed pass reruns once with a new reader over the same asset.
+        func read(retaining retained: Set<Int>?) async throws -> (
+            frames: [GLM5NextRGBImage], indices: [Int], decoded: Int
+        ) {
+            do {
+                return try await VideoReaderRetry.run {
+                    try decodeFrames(asset, track: track, transform: transform, retaining: retained)
+                }
+            } catch let failure as VideoReaderFailure {
+                throw GLM5NextVisionError.videoReader(failure)
+            }
+        }
         guard configuration.videoSamplingPolicy == .official else {
-            let all = try decodeFrames(asset, track: track, transform: transform, retaining: nil)
+            let all = try await read(retaining: nil)
             return try .init(frames: all.frames, framesPerSecond: fps, duration: duration)
         }
         // The official sampler needs only the source frame count, so decoding
@@ -1210,13 +1222,11 @@ public struct GLM5NextProcessor: UserInputProcessor {
                 try GLM5NextMediaGeometry.sampleFrameIndices(
                     totalFrames: count, sourceFPS: fps, duration: duration))
         }
-        var pass = try decodeFrames(
-            asset, track: track, transform: transform,
-            retaining: sampled(max(1, Int((duration * fps).rounded()))))
+        var pass = try await read(retaining: sampled(max(1, Int((duration * fps).rounded()))))
         let needed = try sampled(pass.decoded)
         if !needed.isSubset(of: pass.indices) {
             let count = pass.decoded
-            pass = try decodeFrames(asset, track: track, transform: transform, retaining: needed)
+            pass = try await read(retaining: needed)
             guard pass.decoded == count else {
                 throw GLM5NextVisionError.invalidInput("video decoding is not repeatable")
             }
@@ -1230,7 +1240,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
     /// only `retaining` (every frame when nil). Timestamps need only increase:
     /// like the reference loader, frame i is timed at i / `nominalFrameRate`,
     /// the track's average rate, so a variable-frame-rate track is indexed
-    /// rather than refused.
+    /// rather than refused. A reader that does not complete throws
+    /// `VideoReaderFailure`.
     private func decodeFrames(
         _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform,
         retaining retained: Set<Int>?
@@ -1280,9 +1291,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
             frames.append(image)
             indices.append(index)
         }
-        guard reader.status == .completed else {
-            throw GLM5NextVisionError.invalidInput("video decoding failed")
-        }
+        guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }
         return (frames, indices, decoded)
     }
 }
