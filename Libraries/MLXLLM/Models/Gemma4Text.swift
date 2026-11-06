@@ -1494,16 +1494,11 @@ public class Gemma4DecoderLayer: Module {
             tensorParallel != nil && isMoE && outputStart == 0 && activePerLayerInput == nil
             ? Gemma4TensorParallelPromptParts.count(x, isExpertPrefill: isExpertPrefill) : 1
         if promptParts > 1, let tensorParallel {
-            let deferred = Gemma4TensorParallelContext.DeferredSum()
-            let (partial, kvPair, attnPositionOffset) = Gemma4TensorParallelContext.$deferred
-                .withValue(deferred) {
-                    selfAttn(
-                        h, mask: mask, cache: cache, sharedKV: sharedKV,
-                        positionOffset: positionOffset, v2SharedSource: v2SharedSource,
-                        outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
-                }
-            guard let dtype = deferred.dtype else {
-                preconditionFailure("Gemma 4 tensor-parallel attention did not reduce its output")
+            let ((partial, kvPair, attnPositionOffset), dtype) = tensorParallel.withoutCollective {
+                selfAttn(
+                    h, mask: mask, cache: cache, sharedKV: sharedKV,
+                    positionOffset: positionOffset, v2SharedSource: v2SharedSource,
+                    outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
             }
             return (
                 tensorParallelPromptParts(

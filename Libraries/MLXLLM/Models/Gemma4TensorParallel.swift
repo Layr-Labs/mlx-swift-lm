@@ -144,6 +144,9 @@ public enum Gemma4LayerSubmission {
 /// link run, never a value. Chunks shorter than two parts of `minimumRows` run whole.
 public enum Gemma4TensorParallelPromptParts {
     @TaskLocal public static var parts = 1
+    /// The fewest rows a part takes. More than one row keeps a part a registered prompt frame
+    /// (`Gemma4PrefillProjection.applies`), so its projections and experts take the same one-row
+    /// paths as the whole chunk.
     public static let minimumRows = 4
 
     /// Parts for a layer input `x`: only a registered prompt chunk whose experts take the shared
@@ -199,13 +202,24 @@ final class Gemma4TensorParallelContext {
         self.allSum = allSum
     }
 
-    /// Receives the first row-parallel projection's dtype inside `deferred`:
-    /// that `reduce` returns its FP32 partial unsummed, for a caller that sums
-    /// it in row parts (`Gemma4TensorParallelPromptParts`).
-    final class DeferredSum: @unchecked Sendable {
+    /// The activation dtype of the `reduce` call inside `withoutCollective`.
+    private final class DeferredSum: @unchecked Sendable {
         var dtype: DType?
     }
-    @TaskLocal static var deferred: DeferredSum?
+    @TaskLocal private static var deferred: DeferredSum?
+
+    /// Runs `body`, a layer's attention, which calls `reduce` once (its output projection),
+    /// without that call's collective: `reduce` returns its unrounded FP32 partial. Returns
+    /// `body`'s result and the dtype `reduce` would have rounded the sum to, for a caller that
+    /// sums the partial in row parts (`Gemma4TensorParallelPromptParts`).
+    func withoutCollective<R>(_ body: () -> R) -> (result: R, dtype: DType) {
+        let deferred = DeferredSum()
+        let result = Self.$deferred.withValue(deferred, operation: body)
+        guard let dtype = deferred.dtype else {
+            preconditionFailure("Gemma 4 tensor-parallel attention did not reduce its output")
+        }
+        return (result, dtype)
+    }
 
     /// A row-parallel projection: the FP32 partials summed across ranks,
     /// then one rounding to the activation dtype.
@@ -288,6 +302,15 @@ extension Gemma4DecoderLayer {
 }
 
 extension Gemma4Experts {
+    /// A tensor-parallel rank's expert down projection, whose collective sums the experts' FP32
+    /// partials.
+    private var tensorParallelDown: TensorParallelSwitchLinear {
+        guard let down = switchGLU.downProjection as? TensorParallelSwitchLinear else {
+            preconditionFailure("A tensor-parallel Gemma 4 rank sums its experts' partials")
+        }
+        return down
+    }
+
     /// Every selected expert's FP32 partial and `densePartial` summed in one collective: the
     /// weighted expert output and the dense FP32 sum. A registered prompt chunk's tokens share one
     /// expert dispatch per projection; scoped batch decode rows run their experts one row each.
@@ -295,9 +318,7 @@ extension Gemma4Experts {
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray,
         isExpertPrefill: Bool, carrying densePartial: MLXArray
     ) -> (output: MLXArray, denseSum: MLXArray) {
-        guard let down = switchGLU.downProjection as? TensorParallelSwitchLinear else {
-            preconditionFailure("A tensor-parallel Gemma 4 rank sums its experts' partials")
-        }
+        let down = tensorParallelDown
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
         let byToken = Gemma4PrefillProjection.appliesExperts(
@@ -348,9 +369,7 @@ extension Gemma4Experts {
     func tensorParallelPromptSum(
         _ x: MLXArray, topKIndices: MLXArray, carrying densePartial: MLXArray
     ) -> MLXArray {
-        guard let down = switchGLU.downProjection as? TensorParallelSwitchLinear else {
-            preconditionFailure("A tensor-parallel Gemma 4 rank sums its experts' partials")
-        }
+        let down = tensorParallelDown
         let (S, H, K) = (x.dim(1), x.dim(2), topKIndices.dim(-1))
         let rows = down.withoutCollective {
             switchGLU.expertRowsByRow(x.reshaped(S, H), topKIndices.reshaped(S, K))
@@ -375,7 +394,8 @@ extension Gemma4Experts {
 extension Gemma4DecoderLayer {
     /// The layer after attention for a registered prompt chunk in `parts` row parts
     /// (`Gemma4TensorParallelPromptParts`): `attentionPartial` is the attention output
-    /// projection's unsummed FP32 partial of the whole chunk. Every part's attention sum is issued
+    /// projection's unsummed FP32 partial of the whole chunk, and `dtype` the dtype its sum rounds
+    /// to (`Gemma4TensorParallelContext.withoutCollective`). Every part's attention sum is issued
     /// first, then every part's feed-forward collective, then every part's rounding and norms, so
     /// the GPU computes one part while the link carries another's sum. Each value is the one the
     /// whole layer computes for that row.
