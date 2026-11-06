@@ -338,7 +338,10 @@ def:
             unscaled normalization arithmetic independently for each request row.
             A tensor-parallel rank's registered prompt chunk runs every token's experts in one shared
             dispatch per projection (`SwitchGLU.expertRowsByRow`, each (token, expert) pair the native M=1
-            product its own call computes) before the chunk's single packed collective.
+            product its own call computes) before the chunk's single packed collective; its work after
+            attention can run in row parts whose sums are issued as built (`Gemma4TensorParallelPromptParts`,
+            off by default: bit-identical on the GPU for two ranks while every op after attention is per-row,
+            not on the CPU backend, not exact with more than two ranks, and not enforced).
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"

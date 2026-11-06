@@ -1490,6 +1490,23 @@ public class Gemma4DecoderLayer: Module {
         }
 
         let h = inputLayernorm(x)
+        let promptParts =
+            tensorParallel != nil && isMoE && outputStart == 0 && activePerLayerInput == nil
+            ? Gemma4TensorParallelPromptParts.count(x, isExpertPrefill: isExpertPrefill) : 1
+        if promptParts > 1, let tensorParallel {
+            let ((partial, kvPair, attnPositionOffset), dtype) = tensorParallel.withoutCollective {
+                selfAttn(
+                    h, mask: mask, cache: cache, sharedKV: sharedKV,
+                    positionOffset: positionOffset, v2SharedSource: v2SharedSource,
+                    outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+            }
+            return (
+                tensorParallelPromptParts(
+                    residual: x, attentionPartial: partial, dtype: dtype, parts: promptParts,
+                    context: tensorParallel),
+                kvPair, attnPositionOffset
+            )
+        }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
