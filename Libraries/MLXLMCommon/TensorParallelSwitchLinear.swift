@@ -46,15 +46,6 @@ public final class TensorParallelSwitchLinear: QuantizedSwitchLinear, SwitchLine
 
     private let reduction: Reduction
 
-    /// Counts this projection's forwards on the binding thread (tests: how many expert
-    /// dispatches a forward builds).
-    public final class ForwardCount: @unchecked Sendable {
-        public private(set) var value = 0
-        public init() {}
-        fileprivate func add() { value += 1 }
-    }
-    @TaskLocal public static var forwards: ForwardCount?
-
     public enum InstallationError: Error {
         case unsupportedProjection
     }
@@ -125,7 +116,6 @@ public final class TensorParallelSwitchLinear: QuantizedSwitchLinear, SwitchLine
     public override func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
-        Self.forwards?.add()
         let partial = super.callAsFunction(
             x.asType(.float32), indices,
             sortedIndices: sortedIndices)

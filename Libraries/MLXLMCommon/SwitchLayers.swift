@@ -1226,12 +1226,7 @@ open class SwitchGLU: Module {
     package func callAndWeightedReduceRows(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> MLXArray {
-        var projected = projectExperts(x, indices, hintsSorted: false)
-        if let inverseOrder = projected.inverseOrder {
-            projected.output = scatterUnsort(
-                x: projected.output, invOrder: inverseOrder, shape: indices.shape)
-        }
-        return weightedExpertSum(MLX.squeezed(projected.output, axis: -2), weights)
+        weightedExpertSum(expertRowsByRow(x, indices), weights)
     }
 }
 
