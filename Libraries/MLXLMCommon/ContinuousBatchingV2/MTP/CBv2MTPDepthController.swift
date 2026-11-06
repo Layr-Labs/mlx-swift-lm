@@ -186,10 +186,12 @@ final class CBv2MTPDepthController {
         var roundCosts: [Int: CostState] = [:]
         /// Request-probe mode: this request's opening probe is still due.
         var probeDue = true
+        /// Request-probe mode: ordinary decode re-probes after `plainGapTokens`
+        /// tokens; each return to ordinary decode takes that gap from the
+        /// back-off, `nextPlainGapTokens`.
         var plainTokensSinceProbe = 0
-        /// Plain tokens before the next probe, and the gap after the next losing one.
         var plainGapTokens = CBv2MTPDepthController.probeBaseIntervalTokens
-        var probeIntervalTokens = CBv2MTPDepthController.probeBaseIntervalTokens
+        var nextPlainGapTokens = CBv2MTPDepthController.probeBaseIntervalTokens
     }
 
     let maxDepth: Int
@@ -505,6 +507,8 @@ final class CBv2MTPDepthController {
         }
 
         let state = buckets[bucket] ?? freshBucket()
+        // Request-probe mode runs depths past the acceptance frontier; clamping
+        // its open window to the frontier would change the depth and discard it.
         let limit =
             requestProbeDepth != nil ? maxDepth : min(maxDepth, state.acceptance.frontier + 1)
         let decision: CBv2MTPDepthDecision
@@ -593,14 +597,13 @@ final class CBv2MTPDepthController {
             reason: state.activeDepth == 0 ? "unprofitable" : "goodput", isExploration: false)
     }
 
-    /// Request-probe mode: the depth with the highest expected goodput, the
-    /// request's expected committed tokens per round (positions beyond the
-    /// trusted ones take the last trusted rate) over this engine's measured
-    /// round cost; ordinary decode unless a depth beats it by the hysteresis,
-    /// and the current depth unless another beats it by the hysteresis. A
-    /// depth whose round cost was never measured is chosen once to measure it
-    /// (`measuring`).
-    private func modelDepth(state: BucketState) -> (depth: Int, measuring: Bool) {
+    /// Request-probe mode, after a completed window: the depth with the highest
+    /// expected goodput, the request's expected committed tokens per round
+    /// (positions beyond the trusted ones take the last trusted rate) over this
+    /// engine's measured round cost. Another depth must beat the current one
+    /// (ordinary decode after a probe) by the hysteresis. A depth whose round
+    /// cost was never measured comes first, for one window (`measuring`).
+    private func depthAfterWindow(state: BucketState) -> (depth: Int, measuring: Bool) {
         guard state.acceptance.frontier > 0, let plain = effectiveCost(depth: 0, state: state),
             plain.ewmaNanos > 0
         else { return (0, false) }
@@ -628,6 +631,34 @@ final class CBv2MTPDepthController {
         return (best, false)
     }
 
+    /// Request-probe mode, for a decision `probeDecision` made: an ordinary
+    /// step counts toward the next probe, and a completed window moves to the
+    /// depth `depthAfterWindow` picks and updates the back-off.
+    private func completeProbeDecision(
+        _ decision: CBv2MTPDepthDecision, state: inout BucketState
+    ) {
+        guard decision.depth > 0 else {
+            state.plainTokensSinceProbe += 1
+            return
+        }
+        let wasProbe = decision.reason == "probe"
+        let (next, measuring) = depthAfterWindow(state: state)
+        state.activeDepth = next
+        if wasProbe { state.probeDue = false }
+        if next == 0 {
+            // Ordinary decode for the current gap; a losing probe doubles the next one.
+            state.plainTokensSinceProbe = 0
+            state.plainGapTokens = state.nextPlainGapTokens
+            if wasProbe {
+                state.nextPlainGapTokens = min(
+                    state.nextPlainGapTokens * 2, Self.probeMaxIntervalTokens)
+            }
+        } else if wasProbe, !measuring {
+            // A winning probe resets the back-off; one that only measures a depth does not.
+            state.nextPlainGapTokens = Self.probeBaseIntervalTokens
+        }
+    }
+
     private func complete(
         _ decision: CBv2MTPDepthDecision,
         state: inout BucketState
@@ -636,28 +667,7 @@ final class CBv2MTPDepthController {
             decision.reason == "probe" || decision.reason == "goodput"
                 || decision.reason == "unprofitable"
         {
-            if decision.depth == 0 {
-                state.plainTokensSinceProbe += 1
-                return
-            }
-            // A completed window at a positive depth.
-            let (next, measuring) = modelDepth(state: state)
-            if decision.reason == "probe" {
-                state.probeDue = false
-                if next == 0 {
-                    // A losing probe: plain for the current interval, doubled for the next loss.
-                    state.plainGapTokens = state.probeIntervalTokens
-                    state.probeIntervalTokens = min(
-                        state.probeIntervalTokens * 2, Self.probeMaxIntervalTokens)
-                } else if !measuring {
-                    state.probeIntervalTokens = Self.probeBaseIntervalTokens
-                }
-            } else if next == 0 {
-                // Speculation stopped paying: plain for the current interval.
-                state.plainGapTokens = state.probeIntervalTokens
-            }
-            if next == 0 { state.plainTokensSinceProbe = 0 }
-            state.activeDepth = next
+            completeProbeDecision(decision, state: &state)
             return
         }
         if decision.isExploration {

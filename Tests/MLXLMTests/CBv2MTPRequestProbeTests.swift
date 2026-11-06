@@ -34,8 +34,8 @@ struct CBv2MTPRequestProbeTests {
         }
     }
 
-    /// Runs whole windows at the decided depth with `accepted(depth)` drafts kept each round, or `plain` ordinary
-    /// steps; returns every decision taken.
+    /// Takes `rounds` decisions: depth zero runs one ordinary step, a positive depth one round that keeps
+    /// `accepted(depth)` drafts. Returns every decision taken.
     @discardableResult
     static func run(_ controller: CBv2MTPDepthController, rounds: Int, accepted: (Int) -> Int)
         -> [CBv2MTPDepthDecision]
