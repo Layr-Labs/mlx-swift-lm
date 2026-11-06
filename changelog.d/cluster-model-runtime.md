@@ -95,5 +95,4 @@
   (`SwitchGLU.expertRowsByRow`) instead of one expert forward per token, then
   sums them in the same single collective. Every row's bytes are unchanged.
   On two M5 Ultras over JACCL, prefill of a 9,651-token prompt went from 569
-  to 1,066 tok/s with identical tokens. `TensorParallelSwitchLinear.forwards`
-  counts the projection's forwards for tests.
+  to 1,066 tok/s with identical tokens.
