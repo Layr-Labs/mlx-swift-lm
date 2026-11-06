@@ -336,6 +336,9 @@ def:
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
             Explicit cluster decode scopes preserve singleton packed projection, expert and
             unscaled normalization arithmetic independently for each request row.
+            A tensor-parallel rank's registered prompt chunk runs every token's experts in one shared
+            dispatch per projection (`SwitchGLU.expertRowsByRow`, each (token, expert) pair the native M=1
+            product its own call computes) before the chunk's single packed collective.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
