@@ -300,14 +300,18 @@ extension Gemma4Experts {
         for row in 0 ..< B {
             partials.append(
                 down.withoutCollective {
-                    switchGLU(x[row ..< row + 1].reshaped(S, H), topKIndices[row ..< row + 1].reshaped(S, K))
+                    switchGLU(
+                        x[row ..< row + 1].reshaped(S, H),
+                        topKIndices[row ..< row + 1].reshaped(S, K))
                 }
                 .reshaped([-1, H]))
         }
         let summed = down.sum(concatenated(partials + [densePartial.reshaped([-1, H])], axis: 0))
         let outputs = (0 ..< B).map { row -> MLXArray in
-            let experts = summed[(row * S * K) ..< ((row + 1) * S * K)].reshaped([S, K, H]).asType(x.dtype)
-            return weightedExpertSum(experts, topKWeights[row ..< row + 1].reshaped(S, K)).reshaped([1, S, H])
+            let experts = summed[(row * S * K) ..< ((row + 1) * S * K)].reshaped([S, K, H]).asType(
+                x.dtype)
+            return weightedExpertSum(experts, topKWeights[row ..< row + 1].reshaped(S, K)).reshaped(
+                [1, S, H])
         }
         return (concatenated(outputs, axis: 0), summed[(B * S * K)...].reshaped(densePartial.shape))
     }
