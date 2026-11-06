@@ -119,26 +119,27 @@ public enum VideoReaderRetry {
 
 /// Fails data requests of the in-memory video resource loaders, for
 /// fault-injection tests. A loader reads `current` when its asset is created;
-/// production code never binds it.
+/// production code never binds it. AVFoundation requests a failed range again,
+/// so a reader pass fails only while the fault stays armed.
 public final class VideoDataRequestFault: @unchecked Sendable {
     @TaskLocal public static var current: VideoDataRequestFault?
 
     private let offset: Int
     private let error: any Error & Sendable
     private let lock = NSLock()
-    private var skipping: Int
-    private var remaining: Int
+    private var armed: Bool
     private var count = 0
 
-    /// Lets the first `skipping` data requests whose range holds byte `offset`
-    /// through, then fails the next `failures` of them after serving the bytes
-    /// before `offset`.
-    public init(offset: Int, failures: Int, skipping: Int = 0, error: any Error & Sendable) {
+    /// While armed, fails every data request whose range holds byte `offset`,
+    /// after serving the bytes before it.
+    public init(offset: Int, error: any Error & Sendable, armed: Bool = true) {
         self.offset = offset
-        self.skipping = skipping
-        self.remaining = failures
         self.error = error
+        self.armed = armed
     }
+
+    public func arm() { lock.withLock { armed = true } }
+    public func disarm() { lock.withLock { armed = false } }
 
     /// Requests failed so far.
     public var injected: Int { lock.withLock { count } }
@@ -148,12 +149,7 @@ public final class VideoDataRequestFault: @unchecked Sendable {
     public func intercept(_ range: Range<Int>) -> (served: Range<Int>, error: any Error)? {
         guard range.contains(offset) else { return nil }
         return lock.withLock {
-            guard skipping == 0 else {
-                skipping -= 1
-                return nil
-            }
-            guard remaining > 0 else { return nil }
-            remaining -= 1
+            guard armed else { return nil }
             count += 1
             return (range.lowerBound ..< offset, error)
         }

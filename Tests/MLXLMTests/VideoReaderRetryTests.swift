@@ -10,21 +10,29 @@ import XCTest
 @testable import MLXLMCommon
 @testable import MLXVLM
 
-/// Every failed reader pass, in order.
+/// Every failed reader pass, in order. Disarms `fault` when a pass fails and a
+/// second pass follows, so that pass reads every byte.
 private final class FailedPasses: @unchecked Sendable {
     private let lock = NSLock()
+    private let fault: VideoDataRequestFault?
     private var recorded: [(failure: VideoReaderFailure, retrying: Bool)] = []
+
+    init(disarming fault: VideoDataRequestFault? = nil) { self.fault = fault }
 
     var all: [(failure: VideoReaderFailure, retrying: Bool)] { lock.withLock { recorded } }
     var retrying: [Bool] { all.map { $0.retrying } }
 
     var observer: VideoReaderRetry.Observer {
-        { [self] failure, retrying in lock.withLock { recorded.append((failure, retrying)) } }
+        { [self] failure, retrying in
+            lock.withLock { recorded.append((failure, retrying)) }
+            if retrying { fault?.disarm() }
+        }
     }
 }
 
 /// The real decoders over the real in-memory resource loader, with data requests
-/// failed partway through the clip.
+/// failed partway through the clip. AVFoundation requests a failed range again,
+/// so the fault stays armed until a reader pass fails.
 final class VideoReaderRetryTests: XCTestCase {
     private struct Unrelated: Error {}
 
@@ -37,10 +45,8 @@ final class VideoReaderRetryTests: XCTestCase {
 
     /// Both clips keep `moov` after `mdat`, so the middle byte is sample data that
     /// only a full reader pass requests.
-    private func midClipFault(_ data: Data, failures: Int, error: any Error & Sendable)
-        -> VideoDataRequestFault
-    {
-        VideoDataRequestFault(offset: data.count / 2, failures: failures, error: error)
+    private func midClipFault(_ data: Data, error: any Error & Sendable) -> VideoDataRequestFault {
+        VideoDataRequestFault(offset: data.count / 2, error: error)
     }
 
     private func owner(_ data: Data, _ fault: VideoDataRequestFault? = nil) throws
@@ -210,15 +216,18 @@ final class VideoReaderRetryTests: XCTestCase {
         XCTAssertEqual(passes.retrying, [false])
     }
 
-    /// The fault serves the bytes before its offset, then fails the request.
-    func testFaultSkipsThenFailsOnlyRequestsHoldingItsOffset() {
+    /// The fault serves the bytes before its offset, then fails the request,
+    /// only while armed.
+    func testFaultFailsOnlyArmedRequestsHoldingItsOffset() {
         let fault = VideoDataRequestFault(
-            offset: 10, failures: 1, skipping: 1, error: MemoryBackedVideoAssetError.invalidRange)
+            offset: 10, error: MemoryBackedVideoAssetError.invalidRange, armed: false)
+        XCTAssertNil(fault.intercept(4 ..< 20))
+        fault.arm()
         XCTAssertNil(fault.intercept(0 ..< 10))
-        XCTAssertNil(fault.intercept(0 ..< 20))
         let injected = fault.intercept(4 ..< 20)
         XCTAssertEqual(injected?.served, 4 ..< 10)
         XCTAssertEqual(injected?.error as? MemoryBackedVideoAssetError, .invalidRange)
+        fault.disarm()
         XCTAssertNil(fault.intercept(4 ..< 20))
         XCTAssertEqual(fault.injected, 1)
     }
@@ -229,16 +238,16 @@ final class VideoReaderRetryTests: XCTestCase {
         try GLM5NextProcessor(configuration: .init(), tokenizer: GLM5NextTestTokenizer())
     }
 
-    func testGLMRetryAfterAFailedDataRequestKeepsTheDecodedFrames() async throws {
+    func testGLMRetryAfterAFailedReaderPassKeepsTheDecodedFrames() async throws {
         let data = try clip("input-video-url.mp4")
         let processor = try glmProcessor()
         let baseline = try await processor.decode(.memoryBacked(owner(data)))
-        let fault = midClipFault(data, failures: 1, error: MemoryBackedVideoAssetError.invalidRange)
-        let passes = FailedPasses()
+        let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
+        let passes = FailedPasses(disarming: fault)
         let retried = try await observing(passes) {
             try await processor.decode(.memoryBacked(owner(data, fault)))
         }
-        XCTAssertEqual(fault.injected, 1)
+        XCTAssertGreaterThanOrEqual(fault.injected, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertFalse(try XCTUnwrap(passes.all.first).failure.codes.isEmpty)
         XCTAssertEqual(retried.sourceFrameCount, baseline.sourceFrameCount)
@@ -255,7 +264,7 @@ final class VideoReaderRetryTests: XCTestCase {
             (MemoryBackedVideoAssetError.invalidRange as any Error & Sendable, false),
             (decoderUnavailable, true),
         ] {
-            let fault = midClipFault(data, failures: .max, error: error)
+            let fault = midClipFault(data, error: error)
             let passes = FailedPasses()
             do {
                 _ = try await observing(passes) {
@@ -273,7 +282,7 @@ final class VideoReaderRetryTests: XCTestCase {
 
     // MARK: - MiMo and Qwen4
 
-    func testMiMoRetryAfterAFailedDataRequestKeepsThePlanAndFrames() async throws {
+    func testMiMoRetryAfterAFailedReaderPassKeepsThePlanAndFrames() async throws {
         let data = try clip("input-video-base64.mov")
         let sampling = try MiMoV26EncodedVisualDecoder.Sampling(
             fps: 2, minimumFrames: 4, maximumFrames: 64)
@@ -290,16 +299,16 @@ final class VideoReaderRetryTests: XCTestCase {
             return (plan.sampledIndices, video.frames.map(\.planarRGB))
         }
         let baseline = try await decode(owner(data))
-        let fault = midClipFault(data, failures: 1, error: MemoryBackedVideoAssetError.invalidRange)
-        let passes = FailedPasses()
+        let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
+        let passes = FailedPasses(disarming: fault)
         let retried = try await observing(passes) { try await decode(owner(data, fault)) }
-        XCTAssertEqual(fault.injected, 1)
+        XCTAssertGreaterThanOrEqual(fault.injected, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertEqual(retried.indices, baseline.indices)
         XCTAssertEqual(retried.frames, baseline.frames)
     }
 
-    func testQwen4RetryAfterAFailedDataRequestKeepsTheSampledFrames() async throws {
+    func testQwen4RetryAfterAFailedReaderPassKeepsTheSampledFrames() async throws {
         let data = try clip("input-video-base64.mov")
         let config = try JSONDecoder().decode(
             Qwen4ExpVideoConfiguration.self, from: Data("{}".utf8))
@@ -310,10 +319,10 @@ final class VideoReaderRetryTests: XCTestCase {
             }
         }
         let baseline = try await sample(owner(data))
-        let fault = midClipFault(data, failures: 1, error: MemoryBackedVideoAssetError.invalidRange)
-        let passes = FailedPasses()
+        let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
+        let passes = FailedPasses(disarming: fault)
         let retried = try await observing(passes) { try await sample(owner(data, fault)) }
-        XCTAssertEqual(fault.injected, 1)
+        XCTAssertGreaterThanOrEqual(fault.injected, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertEqual(retried.indices, baseline.indices)
         XCTAssertEqual(retried.sourceFPS, baseline.sourceFPS)
