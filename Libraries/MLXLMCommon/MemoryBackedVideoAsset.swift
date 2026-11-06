@@ -210,6 +210,45 @@ public final class MemoryBackedVideoAsset: @unchecked Sendable {
     }
 }
 
+/// Fails data requests of the in-memory video resource loaders, for
+/// fault-injection tests. A loader reads `current` when its asset is created;
+/// production code never binds it. AVFoundation requests a failed range again,
+/// so a reader pass fails only while the fault stays armed.
+public final class VideoDataRequestFault: @unchecked Sendable {
+    @TaskLocal public static var current: VideoDataRequestFault?
+
+    private let offset: Int
+    private let error: any Error & Sendable
+    private let lock = NSLock()
+    private var armed: Bool
+    private var count = 0
+
+    /// While armed, fails every data request whose range holds byte `offset`,
+    /// after serving the bytes before it.
+    public init(offset: Int, error: any Error & Sendable, armed: Bool = true) {
+        self.offset = offset
+        self.error = error
+        self.armed = armed
+    }
+
+    public func arm() { lock.withLock { armed = true } }
+    public func disarm() { lock.withLock { armed = false } }
+
+    /// Requests failed so far.
+    public var injected: Int { lock.withLock { count } }
+
+    /// The bytes to serve before failing a request for `range`, and the error to
+    /// fail it with; nil to serve the request in full.
+    public func intercept(_ range: Range<Int>) -> (served: Range<Int>, error: any Error)? {
+        guard range.contains(offset) else { return nil }
+        return lock.withLock {
+            guard armed else { return nil }
+            count += 1
+            return (range.lowerBound ..< offset, error)
+        }
+    }
+}
+
 private final class MemoryAssetResourceLoader: NSObject,
     AVAssetResourceLoaderDelegate, @unchecked Sendable
 {

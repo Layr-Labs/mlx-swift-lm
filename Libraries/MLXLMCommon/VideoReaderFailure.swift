@@ -87,13 +87,22 @@ public enum VideoReaderRetry {
     /// Receives every failed pass. `retrying` is true when a second pass follows.
     @TaskLocal public static var failedPassObserver: Observer?
 
+    /// Tests only: runs before each sample read with that reader, on the reading
+    /// thread, so a test can end a reader partway.
+    @TaskLocal public static var beforeReadForTesting: (@Sendable (AVAssetReader) -> Void)?
+
     public static func run<Output>(
         isolation: isolated (any Actor)? = #isolation, _ pass: () async throws -> Output
     ) async throws -> Output {
         do {
             return try await pass()
         } catch let failure as VideoReaderFailure {
-            try retrying(after: failure)
+            // A cancelled task does not retry: the reader failed because it was stopped.
+            guard !Task.isCancelled else {
+                report(failure, retrying: false)
+                throw CancellationError()
+            }
+            report(failure, retrying: true)
             do {
                 return try await pass()
             } catch let failure as VideoReaderFailure {
@@ -103,9 +112,10 @@ public enum VideoReaderRetry {
         }
     }
 
-    /// Tests only: runs before each sample read with that reader, on the reading
-    /// thread, so a test can end a reader partway.
-    @TaskLocal public static var beforeReadForTesting: (@Sendable (AVAssetReader) -> Void)?
+    /// Reports `failure` to the task's observer.
+    public static func report(_ failure: VideoReaderFailure, retrying: Bool) {
+        failedPassObserver?(failure, retrying)
+    }
 
     /// The next sample of `reader`'s `output`, after the task's test hook.
     public static func nextSample(_ output: AVAssetReaderOutput, of reader: AVAssetReader)
@@ -113,59 +123,6 @@ public enum VideoReaderRetry {
     {
         beforeReadForTesting?(reader)
         return output.copyNextSampleBuffer()
-    }
-
-    /// Reports `failure` to the task's observer.
-    public static func report(_ failure: VideoReaderFailure, retrying: Bool) {
-        failedPassObserver?(failure, retrying)
-    }
-
-    /// A cancelled task does not retry: the reader failed because it was stopped.
-    private static func retrying(after failure: VideoReaderFailure) throws {
-        guard !Task.isCancelled else {
-            report(failure, retrying: false)
-            throw CancellationError()
-        }
-        report(failure, retrying: true)
-    }
-}
-
-/// Fails data requests of the in-memory video resource loaders, for
-/// fault-injection tests. A loader reads `current` when its asset is created;
-/// production code never binds it. AVFoundation requests a failed range again,
-/// so a reader pass fails only while the fault stays armed.
-public final class VideoDataRequestFault: @unchecked Sendable {
-    @TaskLocal public static var current: VideoDataRequestFault?
-
-    private let offset: Int
-    private let error: any Error & Sendable
-    private let lock = NSLock()
-    private var armed: Bool
-    private var count = 0
-
-    /// While armed, fails every data request whose range holds byte `offset`,
-    /// after serving the bytes before it.
-    public init(offset: Int, error: any Error & Sendable, armed: Bool = true) {
-        self.offset = offset
-        self.error = error
-        self.armed = armed
-    }
-
-    public func arm() { lock.withLock { armed = true } }
-    public func disarm() { lock.withLock { armed = false } }
-
-    /// Requests failed so far.
-    public var injected: Int { lock.withLock { count } }
-
-    /// The bytes to serve before failing a request for `range`, and the error to
-    /// fail it with; nil to serve the request in full.
-    public func intercept(_ range: Range<Int>) -> (served: Range<Int>, error: any Error)? {
-        guard range.contains(offset) else { return nil }
-        return lock.withLock {
-            guard armed else { return nil }
-            count += 1
-            return (range.lowerBound ..< offset, error)
-        }
     }
 }
 #endif
