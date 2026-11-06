@@ -257,7 +257,8 @@ extension Gemma4DecoderLayer {
 
 extension Gemma4Experts {
     /// Every selected expert's FP32 partial and `densePartial` summed in one collective: the
-    /// weighted expert output and the dense FP32 sum. Scoped singleton slices pack into it too.
+    /// weighted expert output and the dense FP32 sum. A registered prompt chunk's tokens share one
+    /// expert dispatch per projection; scoped batch decode rows run their experts one row each.
     func tensorParallelCall(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray,
         isExpertPrefill: Bool, carrying densePartial: MLXArray
@@ -279,37 +280,40 @@ extension Gemma4Experts {
             }
             return (packed.output.reshaped(B, S, H), packed.rowsSum)
         }
-        let count = byToken ? S : B
-        func slice(_ value: MLXArray, _ index: Int) -> MLXArray {
-            byToken ? value[0..., index ..< index + 1, 0...] : value[index ..< index + 1]
+        if byToken {
+            // A registered prompt chunk: every token's expert rows in one shared dispatch per
+            // projection, each (token, expert) pair the native M=1 product its own call computes.
+            let rows = down.withoutCollective {
+                switchGLU.expertRowsByRow(x.reshaped(S, H), topKIndices.reshaped(S, K))
+            }
+            .reshaped([S * K, H])
+            let summed = down.sum(concatenated([rows, densePartial.reshaped([-1, H])], axis: 0))
+            let experts = summed[..<(S * K)].reshaped([S, K, H]).asType(x.dtype)
+            return (
+                weightedExpertSum(experts, topKWeights.reshaped(S, K)).reshaped(x.shape),
+                summed[(S * K)...].reshaped(densePartial.shape)
+            )
         }
+        // Scoped batch decode rows (B > 1, S == 1): each row's experts alone, every row's
+        // partials in the one collective.
         var partials: [MLXArray] = []
-        for index in 0 ..< count {
-            let rows = slice(x, index)
-            let routes = slice(topKIndices, index)
-            let tokens = rows.dim(0) * rows.dim(1)
+        for row in 0 ..< B {
             partials.append(
                 down.withoutCollective {
-                    switchGLU(rows.reshaped(tokens, H), routes.reshaped(tokens, K))
+                    switchGLU(
+                        x[row ..< row + 1].reshaped(S, H),
+                        topKIndices[row ..< row + 1].reshaped(S, K))
                 }
                 .reshaped([-1, H]))
         }
-        let expertRows = partials.reduce(0) { $0 + $1.dim(0) }
         let summed = down.sum(concatenated(partials + [densePartial.reshaped([-1, H])], axis: 0))
-        var offset = 0
-        let outputs = (0 ..< count).map { index -> MLXArray in
-            let rows = slice(x, index)
-            let tokens = rows.dim(0) * rows.dim(1)
-            let experts = summed[offset ..< offset + tokens * K].reshaped([tokens, K, H])
-                .asType(x.dtype)
-            offset += tokens * K
-            return weightedExpertSum(experts, slice(topKWeights, index).reshaped(tokens, K))
-                .reshaped(rows.shape)
+        let outputs = (0 ..< B).map { row -> MLXArray in
+            let experts = summed[(row * S * K) ..< ((row + 1) * S * K)].reshaped([S, K, H]).asType(
+                x.dtype)
+            return weightedExpertSum(experts, topKWeights[row ..< row + 1].reshaped(S, K)).reshaped(
+                [1, S, H])
         }
-        return (
-            concatenated(outputs, axis: byToken ? 1 : 0),
-            summed[expertRows...].reshaped(densePartial.shape)
-        )
+        return (concatenated(outputs, axis: 0), summed[(B * S * K)...].reshaped(densePartial.shape))
     }
 }
 
