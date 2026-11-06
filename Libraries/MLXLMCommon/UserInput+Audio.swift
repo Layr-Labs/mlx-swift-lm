@@ -42,7 +42,6 @@ extension UserInput.Audio {
                 AVLinearPCMIsNonInterleaved: false,
             ]
 
-            // A failed pass reruns once with a new reader over the same asset.
             let samples = try await VideoReaderRetry.run {
                 try Self.samples(asset, track: track, settings: settings)
             }

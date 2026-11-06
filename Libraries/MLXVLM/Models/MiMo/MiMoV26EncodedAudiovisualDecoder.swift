@@ -243,7 +243,6 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             guard tracks.count == 1, let track = tracks.first, track.trackID == plan.trackID else {
                 throw Failure.invalidAudio
             }
-            // A failed pass reruns once with a new reader over the same asset.
             return try await VideoReaderRetry.run {
                 try passthroughPass(asset, track: track, plan: plan)
             }
