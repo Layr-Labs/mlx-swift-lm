@@ -96,6 +96,17 @@
   sums them in the same single collective. Every row's bytes are unchanged.
   On two M5 Ultras over JACCL, prefill of a 9,651-token prompt went from 569
   to 1,066 tok/s with identical tokens.
+- A Gemma 4 tensor-parallel rank can run a registered prompt chunk's work after
+  attention in row parts (`Gemma4TensorParallelPromptParts.parts`, 1 by
+  default): every part's attention sum and feed-forward collective is issued as
+  soon as it is built, so one part's sum crosses the link while the next part
+  computes. The attention core still runs the whole chunk. The parts are
+  bit-identical to the whole chunk on the GPU for two ranks while every op after
+  attention computes each row alone (today's kernels do); not on the CPU backend
+  (RMSNorm's fallback), not with more than two ranks (the collective's sum order
+  depends on its size), and nothing enforces it, so it stays off. On two M5
+  Ultras, 4 parts measured best: 9,651-token prefill 1,064 -> 1,196-1,208 tok/s
+  (+13 %), identical tokens.
 - `Qwen35PromptWavefront.prefillWithHidden` returns, beside `prefill`'s
   outputs, each prompt chunk's last decoder layer rows (before the final norm)
   from the same graph, so an assisted tensor-parallel lane can merge prompt
