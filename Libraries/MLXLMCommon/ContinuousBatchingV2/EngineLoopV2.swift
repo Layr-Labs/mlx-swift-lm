@@ -1246,11 +1246,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }
-            scheduler.speculationDraftTokenUpperBound = mtp.projectionDraftTokenUpperBound
-            // The same gates `beginMTPPlan` applies to every planned step.
-            scheduler.speculationDepthCeiling = { [unowned mtp] decodeRows in
-                mtp.speculationDepthCeiling(decodeRows: decodeRows)
-            }
+            Self.wireSpeculationProjection(scheduler, to: mtp)
+        }
+    }
+
+    /// The first-token deadline projection's view of `mtp`: the draft tokens
+    /// it charges per decoding row and the same depth gates `beginMTPPlan`
+    /// applies to every planned step.
+    static func wireSpeculationProjection(_ scheduler: SchedulerV2, to mtp: CBv2MTPRoundDriver) {
+        scheduler.speculationDraftTokenUpperBound = mtp.projectionDraftTokenUpperBound
+        scheduler.speculationDepthCeiling = { [unowned mtp] decodeRows in
+            mtp.speculationDepthCeiling(decodeRows: decodeRows)
         }
     }
 

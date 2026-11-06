@@ -195,7 +195,7 @@ struct CBv2MTPEngineParityTests {
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? adaptiveMaxDepth ?? k
-        // A request-probe engine is adaptive (no fixed depth) up to `k`.
+        // A request-probe engine is adaptive (no fixed depth) up to `adaptiveMaxDepth ?? k`.
         let mtpConfig = CBv2MTPConfig(
             enabled: drafter != nil, maxDraftTokens: depth,
             maxSpeculativeBatch: maxSpeculativeBatch,

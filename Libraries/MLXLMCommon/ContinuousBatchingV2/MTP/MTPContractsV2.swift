@@ -711,8 +711,13 @@ public struct CBv2MTPMetrics: Sendable {
     /// Rows that were round-eligible but clamped to plain decode, keyed by
     /// reason ("batch_gate", "kv_headroom", "carry_invalid", ...).
     public var skippedRows: [String: Int] = [:]
-    /// Step selections by depth, including depth zero.
+    /// Step selections by depth, including depth zero. A later clamp in the
+    /// same plan moves its count, so this can decrease between snapshots.
     public var depthSelections: [Int: Int] = [:]
+    /// Planned decode steps by final depth (after every clamp), including
+    /// depth zero. Monotonic: each plan is counted once, when the next plan
+    /// begins, so the newest plan is not yet included.
+    public var plannedDepthSteps: [Int: Int] = [:]
     /// Request-probe mode: completed probe windows by outcome (`won`, `lost`,
     /// `measuring`; `CBv2MTPDepthController.probeOutcomes`). Empty otherwise.
     public var probeOutcomes: [String: Int] = [:]

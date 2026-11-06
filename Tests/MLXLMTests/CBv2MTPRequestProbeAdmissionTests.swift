@@ -30,7 +30,7 @@ struct CBv2MTPRequestProbeAdmissionTests {
     }
 
     /// The decode steps, by shape, that the projection charges before a `prompt`-token request's first token,
-    /// with `running` requests decoding, wired to `driver` as `EngineLoopV2` wires it.
+    /// with `running` requests decoding, wired to `driver` by the engine's own `wireSpeculationProjection`.
     private static func projectedDecodeSteps(
         driver: CBv2MTPRoundDriver, running: Int, maxConcurrent: Int, runningMaxTokens: Int,
         prompt: Int
@@ -49,10 +49,7 @@ struct CBv2MTPRequestProbeAdmissionTests {
             scheduler.recordSampled(id: id, token: (rec.tokens.last ?? 0) + 1)
         }
         scheduler.speculationPlanner = { _ in 0 }
-        scheduler.speculationDraftTokenUpperBound = driver.projectionDraftTokenUpperBound
-        scheduler.speculationDepthCeiling = { [driver] rows in
-            driver.speculationDepthCeiling(decodeRows: rows)
-        }
+        EngineLoopV2.wireSpeculationProjection(scheduler, to: driver)
         let target = CBv2SchedFixtures.request(prompt: Array(1 ... prompt), maxTokens: 64)
         try scheduler.enqueue(target)
         guard
@@ -103,6 +100,31 @@ struct CBv2MTPRequestProbeAdmissionTests {
                 model: model, drafter: ProbeAdmissionDrafter(target: model),
                 config: CBv2MTPConfig(enabled: true, maxDraftTokens: 4, fixedDraftTokens: 3)))
         #expect(fixed.projectionDraftTokenUpperBound == 3)
+    }
+
+    /// `plannedDepthSteps` never steps back: a plan is counted once, at its final depth, when the next plan begins.
+    /// A tail clamp moves `depthSelections` (the plan's live view) back, but not the counter.
+    @Test func plannedDepthStepsCountEachPlanOnceAtItsFinalDepth() throws {
+        let model = ProbeAdmissionModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model, drafter: ProbeAdmissionDrafter(target: model),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 4, fixedDraftTokens: 2,
+                    verificationMode: .automatic, maxAutomaticRectangularTokens: 8)))
+        let rows = [CBv2RequestID(1)]
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true, rowIDs: rows)
+        #expect(driver.planDecision.depth == 2)
+        #expect(driver.metricsSnapshot().plannedDepthSteps.isEmpty)
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true, rowIDs: rows)
+        #expect(driver.metricsSnapshot().plannedDepthSteps == [2: 1])
+        #expect(driver.metricsSnapshot().depthSelections == [2: 2])
+        driver.clampPlanDepth(to: 0, reason: "tail_depth")
+        // The live view moved back (2: 2 -> 2: 1); the counter is unchanged until the plan is final.
+        #expect(driver.metricsSnapshot().depthSelections == [2: 1, 0: 1])
+        #expect(driver.metricsSnapshot().plannedDepthSteps == [2: 1])
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true, rowIDs: rows)
+        #expect(driver.metricsSnapshot().plannedDepthSteps == [2: 1, 0: 1])
     }
 }
 

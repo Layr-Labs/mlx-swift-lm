@@ -329,6 +329,9 @@ final class CBv2MTPRoundDriver {
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
     private(set) var planDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
+    /// The last plan's depth, counted into `metrics.plannedDepthSteps` when
+    /// the next plan begins: only then can no clamp change it.
+    private var uncommittedPlanDepth: Int?
     private(set) var controllerMeasurementEligible = false
 
     private let metricsLock = NSLock()
@@ -480,6 +483,7 @@ final class CBv2MTPRoundDriver {
         plannedDecodeRows: Int, canSpeculate: Bool,
         rowIDs: [CBv2RequestID]? = nil
     ) {
+        commitPlannedDepth()
         if let rowIDs, depthController.usesCommittedDecodeBaseline {
             let changedCohort = Set(rowIDs) != Set(goodputPlanRows)
             if changedCohort {
@@ -514,6 +518,7 @@ final class CBv2MTPRoundDriver {
         planDecision = adaptiveSerialLimitedDecision(
             verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
         guard plannedDecodeRows > 0 else { return }
+        uncommittedPlanDepth = planDecision.depth
         metricsLock.lock()
         metrics.selectedDepth = planDecision.depth
         metrics.decodeRowBucket = planDecision.decodeRowBucket
@@ -622,6 +627,7 @@ final class CBv2MTPRoundDriver {
         planDecision = CBv2MTPDepthDecision(
             depth: newDepth, decodeRowBucket: planDecision.decodeRowBucket,
             reason: reason, isExploration: false)
+        if uncommittedPlanDepth != nil { uncommittedPlanDepth = newDepth }
         metricsLock.lock()
         metrics.selectedDepth = newDepth
         if let count = metrics.depthSelections[oldDepth], count > 0 {
@@ -1247,6 +1253,15 @@ final class CBv2MTPRoundDriver {
 
     func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
         depthController.probeIntervalForTesting(decodeRowBucket: decodeRowBucket)
+    }
+
+    /// Counts the previous plan's final depth once (`plannedDepthSteps`).
+    private func commitPlannedDepth() {
+        guard let depth = uncommittedPlanDepth else { return }
+        uncommittedPlanDepth = nil
+        metricsLock.lock()
+        metrics.plannedDepthSteps[depth, default: 0] += 1
+        metricsLock.unlock()
     }
 
     func metricsSnapshot() -> CBv2MTPMetrics {
