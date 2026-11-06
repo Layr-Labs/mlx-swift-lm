@@ -282,8 +282,10 @@ final class VideoReaderRetryTests: XCTestCase {
 
     // MARK: - MiMo and Qwen4
 
+    /// The MP4: on the QuickTime clip a compressed-sample pass that loses its
+    /// bytes ends `.completed` with fewer samples, not `.failed`.
     func testMiMoRetryAfterAFailedReaderPassKeepsThePlanAndFrames() async throws {
-        let data = try clip("input-video-base64.mov")
+        let data = try clip("input-video-url.mp4")
         let sampling = try MiMoV26EncodedVisualDecoder.Sampling(
             fps: 2, minimumFrames: 4, maximumFrames: 64)
         let limits = MiMoV26EncodedVisualDecoder.Limits(
@@ -295,7 +297,8 @@ final class VideoReaderRetryTests: XCTestCase {
         ) {
             let plan = try await MiMoV26EncodedVisualDecoder.inspectVideo(
                 owner, sampling: sampling, limits: limits)
-            let video = try await MiMoV26EncodedVisualDecoder.silentVideo(plan, limits: limits)
+            let video = try await MiMoV26EncodedVisualDecoder.audiovisualFrames(
+                plan, limits: limits)
             return (plan.sampledIndices, video.frames.map(\.planarRGB))
         }
         let baseline = try await decode(owner(data))
@@ -308,8 +311,9 @@ final class VideoReaderRetryTests: XCTestCase {
         XCTAssertEqual(retried.frames, baseline.frames)
     }
 
+    /// The MP4, as for MiMo.
     func testQwen4RetryAfterAFailedReaderPassKeepsTheSampledFrames() async throws {
-        let data = try clip("input-video-base64.mov")
+        let data = try clip("input-video-url.mp4")
         let config = try JSONDecoder().decode(
             Qwen4ExpVideoConfiguration.self, from: Data("{}".utf8))
         func sample(_ owner: MemoryBackedVideoAsset) async throws -> Qwen4ExpVideoSampler.Sample {
