@@ -97,3 +97,9 @@
   On two M5 Ultras over JACCL, prefill of a 9,651-token prompt went from 569
   to 1,066 tok/s with identical tokens. `TensorParallelSwitchLinear.forwards`
   counts the projection's forwards for tests.
+- A Gemma 4 tensor-parallel rank can run a registered prompt chunk's work after
+  attention in row parts (`Gemma4TensorParallelPromptParts.parts`, 1 by
+  default): every part's attention sum and feed-forward collective is issued as
+  soon as it is built, so one part's sum crosses the link while the next part
+  computes. The attention core still runs the whole chunk and every later op
+  keeps each row's one-row bytes, so values are unchanged.

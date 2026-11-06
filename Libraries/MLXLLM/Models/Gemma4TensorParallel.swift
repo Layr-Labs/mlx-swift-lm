@@ -136,6 +136,25 @@ public enum Gemma4LayerSubmission {
     @TaskLocal public static var stride = 0
 }
 
+/// A tensor-parallel registered prompt chunk's work after attention in this many consecutive
+/// row parts (1: whole). Each part's attention sum and feed-forward collective is issued as soon as
+/// it is built, so one part's sum crosses the link while the next part computes. Under the
+/// registered prompt policy every op after the attention core keeps each row's one-row bytes, and
+/// the attention core still runs the whole chunk, so the parts change only when the GPU and the
+/// link run, never a value. Chunks shorter than two parts of `minimumRows` run whole.
+public enum Gemma4TensorParallelPromptParts {
+    @TaskLocal public static var parts = 1
+    public static let minimumRows = 4
+
+    /// Parts for a layer input `x`: only a registered prompt chunk whose experts take the shared
+    /// one-row dispatch (`Gemma4PrefillProjection.appliesExperts`: BF16 rows, expert prefill).
+    static func count(_ x: MLXArray, isExpertPrefill: Bool) -> Int {
+        guard parts > 1, isExpertPrefill, x.dtype == .bfloat16, Gemma4PrefillProjection.applies(x)
+        else { return 1 }
+        return max(1, min(parts, x.dim(1) / minimumRows))
+    }
+}
+
 /// Unrounded FP32 partials of a row-parallel projection.
 public enum Gemma4TensorParallelProjection {
     /// This rank's FP32 partial of `linear` over `x`: the input widened
@@ -180,10 +199,23 @@ final class Gemma4TensorParallelContext {
         self.allSum = allSum
     }
 
+    /// Receives the first row-parallel projection's dtype inside `deferred`:
+    /// that `reduce` returns its FP32 partial unsummed, for a caller that sums
+    /// it in row parts (`Gemma4TensorParallelPromptParts`).
+    final class DeferredSum: @unchecked Sendable {
+        var dtype: DType?
+    }
+    @TaskLocal static var deferred: DeferredSum?
+
     /// A row-parallel projection: the FP32 partials summed across ranks,
     /// then one rounding to the activation dtype.
     func reduce(_ projection: Linear, _ x: MLXArray) -> MLXArray {
-        allSum(Gemma4TensorParallelProjection.partial(projection, x)).asType(x.dtype)
+        let partial = Gemma4TensorParallelProjection.partial(projection, x)
+        if let deferred = Self.deferred, deferred.dtype == nil {
+            deferred.dtype = x.dtype
+            return partial
+        }
+        return allSum(partial).asType(x.dtype)
     }
 }
 
@@ -280,18 +312,9 @@ extension Gemma4Experts {
             return (packed.output.reshaped(B, S, H), packed.rowsSum)
         }
         if byToken {
-            // A registered prompt chunk: every token's expert rows in one shared dispatch per
-            // projection, each (token, expert) pair the native M=1 product its own call computes.
-            let rows = down.withoutCollective {
-                switchGLU.expertRowsByRow(x.reshaped(S, H), topKIndices.reshaped(S, K))
-            }
-            .reshaped([S * K, H])
-            let summed = down.sum(concatenated([rows, densePartial.reshaped([-1, H])], axis: 0))
-            let experts = summed[..<(S * K)].reshaped([S, K, H]).asType(x.dtype)
-            return (
-                weightedExpertSum(experts, topKWeights.reshaped(S, K)).reshaped(x.shape),
-                summed[(S * K)...].reshaped(densePartial.shape)
-            )
+            let summed = tensorParallelPromptSum(x, topKIndices: topKIndices, carrying: densePartial)
+            return tensorParallelPromptOutput(
+                summed, x, topKWeights: topKWeights, densePartialShape: densePartial.shape)
         }
         let count = byToken ? S : B
         func slice(_ value: MLXArray, _ index: Int) -> MLXArray {
@@ -324,6 +347,87 @@ extension Gemma4Experts {
             concatenated(outputs, axis: byToken ? 1 : 0),
             summed[expertRows...].reshaped(densePartial.shape)
         )
+    }
+}
+
+extension Gemma4Experts {
+    /// A registered prompt chunk's one collective: every token's expert rows in one shared dispatch
+    /// per projection (each (token, expert) pair the native M=1 product its own call computes),
+    /// then `densePartial`'s rows, summed across ranks in FP32: `[S * K + S, H]`.
+    func tensorParallelPromptSum(
+        _ x: MLXArray, topKIndices: MLXArray, carrying densePartial: MLXArray
+    ) -> MLXArray {
+        guard let down = switchGLU.downProjection as? TensorParallelSwitchLinear else {
+            preconditionFailure("A tensor-parallel Gemma 4 rank sums its experts' partials")
+        }
+        let (S, H, K) = (x.dim(1), x.dim(2), topKIndices.dim(-1))
+        let rows = down.withoutCollective {
+            switchGLU.expertRowsByRow(x.reshaped(S, H), topKIndices.reshaped(S, K))
+        }
+        .reshaped([S * K, H])
+        return down.sum(concatenated([rows, densePartial.reshaped([-1, H])], axis: 0))
+    }
+
+    /// The weighted expert output and the dense FP32 sum of `tensorParallelPromptSum`.
+    func tensorParallelPromptOutput(
+        _ summed: MLXArray, _ x: MLXArray, topKWeights: MLXArray, densePartialShape: [Int]
+    ) -> (output: MLXArray, denseSum: MLXArray) {
+        let (S, H, K) = (x.dim(1), x.dim(2), topKWeights.dim(-1))
+        let experts = summed[..<(S * K)].reshaped([S, K, H]).asType(x.dtype)
+        return (
+            weightedExpertSum(experts, topKWeights.reshaped(S, K)).reshaped(x.shape),
+            summed[(S * K)...].reshaped(densePartialShape)
+        )
+    }
+}
+
+extension Gemma4DecoderLayer {
+    /// The layer after attention for a registered prompt chunk in `parts` row parts
+    /// (`Gemma4TensorParallelPromptParts`): `attentionPartial` is the attention output
+    /// projection's unsummed FP32 partial of the whole chunk. Every part's attention sum is issued
+    /// first, then every part's feed-forward collective, then every part's rounding and norms, so
+    /// the GPU computes one part while the link carries another's sum. Each value is the one the
+    /// whole layer computes for that row.
+    func tensorParallelPromptParts(
+        residual x: MLXArray, attentionPartial: MLXArray, dtype: DType, parts: Int,
+        context: Gemma4TensorParallelContext
+    ) -> MLXArray {
+        guard let router, let experts, let postFeedforwardLayernorm1, let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm2
+        else { preconditionFailure("Gemma 4 tensor-parallel prompt parts need the MoE block") }
+        let bounds = (0 ... parts).map { $0 * x.dim(1) / parts }
+        func rows(_ value: MLXArray, _ part: Int) -> MLXArray {
+            value[0..., bounds[part] ..< bounds[part + 1], 0...]
+        }
+        let attention = (0 ..< parts).map { part -> MLXArray in
+            let sum = context.allSum(rows(attentionPartial, part)).asType(dtype)
+            asyncEval(sum)
+            return sum
+        }
+        let built = (0 ..< parts).map {
+            part -> (out: MLXArray, h1: MLXArray, h2: MLXArray, weights: MLXArray, dense: [Int], summed: MLXArray) in
+            let out = rows(x, part) + postAttentionLayernorm(attention[part])
+            let h1 = preFeedforwardLayernorm(out)
+            let densePartial = mlp.tensorParallelPartial(h1)
+            let (topKIndices, topKWeights) = router(out)
+            let h2 = preFeedforwardLayernorm2(out)
+            precondition(
+                Gemma4PrefillProjection.appliesExperts(
+                    h2, indices: topKIndices, weights: topKWeights, isExpertPrefill: true),
+                "Gemma 4 tensor-parallel prompt parts take the shared one-row expert dispatch")
+            let summed = experts.tensorParallelPromptSum(
+                h2, topKIndices: topKIndices, carrying: densePartial)
+            asyncEval(summed)
+            return (out, h1, h2, topKWeights, densePartial.shape, summed)
+        }
+        let outputs = built.map { part -> MLXArray in
+            let (expertOutput, denseSum) = experts.tensorParallelPromptOutput(
+                part.summed, part.h2, topKWeights: part.weights, densePartialShape: part.dense)
+            let dense = postFeedforwardLayernorm1(denseSum.asType(part.h1.dtype))
+            let feedForward = dense + postFeedforwardLayernorm2(expertOutput)
+            return (part.out + postFeedforwardLayernorm(feedForward)) * layerScalar
+        }
+        return concatenated(outputs, axis: 1)
     }
 }
 
