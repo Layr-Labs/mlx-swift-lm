@@ -29,20 +29,15 @@ public enum Qwen35PromptWavefront {
         _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
         recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
     ) -> [MLXArray] {
-        let streams = layered(
+        // The hidden rows add no operation: a chunk's evaluation handle is a view of its rows,
+        // and the prompt's last chunk's rows are the sum its final norm reads.
+        prefillWithHidden(
             model, chunks: chunks, finalChunk: finalChunk, caches: caches,
-            recurrentState: recurrentState, phaseBuilt: phaseBuilt)
-        return chunks.indices.map { chunk in
-            switch streams[chunk] {
-            case .plain(let hidden):
-                return hidden[0..., -1, 0 ..< 1]
-            case .fused(let residual, let pending):
-                return head(model, residual, pending, tokens: chunks[chunk]).logits
-            }
-        }
+            recurrentState: recurrentState, phaseBuilt: phaseBuilt
+        ).outputs
     }
 
-    /// `prefill` on the wrapped text model, with every chunk's hidden rows.
+    /// `prefillWithHidden` on the wrapped text model.
     public static func prefillWithHidden(
         _ model: Qwen35Model, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
         recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
@@ -52,9 +47,15 @@ public enum Qwen35PromptWavefront {
             recurrentState: recurrentState, phaseBuilt: phaseBuilt)
     }
 
-    /// `prefill`'s graph, also returning each chunk's last decoder layer output (`[1, L, H]`,
-    /// before the final norm: the target hidden an MTP assistant's history takes, as
-    /// `Qwen35TextModel.cbv2ForwardWithHidden` returns it). The outputs are `prefill`'s.
+    /// `prefill`'s outputs and each chunk's last decoder layer rows (`[1, L, H]`, before the
+    /// final norm), the target hidden an MTP assistant's history takes. They are the rows
+    /// `Qwen35TextModel.cbv2ForwardWithHidden` returns for the chunk alone: every chunk but the
+    /// prompt's last runs the unfused ops here, which that forward may fuse
+    /// (`cbv2ForwardNormalized`, the same values).
+    ///
+    /// Only this graph can give the rows: building it appends each chunk's K/V rows and stages
+    /// the recurrent state the chunks leave, so a second forward would write both again. Each
+    /// chunk's rows are their own array, so a view of them keeps no other chunk's rows alive.
     public static func prefillWithHidden(
         _ model: Qwen35TextModel, chunks: [MLXArray], finalChunk: Bool, caches: [KVCache],
         recurrentState: CBv2RecurrentStateEvaluation, phaseBuilt: () -> Void
