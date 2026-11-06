@@ -16,7 +16,7 @@ private final class FailedPasses: @unchecked Sendable {
     private var recorded: [(failure: VideoReaderFailure, retrying: Bool)] = []
 
     var all: [(failure: VideoReaderFailure, retrying: Bool)] { lock.withLock { recorded } }
-    var retrying: [Bool] { all.map(\.retrying) }
+    var retrying: [Bool] { all.map { $0.retrying } }
 
     var observer: VideoReaderRetry.Observer {
         { [self] failure, retrying in lock.withLock { recorded.append((failure, retrying)) } }
@@ -122,7 +122,7 @@ final class VideoReaderRetryTests: XCTestCase {
         }
         XCTAssertEqual(value, 7)
         XCTAssertEqual(calls, 2)
-        XCTAssertEqual(recovered.all.map(\.failure), [first])
+        XCTAssertEqual(recovered.all.map { $0.failure }, [first])
         XCTAssertEqual(recovered.retrying, [true])
 
         let failed = FailedPasses()
@@ -134,7 +134,7 @@ final class VideoReaderRetryTests: XCTestCase {
             XCTAssertEqual(error as? VideoReaderFailure, second)
         }
         XCTAssertEqual(calls, 2)
-        XCTAssertEqual(failed.all.map(\.failure), [first, second])
+        XCTAssertEqual(failed.all.map { $0.failure }, [first, second])
         XCTAssertEqual(failed.retrying, [true, false])
 
         let unrelated = FailedPasses()
