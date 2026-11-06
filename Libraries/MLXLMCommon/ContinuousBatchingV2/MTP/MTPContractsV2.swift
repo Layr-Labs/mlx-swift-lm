@@ -576,6 +576,13 @@ public struct CBv2MTPConfig: Sendable {
     /// the first carry, so a round can follow the first token without a
     /// seed step. False keeps the seed step.
     public var prefillCarry: Bool
+    /// Adaptive stateless verification only (`fixedDraftTokens == nil`): open
+    /// each request with one probe window at this depth, then decode at the
+    /// depth with the highest expected goodput from the request's own
+    /// acceptance and this engine's measured round cost by depth (kept across
+    /// requests), or ordinary decode, re-probing on a backed-off interval
+    /// (`CBv2MTPDepthController`). nil keeps the incremental controller.
+    public var requestProbeDepth: Int?
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -603,7 +610,8 @@ public struct CBv2MTPConfig: Sendable {
         allowsAdaptiveSerialRounds: Bool = true,
         acceptance: CBv2MTPAcceptance = .exact,
         ordinaryDecodeHistory: Bool = Self.envOrdinaryDecodeHistory,
-        prefillCarry: Bool = Self.envPrefillCarry
+        prefillCarry: Bool = Self.envPrefillCarry,
+        requestProbeDepth: Int? = nil
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
@@ -622,6 +630,9 @@ public struct CBv2MTPConfig: Sendable {
         }
         self.verificationMode = verificationMode
         self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)
+        self.requestProbeDepth = requestProbeDepth.flatMap {
+            resolvedMax > 0 && fixedDraftTokens == nil ? min(max($0, 1), resolvedMax) : nil
+        }
     }
 
     /// The effective on/off state (config AND env kill switch).

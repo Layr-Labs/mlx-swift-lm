@@ -414,7 +414,8 @@ final class CBv2MTPRoundDriver {
             fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,
             useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
                 && drafter.supportsTargetPrefixAcceptance
-                && !(drafter is any CBv2MTPRequestStatefulDrafter))
+                && !(drafter is any CBv2MTPRequestStatefulDrafter),
+            requestProbeDepth: self.config.requestProbeDepth)
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.acceptance = self.config.acceptance
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
