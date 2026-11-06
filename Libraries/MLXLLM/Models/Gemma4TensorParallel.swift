@@ -138,10 +138,14 @@ public enum Gemma4LayerSubmission {
 
 /// A tensor-parallel registered prompt chunk's work after attention in this many consecutive
 /// row parts (1: whole). Each part's attention sum and feed-forward collective is issued as soon as
-/// it is built, so one part's sum crosses the link while the next part computes. Under the
-/// registered prompt policy every op after the attention core keeps each row's one-row bytes, and
-/// the attention core still runs the whole chunk, so the parts change only when the GPU and the
-/// link run, never a value. Chunks shorter than two parts of `minimumRows` run whole.
+/// it is built, so one part's sum crosses the link while the next part computes. The attention core
+/// still runs the whole chunk. Exactness is conditional: on the GPU, for two ranks, the parts are
+/// bit-identical to the whole chunk while every op after attention computes each row alone
+/// whatever the row count (today's kernels do) and the cross-rank sum is one add per element. On
+/// the CPU backend they are not (RMSNorm's fallback runs vector steps across rows), and with more
+/// than two ranks they are not exact (the collective's per-element sum order depends on its size).
+/// Nothing enforces this at production size, so it stays off (1) in the product. Chunks shorter
+/// than two parts of `minimumRows` run whole.
 public enum Gemma4TensorParallelPromptParts {
     @TaskLocal public static var parts = 1
     /// The fewest rows a part takes. More than one row keeps a part a registered prompt frame
@@ -398,7 +402,8 @@ extension Gemma4DecoderLayer {
     /// to (`Gemma4TensorParallelContext.withoutCollective`). Every part's attention sum is issued
     /// first, then every part's feed-forward collective, then every part's rounding and norms, so
     /// the GPU computes one part while the link carries another's sum. Each value is the one the
-    /// whole layer computes for that row.
+    /// whole layer computes for that row under the conditions `Gemma4TensorParallelPromptParts`
+    /// states (GPU, two ranks, per-row ops after attention).
     func tensorParallelPromptParts(
         residual x: MLXArray, attentionPartial: MLXArray, dtype: DType, parts: Int,
         context: Gemma4TensorParallelContext

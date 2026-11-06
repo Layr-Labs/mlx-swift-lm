@@ -100,7 +100,10 @@
   attention in row parts (`Gemma4TensorParallelPromptParts.parts`, 1 by
   default): every part's attention sum and feed-forward collective is issued as
   soon as it is built, so one part's sum crosses the link while the next part
-  computes. The attention core still runs the whole chunk and every later op
-  keeps each row's one-row bytes, so values are unchanged. On two M5 Ultras, 4
-  parts measured best: 9,651-token prefill 1,064 -> 1,196-1,208 tok/s (+13 %),
-  identical tokens.
+  computes. The attention core still runs the whole chunk. The parts are
+  bit-identical to the whole chunk on the GPU for two ranks while every op after
+  attention computes each row alone (today's kernels do); not on the CPU backend
+  (RMSNorm's fallback), not with more than two ranks (the collective's sum order
+  depends on its size), and nothing enforces it, so it stays off. On two M5
+  Ultras, 4 parts measured best: 9,651-token prefill 1,064 -> 1,196-1,208 tok/s
+  (+13 %), identical tokens.
