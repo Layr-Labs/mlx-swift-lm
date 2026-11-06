@@ -243,110 +243,122 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             guard tracks.count == 1, let track = tracks.first, track.trackID == plan.trackID else {
                 throw Failure.invalidAudio
             }
-            let reader = try AVAssetReader(asset: asset)
-            // Passthrough: no platform decoder/converter numerical contract.
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            guard reader.canAdd(output) else { throw Failure.invalidAudio }
-            reader.add(output)
-            guard reader.startReading() else { throw Failure.invalidAudio }
-            defer { reader.cancelReading() }
-            var values: [Float] = []
-            values.reserveCapacity(plan.frameCount)
-            var digest = SHA256()
-            var buffers = 0
-            var markerCount = 0
-            while let sample = output.copyNextSampleBuffer() {
-                try Task.checkCancellation()
-                buffers += 1
-                guard buffers <= plan.maximumBuffers else { throw Failure.limit }
-                if try consumeEmptyMarker(sample, count: &markerCount, limit: plan.maximumBuffers) {
-                    continue
-                }
-                guard CMSampleBufferDataIsReady(sample),
-                    let description = CMSampleBufferGetFormatDescription(sample),
-                    try encoding(description) == plan.encoding,
-                    CMGetAttachment(
-                        sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
-                        attachmentModeOut: nil) == nil,
-                    CMGetAttachment(
-                        sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
-                        attachmentModeOut: nil) == nil,
-                    CMGetAttachment(
-                        sample, key: kCMSampleBufferAttachmentKey_SpeedMultiplier,
-                        attachmentModeOut: nil) == nil,
-                    CMGetAttachment(
-                        sample, key: kCMSampleBufferAttachmentKey_Reverse,
-                        attachmentModeOut: nil) == nil,
-                    CMGetAttachment(
-                        sample, key: kCMSampleBufferAttachmentKey_EmptyMedia,
-                        attachmentModeOut: nil) == nil
-                else { throw Failure.unsupportedTimeline }
-                let count = CMSampleBufferGetNumSamples(sample)
-                let next = try sum(values.count, count)
-                guard count > 0, next <= plan.frameCount else { throw Failure.limit }
-                // Reject gaps, overlap, edits, retiming or codec priming. No
-                // synthesized silence and no dropped/shifted audio samples.
-                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                let duration = CMSampleBufferGetDuration(sample)
-                var timing = CMSampleTimingInfo()
-                var timingCount: CMItemCount = 0
-                // A single descriptor applies to EVERY sample. Refuse a
-                // variable-timing buffer instead of trusting its total span.
-                guard
-                    CMSampleBufferGetSampleTimingInfoArray(
-                        sample, entryCount: 1,
-                        arrayToFill: &timing, entriesNeededOut: &timingCount) == noErr,
-                    timingCount == 1, timing.duration == CMTime(value: 1, timescale: 24000),
-                    timing.presentationTimeStamp == pts
-                else { throw Failure.unsupportedTimeline }
-                guard pts.isNumeric, duration.isNumeric,
-                    pts == CMTime(value: Int64(values.count), timescale: 24000),
-                    duration == CMTime(value: Int64(count), timescale: 24000)
-                else {
-                    throw Failure.unsupportedTimeline
-                }
-                let size = try product(count, plan.encoding.bytesPerFrame)
-                guard let block = CMSampleBufferGetDataBuffer(sample),
-                    CMBlockBufferGetDataLength(block) == size
-                else { throw Failure.invalidAudio }
-                var bytes = Data(count: size)
-                let status = bytes.withUnsafeMutableBytes {
-                    CMBlockBufferCopyDataBytes(
-                        block, atOffset: 0, dataLength: size,
-                        destination: $0.baseAddress!)
-                }
-                guard status == kCMBlockBufferNoErr else { throw Failure.invalidAudio }
-                digest.update(data: bytes)
-                try bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                    for index in 0 ..< count {
-                        if index.isMultiple(of: 1024) { try Task.checkCancellation() }
-                        let at = index * plan.encoding.bytesPerFrame
-                        let low = UInt16(raw[at]) | UInt16(raw[at + 1]) << 8
-                        let value: Float
-                        switch plan.encoding {
-                        case .pcm16: value = Float(Int16(bitPattern: low)) / 32768
-                        case .float32:
-                            value = Float(
-                                bitPattern: UInt32(low)
-                                    | UInt32(raw[at + 2]) << 16 | UInt32(raw[at + 3]) << 24)
-                        }
-                        guard value.isFinite else { throw Failure.nonfiniteSamples }
-                        values.append(value)
-                    }
-                }
+            // A failed pass reruns once with a new reader over the same asset.
+            return try await VideoReaderRetry.run {
+                try passthroughPass(asset, track: track, plan: plan)
             }
-            guard reader.status == .completed, values.count == plan.frameCount else {
-                throw Failure.invalidAudio
-            }
-            // Exact raw-track provenance, not codec weights/profile authority.
-            let identity =
-                "mimo-av-\(plan.encoding)-24k:"
-                + digest.finalize().map { String(format: "%02x", $0) }.joined()
-            return try .init(
-                samples: values,
-                descriptor: .init(
-                    sourceIdentity: identity,
-                    channels: 1, frameCount: plan.frameCount, sampleRate: 24000))
         }
+    }
+
+    /// One passthrough reader pass over the LPCM track. A reader that does not
+    /// complete throws `VideoReaderFailure`.
+    private static func passthroughPass(
+        _ asset: AVAsset, track: AVAssetTrack, plan: Plan
+    ) throws -> MiMoV26DecodedPCM {
+        let reader = try AVAssetReader(asset: asset)
+        // Passthrough: no platform decoder/converter numerical contract.
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        guard reader.canAdd(output) else { throw Failure.invalidAudio }
+        reader.add(output)
+        guard reader.startReading() else { throw Failure.invalidAudio }
+        defer { reader.cancelReading() }
+        var values: [Float] = []
+        values.reserveCapacity(plan.frameCount)
+        var digest = SHA256()
+        var buffers = 0
+        var markerCount = 0
+        while let sample = VideoReaderRetry.nextSample(output, of: reader) {
+            try Task.checkCancellation()
+            buffers += 1
+            guard buffers <= plan.maximumBuffers else { throw Failure.limit }
+            if try consumeEmptyMarker(sample, count: &markerCount, limit: plan.maximumBuffers) {
+                continue
+            }
+            guard CMSampleBufferDataIsReady(sample),
+                let description = CMSampleBufferGetFormatDescription(sample),
+                try encoding(description) == plan.encoding,
+                CMGetAttachment(
+                    sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                    attachmentModeOut: nil) == nil,
+                CMGetAttachment(
+                    sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
+                    attachmentModeOut: nil) == nil,
+                CMGetAttachment(
+                    sample, key: kCMSampleBufferAttachmentKey_SpeedMultiplier,
+                    attachmentModeOut: nil) == nil,
+                CMGetAttachment(
+                    sample, key: kCMSampleBufferAttachmentKey_Reverse,
+                    attachmentModeOut: nil) == nil,
+                CMGetAttachment(
+                    sample, key: kCMSampleBufferAttachmentKey_EmptyMedia,
+                    attachmentModeOut: nil) == nil
+            else { throw Failure.unsupportedTimeline }
+            let count = CMSampleBufferGetNumSamples(sample)
+            let next = try sum(values.count, count)
+            guard count > 0, next <= plan.frameCount else { throw Failure.limit }
+            // Reject gaps, overlap, edits, retiming or codec priming. No
+            // synthesized silence and no dropped/shifted audio samples.
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            let duration = CMSampleBufferGetDuration(sample)
+            var timing = CMSampleTimingInfo()
+            var timingCount: CMItemCount = 0
+            // A single descriptor applies to EVERY sample. Refuse a
+            // variable-timing buffer instead of trusting its total span.
+            guard
+                CMSampleBufferGetSampleTimingInfoArray(
+                    sample, entryCount: 1,
+                    arrayToFill: &timing, entriesNeededOut: &timingCount) == noErr,
+                timingCount == 1, timing.duration == CMTime(value: 1, timescale: 24000),
+                timing.presentationTimeStamp == pts
+            else { throw Failure.unsupportedTimeline }
+            guard pts.isNumeric, duration.isNumeric,
+                pts == CMTime(value: Int64(values.count), timescale: 24000),
+                duration == CMTime(value: Int64(count), timescale: 24000)
+            else {
+                throw Failure.unsupportedTimeline
+            }
+            let size = try product(count, plan.encoding.bytesPerFrame)
+            guard let block = CMSampleBufferGetDataBuffer(sample),
+                CMBlockBufferGetDataLength(block) == size
+            else { throw Failure.invalidAudio }
+            var bytes = Data(count: size)
+            let status = bytes.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(
+                    block, atOffset: 0, dataLength: size,
+                    destination: $0.baseAddress!)
+            }
+            guard status == kCMBlockBufferNoErr else { throw Failure.invalidAudio }
+            digest.update(data: bytes)
+            try bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                for index in 0 ..< count {
+                    if index.isMultiple(of: 1024) { try Task.checkCancellation() }
+                    let at = index * plan.encoding.bytesPerFrame
+                    let low = UInt16(raw[at]) | UInt16(raw[at + 1]) << 8
+                    let value: Float
+                    switch plan.encoding {
+                    case .pcm16: value = Float(Int16(bitPattern: low)) / 32768
+                    case .float32:
+                        value = Float(
+                            bitPattern: UInt32(low)
+                                | UInt32(raw[at + 2]) << 16 | UInt32(raw[at + 3]) << 24)
+                    }
+                    guard value.isFinite else { throw Failure.nonfiniteSamples }
+                    values.append(value)
+                }
+            }
+        }
+        guard reader.status == .completed else {
+            throw VideoReaderFailure(reader: reader, medium: .audio)
+        }
+        guard values.count == plan.frameCount else { throw Failure.invalidAudio }
+        // Exact raw-track provenance, not codec weights/profile authority.
+        let identity =
+            "mimo-av-\(plan.encoding)-24k:"
+            + digest.finalize().map { String(format: "%02x", $0) }.joined()
+        return try .init(
+            samples: values,
+            descriptor: .init(
+                sourceIdentity: identity,
+                channels: 1, frameCount: plan.frameCount, sampleRate: 24000))
     }
 }

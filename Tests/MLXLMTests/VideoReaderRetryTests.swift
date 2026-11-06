@@ -10,59 +10,6 @@ import XCTest
 @testable import MLXLMCommon
 @testable import MLXVLM
 
-/// Every failed reader pass, in order. Disarms `fault` when a pass fails and a
-/// second pass follows, so that pass reads every byte.
-private final class FailedPasses: @unchecked Sendable {
-    private let lock = NSLock()
-    private let fault: VideoDataRequestFault?
-    private var recorded: [(failure: VideoReaderFailure, retrying: Bool)] = []
-
-    init(disarming fault: VideoDataRequestFault? = nil) { self.fault = fault }
-
-    var all: [(failure: VideoReaderFailure, retrying: Bool)] { lock.withLock { recorded } }
-    var retrying: [Bool] { all.map { $0.retrying } }
-
-    var observer: VideoReaderRetry.Observer {
-        { [self] failure, retrying in
-            lock.withLock { recorded.append((failure, retrying)) }
-            if retrying { fault?.disarm() }
-        }
-    }
-}
-
-/// Cancels the readers in `ending` (1 is the first reader the task opens)
-/// before their read number `read`, on the reading thread between two reads.
-/// Each then ends `.cancelled`, as a reader that fails partway ends `.failed`.
-private final class ReaderEnder: @unchecked Sendable {
-    private let lock = NSLock()
-    private let ending: Set<Int>
-    private let read: Int
-    private var order: [ObjectIdentifier: (ordinal: Int, reads: Int)] = [:]
-    private var endedCount = 0
-
-    init(ending: Set<Int>, atRead read: Int) {
-        self.ending = ending
-        self.read = read
-    }
-
-    var ended: Int { lock.withLock { endedCount } }
-
-    var hook: @Sendable (AVAssetReader) -> Void {
-        { [self] reader in
-            let end = lock.withLock { () -> Bool in
-                let id = ObjectIdentifier(reader)
-                var entry = order[id] ?? (ordinal: order.count + 1, reads: 0)
-                entry.reads += 1
-                order[id] = entry
-                guard entry.reads == read, ending.contains(entry.ordinal) else { return false }
-                endedCount += 1
-                return true
-            }
-            if end { reader.cancelReading() }
-        }
-    }
-}
-
 /// The real decoders over the real in-memory resource loader, with data requests
 /// failed partway through the clip. AVFoundation requests a failed range again,
 /// so the fault stays armed until a reader pass fails. A compressed-sample pass
@@ -91,12 +38,6 @@ final class VideoReaderRetryTests: XCTestCase {
         try VideoDataRequestFault.$current.withValue(fault) {
             try MemoryBackedVideoAsset(videoData: data)
         }
-    }
-
-    private func observing<Output>(_ passes: FailedPasses, _ body: () async throws -> Output)
-        async throws -> Output
-    {
-        try await VideoReaderRetry.$failedPassObserver.withValue(passes.observer, operation: body)
     }
 
     private let decoderUnavailable = NSError(
@@ -186,7 +127,7 @@ final class VideoReaderRetryTests: XCTestCase {
         let second = VideoReaderFailure(status: 4, error: nil)
         var calls = 0
         func run(_ passes: FailedPasses, _ pass: () throws -> Int) async throws -> Int {
-            try await observing(passes) {
+            try await withReaderFaults(passes) {
                 try await VideoReaderRetry.run { () async throws -> Int in
                     calls += 1
                     return try pass()
@@ -280,7 +221,7 @@ final class VideoReaderRetryTests: XCTestCase {
         let baseline = try await processor.decode(.memoryBacked(owner(data)))
         let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
         let passes = FailedPasses(disarming: fault)
-        let retried = try await observing(passes) {
+        let retried = try await withReaderFaults(passes) {
             try await processor.decode(.memoryBacked(owner(data, fault)))
         }
         XCTAssertGreaterThanOrEqual(fault.injected, 1)
@@ -303,7 +244,7 @@ final class VideoReaderRetryTests: XCTestCase {
             let fault = midClipFault(data, error: error)
             let passes = FailedPasses()
             do {
-                _ = try await observing(passes) {
+                _ = try await withReaderFaults(passes) {
                     try await processor.decode(.memoryBacked(owner(data, fault)))
                 }
                 XCTFail("\(error): both passes failed but the video decoded")
@@ -317,12 +258,6 @@ final class VideoReaderRetryTests: XCTestCase {
     }
 
     // MARK: - MiMo and Qwen4
-
-    private func ending<Output>(_ ender: ReaderEnder, _ body: () async throws -> Output)
-        async throws -> Output
-    {
-        try await VideoReaderRetry.$beforeReadForTesting.withValue(ender.hook, operation: body)
-    }
 
     /// Reader 1 counts the compressed samples; reader 2 decodes and ends partway.
     func testMiMoRetryAfterAFailedReaderPassKeepsThePlanAndFrames() async throws {
@@ -342,7 +277,7 @@ final class VideoReaderRetryTests: XCTestCase {
         let baseline = try await decode()
         let ender = ReaderEnder(ending: [2], atRead: 20)
         let passes = FailedPasses()
-        let retried = try await observing(passes) { try await ending(ender) { try await decode() } }
+        let retried = try await withReaderFaults(passes, ending: ender) { try await decode() }
         XCTAssertEqual(ender.ended, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertEqual(
@@ -365,7 +300,7 @@ final class VideoReaderRetryTests: XCTestCase {
         let baseline = try await sample()
         let ender = ReaderEnder(ending: [2], atRead: 20)
         let passes = FailedPasses()
-        let retried = try await observing(passes) { try await ending(ender) { try await sample() } }
+        let retried = try await withReaderFaults(passes, ending: ender) { try await sample() }
         XCTAssertEqual(ender.ended, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertEqual(retried.indices, baseline.indices)

@@ -6,11 +6,18 @@ import CoreMedia
 import Foundation
 import VideoToolbox
 
-/// An `AVAssetReader` pass that ended in a state other than `.completed`.
+/// An `AVAssetReader` pass over a video or audio track that ended in a state
+/// other than `.completed`.
 ///
-/// Holds the reader's status and the domain and code of its error and of each
-/// underlying error. It never holds media bytes, frames or error descriptions.
+/// Holds the track's medium, the reader's status and the domain and code of its
+/// error and of each underlying error. It never holds media bytes, frames,
+/// samples or error descriptions.
 public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConvertible {
+    /// The kind of track the reader read.
+    public enum Medium: String, Sendable {
+        case video, audio
+    }
+
     public struct Code: Equatable, Sendable {
         public let domain: String
         public let code: Int
@@ -21,6 +28,7 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
         }
     }
 
+    public let medium: Medium
     /// `AVAssetReader.Status.rawValue` when the pass ended.
     public let status: Int
     /// The reader's error first, then its `NSUnderlyingErrorKey` chain.
@@ -28,7 +36,8 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
 
     static let maximumChainDepth = 4
 
-    public init(status: Int, error: (any Error)?) {
+    public init(status: Int, error: (any Error)?, medium: Medium = .video) {
+        self.medium = medium
         self.status = status
         var codes: [Code] = []
         var next = error.map { $0 as NSError }
@@ -39,8 +48,8 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
         self.codes = codes
     }
 
-    public init(reader: AVAssetReader) {
-        self.init(status: reader.status.rawValue, error: reader.error)
+    public init(reader: AVAssetReader, medium: Medium = .video) {
+        self.init(status: reader.status.rawValue, error: reader.error, medium: medium)
     }
 
     /// `AVErrorMediaServicesWereReset` and `AVErrorOperationInterrupted`. `AVError.Code`
@@ -49,7 +58,8 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
     static let operationInterrupted = -11847
 
     /// Decoder, hardware and interruption faults of the decoding machine. Another
-    /// provider can decode the same bytes, so these refuse as retryable.
+    /// provider can decode the same bytes, so these refuse as retryable. Audio
+    /// and video passes share the table; only video passes raise VideoToolbox codes.
     static let transientCodes: [String: Set<Int>] = [
         AVFoundationErrorDomain: [
             AVError.Code.outOfMemory.rawValue,
@@ -74,13 +84,13 @@ public struct VideoReaderFailure: Error, Equatable, Sendable, CustomStringConver
 
     public var description: String {
         let chain = codes.map { "\($0.domain) \($0.code)" }.joined(separator: " < ")
-        return "video reader status \(status): \(chain.isEmpty ? "no error" : chain)"
+        return "\(medium.rawValue) reader status \(status): \(chain.isEmpty ? "no error" : chain)"
     }
 }
 
-/// Runs a reader pass a second time, with a new reader over the same asset,
-/// when the first pass throws a `VideoReaderFailure`. The second pass decodes
-/// the same bytes, so a success returns the same output.
+/// Runs a video or audio reader pass a second time, with a new reader over the
+/// same asset, when the first pass throws a `VideoReaderFailure`. The second
+/// pass decodes the same bytes, so a success returns the same output.
 public enum VideoReaderRetry {
     public typealias Observer = @Sendable (_ failure: VideoReaderFailure, _ retrying: Bool) -> Void
 

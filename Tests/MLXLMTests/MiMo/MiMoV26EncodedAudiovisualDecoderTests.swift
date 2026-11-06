@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import Foundation
 import MLXLMCommon
 import XCTest
@@ -194,6 +195,52 @@ final class MiMoV26EncodedAudiovisualDecoderTests: XCTestCase {
             Float(Int16(bitPattern: words[$0 % 5])) / 32768
         }
         XCTAssertEqual(decoded.wholeAudio.samples.map(\.bitPattern), expected.map(\.bitPattern))
+    }
+
+    /// Reader 1 reads the LPCM track and ends at its second read, as a failed reader
+    /// ends partway; a new reader reads the track again.
+    func testFailedAudioReaderPassIsReadAgainWithTheSameOutput() async throws {
+        let plan = try await inspect(MiMoAVFixture.movie())
+        let baseline = try await MiMoV26EncodedAudiovisualDecoder.decode(
+            plan, videoLimits: videoLimits, audioLimits: audioLimits)
+        let ender = ReaderEnder(ending: [1], atRead: 2)
+        let passes = FailedPasses()
+        let retried = try await withReaderFaults(passes, ending: ender) {
+            try await MiMoV26EncodedAudiovisualDecoder.decode(
+                plan, videoLimits: videoLimits, audioLimits: audioLimits)
+        }
+        XCTAssertEqual(ender.ended, 1)
+        XCTAssertEqual(passes.retrying, [true])
+        XCTAssertEqual(passes.all.map { $0.failure.medium }, [.audio])
+        XCTAssertEqual(
+            passes.all.map { $0.failure.status }, [AVAssetReader.Status.cancelled.rawValue])
+        XCTAssertEqual(
+            retried.wholeAudio.samples.map(\.bitPattern),
+            baseline.wholeAudio.samples.map(\.bitPattern))
+        XCTAssertEqual(
+            retried.wholeAudio.descriptor.sourceIdentity,
+            baseline.wholeAudio.descriptor.sourceIdentity)
+        XCTAssertEqual(retried.frames.map(\.planarRGB), baseline.frames.map(\.planarRGB))
+        XCTAssertEqual(retried.timestamps.map(\.bitPattern), baseline.timestamps.map(\.bitPattern))
+    }
+
+    func testAudioReaderThatFailsTwiceThrowsItsFailure() async throws {
+        let plan = try await inspect(MiMoAVFixture.movie())
+        let ender = ReaderEnder(ending: [1, 2], atRead: 2)
+        let passes = FailedPasses()
+        do {
+            _ = try await withReaderFaults(passes, ending: ender) {
+                try await MiMoV26EncodedAudiovisualDecoder.decode(
+                    plan, videoLimits: videoLimits, audioLimits: audioLimits)
+            }
+            XCTFail("both audio passes failed but the clip decoded")
+        } catch let failure as VideoReaderFailure {
+            XCTAssertEqual(failure.medium, .audio)
+            XCTAssertEqual(failure.status, AVAssetReader.Status.cancelled.rawValue)
+            XCTAssertFalse(failure.isTransient)
+        }
+        XCTAssertEqual(ender.ended, 2)
+        XCTAssertEqual(passes.retrying, [true, false])
     }
 }
 

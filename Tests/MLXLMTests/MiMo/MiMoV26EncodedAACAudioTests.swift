@@ -1,4 +1,5 @@
 // Copyright © 2026 Eigen Labs.
+@preconcurrency import AVFoundation
 import Foundation
 import MLXLMCommon
 import XCTest
@@ -58,6 +59,51 @@ final class MiMoV26EncodedAACAudioTests: XCTestCase {
                     maximumFrames: 48000, maximumWorkingBytes: 64 << 20, maximumChannels: 1))
             XCTFail("reused AAC plan bypassed channel cap")
         } catch { XCTAssertEqual(error as? MiMoV26EncodedAudiovisualDecoder.Failure, .limit) }
+    }
+    /// Reader 1 decodes the AAC track and ends at its second read; a new reader
+    /// decodes the track again.
+    func testFailedAACReaderPassIsDecodedAgainWithTheSameOutput() async throws {
+        let plan = try await MiMoV26EncodedAudiovisualDecoder.inspect(video(), limits: audioLimits)
+        let baseline = try await MiMoV26EncodedAudiovisualDecoder.decode(
+            plan, videoLimits: videoLimits, audioLimits: audioLimits)
+        let ender = ReaderEnder(ending: [1], atRead: 2)
+        let passes = FailedPasses()
+        let retried = try await withReaderFaults(passes, ending: ender) {
+            try await MiMoV26EncodedAudiovisualDecoder.decode(
+                plan, videoLimits: videoLimits, audioLimits: audioLimits)
+        }
+        XCTAssertEqual(ender.ended, 1)
+        XCTAssertEqual(passes.retrying, [true])
+        XCTAssertEqual(passes.all.map { $0.failure.medium }, [.audio])
+        XCTAssertEqual(
+            passes.all.map { $0.failure.status }, [AVAssetReader.Status.cancelled.rawValue])
+        XCTAssertEqual(
+            retried.wholeAudio.samples.map(\.bitPattern),
+            baseline.wholeAudio.samples.map(\.bitPattern))
+        XCTAssertEqual(
+            retried.wholeAudio.descriptor.sourceIdentity,
+            baseline.wholeAudio.descriptor.sourceIdentity)
+        XCTAssertEqual(
+            retried.wholeAudio.descriptor.frameCount, baseline.wholeAudio.descriptor.frameCount)
+        XCTAssertEqual(retried.frames.map(\.planarRGB), baseline.frames.map(\.planarRGB))
+    }
+    func testAACReaderThatFailsTwiceThrowsItsFailure() async throws {
+        let plan = try await MiMoV26EncodedAudiovisualDecoder.inspect(video(), limits: audioLimits)
+        let ender = ReaderEnder(ending: [1, 2], atRead: 2)
+        let passes = FailedPasses()
+        do {
+            _ = try await withReaderFaults(passes, ending: ender) {
+                try await MiMoV26EncodedAudiovisualDecoder.decode(
+                    plan, videoLimits: videoLimits, audioLimits: audioLimits)
+            }
+            XCTFail("both AAC passes failed but the clip decoded")
+        } catch let failure as VideoReaderFailure {
+            XCTAssertEqual(failure.medium, .audio)
+            XCTAssertEqual(failure.status, AVAssetReader.Status.cancelled.rawValue)
+            XCTAssertFalse(failure.isTransient)
+        }
+        XCTAssertEqual(ender.ended, 2)
+        XCTAssertEqual(passes.retrying, [true, false])
     }
     // Original synthetic black video + 440 Hz tone, 1 s, H.264 + stereo AAC.
     // AVAssetReader performs real decompression, including container priming.
