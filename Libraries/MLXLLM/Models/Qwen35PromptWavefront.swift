@@ -62,7 +62,8 @@ public enum Qwen35PromptWavefront {
         let streams = layered(
             model, chunks: chunks, finalChunk: finalChunk, caches: caches,
             recurrentState: recurrentState, phaseBuilt: phaseBuilt)
-        var outputs: [MLXArray] = [], hidden: [MLXArray] = []
+        var outputs: [MLXArray] = []
+        var hidden: [MLXArray] = []
         for chunk in chunks.indices {
             switch streams[chunk] {
             case .plain(let rows):
