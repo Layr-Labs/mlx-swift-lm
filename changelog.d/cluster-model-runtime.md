@@ -90,3 +90,8 @@
   `AffineQuantizedVectors` with one vector per row; each row's attention reads
   its own pages, so every row proposes what it proposes alone. Standalone
   drafting (`draftStep`, `draftHidden`) is unchanged.
+- `Qwen35PromptWavefront.prefillWithHidden` returns, beside `prefill`'s
+  outputs, each prompt chunk's last decoder layer rows (before the final norm)
+  from the same graph, so an assisted tensor-parallel lane can merge prompt
+  frames and still give its assistant every frame's rows. `prefill` builds the
+  same operations as before.
