@@ -311,7 +311,8 @@ struct CBv2MTPEngineParityTests {
         let fixture = try makeFixture(deterministicTarget: true)
         let engine = makeEngine(
             target: fixture.target, drafter: try realDrafter(fixture), maxSpeculativeBatch: 1,
-            maxConcurrent: 1, verificationMode: .automatic, requestProbeDepth: 2)
+            maxConcurrent: 1, verificationMode: .automatic, requestProbeDepth: 2,
+            adaptiveMaxDepth: 4)
         for (index, length) in [7, 19, 33].enumerated() {
             let prompt = makePromptTokens(
                 length: length, seed: UInt64(300 + index), vocabSize: vocabSize)
@@ -323,6 +324,11 @@ struct CBv2MTPEngineParityTests {
         }
         let metrics = try #require(engine.mtpMetricsSnapshot())
         #expect(metrics.rounds > 0)
+        // The probe at 2, then one measuring window each at 1, 3 and 4 (B=1, envelope 8: ceiling 4).
+        #expect(
+            Set(metrics.depthSelections.keys).isSuperset(of: [1, 2, 3, 4]),
+            "\(metrics.depthSelections)")
+        #expect(metrics.probeOutcomes["measuring", default: 0] >= 1)
         let prompt = makePromptTokens(length: 21, seed: 0x5A, vocabSize: vocabSize)
         var sampled = request(id: 77, prompt: prompt, maxTokens: 32)
         sampled.sampling = CBv2SamplingParams(temperature: 0.8, topP: 0.95, topK: 16, seed: 4242)

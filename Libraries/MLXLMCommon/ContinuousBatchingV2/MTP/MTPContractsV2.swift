@@ -713,6 +713,9 @@ public struct CBv2MTPMetrics: Sendable {
     public var skippedRows: [String: Int] = [:]
     /// Step selections by depth, including depth zero.
     public var depthSelections: [Int: Int] = [:]
+    /// Request-probe mode: completed probe windows by outcome (`won`, `lost`,
+    /// `measuring`; `CBv2MTPDepthController.probeOutcomes`). Empty otherwise.
+    public var probeOutcomes: [String: Int] = [:]
     /// Stable controller/fallback reasons (warmup, exploration, hysteresis,
     /// unprofitable depth zero, batch gate, token/KV headroom, and so on).
     public var controllerFallbacks: [String: Int] = [:]

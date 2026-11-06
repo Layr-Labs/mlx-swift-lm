@@ -1246,10 +1246,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }
-            scheduler.speculationDraftTokenUpperBound = max(
-                0,
-                mtp.config.fixedDraftTokens
-                    ?? mtp.config.maxDraftTokens)
+            scheduler.speculationDraftTokenUpperBound = mtp.projectionDraftTokenUpperBound
             // The same gates `beginMTPPlan` applies to every planned step.
             scheduler.speculationDepthCeiling = { [unowned mtp] decodeRows in
                 mtp.speculationDepthCeiling(decodeRows: decodeRows)

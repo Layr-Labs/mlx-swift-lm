@@ -573,6 +573,17 @@ final class CBv2MTPRoundDriver {
         return min(config.maxDraftTokens, max(0, maxWidth - 1))
     }
 
+    /// The draft tokens the first-token deadline projection charges per
+    /// decoding row (before `speculationDepthCeiling`). Request-probe mode
+    /// charges one, as the adaptive depth-1 controller does: its depth follows
+    /// measured goodput, and admission prices a projected step at the measured
+    /// mean step, which already includes the deep rounds that ran. Charging
+    /// the cap would price each row at up to `1 + cap` over that mean.
+    var projectionDraftTokenUpperBound: Int {
+        let configured = max(0, config.fixedDraftTokens ?? config.maxDraftTokens)
+        return depthController.requestProbeDepth != nil ? min(1, configured) : configured
+    }
+
     /// Pure ceiling on any plan depth with `decodeRows` decode-ready rows:
     /// zero beyond the batch gate, otherwise the automatic envelope. Deadline
     /// projection mirrors it without touching controller state.
@@ -1258,6 +1269,7 @@ final class CBv2MTPRoundDriver {
         let snapshot = depthController.snapshot()
         metrics.conditionalAcceptance = snapshot.conditionalAcceptance
         metrics.costInputs = snapshot.costInputs
+        metrics.probeOutcomes = depthController.probeOutcomes
     }
 }
 

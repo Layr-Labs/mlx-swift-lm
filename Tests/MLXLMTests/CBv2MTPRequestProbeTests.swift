@@ -237,15 +237,45 @@ struct CBv2MTPRequestProbeTests {
     /// opening probe due.
     @Test func aCeilingOfZeroDecodesOrdinarilyAndKeepsTheProbeDue() {
         let result = Self.rejectedUnderCeiling(rows: 6, ceiling: 0, steps: 200)
-        #expect(result.plain == 200 && result.reasons == ["automatic_rectangular_limit"])
+        #expect(result.plain == 200 && result.reasons == ["automatic_envelope_plain"])
         let controller = Self.controller()
         Self.calibrate(controller)
         let blocked = controller.select(plannedDecodeRows: 1, canSpeculate: true, depthCeiling: 0)
-        #expect(blocked.depth == 0 && blocked.reason == "automatic_rectangular_limit")
+        #expect(blocked.depth == 0 && blocked.reason == "automatic_envelope_plain")
         _ = controller.recordFinalizedStep(
             decision: blocked, actualDepth: 0, wallTimeNanos: Self.plainNanos, costEligible: true,
             chained: true, finalizedPlainWork: true, finalizedVerification: false)
         let opened = controller.select(plannedDecodeRows: 1, canSpeculate: true, depthCeiling: 4)
         #expect(opened.reason == "probe" && opened.depth == 2)
+    }
+
+    /// Probe outcomes are counted by completed probe window: a probe followed by a depth with no measured round cost
+    /// is `measuring` (neither a win nor a loss), one followed by a speculative depth is `won`, one followed by
+    /// ordinary decode is `lost`.
+    /// A later request's three chained intervals (the isolated warmup survives requests).
+    static func rebaseline(_ controller: CBv2MTPDepthController) {
+        for _ in 0 ..< 3 {
+            #expect(
+                controller.select(plannedDecodeRows: 1, canSpeculate: true).reason
+                    == "warmup_chained_baseline")
+            controller.observeCommittedDecodeInterval(decodeRowBucket: 1, wallTimeNanos: plainNanos)
+        }
+    }
+
+    @Test func probeOutcomesAreCountedByWindow() {
+        let controller = Self.controller()
+        controller.beginWorkload(rowIDs: [CBv2RequestID(1)])
+        Self.calibrate(controller)
+        Self.run(controller, rounds: 8, accepted: { $0 })
+        #expect(controller.probeOutcomes == ["measuring": 1])
+        Self.run(controller, rounds: 8 * 3, accepted: { $0 })  // depths 1, 3 and 4 measured
+        controller.beginWorkload(rowIDs: [CBv2RequestID(2)])
+        Self.rebaseline(controller)
+        Self.run(controller, rounds: 8, accepted: { $0 })
+        #expect(controller.probeOutcomes == ["measuring": 1, "won": 1])
+        controller.beginWorkload(rowIDs: [CBv2RequestID(3)])
+        Self.rebaseline(controller)
+        Self.run(controller, rounds: 8, accepted: { _ in 0 })
+        #expect(controller.probeOutcomes == ["measuring": 1, "won": 1, "lost": 1])
     }
 }

@@ -205,6 +205,10 @@ final class CBv2MTPDepthController {
     /// `CBv2MTPConfig.requestProbeDepth`, in committed-baseline adaptive mode only.
     let requestProbeDepth: Int?
     private var buckets: [Int: BucketState] = [:]
+    /// Request-probe mode: completed probe windows by outcome since the
+    /// engine started: `won` (a depth beat ordinary decode), `lost` (ordinary
+    /// decode followed) and `measuring` (an unmeasured depth runs next).
+    private(set) var probeOutcomes: [String: Int] = [:]
     private struct VerificationShape: Hashable {
         let rowCount: Int
         let depth: Int
@@ -602,14 +606,16 @@ final class CBv2MTPDepthController {
     /// Request-probe mode, once the depth-zero baselines exist and no window
     /// is open: the request's opening probe, a backed-off re-probe from
     /// ordinary decode, or the depth the last completed window chose, all
-    /// within the plan's ceiling. A plan that cannot speculate decodes
-    /// ordinarily without touching the probe schedule.
+    /// within the plan's ceiling. A plan the envelope keeps at depth zero
+    /// decodes ordinarily (`automatic_envelope_plain`, distinct from the
+    /// driver's `automatic_rectangular_limit` clamp) without touching the
+    /// probe schedule.
     private func probeDecision(
         probe: Int, bucket: Int, state: BucketState, ceiling: Int
     ) -> CBv2MTPDepthDecision {
         guard ceiling > 0 else {
             return CBv2MTPDepthDecision(
-                depth: 0, decodeRowBucket: bucket, reason: "automatic_rectangular_limit",
+                depth: 0, decodeRowBucket: bucket, reason: "automatic_envelope_plain",
                 isExploration: false)
         }
         if state.probeDue
@@ -672,6 +678,10 @@ final class CBv2MTPDepthController {
         }
         let wasProbe = decision.reason == "probe"
         let (next, measuring) = depthAfterWindow(state: state)
+        if wasProbe {
+            let outcome = next == 0 ? "lost" : measuring ? "measuring" : "won"
+            probeOutcomes[outcome, default: 0] += 1
+        }
         state.activeDepth = next
         if wasProbe { state.probeDue = false }
         if next == 0 {
