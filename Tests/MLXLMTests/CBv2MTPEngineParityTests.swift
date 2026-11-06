@@ -5,11 +5,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
     let baseIndices: [Int]
@@ -53,9 +53,10 @@ final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
         let ids = cursor.baseIndices.map { base -> Int32 in
             let index = base + cursor.step
             let value = index < script.count ? script[index] : 0
-            let stepOffset = offsetsByStep.flatMap {
-                cursor.step < $0.count ? $0[cursor.step] : nil
-            } ?? offset
+            let stepOffset =
+                offsetsByStep.flatMap {
+                    cursor.step < $0.count ? $0[cursor.step] : nil
+                } ?? offset
             return Int32((value + stepOffset) % vocabSize)
         }
         return (MLXArray(ids), hidden)
@@ -311,9 +312,12 @@ struct CBv2MTPEngineParityTests {
             target: fixture.target, drafter: try realDrafter(fixture), maxSpeculativeBatch: 1,
             maxConcurrent: 1, verificationMode: .automatic, requestProbeDepth: 2)
         for (index, length) in [7, 19, 33].enumerated() {
-            let prompt = makePromptTokens(length: length, seed: UInt64(300 + index), vocabSize: vocabSize)
-            let off = try await baseline(fixture, prompt: prompt, maxTokens: 48, id: UInt64(10 + index))
-            let on = try await run(engine, request(id: UInt64(10 + index), prompt: prompt, maxTokens: 48))
+            let prompt = makePromptTokens(
+                length: length, seed: UInt64(300 + index), vocabSize: vocabSize)
+            let off = try await baseline(
+                fixture, prompt: prompt, maxTokens: 48, id: UInt64(10 + index))
+            let on = try await run(
+                engine, request(id: UInt64(10 + index), prompt: prompt, maxTokens: 48))
             #expect(on.tokens == off.tokens, "prompt length \(length)")
         }
         let metrics = try #require(engine.mtpMetricsSnapshot())

@@ -110,7 +110,8 @@ final class CBv2MTPDepthController {
                 } else {
                     let weight =
                         averagesFirstSamples
-                        ? max(CBv2MTPDepthController.acceptanceAlpha, 1 / Double(seen[position] + 1))
+                        ? max(
+                            CBv2MTPDepthController.acceptanceAlpha, 1 / Double(seen[position] + 1))
                         : CBv2MTPDepthController.acceptanceAlpha
                     rates[position] += weight * (outcome - rates[position])
                 }
@@ -504,7 +505,8 @@ final class CBv2MTPDepthController {
         }
 
         let state = buckets[bucket] ?? freshBucket()
-        let limit = requestProbeDepth != nil ? maxDepth : min(maxDepth, state.acceptance.frontier + 1)
+        let limit =
+            requestProbeDepth != nil ? maxDepth : min(maxDepth, state.acceptance.frontier + 1)
         let decision: CBv2MTPDepthDecision
 
         if state.costs[0] == nil {
@@ -578,7 +580,8 @@ final class CBv2MTPDepthController {
     /// Request-probe mode, once the depth-zero baselines exist and no window
     /// is open: the request's opening probe, a backed-off re-probe from
     /// ordinary decode, or the depth the last completed window chose.
-    private func probeDecision(probe: Int, bucket: Int, state: BucketState) -> CBv2MTPDepthDecision {
+    private func probeDecision(probe: Int, bucket: Int, state: BucketState) -> CBv2MTPDepthDecision
+    {
         if state.probeDue
             || (state.activeDepth == 0 && state.plainTokensSinceProbe >= state.plainGapTokens)
         {
@@ -629,8 +632,9 @@ final class CBv2MTPDepthController {
         _ decision: CBv2MTPDepthDecision,
         state: inout BucketState
     ) {
-        if requestProbeDepth != nil, decision.reason == "probe" || decision.reason == "goodput"
-            || decision.reason == "unprofitable"
+        if requestProbeDepth != nil,
+            decision.reason == "probe" || decision.reason == "goodput"
+                || decision.reason == "unprofitable"
         {
             if decision.depth == 0 {
                 state.plainTokensSinceProbe += 1
@@ -643,7 +647,8 @@ final class CBv2MTPDepthController {
                 if next == 0 {
                     // A losing probe: plain for the current interval, doubled for the next loss.
                     state.plainGapTokens = state.probeIntervalTokens
-                    state.probeIntervalTokens = min(state.probeIntervalTokens * 2, Self.probeMaxIntervalTokens)
+                    state.probeIntervalTokens = min(
+                        state.probeIntervalTokens * 2, Self.probeMaxIntervalTokens)
                 } else if !measuring {
                     state.probeIntervalTokens = Self.probeBaseIntervalTokens
                 }

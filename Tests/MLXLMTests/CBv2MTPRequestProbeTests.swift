@@ -13,18 +13,23 @@ struct CBv2MTPRequestProbeTests {
     static func roundNanos(_ depth: Int) -> UInt64 { plainNanos + UInt64(depth) * plainNanos / 2 }
 
     static func controller(maxDepth: Int = 4, probe: Int? = 2) -> CBv2MTPDepthController {
-        CBv2MTPDepthController(maxDepth: maxDepth, fixedDepth: nil, useCommittedDecodeBaseline: true,
-                               requestProbeDepth: probe)
+        CBv2MTPDepthController(
+            maxDepth: maxDepth, fixedDepth: nil, useCommittedDecodeBaseline: true,
+            requestProbeDepth: probe)
     }
 
     /// The isolated warmup and three chained intervals: the depth-zero baselines.
     static func calibrate(_ controller: CBv2MTPDepthController) {
         let warmup = controller.select(plannedDecodeRows: 1, canSpeculate: true)
         #expect(warmup.reason == "warmup_baseline")
-        _ = controller.recordFinalizedStep(decision: warmup, actualDepth: 0, wallTimeNanos: plainNanos,
-            costEligible: true, chained: false, finalizedPlainWork: true, finalizedVerification: false)
+        _ = controller.recordFinalizedStep(
+            decision: warmup, actualDepth: 0, wallTimeNanos: plainNanos,
+            costEligible: true, chained: false, finalizedPlainWork: true,
+            finalizedVerification: false)
         for _ in 0 ..< 3 {
-            #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason == "warmup_chained_baseline")
+            #expect(
+                controller.select(plannedDecodeRows: 1, canSpeculate: true).reason
+                    == "warmup_chained_baseline")
             controller.observeCommittedDecodeInterval(decodeRowBucket: 1, wallTimeNanos: plainNanos)
         }
     }
@@ -32,19 +37,26 @@ struct CBv2MTPRequestProbeTests {
     /// Runs whole windows at the decided depth with `accepted(depth)` drafts kept each round, or `plain` ordinary
     /// steps; returns every decision taken.
     @discardableResult
-    static func run(_ controller: CBv2MTPDepthController, rounds: Int, accepted: (Int) -> Int) -> [CBv2MTPDepthDecision] {
+    static func run(_ controller: CBv2MTPDepthController, rounds: Int, accepted: (Int) -> Int)
+        -> [CBv2MTPDepthDecision]
+    {
         var decisions: [CBv2MTPDepthDecision] = []
         for _ in 0 ..< rounds {
             let decision = controller.select(plannedDecodeRows: 1, canSpeculate: true)
             decisions.append(decision)
             if decision.depth == 0 {
-                _ = controller.recordFinalizedStep(decision: decision, actualDepth: 0, wallTimeNanos: plainNanos,
-                    costEligible: true, chained: true, finalizedPlainWork: true, finalizedVerification: false)
-                controller.observeCommittedDecodeInterval(decodeRowBucket: 1, wallTimeNanos: plainNanos)
+                _ = controller.recordFinalizedStep(
+                    decision: decision, actualDepth: 0, wallTimeNanos: plainNanos,
+                    costEligible: true, chained: true, finalizedPlainWork: true,
+                    finalizedVerification: false)
+                controller.observeCommittedDecodeInterval(
+                    decodeRowBucket: 1, wallTimeNanos: plainNanos)
             } else {
                 let kept = min(accepted(decision.depth), decision.depth)
-                controller.observeAcceptance(decodeRowBucket: 1, drafted: decision.depth, accepted: kept)
-                controller.recordCommittedVerification(decision: decision, wallTimeNanos: roundNanos(decision.depth),
+                controller.observeAcceptance(
+                    decodeRowBucket: 1, drafted: decision.depth, accepted: kept)
+                controller.recordCommittedVerification(
+                    decision: decision, wallTimeNanos: roundNanos(decision.depth),
                     committedTokens: kept + 1, rowCount: 1)
             }
         }
@@ -79,9 +91,15 @@ struct CBv2MTPRequestProbeTests {
         // An earlier request measured every depth's round cost (it survives requests).
         Self.run(controller, rounds: 8 * 4, accepted: { _ in 0 })
         controller.beginWorkload(rowIDs: [CBv2RequestID(2)])
-        var gaps: [Int] = [], plain = 0
+        var gaps: [Int] = []
+        var plain = 0
         for decision in Self.run(controller, rounds: 2_500, accepted: { _ in 0 }) {
-            if decision.reason == "unprofitable" { plain += 1 } else if plain > 0 { gaps.append(plain); plain = 0 }
+            if decision.reason == "unprofitable" {
+                plain += 1
+            } else if plain > 0 {
+                gaps.append(plain)
+                plain = 0
+            }
         }
         #expect(gaps.count >= 4)
         #expect(Array(gaps.prefix(4)) == [128, 256, 512, 512])
@@ -101,9 +119,15 @@ struct CBv2MTPRequestProbeTests {
         let winning = Self.run(controller, rounds: 600, accepted: { $0 })
         #expect(winning.suffix(8).allSatisfy { $0.depth > 0 })
         // Drafts rejected again: it returns to ordinary decode, and the next probe comes after the base interval.
-        var plain = 0, gap: Int?
+        var plain = 0
+        var gap: Int?
         for decision in Self.run(controller, rounds: 400, accepted: { _ in 0 }) {
-            if decision.reason == "unprofitable" { plain += 1 } else if plain > 0 { gap = plain; break }
+            if decision.reason == "unprofitable" {
+                plain += 1
+            } else if plain > 0 {
+                gap = plain
+                break
+            }
         }
         #expect(gap == CBv2MTPDepthController.probeBaseIntervalTokens)
     }
@@ -117,11 +141,17 @@ struct CBv2MTPRequestProbeTests {
         let measured = controller.snapshot().costInputs.filter { $0.depth > 0 }.map(\.depth)
         #expect(Set(measured) == [1, 2, 3, 4])
         controller.beginWorkload(rowIDs: [CBv2RequestID(2)])
-        #expect(Set(controller.snapshot().costInputs.filter { $0.depth > 0 }.map(\.depth)) == [1, 2, 3, 4])
+        #expect(
+            Set(controller.snapshot().costInputs.filter { $0.depth > 0 }.map(\.depth)) == [
+                1, 2, 3, 4,
+            ])
         #expect(controller.snapshot().conditionalAcceptance.isEmpty)
         for _ in 0 ..< 3 {
-            #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason == "warmup_chained_baseline")
-            controller.observeCommittedDecodeInterval(decodeRowBucket: 1, wallTimeNanos: Self.plainNanos)
+            #expect(
+                controller.select(plannedDecodeRows: 1, canSpeculate: true).reason
+                    == "warmup_chained_baseline")
+            controller.observeCommittedDecodeInterval(
+                decodeRowBucket: 1, wallTimeNanos: Self.plainNanos)
         }
         let probe = controller.select(plannedDecodeRows: 1, canSpeculate: true)
         #expect(probe.reason == "probe" && probe.depth == 2)
@@ -136,9 +166,16 @@ struct CBv2MTPRequestProbeTests {
         Self.calibrate(controller)
         let first = controller.select(plannedDecodeRows: 1, canSpeculate: true)
         #expect(first.depth == 1 && first.reason == "explore_cost")
-        #expect(CBv2MTPConfig(enabled: true, maxDraftTokens: 4, fixedDraftTokens: 1, requestProbeDepth: 2)
+        #expect(
+            CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 4, fixedDraftTokens: 1, requestProbeDepth: 2
+            )
             .requestProbeDepth == nil)
-        #expect(CBv2MTPConfig(enabled: true, maxDraftTokens: 4, requestProbeDepth: 9).requestProbeDepth == 4)
-        #expect(CBv2MTPConfig(enabled: true, maxDraftTokens: 0, requestProbeDepth: 2).requestProbeDepth == nil)
+        #expect(
+            CBv2MTPConfig(enabled: true, maxDraftTokens: 4, requestProbeDepth: 9).requestProbeDepth
+                == 4)
+        #expect(
+            CBv2MTPConfig(enabled: true, maxDraftTokens: 0, requestProbeDepth: 2).requestProbeDepth
+                == nil)
     }
 }
