@@ -178,4 +178,74 @@ struct CBv2MTPRequestProbeTests {
             CBv2MTPConfig(enabled: true, maxDraftTokens: 0, requestProbeDepth: 2).requestProbeDepth
                 == nil)
     }
+
+    /// Every draft rejected under a plan ceiling (the driver's automatic envelope: rows x (1 + depth) <= 8 on M3-M5,
+    /// <= 4 on M1/M2). Returns ordinary steps, the deepest depth asked for, and the decisions' reasons.
+    static func rejectedUnderCeiling(rows: Int, ceiling: Int, steps: Int)
+        -> (plain: Int, deepest: Int, reasons: Set<String>)
+    {
+        let controller = Self.controller()
+        let bucket = CBv2MTPDepthController.decodeRowBucket(rows)
+        let warmup = controller.select(
+            plannedDecodeRows: rows, canSpeculate: true, depthCeiling: ceiling)
+        _ = controller.recordFinalizedStep(
+            decision: warmup, actualDepth: 0, wallTimeNanos: plainNanos, costEligible: true,
+            chained: false, finalizedPlainWork: true, finalizedVerification: false)
+        for _ in 0 ..< 3 {
+            _ = controller.select(
+                plannedDecodeRows: rows, canSpeculate: true, depthCeiling: ceiling)
+            controller.observeCommittedDecodeInterval(
+                decodeRowBucket: bucket, wallTimeNanos: plainNanos)
+        }
+        var plain = 0
+        var deepest = 0
+        var reasons: Set<String> = []
+        for _ in 0 ..< steps {
+            let decision = controller.select(
+                plannedDecodeRows: rows, canSpeculate: true, depthCeiling: ceiling)
+            deepest = max(deepest, decision.depth)
+            reasons.insert(decision.reason)
+            if decision.depth == 0 {
+                plain += 1
+                _ = controller.recordFinalizedStep(
+                    decision: decision, actualDepth: 0, wallTimeNanos: plainNanos,
+                    costEligible: true, chained: true, finalizedPlainWork: true,
+                    finalizedVerification: false)
+                controller.observeCommittedDecodeInterval(
+                    decodeRowBucket: bucket, wallTimeNanos: plainNanos)
+            } else {
+                controller.observeAcceptance(
+                    decodeRowBucket: bucket, drafted: decision.depth, accepted: 0)
+                controller.recordCommittedVerification(
+                    decision: decision, wallTimeNanos: roundNanos(decision.depth),
+                    committedTokens: rows, rowCount: rows)
+            }
+        }
+        return (plain, deepest, reasons)
+    }
+
+    /// The envelope's ceilings: M3-M5 with 1 (none), 2 (depth 3) and 3-4 rows (depth 1); M1/M2 with 1 (depth 3) and
+    /// 2 rows (depth 1). The request probes and measures within the ceiling, then decodes ordinarily.
+    @Test(arguments: [(1, 4), (2, 3), (3, 1), (4, 1), (1, 3), (2, 1)])
+    func aRejectedRequestReturnsToOrdinaryDecodeUnderTheCeiling(rows: Int, ceiling: Int) {
+        let result = Self.rejectedUnderCeiling(rows: rows, ceiling: ceiling, steps: 2_000)
+        #expect(result.deepest == ceiling)
+        #expect(result.plain >= 1_850, "ordinary steps \(result.plain)")
+    }
+
+    /// A plan that cannot speculate (5+ rows on M3-M5, 3+ on M1/M2) decodes ordinarily and leaves the request's
+    /// opening probe due.
+    @Test func aCeilingOfZeroDecodesOrdinarilyAndKeepsTheProbeDue() {
+        let result = Self.rejectedUnderCeiling(rows: 6, ceiling: 0, steps: 200)
+        #expect(result.plain == 200 && result.reasons == ["automatic_rectangular_limit"])
+        let controller = Self.controller()
+        Self.calibrate(controller)
+        let blocked = controller.select(plannedDecodeRows: 1, canSpeculate: true, depthCeiling: 0)
+        #expect(blocked.depth == 0 && blocked.reason == "automatic_rectangular_limit")
+        _ = controller.recordFinalizedStep(
+            decision: blocked, actualDepth: 0, wallTimeNanos: Self.plainNanos, costEligible: true,
+            chained: true, finalizedPlainWork: true, finalizedVerification: false)
+        let opened = controller.select(plannedDecodeRows: 1, canSpeculate: true, depthCeiling: 4)
+        #expect(opened.reason == "probe" && opened.depth == 2)
+    }
 }

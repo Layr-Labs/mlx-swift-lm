@@ -501,7 +501,8 @@ final class CBv2MTPRoundDriver {
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
-            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate,
+            depthCeiling: maximumAutomaticDepth(plannedDecodeRows: plannedDecodeRows))
         let offered =
             usesMarginalPolicy && canSpeculate && !controllerDecision.isExploration
             ? CBv2MTPDepthDecision(
@@ -528,7 +529,8 @@ final class CBv2MTPRoundDriver {
         adaptiveSerialLimitedDecision(
             verificationLimitedDecision(
                 depthController.preview(
-                    plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
+                    plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate,
+                    depthCeiling: maximumAutomaticDepth(plannedDecodeRows: plannedDecodeRows)),
                 plannedDecodeRows: plannedDecodeRows))
     }
 

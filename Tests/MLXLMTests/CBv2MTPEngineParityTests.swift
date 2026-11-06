@@ -190,10 +190,11 @@ struct CBv2MTPEngineParityTests {
         sampler: CBv2StepSampler = CBv2DefaultSampler(),
         verificationMode: CBv2MTPVerificationMode = .serialTarget,
         maxAutomaticRectangularTokens: Int = 8,
-        requestProbeDepth: Int? = nil
+        requestProbeDepth: Int? = nil,
+        adaptiveMaxDepth: Int? = nil
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
-        let depth = fixedDepth ?? k
+        let depth = fixedDepth ?? adaptiveMaxDepth ?? k
         // A request-probe engine is adaptive (no fixed depth) up to `k`.
         let mtpConfig = CBv2MTPConfig(
             enabled: drafter != nil, maxDraftTokens: depth,
@@ -331,6 +332,52 @@ struct CBv2MTPEngineParityTests {
         let speculative = try await run(engine, sampled)
         await engine.shutdown()
         #expect(speculative.tokens == plain.tokens)
+    }
+
+    /// Request-probe mode under the automatic verification envelope (`B * (1 + depth) <= limit`): 8 on M3-M5 with 2-4
+    /// concurrent requests, 4 on M1/M2 with 1-2. The assistant's random drafts are rejected, so ordinary decode must win
+    /// after the probe and the measuring windows, and the controller never asks for a depth the envelope refuses.
+    @Test(arguments: [(1, 4), (2, 4), (2, 8), (3, 8), (4, 8)])
+    func requestProbeReturnsToOrdinaryDecodeUnderTheEnvelope(rows: Int, envelope: Int) async throws
+    {
+        // Wide logit margins: greedy equality checks the controller, not near-ties of random weights.
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = (0 ..< rows).map { row in
+            makePromptTokens(
+                length: 11 + row * 5, seed: UInt64(500 + rows * 10 + row), vocabSize: vocabSize)
+        }
+        let maxTokens = 160
+        var expected: [CBv2SchedCollected] = []
+        for (row, prompt) in prompts.enumerated() {
+            expected.append(
+                try await baseline(
+                    fixture, prompt: prompt, maxTokens: maxTokens, id: UInt64(row + 1)))
+        }
+        let engine = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture), maxSpeculativeBatch: 4,
+            verificationMode: .automatic, maxAutomaticRectangularTokens: envelope,
+            requestProbeDepth: 2, adaptiveMaxDepth: 4)
+        let streams = try prompts.enumerated().map { row, prompt in
+            try engine.submit(request(id: UInt64(row + 1), prompt: prompt, maxTokens: maxTokens))
+        }
+        var results: [CBv2SchedCollected] = []
+        for stream in streams { results.append(await cbv2SchedCollect(stream)) }
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        for row in prompts.indices {
+            #expect(
+                results[row].tokens == expected[row].tokens,
+                "B=\(rows) envelope \(envelope) row \(row)")
+        }
+        let ceiling = envelope / rows - 1
+        #expect(metrics.rounds > 0)
+        #expect(metrics.depthSelections.keys.allSatisfy { $0 <= ceiling })
+        #expect(
+            metrics.controllerFallbacks["automatic_rectangular_limit", default: 0] == 0,
+            "the controller asked past the envelope: \(metrics.controllerFallbacks)")
+        #expect(
+            metrics.depthSelections[0, default: 0] >= maxTokens / 2,
+            "ordinary decode steps: \(metrics.depthSelections)")
     }
 
     @Test func b2AndB4RaggedBatchesMatchSoloTargetDecode() async throws {
