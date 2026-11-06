@@ -104,7 +104,7 @@ enum Qwen4ExpVideoSampler {
         guard reader.startReading() else { throw Failure.decodeFailed }
         defer { reader.cancelReading() }
         var totalFrames = 0
-        while let buffer = output.copyNextSampleBuffer() {
+        while let buffer = VideoReaderRetry.nextSample(output, of: reader) {
             try Task.checkCancellation()
             let count = CMSampleBufferGetNumSamples(buffer)
             guard count >= 0, count <= maxIndexedFrames - totalFrames else {
@@ -136,7 +136,7 @@ enum Qwen4ExpVideoSampler {
         frames.reserveCapacity(indices.count)
         var ordinal = 0
         var selected = 0
-        while let buffer = decoded.copyNextSampleBuffer() {
+        while let buffer = VideoReaderRetry.nextSample(decoded, of: decodedReader) {
             try Task.checkCancellation()
             guard ordinal < totalFrames, let pixel = CMSampleBufferGetImageBuffer(buffer) else {
                 throw Failure.invalidMetadata

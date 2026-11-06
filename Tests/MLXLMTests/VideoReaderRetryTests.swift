@@ -30,9 +30,45 @@ private final class FailedPasses: @unchecked Sendable {
     }
 }
 
+/// Cancels the readers in `ending` (1 is the first reader the task opens)
+/// before their read number `read`, on the reading thread between two reads.
+/// Each then ends `.cancelled`, as a reader that fails partway ends `.failed`.
+private final class ReaderEnder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let ending: Set<Int>
+    private let read: Int
+    private var order: [ObjectIdentifier: (ordinal: Int, reads: Int)] = [:]
+    private var endedCount = 0
+
+    init(ending: Set<Int>, atRead read: Int) {
+        self.ending = ending
+        self.read = read
+    }
+
+    var ended: Int { lock.withLock { endedCount } }
+
+    var hook: @Sendable (AVAssetReader) -> Void {
+        { [self] reader in
+            let end = lock.withLock { () -> Bool in
+                let id = ObjectIdentifier(reader)
+                var entry = order[id] ?? (ordinal: order.count + 1, reads: 0)
+                entry.reads += 1
+                order[id] = entry
+                guard entry.reads == read, ending.contains(entry.ordinal) else { return false }
+                endedCount += 1
+                return true
+            }
+            if end { reader.cancelReading() }
+        }
+    }
+}
+
 /// The real decoders over the real in-memory resource loader, with data requests
 /// failed partway through the clip. AVFoundation requests a failed range again,
-/// so the fault stays armed until a reader pass fails.
+/// so the fault stays armed until a reader pass fails. A compressed-sample pass
+/// that loses its bytes ends `.completed` with fewer samples instead, and a
+/// later pass reads bytes an earlier pass loaded, so the MiMo and Qwen4 tests
+/// end their decoded-frame reader partway instead.
 final class VideoReaderRetryTests: XCTestCase {
     private struct Unrelated: Error {}
 
@@ -282,51 +318,55 @@ final class VideoReaderRetryTests: XCTestCase {
 
     // MARK: - MiMo and Qwen4
 
-    /// The MP4: on the QuickTime clip a compressed-sample pass that loses its
-    /// bytes ends `.completed` with fewer samples, not `.failed`.
+    private func ending<Output>(_ ender: ReaderEnder, _ body: () async throws -> Output)
+        async throws -> Output
+    {
+        try await VideoReaderRetry.$beforeReadForTesting.withValue(ender.hook, operation: body)
+    }
+
+    /// Reader 1 counts the compressed samples; reader 2 decodes and ends partway.
     func testMiMoRetryAfterAFailedReaderPassKeepsThePlanAndFrames() async throws {
-        let data = try clip("input-video-url.mp4")
+        let data = try clip("input-video-base64.mov")
         let sampling = try MiMoV26EncodedVisualDecoder.Sampling(
             fps: 2, minimumFrames: 4, maximumFrames: 64)
         let limits = MiMoV26EncodedVisualDecoder.Limits(
             maximumPixels: 8_388_608, maximumWorkingBytes: 1 << 30,
             maximumSourceFrames: 360_000, maximumSampledFrames: 64,
             maximumEncodedBytes: 32 << 20)
-        func decode(_ owner: MemoryBackedVideoAsset) async throws -> (
-            indices: [Int], frames: [[Float]]
-        ) {
+        func decode() async throws -> (indices: [Int], frames: [[Float]]) {
             let plan = try await MiMoV26EncodedVisualDecoder.inspectVideo(
-                owner, sampling: sampling, limits: limits)
-            let video = try await MiMoV26EncodedVisualDecoder.audiovisualFrames(
-                plan, limits: limits)
+                owner(data), sampling: sampling, limits: limits)
+            let video = try await MiMoV26EncodedVisualDecoder.silentVideo(plan, limits: limits)
             return (plan.sampledIndices, video.frames.map(\.planarRGB))
         }
-        let baseline = try await decode(owner(data))
-        let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
-        let passes = FailedPasses(disarming: fault)
-        let retried = try await observing(passes) { try await decode(owner(data, fault)) }
-        XCTAssertGreaterThanOrEqual(fault.injected, 1)
+        let baseline = try await decode()
+        let ender = ReaderEnder(ending: [2], atRead: 20)
+        let passes = FailedPasses()
+        let retried = try await observing(passes) { try await ending(ender) { try await decode() } }
+        XCTAssertEqual(ender.ended, 1)
         XCTAssertEqual(passes.retrying, [true])
+        XCTAssertEqual(
+            passes.all.map { $0.failure.status }, [AVAssetReader.Status.cancelled.rawValue])
         XCTAssertEqual(retried.indices, baseline.indices)
         XCTAssertEqual(retried.frames, baseline.frames)
     }
 
-    /// The MP4, as for MiMo.
+    /// Reader 1 counts the compressed samples; reader 2 decodes and ends partway.
     func testQwen4RetryAfterAFailedReaderPassKeepsTheSampledFrames() async throws {
-        let data = try clip("input-video-url.mp4")
+        let data = try clip("input-video-base64.mov")
         let config = try JSONDecoder().decode(
             Qwen4ExpVideoConfiguration.self, from: Data("{}".utf8))
-        func sample(_ owner: MemoryBackedVideoAsset) async throws -> Qwen4ExpVideoSampler.Sample {
-            try await Qwen4ExpVideoSampler.sample(.memoryBacked(owner), config: config) {
+        func sample() async throws -> Qwen4ExpVideoSampler.Sample {
+            try await Qwen4ExpVideoSampler.sample(.memoryBacked(owner(data)), config: config) {
                 frame, _ in
                 frame.transformed(by: CGAffineTransform(scaleX: 0.125, y: 0.125))
             }
         }
-        let baseline = try await sample(owner(data))
-        let fault = midClipFault(data, error: MemoryBackedVideoAssetError.invalidRange)
-        let passes = FailedPasses(disarming: fault)
-        let retried = try await observing(passes) { try await sample(owner(data, fault)) }
-        XCTAssertGreaterThanOrEqual(fault.injected, 1)
+        let baseline = try await sample()
+        let ender = ReaderEnder(ending: [2], atRead: 20)
+        let passes = FailedPasses()
+        let retried = try await observing(passes) { try await ending(ender) { try await sample() } }
+        XCTAssertEqual(ender.ended, 1)
         XCTAssertEqual(passes.retrying, [true])
         XCTAssertEqual(retried.indices, baseline.indices)
         XCTAssertEqual(retried.sourceFPS, baseline.sourceFPS)

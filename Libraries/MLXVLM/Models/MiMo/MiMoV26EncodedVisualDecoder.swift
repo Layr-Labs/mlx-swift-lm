@@ -377,7 +377,9 @@ public enum MiMoV26EncodedVisualDecoder {
         var markerCount = 0
         var duration = CMTime.zero
         while try autoreleasepool(invoking: { () throws -> Bool in
-            guard let sample = output.copyNextSampleBuffer() else { return false }
+            guard let sample = VideoReaderRetry.nextSample(output, of: reader) else {
+                return false
+            }
             try Task.checkCancellation()
             if try consumeEmptyMarker(
                 sample, count: &markerCount, limit: limits.maximumControlMarkers)
@@ -471,7 +473,9 @@ public enum MiMoV26EncodedVisualDecoder {
         var frames: [MiMoV26Pixels.DecodedRGB] = []
         var lastPTS: CMTime?
         while try autoreleasepool(invoking: { () throws -> Bool in
-            guard let sample = output.copyNextSampleBuffer() else { return false }
+            guard let sample = VideoReaderRetry.nextSample(output, of: reader) else {
+                return false
+            }
             try Task.checkCancellation()
             if try consumeEmptyMarker(sample, count: &markerCount, limit: markerLimit) {
                 return true

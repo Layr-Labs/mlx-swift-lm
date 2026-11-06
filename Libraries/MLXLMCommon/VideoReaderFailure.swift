@@ -2,6 +2,7 @@
 
 #if canImport(AVFoundation)
 @preconcurrency import AVFoundation
+import CoreMedia
 import Foundation
 import VideoToolbox
 
@@ -100,6 +101,18 @@ public enum VideoReaderRetry {
                 throw failure
             }
         }
+    }
+
+    /// Tests only: runs before each sample read with that reader, on the reading
+    /// thread, so a test can end a reader partway.
+    @TaskLocal public static var beforeReadForTesting: (@Sendable (AVAssetReader) -> Void)?
+
+    /// The next sample of `reader`'s `output`, after the task's test hook.
+    public static func nextSample(_ output: AVAssetReaderOutput, of reader: AVAssetReader)
+        -> CMSampleBuffer?
+    {
+        beforeReadForTesting?(reader)
+        return output.copyNextSampleBuffer()
     }
 
     /// Reports `failure` to the task's observer.

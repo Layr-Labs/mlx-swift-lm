@@ -1266,7 +1266,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
         var decoded = 0
         var bytes = 0
         var previous: Double?
-        while let sample = output.copyNextSampleBuffer() {
+        while let sample = VideoReaderRetry.nextSample(output, of: reader) {
             try Task.checkCancellation()
             guard let pixels = CMSampleBufferGetImageBuffer(sample), decoded < 100_000 else {
                 throw GLM5NextVisionError.invalidInput("video decoder sample")
