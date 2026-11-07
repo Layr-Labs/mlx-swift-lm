@@ -54,6 +54,14 @@ final class CBv2MTPDepthController {
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
     private static let committedBaselineMinSamples = 3
+    /// Request-probe mode (`requestProbeDepth`): ordinary decode re-probes
+    /// after this many tokens, doubling after each losing probe up to the
+    /// maximum and back to the base after a winning one.
+    static let probeBaseIntervalTokens = 128
+    static let probeMaxIntervalTokens = 512
+    /// Request-probe mode: a position's acceptance is trusted after this many
+    /// observations (one probe window gives eight).
+    private static let probeTrustedSamples = 4
 
     private struct CostState {
         var samples = 0
@@ -85,6 +93,11 @@ final class CBv2MTPDepthController {
         /// Index zero is unused so the draft-position math is 1-based.
         var rates: [Double] = [0]
         var seen: [Int] = [0]
+        /// Observations before a position is trusted.
+        var minimumSamples = CBv2MTPDepthController.acceptanceMinSamples
+        /// Average the first observations (weight 1/n until the EWMA's own
+        /// weight is larger) instead of starting from the first outcome.
+        var averagesFirstSamples = false
 
         mutating func observe(drafted: Int, accepted: Int) {
             guard drafted > 0 else { return }
@@ -95,9 +108,12 @@ final class CBv2MTPDepthController {
                 if seen[position] == 0 {
                     rates[position] = outcome
                 } else {
-                    rates[position] +=
-                        CBv2MTPDepthController.acceptanceAlpha
-                        * (outcome - rates[position])
+                    let weight =
+                        averagesFirstSamples
+                        ? max(
+                            CBv2MTPDepthController.acceptanceAlpha, 1 / Double(seen[position] + 1))
+                        : CBv2MTPDepthController.acceptanceAlpha
+                    rates[position] += weight * (outcome - rates[position])
                 }
                 seen[position] += 1
             }
@@ -105,14 +121,14 @@ final class CBv2MTPDepthController {
 
         func rate(at position: Int) -> Double {
             if position > 0, position < seen.count,
-                seen[position] >= CBv2MTPDepthController.acceptanceMinSamples
+                seen[position] >= minimumSamples
             {
                 return rates[position]
             }
             guard position > 1 else { return 1 }
             for prior in stride(from: position - 1, through: 1, by: -1) {
                 if prior < seen.count,
-                    seen[prior] >= CBv2MTPDepthController.acceptanceMinSamples
+                    seen[prior] >= minimumSamples
                 {
                     return rates[prior]
                 }
@@ -135,7 +151,7 @@ final class CBv2MTPDepthController {
             var result = 0
             guard seen.count > 1 else { return result }
             for position in 1 ..< seen.count {
-                guard seen[position] >= CBv2MTPDepthController.acceptanceMinSamples else {
+                guard seen[position] >= minimumSamples else {
                     break
                 }
                 result = position
@@ -165,6 +181,20 @@ final class CBv2MTPDepthController {
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
         var roundsSinceProbe = 0
+        /// Request-probe mode: one round's measured cost by depth (a window's
+        /// charged time over its charged rounds), kept across requests.
+        var roundCosts: [Int: CostState] = [:]
+        /// Request-probe mode: this request's opening probe is still due.
+        var probeDue = true
+        /// Request-probe mode: ordinary decode re-probes after `plainGapTokens`
+        /// tokens; each return to ordinary decode takes that gap from the
+        /// back-off, `nextPlainGapTokens`.
+        var plainTokensSinceProbe = 0
+        var plainGapTokens = CBv2MTPDepthController.probeBaseIntervalTokens
+        var nextPlainGapTokens = CBv2MTPDepthController.probeBaseIntervalTokens
+        /// Request-probe mode: the deepest depth the last selection's plan
+        /// could run (the driver's automatic verification envelope).
+        var depthCeiling: Int?
     }
 
     let maxDepth: Int
@@ -172,7 +202,13 @@ final class CBv2MTPDepthController {
     /// Fixed depth by planned decode rows (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`).
     let fixedDepthByDecodeRows: [Int]?
     let usesCommittedDecodeBaseline: Bool
+    /// `CBv2MTPConfig.requestProbeDepth`, in committed-baseline adaptive mode only.
+    let requestProbeDepth: Int?
     private var buckets: [Int: BucketState] = [:]
+    /// Request-probe mode: completed probe windows by outcome since the
+    /// engine started: `won` (a depth beat ordinary decode), `lost` (ordinary
+    /// decode followed) and `measuring` (an unmeasured depth runs next).
+    private(set) var probeOutcomes: [String: Int] = [:]
     private struct VerificationShape: Hashable {
         let rowCount: Int
         let depth: Int
@@ -185,7 +221,7 @@ final class CBv2MTPDepthController {
 
     init(
         maxDepth: Int, fixedDepth: Int?, fixedDepthByDecodeRows: [Int]? = nil,
-        useCommittedDecodeBaseline: Bool = false
+        useCommittedDecodeBaseline: Bool = false, requestProbeDepth: Int? = nil
     ) {
         let resolvedMax = min(max(maxDepth, 0), CBv2MTPConfig.testedMaxDraftTokens)
         self.maxDepth = resolvedMax
@@ -196,6 +232,33 @@ final class CBv2MTPDepthController {
             ? nil : fixedDepthByDecodeRows
         self.fixedDepthByDecodeRows = table.map { $0.map { min(max($0, 0), resolvedMax) } }
         self.usesCommittedDecodeBaseline = useCommittedDecodeBaseline && fixedDepth == nil
+        self.requestProbeDepth =
+            self.usesCommittedDecodeBaseline && resolvedMax > 0
+            ? requestProbeDepth.map { min(max($0, 1), resolvedMax) } : nil
+    }
+
+    /// A bucket's empty state; request-probe mode trusts acceptance sooner
+    /// and averages its first observations.
+    private func freshBucket() -> BucketState {
+        var state = BucketState()
+        if requestProbeDepth != nil {
+            state.acceptance.minimumSamples = Self.probeTrustedSamples
+            state.acceptance.averagesFirstSamples = true
+        }
+        return state
+    }
+
+    /// What survives a request generation: the isolated depth-zero warmup,
+    /// and in request-probe mode every depth's measured cost (a property of
+    /// this engine, not of the request).
+    private func survivingState(_ previous: BucketState) -> BucketState {
+        var fresh = freshBucket()
+        fresh.costs[0] = previous.costs[0]
+        if requestProbeDepth != nil {
+            fresh.costs = previous.costs
+            fresh.roundCosts = previous.roundCosts
+        }
+        return fresh
     }
 
     static func decodeRowBucket(_ rows: Int) -> Int {
@@ -205,12 +268,23 @@ final class CBv2MTPDepthController {
         return bucket
     }
 
-    func preview(plannedDecodeRows: Int, canSpeculate: Bool) -> CBv2MTPDepthDecision {
-        decide(plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate, mutate: false)
+    /// `depthCeiling` is the deepest depth the plan can run (the driver's
+    /// automatic verification envelope). Request-probe mode probes, measures
+    /// and chooses only depths within it; the incremental mode ignores it.
+    func preview(
+        plannedDecodeRows: Int, canSpeculate: Bool, depthCeiling: Int? = nil
+    ) -> CBv2MTPDepthDecision {
+        decide(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate,
+            depthCeiling: depthCeiling, mutate: false)
     }
 
-    func select(plannedDecodeRows: Int, canSpeculate: Bool) -> CBv2MTPDepthDecision {
-        decide(plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate, mutate: true)
+    func select(
+        plannedDecodeRows: Int, canSpeculate: Bool, depthCeiling: Int? = nil
+    ) -> CBv2MTPDepthDecision {
+        decide(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate,
+            depthCeiling: depthCeiling, mutate: true)
     }
 
     /// Request membership changes require a fresh ordinary baseline and fresh
@@ -220,10 +294,7 @@ final class CBv2MTPDepthController {
         workloadRows = rowIDs
         let bucket = Self.decodeRowBucket(rowIDs.count)
         guard bucket > 0 else { return }
-        let previous = buckets[bucket] ?? BucketState()
-        var fresh = BucketState()
-        fresh.costs[0] = previous.costs[0]
-        buckets[bucket] = fresh
+        buckets[bucket] = survivingState(buckets[bucket] ?? freshBucket())
     }
 
     /// Finishing a request ends this workload generation even if the caller
@@ -234,9 +305,7 @@ final class CBv2MTPDepthController {
         let bucket = Self.decodeRowBucket(workloadRows.count)
         workloadRows.removeAll(keepingCapacity: true)
         guard bucket > 0 else { return }
-        var fresh = BucketState()
-        fresh.costs[0] = buckets[bucket]?.costs[0]
-        buckets[bucket] = fresh
+        buckets[bucket] = survivingState(buckets[bucket] ?? freshBucket())
     }
 
     /// Invalid/cohort-changing work cannot extend a contiguous observation.
@@ -263,7 +332,7 @@ final class CBv2MTPDepthController {
             cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
             return false
         }
-        var state = buckets[decision.decodeRowBucket] ?? BucketState()
+        var state = buckets[decision.decodeRowBucket] ?? freshBucket()
         var window =
             state.committedWindow
             ?? CBv2MTPCommittedWindow(decision: decision, rowCount: rowCount)
@@ -285,6 +354,11 @@ final class CBv2MTPDepthController {
             return false
         }
         state.committedWindow = nil
+        if requestProbeDepth != nil, window.timedRounds > 0 {
+            var round = state.roundCosts[decision.depth] ?? CostState()
+            round.observe(window.wallTimeNanos / UInt64(window.timedRounds), clampInnovation: false)
+            state.roundCosts[decision.depth] = round
+        }
         var wall = state.costs[decision.depth] ?? CostState()
         // Use identical EWMA weights for whole-window time and outputs.
         // Clamping time alone would undercharge seed transitions while
@@ -302,7 +376,7 @@ final class CBv2MTPDepthController {
 
     func observeAcceptance(decodeRowBucket: Int, drafted: Int, accepted: Int) {
         guard decodeRowBucket > 0, drafted > 0 else { return }
-        var state = buckets[decodeRowBucket] ?? BucketState()
+        var state = buckets[decodeRowBucket] ?? freshBucket()
         state.acceptance.observe(drafted: drafted, accepted: accepted)
         buckets[decodeRowBucket] = state
     }
@@ -311,7 +385,7 @@ final class CBv2MTPDepthController {
         guard decodeRowBucket > 0, depth >= 0, depth <= maxDepth, wallTimeNanos > 0 else {
             return
         }
-        var state = buckets[decodeRowBucket] ?? BucketState()
+        var state = buckets[decodeRowBucket] ?? freshBucket()
         var cost = state.costs[depth] ?? CostState()
         cost.observe(wallTimeNanos)
         state.costs[depth] = cost
@@ -323,7 +397,7 @@ final class CBv2MTPDepthController {
     /// never a chained step's overlapping launch-to-finalize latency.
     func observeCommittedDecodeInterval(decodeRowBucket: Int, wallTimeNanos: UInt64) {
         guard usesCommittedDecodeBaseline, decodeRowBucket > 0, wallTimeNanos > 0 else { return }
-        var state = buckets[decodeRowBucket] ?? BucketState()
+        var state = buckets[decodeRowBucket] ?? freshBucket()
         state.committedBaseline.observe(wallTimeNanos)
         buckets[decodeRowBucket] = state
     }
@@ -364,7 +438,7 @@ final class CBv2MTPDepthController {
         } else {
             guard finalizedPlainWork else { return false }
             if chained {
-                var state = buckets[decision.decodeRowBucket] ?? BucketState()
+                var state = buckets[decision.decodeRowBucket] ?? freshBucket()
                 // A warmup baseline must be measured non-chained. Once it
                 // exists, completed chained target work may drive the bounded
                 // exploration cadence without polluting the cost curve.
@@ -376,7 +450,7 @@ final class CBv2MTPDepthController {
             guard costEligible, wallTimeNanos > 0 else { return false }
         }
 
-        var state = buckets[decision.decodeRowBucket] ?? BucketState()
+        var state = buckets[decision.decodeRowBucket] ?? freshBucket()
         var cost = state.costs[actualDepth] ?? CostState()
         cost.observe(wallTimeNanos)
         state.costs[actualDepth] = cost
@@ -420,7 +494,7 @@ final class CBv2MTPDepthController {
     }
 
     private func decide(
-        plannedDecodeRows: Int, canSpeculate: Bool, mutate: Bool
+        plannedDecodeRows: Int, canSpeculate: Bool, depthCeiling: Int?, mutate: Bool
     ) -> CBv2MTPDepthDecision {
         let bucket = Self.decodeRowBucket(plannedDecodeRows)
         guard bucket > 0 else {
@@ -450,8 +524,15 @@ final class CBv2MTPDepthController {
                 mutate: mutate)
         }
 
-        let state = buckets[bucket] ?? BucketState()
-        let limit = min(maxDepth, state.acceptance.frontier + 1)
+        let state = buckets[bucket] ?? freshBucket()
+        let ceiling = min(maxDepth, max(0, depthCeiling ?? maxDepth))
+        if requestProbeDepth != nil, mutate {
+            buckets[bucket, default: freshBucket()].depthCeiling = ceiling
+        }
+        // Request-probe mode runs depths past the acceptance frontier; clamping
+        // its open window to the frontier would change the depth and discard it.
+        let limit =
+            requestProbeDepth != nil ? ceiling : min(maxDepth, state.acceptance.frontier + 1)
         let decision: CBv2MTPDepthDecision
 
         if state.costs[0] == nil {
@@ -471,6 +552,8 @@ final class CBv2MTPDepthController {
                 depth: min(window.decision.depth, limit), decodeRowBucket: bucket,
                 reason: window.decision.isExploration ? "explore_window" : "goodput_window",
                 isExploration: window.decision.isExploration)
+        } else if let probe = requestProbeDepth {
+            decision = probeDecision(probe: probe, bucket: bucket, state: state, ceiling: ceiling)
         } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
@@ -520,10 +603,115 @@ final class CBv2MTPDepthController {
         return finish(decision, mutate: mutate)
     }
 
+    /// Request-probe mode, once the depth-zero baselines exist and no window
+    /// is open: the request's opening probe, a backed-off re-probe from
+    /// ordinary decode, or the depth the last completed window chose, all
+    /// within the plan's ceiling. A plan the envelope keeps at depth zero
+    /// decodes ordinarily (`automatic_envelope_plain`, distinct from the
+    /// driver's `automatic_rectangular_limit` clamp) without touching the
+    /// probe schedule.
+    private func probeDecision(
+        probe: Int, bucket: Int, state: BucketState, ceiling: Int
+    ) -> CBv2MTPDepthDecision {
+        guard ceiling > 0 else {
+            return CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: bucket, reason: "automatic_envelope_plain",
+                isExploration: false)
+        }
+        if state.probeDue
+            || (state.activeDepth == 0 && state.plainTokensSinceProbe >= state.plainGapTokens)
+        {
+            return CBv2MTPDepthDecision(
+                depth: min(probe, ceiling), decodeRowBucket: bucket, reason: "probe",
+                isExploration: true)
+        }
+        return CBv2MTPDepthDecision(
+            depth: min(state.activeDepth, ceiling), decodeRowBucket: bucket,
+            reason: state.activeDepth == 0 ? "unprofitable" : "goodput", isExploration: false)
+    }
+
+    /// Request-probe mode, after a completed window: the depth with the highest
+    /// expected goodput, the request's expected committed tokens per round
+    /// (positions beyond the trusted ones take the last trusted rate) over this
+    /// engine's measured round cost. Another depth must beat the current one
+    /// (ordinary decode after a probe) by the hysteresis. A depth whose round
+    /// cost was never measured comes first, for one window (`measuring`).
+    /// Only depths within the plan's ceiling are measured or chosen.
+    private func depthAfterWindow(state: BucketState) -> (depth: Int, measuring: Bool) {
+        let ceiling = min(maxDepth, state.depthCeiling ?? maxDepth)
+        guard ceiling > 0, state.acceptance.frontier > 0,
+            let plain = effectiveCost(depth: 0, state: state), plain.ewmaNanos > 0
+        else { return (0, false) }
+        func goodput(_ depth: Int) -> Double? {
+            if depth == 0 { return 1 / plain.ewmaNanos }
+            guard let round = state.roundCosts[depth], round.ewmaNanos > 0 else { return nil }
+            return state.acceptance.expectedCommitted(depth: depth) / round.ewmaNanos
+        }
+        if let unmeasured = (1 ... ceiling).first(where: { goodput($0) == nil }) {
+            return (unmeasured, true)
+        }
+        let current = min(state.activeDepth, ceiling)
+        let currentGoodput = goodput(current) ?? 0
+        var best = current
+        var bestGoodput = currentGoodput
+        for depth in 0 ... ceiling {
+            if let candidate = goodput(depth), candidate > bestGoodput {
+                best = depth
+                bestGoodput = candidate
+            }
+        }
+        if best != current, bestGoodput < currentGoodput * (1 + Self.hysteresisFraction) {
+            return (current, false)
+        }
+        return (best, false)
+    }
+
+    /// Request-probe mode, for a decision `probeDecision` made: an ordinary
+    /// step counts toward the next probe, and a completed window moves to the
+    /// depth `depthAfterWindow` picks and updates the back-off.
+    private func completeProbeDecision(
+        _ decision: CBv2MTPDepthDecision, state: inout BucketState
+    ) {
+        guard decision.depth > 0 else {
+            state.plainTokensSinceProbe += 1
+            return
+        }
+        let wasProbe = decision.reason == "probe"
+        let (next, measuring) = depthAfterWindow(state: state)
+        if wasProbe {
+            let outcome = next == 0 ? "lost" : measuring ? "measuring" : "won"
+            probeOutcomes[outcome, default: 0] += 1
+        }
+        state.activeDepth = next
+        if wasProbe { state.probeDue = false }
+        if next == 0 {
+            // Ordinary decode for the current gap; a losing probe doubles the next one.
+            state.plainTokensSinceProbe = 0
+            state.plainGapTokens = state.nextPlainGapTokens
+            if wasProbe {
+                state.nextPlainGapTokens = min(
+                    state.nextPlainGapTokens * 2, Self.probeMaxIntervalTokens)
+            }
+        } else if wasProbe, !measuring {
+            // A winning probe resets the back-off; one that only measures a depth does not.
+            state.nextPlainGapTokens = Self.probeBaseIntervalTokens
+        }
+    }
+
     private func complete(
         _ decision: CBv2MTPDepthDecision,
         state: inout BucketState
     ) {
+        if requestProbeDepth != nil {
+            // Only `probeDecision`'s decisions move the probe schedule; warmup,
+            // driver clamps and tail clamps leave it as it was.
+            if decision.reason == "probe" || decision.reason == "goodput"
+                || decision.reason == "unprofitable"
+            {
+                completeProbeDecision(decision, state: &state)
+            }
+            return
+        }
         if decision.isExploration {
             state.roundsSinceProbe = 0
             if decision.reason == "explore_deeper" {
