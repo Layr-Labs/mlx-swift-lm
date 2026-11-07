@@ -462,7 +462,8 @@ final class CBv2InFlightStep {
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
             donation: CBv2DonationIntent?, recurrent: CBv2RecurrentRequestState?,
             hybridPublication: CBv2DonationIntent?,
-            ownership: CBv2OutputStream?, terminalDelivery: (() -> Void)?
+            ownership: CBv2OutputStream?, terminalDelivery: (() -> Void)?,
+            terminalPrecedesPublication: Bool
         )] = []
     /// One recurrent transaction per participating row. A normal finalized
     /// step commits it; a one-step-late discarded chained decode rolls it
@@ -3094,7 +3095,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                             id: id, state: state, rollbackOne: false, donation: nil,
                             recurrent: recurrentStates.removeValue(forKey: id),
                             hybridPublication: nil,
-                            ownership: nil, terminalDelivery: nil
+                            ownership: nil, terminalDelivery: nil,
+                            terminalPrecedesPublication: false
                         ))
                 } else {
                     backend.release(state)
@@ -5403,7 +5405,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // the prefix cache when eligible, else release).
         for (
             id, state, rollbackOne, donation, recurrent, hybridPublication, ownership,
-            terminalDelivery
+            terminalDelivery, terminalPrecedesPublication
         ) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
@@ -5413,9 +5415,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                 nativeRequestID: id,
                 afterPublication: { [self] in
                     finishAfterCompletePrefixPublication(
-                        id, ownership: ownership, terminal: terminalDelivery)
+                        id, ownership: ownership,
+                        terminal: terminalPrecedesPublication ? nil : terminalDelivery)
                 })
             releaseRecurrentState(recurrent)
+            if publicationDeferred, terminalPrecedesPublication {
+                terminalDelivery?()
+            }
             if !publicationDeferred {
                 if nativeShutdownState != nil, let ownership {
                     retireStream(
@@ -5721,6 +5727,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var ownershipReleaseDeferred = false
+        // Only the consumer terminal moves; ownership still waits for publication.
+        let terminalPrecedesPublication =
+            rec.request.terminalPrecedesCheckpointPublication && nativeShutdownState == nil
+        let publishedTerminal: (() -> Void)? = terminalPrecedesPublication ? nil : terminalDelivery
         if hybridPublication == nil { discardHybridCheckpoints(id) }
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
@@ -5737,7 +5747,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                         recurrent: recurrentStates.removeValue(forKey: id),
                         hybridPublication: hybridPublication,
                         ownership: stream,
-                        terminalDelivery: terminalDelivery
+                        terminalDelivery: terminalDelivery,
+                        terminalPrecedesPublication: terminalPrecedesPublication
                     ))
                 ownershipReleaseDeferred = true
             } else {
@@ -5746,9 +5757,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     nativeRequestID: id,
                     afterPublication: { [self] in
                         finishAfterCompletePrefixPublication(
-                            id, ownership: stream, terminal: terminalDelivery)
+                            id, ownership: stream, terminal: publishedTerminal)
                     })
                 releaseRecurrentState(recurrentStates.removeValue(forKey: id))
+                if ownershipReleaseDeferred, terminalPrecedesPublication { terminalDelivery() }
             }
         } else {
             releaseRecurrentState(recurrentStates.removeValue(forKey: id))
@@ -5758,8 +5770,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     nativeRequestID: id,
                     afterPublication: { [self] in
                         finishAfterCompletePrefixPublication(
-                            id, ownership: stream, terminal: terminalDelivery)
+                            id, ownership: stream, terminal: publishedTerminal)
                     })
+                if ownershipReleaseDeferred, terminalPrecedesPublication { terminalDelivery() }
             }
         }
 

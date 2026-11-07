@@ -328,3 +328,14 @@ scheduler, request KV and backend ownership have been released; zero-work
 submissions acknowledge immediately. Native-managed engines retain their native
 work-admission checks. This request acknowledgement does not replace the separate
 native shutdown or physical-memory-release contract.
+
+By default a donor's terminal follows its complete-checkpoint publication, so a
+client waits for the durable write. A request submitted through
+`submitWithRetirement(_:)` or first-token deadline admission may set
+`CBv2Request.terminalPrecedesCheckpointPublication`: the terminal is delivered as
+soon as the answer is complete, while rows, reservations and the request ID stay
+owned until publication finishes and the retirement acknowledgement completes.
+Cancellation and store failures after that terminal release ownership once, at
+retirement. A request with the same prefix that arrives before publication finds
+nothing to restore and computes its prompt in full. Plain `submit(_:)` and the
+native complete-prefix path ignore the flag.
