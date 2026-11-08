@@ -147,7 +147,7 @@ extension KernelTests {
                 },
                 arrays: { [$0.logits, $0.lastHidden] })
             #expect(narrowed.logits.shape == [1, 1, Self.vocabularySize], "\(label)")
-            // Same trunk call on the same data: the history is exact.
+            // The same trunk values on the same data: the history is exact.
             #expect(Self.difference(narrowed.lastHidden, reference.lastHidden) == 0, "\(label)")
             // Same operations as the prompt path without MTP: exact.
             #expect(

@@ -2928,11 +2928,13 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
 /// engine falls back to `cbv2ForwardWithHidden`, which scores every position
 /// with the 248,320-way head and then discards all rows but one.
 ///
-/// The trunk call is the one `cbv2ForwardWithHidden` makes, so every K/V
-/// write, every recurrent stage and the returned hidden history are the same
-/// arrays. The surviving logits row is computed as `cbv2RecurrentPrefill`
-/// computes it with MTP off (final RMSNorm and the head are row-independent,
-/// so norm-and-project after the slice equals the slice after them).
+/// The trunk is the `cbv2Forward` call that `cbv2RecurrentPrefill` makes. It
+/// computes the values `cbv2ForwardWithHidden` computes, with or without that
+/// entry's residual-norm fusion, so every K/V write, every recurrent stage and
+/// the returned hidden history are the same. The surviving logits row is
+/// computed as `cbv2RecurrentPrefill` computes it with MTP off (final RMSNorm
+/// and the head are row-independent, so norm-and-project after the slice
+/// equals the slice after them).
 extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
     public func cbv2ForwardWithHiddenForPrefill(
         _ tokens: MLXArray, caches: [KVCache],
