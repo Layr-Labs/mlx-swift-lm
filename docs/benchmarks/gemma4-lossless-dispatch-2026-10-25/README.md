@@ -1,30 +1,35 @@
 # Gemma 4 dispatch overhead: initial endpoint screen
 
-The combined dense GeGLU reuse and scoped command-buffer limits improved the
-8K-context, single-request HTTP decode proxy by 3.45% and 3.90% in the two
-orderings of an A/B/B/A screen. This is an initial result on one M5 Max, not a
-200–300 token/s result or evidence of a prefill or multi-device gain.
+The screen below measured a branch with two changes: the dense GeGLU reuse and
+scoped command-buffer limits. Together they improved the 8K-context,
+single-request HTTP decode proxy by 3.45% and 3.90% in the two orderings of an
+A/B/B/A screen. This is an initial result on one M5 Max, not a 200–300 token/s
+result or evidence of a prefill or multi-device gain.
+
+Only the GeGLU change remains. The 2026-11-08 rebase onto `67110e7b` dropped the
+scoped limits (see Change). The GeGLU change alone has not been measured.
 
 ## Change
 
 `Gemma4MLP` reuses the existing compiled GeGLU product for matching GPU
 FP16/BF16/FP32 inputs. Mixed dtypes, CPU execution and disabled compiled decode
 retain the prior expression. The shared implementation retains the intermediate
-dtype before the final multiplication.
+dtype before the final multiplication. Four existing DocC references in other
+files are repaired; no executable code changed in them.
 
-The production Gemma 4 MoE geometry with global affine4/group64 quantization
-supplies the existing CBv2 command-buffer scope with 100 operations and input size 512
-thresholds. The second field's Swift API name is `megabytes`, but the current
-backend counts millions of distinct input elements. These are commit heuristics,
-not memory caps. The engine's existing width, admission and pressure checks remain
-in effect. Kernel arithmetic, data dependencies and synchronization correctness are
-preserved; command-buffer submission boundaries change.
+The measured branch also gave the production Gemma 4 MoE configuration
+(affine4/group64) scoped CBv2 command-buffer limits: 100 operations and an input
+size of 512 for plain decode steps and MTP rounds. The rebase dropped them.
+`main` already commits Gemma 4's plain decode steps every 100 operations with no
+input bound (`Gemma4DecodeCommandBuffers.swift`, from #376), and keeps MLX's
+defaults for prefill chunks and MTP rounds.
 
-The measured artifact contains both changes. This screen does not attribute the
-whole gain to either one individually. Larger compiled FFN regions, staged NAX
-gathers and compact kernel metadata are separate experiments and are absent here.
+Larger compiled FFN regions, staged NAX gathers and compact kernel metadata are
+separate experiments and are absent here.
 
 ## Endpoint measurements
+
+These results are for the two-change branch, before the rebase.
 
 | Ordering | Baseline decode proxy | Candidate decode proxy | Median paired ratio |
 |---|---:|---:|---:|
@@ -57,31 +62,35 @@ this is not a matched warm memory-regression estimate. MLX allocator peak was no
 
 ## Correctness and remaining qualification
 
-The combined focused suite passed 14 tests with zero failures or skips. It covers
-exhaustive finite 16-bit GeGLU inputs, special values, actual dense widths,
-strides, CPU/mixed-type and compile-off fallbacks, gradients and nested compiled
-calls, configuration eligibility, scope restoration, thread isolation, and
-byte-identical asynchronous graphs under different command-buffer partitions.
-The GeGLU suite separately passed with compiled decode disabled.
-The same signed candidate also passed all 12 endpoint capability smokes with
-exact baseline output and completion-usage parity, covering reasoning, tools,
-structured JSON, images, videos and text requests interleaved with media.
+Six tests cover this change, in
+`Tests/MLXLMTests/Kernel/Models/Gemma4GeluProductTests.swift`: exhaustive finite
+16-bit gate values, special values, actual dense widths and strides, CPU,
+mixed-dtype and compile-off fallbacks, gradients and nested compiled calls, and
+a graph check that the separate multiply is gone. CI runs all six.
 
-The thread-isolation test emitted a QoS wait warning. It did not fail; this
-fixture warning is preserved in the local test receipt. Tests ran with
-Swift 6.4/Xcode 27, while repository CI selects Xcode 26. Changed files are unchanged
-by the locally available formatter. Xcode 26 CI passed at revision
-`a7cf16a1720ed063bde806edcc1f56039950d80a`. The local DocC check now covers all
-11 required library targets with warnings as errors: eight passed initially,
-and three passed after four existing unresolved references were repaired in
-documentation comments. No executable code changed in those repairs.
+Before the rebase, the focused suite had 14 tests: these six, and eight tests of
+the dropped limits (configuration eligibility, scope restoration, thread
+isolation and byte-identical asynchronous graphs under different command-buffer
+partitions). All 14 passed with zero failures or skips, and the GeGLU suite
+also passed with compiled decode disabled. The measured candidate passed all 12
+endpoint capability smokes with exact baseline output and completion-usage
+parity, covering reasoning, tools, structured JSON, images, videos and text
+requests interleaved with media.
+
+Tests ran with Swift 6.4/Xcode 27, while repository CI selects Xcode 26. Changed
+files are unchanged by the locally available formatter. Xcode 26 CI passed at
+revision `a7cf16a1720ed063bde806edcc1f56039950d80a` before the rebase and at
+`1aace467` after it. The local DocC check covers all 11 required library targets
+with warnings as errors: eight passed initially, and three passed after four
+existing unresolved references were repaired in documentation comments. No
+executable code changed in those repairs.
 
 The dedicated post-test refactor review found no further change warranted.
 The source changes preserve model parameter names, quantization, loaders,
 adapters, attention, prefix caching and SSD policy. The shared text tower serves
-text and VLM callers. Downstream clustering integration requires merging the
-shared-layer change with its stage-specific projection policies and separately
-qualifying command-buffer integration; updating its SDK pin alone is insufficient.
-Clustering and non-M5 performance remain unmeasured. Broader concurrency,
-sustained load and longer histories remain required before generalizing this
-small screen.
+text and VLM callers. Cluster ranks run the same `Gemma4MLP`: pipeline stages
+through `Gemma4DecoderLayer`, tensor-parallel ranks through
+`tensorParallelPartial`. An SDK pin alone therefore gives them the shared
+product, which is elementwise and keeps their bits. Clustering and non-M5
+performance remain unmeasured. Broader concurrency, sustained load and longer
+histories remain required before generalizing this small screen.
