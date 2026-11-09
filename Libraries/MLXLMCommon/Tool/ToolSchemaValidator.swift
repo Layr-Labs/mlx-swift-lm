@@ -185,13 +185,25 @@ package enum ToolSchemaValidator {
             assessment.containsUnknown = true
         }
 
+        // OpenAPI 3.0 `nullable: true` adds null to this node's declared type.
+        // It lifts only the type check; every other assertion still applies.
+        var admitsNull = false
+        switch booleanKeyword(schema["nullable"]) {
+        case .absent, .value(false):
+            break
+        case .malformed:
+            assessment.containsUnknown = true
+        case .value(true):
+            admitsNull = value == .null
+        }
+
         switch declaredTypes(schema["type"]) {
         case .absent:
             break
         case .malformed:
             assessment.containsUnknown = true
         case .value(let types):
-            guard types.contains(where: { matchesType(value, $0) }) else {
+            guard admitsNull || types.contains(where: { matchesType(value, $0) }) else {
                 return .invalid([
                     Violation(path: path, requirement: typeRequirement(types))
                 ])
@@ -645,7 +657,7 @@ package enum ToolSchemaValidator {
         "type", "properties", "required", "additionalProperties", "items",
         "minItems", "maxItems", "uniqueItems", "minLength", "maxLength",
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "enum",
-        "const", "anyOf", "oneOf", "allOf",
+        "const", "anyOf", "oneOf", "allOf", "nullable",
     ]
 
     /// Keywords that carry annotations or reusable schema definitions but do

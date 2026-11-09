@@ -213,6 +213,10 @@ as `pattern` or `$ref` makes the result uncertain and cannot reject a call on
 its own. A tool without a `parameters` schema accepts all arguments. Without
 tool declarations, all parsed calls pass.
 
+The package also reads the OpenAPI 3.0 `nullable` marker. A Boolean `true`
+beside an explicit `type` lets that node accept `null`. Every other keyword on
+the node still applies.
+
 ## Format Resolution
 
 When a model is loaded, the factories resolve the format in this order:
