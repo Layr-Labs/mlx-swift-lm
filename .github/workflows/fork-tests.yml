@@ -13,11 +13,9 @@ name: Fork Tests
 # test runs exactly once.
 #
 # On a pull request the macOS jobs run on a Darkbloom Sandbox when the route
-# job gets one from the Darkbloom plane, else on the GitHub-hosted xcode-27
-# image. Other runs save the caches that pull requests restore, so they stay
-# on xcode-27 and do not ask the plane. The fallback is not Blacksmith: its
-# macOS cache refuses this repository ("Default branch not found"), and the
-# test jobs restore the build from the cache.
+# job gets one from the Darkbloom plane, else on blacksmith-12vcpu-macos-27.
+# Other runs save the caches that pull requests restore, so they stay on the
+# GitHub-hosted xcode-27 image and do not ask the plane.
 
 on:
   pull_request:
@@ -66,20 +64,19 @@ jobs:
   # Chooses the runner of the macOS jobs. They hand the build and the Metal
   # library to each other through the Actions cache, and the cache of a
   # Darkbloom job is not the cache of a fallback runner. So the jobs share one
-  # lane, which the plane grants whole or not at all. Only pull requests ask:
-  # other runs have count 0, which keeps the fallback.
+  # lane, which the plane grants whole or not at all. Only pull requests ask.
   route:
     needs: plan
     uses: ./.github/workflows/darkbloom-route.yml
     permissions: {}
     with:
       lanes: |
-        fork-tests macos_arm64 xcode-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
+        fork-tests macos_arm64 blacksmith-12vcpu-macos-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
 
   build:
     name: Build
     needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
     permissions:
       contents: read
     timeout-minutes: 90
@@ -116,7 +113,7 @@ jobs:
         # the same Xcode, and the build then recompiles only what changed.
         # The test jobs restore the entry that this job saves.
         id: cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -129,7 +126,7 @@ jobs:
 
       - name: Restore the C and C++ compiler cache
         id: ccache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
           key: fork-ccache-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ github.sha }}
@@ -212,7 +209,7 @@ jobs:
         # The test jobs and the next build restore this entry. An exact hit
         # means that the entry already exists.
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -222,7 +219,7 @@ jobs:
 
       - name: Save the C and C++ compiler cache
         if: ${{ steps.ccache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
           key: ${{ steps.ccache.outputs.cache-primary-key }}
@@ -230,7 +227,7 @@ jobs:
   metallib:
     name: Metal library
     needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
     permissions:
       contents: read
     timeout-minutes: 30
@@ -258,7 +255,7 @@ jobs:
         # The library changes only when the mlx-swift pin, the Xcode or the
         # build script changes.
         id: cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
           key: fork-metallib-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ steps.pin.outputs.revision }}-${{ hashFiles('scripts/build-metallib.sh') }}
@@ -284,7 +281,7 @@ jobs:
 
       - name: Save the Metal library
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
           key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -312,7 +309,7 @@ jobs:
   test:
     name: Test shard ${{ matrix.shard }}
     needs: [plan, route, build, metallib]
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
     permissions:
       contents: read
     timeout-minutes: 45
@@ -327,7 +324,7 @@ jobs:
         uses: ./.github/actions/select-xcode
 
       - name: Restore the build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -340,7 +337,7 @@ jobs:
         run: cp .build/fork-tests-Package.resolved Package.resolved
 
       - name: Restore the Metal library
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
           key: ${{ needs.metallib.outputs.cache-key }}
@@ -424,7 +421,7 @@ jobs:
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
     permissions:
       contents: read
     timeout-minutes: 30
@@ -435,7 +432,7 @@ jobs:
         uses: ./.github/actions/select-xcode
 
       - name: Restore the build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
