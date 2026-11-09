@@ -6,6 +6,7 @@ import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXVLM
 
 extension KernelTests {
 
@@ -49,6 +50,38 @@ extension KernelTests {
             if quantized {
                 quantize(model: model, groupSize: 32, bits: 4)
             }
+            eval(model)
+            return model
+        }
+
+        /// MLXVLM's `PrismHadamardQwen35`, which serves Bonsai 2 9B with MTP:
+        /// the dense layers above under Prism's dtypes, FP16 embedding rows
+        /// with FP32 norms and projections. The first residual sum promotes the
+        /// stream to FP32. The packed weights are not loaded.
+        static func makePrismModel() throws -> MLXVLM.PrismHadamardQwen35 {
+            var configuration = PrismHadamardQwen35VisionKernelTests.configuration(
+                outHiddenSize: hiddenSize)
+            configuration["text_config"] = [
+                "model_type": "qwen3_5_text", "hidden_size": hiddenSize, "num_hidden_layers": 4,
+                "intermediate_size": 128, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 64, "linear_num_value_heads": 1, "linear_num_key_heads": 1,
+                "linear_key_head_dim": 64, "linear_value_head_dim": 64,
+                "linear_conv_kernel_dim": 4, "full_attention_interval": 2,
+                "vocab_size": vocabularySize, "num_experts": 0, "num_experts_per_tok": 0,
+                "mtp_num_hidden_layers": 0,
+            ]
+            MLXRandom.seed(7029)
+            let model = try MLXVLM.PrismHadamardQwen35(
+                configurationData: JSONSerialization.data(withJSONObject: configuration))
+            model.update(
+                parameters: ModuleParameters.unflattened(
+                    model.parameters().flattened().map { name, value in
+                        (
+                            name,
+                            name == "language_model.model.embed_tokens.weight"
+                                ? value.asType(.float16) : value
+                        )
+                    }))
             eval(model)
             return model
         }
@@ -213,13 +246,79 @@ extension KernelTests {
             #expect(output.lastHidden.shape == [1, Self.prompt.count, Self.hiddenSize])
         }
 
-        /// The provider serves the dense, MoE and Prism Hadamard checkpoints
-        /// through `Qwen35Model` and its subclasses.
+        /// Bonsai 2 9B runs MTP through MLXVLM's wrapper. The adapter must take
+        /// the wrapper's prompt entry, and the entry must keep the history, K/V
+        /// and recurrent state and give the MTP-off prompt's logits row.
+        @Test func prismWrapperTakesThePrefillEntry() throws {
+            let model = try Self.makePrismModel()
+            try #require(model.languageModel.model.embedTokens.weight.dtype == .float16)
+            let adapter = CBv2SteppableLanguageModelAdapter(model)
+            let input = Self.tokens(Self.prompt)
+            let length = Self.prompt.count
+
+            let full = try Request(model.languageModel, promptLength: length)
+            let reference = try full.commit(
+                {
+                    model.cbv2ForwardWithHidden(
+                        input, caches: $0, recurrentState: [$1], positionIds: nil)
+                },
+                arrays: { [$0.logits, $0.lastHidden] })
+            let plain = try Request(model.languageModel, promptLength: length)
+            let plainLast = try plain.commit(
+                {
+                    model.cbv2RecurrentPrefill(
+                        input, inputEmbedding: nil, cache: $0, recurrentState: [$1],
+                        positionIds: nil, requirement: .lastPositionLogits)
+                },
+                arrays: { [$0] })
+
+            let next = Self.tokens([7])
+            func step(_ request: Request) throws -> (logits: MLXArray, lastHidden: MLXArray) {
+                try request.commit(
+                    {
+                        model.cbv2ForwardWithHidden(
+                            next, caches: $0, recurrentState: [$1], positionIds: nil)
+                    },
+                    arrays: { [$0.logits, $0.lastHidden] })
+            }
+            let expected = try step(full)
+            for requirement in [CBv2PrefillRequirement.lastPositionLogits, .evaluationOnly] {
+                let label = "\(requirement)"
+                let request = try Request(model.languageModel, promptLength: length)
+                let output = try request.commit(
+                    { caches, state in
+                        adapter.forwardWithHiddenForPrefill(
+                            tokens: input,
+                            caches: caches.map { $0 as! any CBv2AttendingLayerCache },
+                            recurrentState: [state], positionIds: nil, requirement: requirement)
+                    },
+                    arrays: { [$0.logits, $0.lastHidden] })
+                #expect(
+                    Self.difference(output.lastHidden, reference.lastHidden) == 0, "\(label)")
+                if requirement == .lastPositionLogits {
+                    #expect(output.logits.shape == [1, 1, Self.vocabularySize], "\(label)")
+                    #expect(
+                        Self.difference(output.logits[0..., -1, 0...], plainLast) == 0, "\(label)")
+                } else {
+                    #expect(output.logits.shape == [1, 1, 1], "\(label)")
+                }
+                let actual = try step(request)
+                #expect(Self.difference(actual.logits, expected.logits) == 0, "\(label)")
+                #expect(Self.difference(actual.lastHidden, expected.lastHidden) == 0, "\(label)")
+            }
+        }
+
+        /// The provider serves the dense and MoE checkpoints through
+        /// `Qwen35Model` and its subclasses, and Bonsai 2 9B through MLXVLM's
+        /// `PrismHadamardQwen35`. The 27B text factory never runs MTP.
         @Test func wrappersConform() {
             #expect((Qwen35Model.self as Any) is any CBv2RecurrentPrefillHiddenForwardable.Type)
             #expect((Qwen35MoEModel.self as Any) is any CBv2RecurrentPrefillHiddenForwardable.Type)
             #expect(
                 (PrismHadamardQwen35TextModel.self as Any)
+                    is any CBv2RecurrentPrefillHiddenForwardable.Type)
+            #expect(
+                (MLXVLM.PrismHadamardQwen35.self as Any)
                     is any CBv2RecurrentPrefillHiddenForwardable.Type)
         }
     }
