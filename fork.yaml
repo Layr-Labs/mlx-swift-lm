@@ -249,10 +249,12 @@ def:
         whose failures carry medium `.audio`. `VideoReaderRetryTests` fails data requests of the in-memory
         resource loader partway through a clip until a reader pass fails, and ends readers partway through
         `VideoReaderRetry.nextSample`'s test hook; `AudioReaderRetryTests` and the MiMo audio tests end
-        audio readers the same way (`ReaderPassFaults.swift`).
+        audio readers the same way (`ReaderPassFaults.swift`). `CorruptClipDecoderCodesTests` decodes
+        H.264 and HEVC clips with corrupt NAL units and checks that none gives a transient code.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Tests/MLXLMTests/VideoReaderRetryTests.swift"
+        - "Tests/MLXLMTests/CorruptClipDecoderCodesTests.swift"
         - "Tests/MLXLMTests/AudioReaderRetryTests.swift"
         - "Tests/MLXLMTests/ReaderPassFaults.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
