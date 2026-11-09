@@ -6,8 +6,9 @@ name: Fork Tests
 # line coverage of the fork's sources.
 #
 # One job builds the package and its tests, and lists the tests. Another job
-# builds the full Metal library at the same time. Both put their products in
-# the Actions cache. The test jobs restore the products and run in parallel.
+# builds the full Metal library at the same time. Both hand their products to
+# the test jobs as artifacts, and keep them in the Actions cache for later
+# runs. The test jobs download the products and run in parallel.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
@@ -80,8 +81,6 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 90
-    outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -205,9 +204,23 @@ jobs:
           path: ${{ runner.temp }}/tests.txt
           retention-days: 7
 
+      - name: Pack the test products
+        # The test and coverage jobs run these products. The Actions cache
+        # cannot hand them over: Blacksmith's cache refuses this repository.
+        run: .github/scripts/test-products.sh pack "$RUNNER_TEMP/test-products/test-products.tar.zst"
+
+      - name: Upload the test products
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-products
+          path: ${{ runner.temp }}/test-products/test-products.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Save the build cache
-        # The test jobs and the next build restore this entry. An exact hit
-        # means that the entry already exists.
+        # The next build restores this entry. An exact hit means that the
+        # entry already exists.
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
@@ -231,8 +244,6 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 30
-    outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -286,6 +297,14 @@ jobs:
           path: ${{ runner.temp }}/metallib
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      - name: Upload the Metal library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metallib
+          path: ${{ runner.temp }}/metallib/mlx.metallib
+          if-no-files-found: error
+          retention-days: 1
+
   list:
     name: Check the shard map
     needs: build
@@ -323,25 +342,23 @@ jobs:
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
 
-      - name: Restore the build
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - name: Download the test products
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: ${{ needs.build.outputs.cache-key }}
-          fail-on-cache-miss: true
+          name: test-products
+          path: ${{ runner.temp }}/test-products
+
+      - name: Unpack the test products
+        run: .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Use the package versions of the build
         run: cp .build/fork-tests-Package.resolved Package.resolved
 
-      - name: Restore the Metal library
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - name: Download the Metal library
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: metallib
           path: ${{ runner.temp }}/metallib
-          key: ${{ needs.metallib.outputs.cache-key }}
-          fail-on-cache-miss: true
 
       - name: Run the shard
         # Runs each run of the shard in its own swift test process, also
@@ -431,15 +448,14 @@ jobs:
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
 
-      - name: Restore the build
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - name: Download the test products
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: ${{ needs.build.outputs.cache-key }}
-          fail-on-cache-miss: true
+          name: test-products
+          path: ${{ runner.temp }}/test-products
+
+      - name: Unpack the test products
+        run: .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Use the package versions of the build
         run: cp .build/fork-tests-Package.resolved Package.resolved
