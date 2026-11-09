@@ -6,8 +6,20 @@ permissions:
   contents: read
 
 jobs:
+  # Chooses a Darkbloom Sandbox for the lint job when the Darkbloom plane
+  # grants one, else blacksmith-12vcpu-macos-27.
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        lint macos_arm64 blacksmith-12vcpu-macos-27
+
   lint:
-    runs-on: xcode-27
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['lint'] }}
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

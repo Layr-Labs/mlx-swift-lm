@@ -1,7 +1,7 @@
 name: Fork Tests
 
-# Builds the fork and runs its self-contained Metal test suites on GitHub-hosted
-# Macs. These suites use tiny test models. They need no model weights, no
+# Builds the fork and runs its self-contained Metal test suites on Macs with
+# Xcode 27.2. These suites use tiny test models. They need no model weights, no
 # network access at test time, and no secrets. The workflow also reports the
 # line coverage of the fork's sources.
 #
@@ -11,6 +11,11 @@ name: Fork Tests
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
+#
+# On a pull request the macOS jobs run on a Darkbloom Sandbox when the route
+# job gets one from the Darkbloom plane, else on blacksmith-12vcpu-macos-27.
+# Other runs save the caches that pull requests restore, so they stay on the
+# GitHub-hosted xcode-27 image and do not ask the plane.
 
 on:
   pull_request:
@@ -40,6 +45,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
+      macos-jobs: ${{ steps.matrix.outputs.macos-jobs }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -48,11 +54,31 @@ jobs:
 
       - name: Read the shard numbers
         id: matrix
-        run: echo "shards=$(python3 .github/scripts/test_shards.py matrix)" >> "$GITHUB_OUTPUT"
+        # The macOS jobs are build, metallib, coverage and one test job per
+        # shard. The route asks for that many.
+        run: |
+          shards=$(python3 .github/scripts/test_shards.py matrix)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "macos-jobs=$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
+
+  # Chooses the runner of the macOS jobs. They hand the build and the Metal
+  # library to each other through the Actions cache, and the cache of a
+  # Darkbloom job is not the cache of a fallback runner. So the jobs share one
+  # lane, which the plane grants whole or not at all. Only pull requests ask.
+  route:
+    needs: plan
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        fork-tests macos_arm64 blacksmith-12vcpu-macos-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
 
   build:
     name: Build
-    runs-on: xcode-27
+    needs: route
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 90
     outputs:
       cache-key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -200,7 +226,10 @@ jobs:
 
   metallib:
     name: Metal library
-    runs-on: xcode-27
+    needs: route
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     outputs:
       cache-key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -275,8 +304,10 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
-    runs-on: xcode-27
+    needs: [plan, route, build, metallib]
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -382,11 +413,13 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [build, test]
+    needs: [route, build, test]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: xcode-27
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
