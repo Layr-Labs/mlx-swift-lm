@@ -5,11 +5,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
     let baseIndices: [Int]
@@ -53,9 +53,10 @@ final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
         let ids = cursor.baseIndices.map { base -> Int32 in
             let index = base + cursor.step
             let value = index < script.count ? script[index] : 0
-            let stepOffset = offsetsByStep.flatMap {
-                cursor.step < $0.count ? $0[cursor.step] : nil
-            } ?? offset
+            let stepOffset =
+                offsetsByStep.flatMap {
+                    cursor.step < $0.count ? $0[cursor.step] : nil
+                } ?? offset
             return Int32((value + stepOffset) % vocabSize)
         }
         return (MLXArray(ids), hidden)
@@ -188,16 +189,20 @@ struct CBv2MTPEngineParityTests {
         fixedDepth: Int? = nil,
         sampler: CBv2StepSampler = CBv2DefaultSampler(),
         verificationMode: CBv2MTPVerificationMode = .serialTarget,
-        maxAutomaticRectangularTokens: Int = 8
+        maxAutomaticRectangularTokens: Int = 8,
+        requestProbeDepth: Int? = nil,
+        adaptiveMaxDepth: Int? = nil
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
-        let depth = fixedDepth ?? k
+        let depth = fixedDepth ?? adaptiveMaxDepth ?? k
+        // A request-probe engine is adaptive (no fixed depth) up to `adaptiveMaxDepth ?? k`.
         let mtpConfig = CBv2MTPConfig(
             enabled: drafter != nil, maxDraftTokens: depth,
             maxSpeculativeBatch: maxSpeculativeBatch,
-            fixedDraftTokens: depth,
+            fixedDraftTokens: requestProbeDepth == nil ? depth : nil,
             verificationMode: verificationMode,
-            maxAutomaticRectangularTokens: maxAutomaticRectangularTokens)
+            maxAutomaticRectangularTokens: maxAutomaticRectangularTokens,
+            requestProbeDepth: requestProbeDepth)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target),
             layerKinds: kinds,
@@ -296,6 +301,89 @@ struct CBv2MTPEngineParityTests {
             #expect(metrics.rounds > 0)
             expectAccounting(metrics)
         }
+    }
+
+    /// The request-probe controller (Gemma QAT's adaptive depth) chooses only how many drafts a round proposes:
+    /// over several requests on one engine, greedy tokens equal target-only decode, and a sampled request takes
+    /// exactly the target-only draws for its seed (target-prefix acceptance keys each column's draw on its output
+    /// index, whatever the depth).
+    @Test func requestProbeDepthKeepsGreedyAndSampledTokens() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let engine = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture), maxSpeculativeBatch: 1,
+            maxConcurrent: 1, verificationMode: .automatic, requestProbeDepth: 2,
+            adaptiveMaxDepth: 4)
+        for (index, length) in [7, 19, 33].enumerated() {
+            let prompt = makePromptTokens(
+                length: length, seed: UInt64(300 + index), vocabSize: vocabSize)
+            let off = try await baseline(
+                fixture, prompt: prompt, maxTokens: 48, id: UInt64(10 + index))
+            let on = try await run(
+                engine, request(id: UInt64(10 + index), prompt: prompt, maxTokens: 48))
+            #expect(on.tokens == off.tokens, "prompt length \(length)")
+        }
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        #expect(metrics.rounds > 0)
+        // The probe at 2, then one measuring window each at 1, 3 and 4 (B=1, envelope 8: ceiling 4).
+        #expect(
+            Set(metrics.depthSelections.keys).isSuperset(of: [1, 2, 3, 4]),
+            "\(metrics.depthSelections)")
+        #expect(metrics.probeOutcomes["measuring", default: 0] >= 1)
+        let prompt = makePromptTokens(length: 21, seed: 0x5A, vocabSize: vocabSize)
+        var sampled = request(id: 77, prompt: prompt, maxTokens: 32)
+        sampled.sampling = CBv2SamplingParams(temperature: 0.8, topP: 0.95, topK: 16, seed: 4242)
+        let plainEngine = makeEngine(target: fixture.target, drafter: nil)
+        let plain = try await run(plainEngine, sampled)
+        await plainEngine.shutdown()
+        let speculative = try await run(engine, sampled)
+        await engine.shutdown()
+        #expect(speculative.tokens == plain.tokens)
+    }
+
+    /// Request-probe mode under the automatic verification envelope (`B * (1 + depth) <= limit`): 8 on M3-M5 with 2-4
+    /// concurrent requests, 4 on M1/M2 with 1-2. The assistant's random drafts are rejected, so ordinary decode must win
+    /// after the probe and the measuring windows, and the controller never asks for a depth the envelope refuses.
+    @Test(arguments: [(1, 4), (2, 4), (2, 8), (3, 8), (4, 8)])
+    func requestProbeReturnsToOrdinaryDecodeUnderTheEnvelope(rows: Int, envelope: Int) async throws
+    {
+        // Wide logit margins: greedy equality checks the controller, not near-ties of random weights.
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = (0 ..< rows).map { row in
+            makePromptTokens(
+                length: 11 + row * 5, seed: UInt64(500 + rows * 10 + row), vocabSize: vocabSize)
+        }
+        let maxTokens = 160
+        var expected: [CBv2SchedCollected] = []
+        for (row, prompt) in prompts.enumerated() {
+            expected.append(
+                try await baseline(
+                    fixture, prompt: prompt, maxTokens: maxTokens, id: UInt64(row + 1)))
+        }
+        let engine = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture), maxSpeculativeBatch: 4,
+            verificationMode: .automatic, maxAutomaticRectangularTokens: envelope,
+            requestProbeDepth: 2, adaptiveMaxDepth: 4)
+        let streams = try prompts.enumerated().map { row, prompt in
+            try engine.submit(request(id: UInt64(row + 1), prompt: prompt, maxTokens: maxTokens))
+        }
+        var results: [CBv2SchedCollected] = []
+        for stream in streams { results.append(await cbv2SchedCollect(stream)) }
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        for row in prompts.indices {
+            #expect(
+                results[row].tokens == expected[row].tokens,
+                "B=\(rows) envelope \(envelope) row \(row)")
+        }
+        let ceiling = envelope / rows - 1
+        #expect(metrics.rounds > 0)
+        #expect(metrics.depthSelections.keys.allSatisfy { $0 <= ceiling })
+        #expect(
+            metrics.controllerFallbacks["automatic_rectangular_limit", default: 0] == 0,
+            "the controller asked past the envelope: \(metrics.controllerFallbacks)")
+        #expect(
+            metrics.depthSelections[0, default: 0] >= maxTokens / 2,
+            "ordinary decode steps: \(metrics.depthSelections)")
     }
 
     @Test func b2AndB4RaggedBatchesMatchSoloTargetDecode() async throws {

@@ -10,6 +10,8 @@ struct CBv2MTPCommittedWindow {
     private(set) var verifiedRounds = 0
     private(set) var wallTimeNanos: UInt64 = 0
     private(set) var committedTokens = 0
+    /// Rounds whose time and outputs the window charges (all but warmup).
+    private(set) var timedRounds = 0
 
     var isComplete: Bool { verifiedRounds >= Self.maximumVerifiedRounds }
 
@@ -19,6 +21,7 @@ struct CBv2MTPCommittedWindow {
         // JIT still consumes a bounded observation slot. The driver records
         // its full elapsed time in telemetry before discarding this sample.
         guard !warmup else { return }
+        timedRounds += 1
         self.wallTimeNanos &+= wallTimeNanos
         self.committedTokens += committedTokens
     }
