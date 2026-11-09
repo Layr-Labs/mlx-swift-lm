@@ -894,7 +894,10 @@ def:
         `CONTRIBUTING.md` documents the variable.
         `prepare-mimo-native-retention-fixtures.py` creates the closed, offline synthetic
         asymmetric payload required by the explicit native historical-retention CI selector.
+        `AGENTS.md` names the swift-format that CI uses: the one of the Xcode 27.2 that
+        `.github/actions/select-xcode` selects.
       globs:
+        - "AGENTS.md"
         - ".pre-commit-config.yaml"
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
