@@ -1,8 +1,8 @@
 import Foundation
-import Metal
 import MLX
 import MLXLMCommon
 import MLXRandom
+import Metal
 import Testing
 
 @testable import MLXLLM
