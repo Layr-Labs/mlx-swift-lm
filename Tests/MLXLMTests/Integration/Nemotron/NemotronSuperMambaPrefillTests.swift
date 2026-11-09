@@ -10,13 +10,38 @@ import Testing
 /// `ssmAttn` oracle, and the whole chunked Mamba prefill against the current
 /// path at Super's shapes. NAX GPUs run the native fragment layout; other
 /// GPUs check the same kernel through the generic layout. Both need a Metal
-/// compiler that builds them (`runtimeCompilerSupported`, macOS 27).
+/// compiler that builds them (`runtimeCompilerSupported`, macOS 27). A
+/// paravirtual GPU's compiler does not build the generic layout, so the suite
+/// first compiles one small scan.
 @Suite(
     .tags(.integration), .serialized,
     .enabled(
-        if: ModelOptNVFP4NAXExperts.runtimeCompilerSupported,
-        "needs the macOS 27 Metal compiler"))
+        if: NemotronSuperMambaPrefillTests.compilerBuildsTheScan,
+        "needs a Metal compiler that builds the chunked scan (macOS 27, not a paravirtual GPU)"))
 struct NemotronSuperMambaPrefillTests {
+    static let compilerBuildsTheScan: Bool = {
+        guard ModelOptNVFP4NAXExperts.runtimeCompilerSupported else { return false }
+        let (heads, headDim, groups, stateDim) = (1, 64, 1, 32)
+        let xbc = MLXArray.zeros([1, 1, heads * headDim + 2 * groups * stateDim], dtype: .bfloat16)
+        do {
+            try MLX.withError { errors in
+                let scan = NemotronSuperSSDChunked.scan(
+                    xbc: xbc, dt: MLXArray.zeros([1, 1, heads], dtype: .bfloat16), dtOffset: 0,
+                    heads: heads, headDim: headDim, groups: groups, stateSize: stateDim,
+                    aLog: MLXArray.zeros([heads]), dtBias: MLXArray.zeros([heads]),
+                    D: MLXArray.ones([heads]),
+                    state: MLXArray.zeros([1, heads, headDim, stateDim]),
+                    timeStepLimit: (0, .infinity), outputDType: .bfloat16)
+                eval(scan.y, scan.state)
+                try errors.check()
+            }
+            return true
+        } catch {
+            print("NemotronSuperMambaPrefillTests skipped: \(error)")
+            return false
+        }
+    }()
+
     @Test(arguments: [
         (37, 64, false), (300, 64, true), (300, 32, true), (2048, 64, true), (2048, 32, true),
         (2000, 64, false), (2000, 32, false),
