@@ -2921,20 +2921,11 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing under MTP
 
-/// Prompt chunk while an inline MTP assistant keeps a per-request history.
-/// The assistant needs the pre-norm hidden row of every prompt position; the
-/// engine needs vocabulary logits for the last position of the frontier chunk
-/// and nothing but a handle for the chunks before it. Without this entry the
-/// engine falls back to `cbv2ForwardWithHidden`, which scores every position
-/// with the 248,320-way head and then discards all rows but one.
-///
-/// The trunk is the `cbv2Forward` call that `cbv2RecurrentPrefill` makes. It
-/// computes the values `cbv2ForwardWithHidden` computes, with or without that
-/// entry's residual-norm fusion, so every K/V write, every recurrent stage and
-/// the returned hidden history are the same. The surviving logits row is
-/// computed as `cbv2RecurrentPrefill` computes it with MTP off (final RMSNorm
-/// and the head are row-independent, so norm-and-project after the slice
-/// equals the slice after them).
+/// Prompt chunk under an inline MTP assistant: the hidden row of every
+/// position, but vocabulary logits only for the frontier's last position
+/// (`cbv2ForwardWithHidden` projected every position). The trunk is
+/// `cbv2RecurrentPrefill`'s, so K/V, recurrent state and hidden history equal
+/// `cbv2ForwardWithHidden`'s, and the logits row equals the MTP-off prompt's.
 extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
     public func cbv2ForwardWithHiddenForPrefill(
         _ tokens: MLXArray, caches: [KVCache],
