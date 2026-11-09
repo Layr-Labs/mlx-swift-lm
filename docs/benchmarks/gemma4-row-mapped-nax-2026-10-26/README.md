@@ -25,6 +25,8 @@ The route requires the exact stock `SwitchGLU` GeGLU profile in evaluation mode,
 
 CPU, custom streams, non-NAX devices, non-Metal builds, training, transformations, subclasses/adapters, other activations, quantizations and shapes keep the complete original graph. One-token tails and decode are outside this route. Both projection calls retain the original K16 MMA sequence, FP32 accumulators, BF16 dequantization and stores. There is no fused gate/up dispatch or changed activation epilogue.
 
+Metal compiles both kernels at run time. The first call that passes every check launches them once on empty work. If Metal rejects either kernel or cannot build its pipeline, the route logs the error once and keeps the original graph for the rest of the process. A CI test covers this on every GPU, with a substitute projection kernel that does not compile.
+
 The embedded Apple MLX source retains its copyright notices and [MIT permission notice](LICENSE-MLX-MIT). [Source provenance](source-provenance.json) records generated-input hashes, the address-only helper diff, and the tested-to-review source mapping. A formatter directive preserves the generated raw Metal header byte-for-byte.
 
 ## Cold endpoint evidence in both orders
@@ -58,7 +60,7 @@ Initial test compiler errors and an OFF lifetime-fixture BF16-to-FP32 promotion 
 
 ## Review and portability limits
 
-This branch starts at SDK 57ead88, retaining the previously reviewed GeGLU/command-buffer, compiled-FFN and greedy-metadata changes. The measured provider retains original Swift `eedca444` and core `ff4bb35`, with baseline Metal SHA 6ccc6296. The historical source mapping describes the original opt-in review. The subsequent automatic-default change alters only startup flag selection in the wrapper and permits an unset flag in the native contract test setup. `SwitchLayers`, every eligibility guard, the embedded Metal kernel and the full-model test are unchanged. Historical timings are not relabeled as measurements of the new revision.
+This branch starts at SDK 57ead88, retaining the previously reviewed GeGLU/command-buffer, compiled-FFN and greedy-metadata changes. The measured provider retains original Swift `eedca444` and core `ff4bb35`, with baseline Metal SHA 6ccc6296. The historical source mapping describes the original opt-in review. The subsequent automatic-default change alters only startup flag selection in the wrapper and permits an unset flag in the native contract test setup. `SwitchLayers`, every eligibility guard, the embedded Metal kernel and the full-model test are unchanged. Historical timings are not relabeled as measurements of the new revision. The later compile fallback adds one check after the existing guards and a task-local kernel set that tests substitute; the embedded Metal source and the arithmetic are unchanged.
 
 Changed-file formatting is idempotent and independently reviewed. Fork coverage describes all 1,953 changed paths and the staged whitespace check passes; all 11 DocC targets passed with warnings treated as errors, using the exact 986-file review Libraries overlay and four jobs. The original review passed CI; the automatic-default revision requires its own checks. Positive NAX and real-checkpoint suites are explicit local opt-ins; ordinary CI compiles them but does not execute those positive paths without their environment and local assets.
 

@@ -363,6 +363,7 @@ def:
             invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
             An automatically enabled, guarded row-mapped NAX route avoids gate/up staging for stock
             affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
+            If Metal rejects one of its kernels, the route logs once and keeps the core path.
             Its report separates exact native-state evidence from two-order cold HTTP timing.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"

@@ -67,7 +67,9 @@ enum Gemma4RowMappedNAX {
             [
                 x, indices, gate.weight, gate.scales, gateBiases,
                 up.weight, up.scales, upBiases,
-            ].allSatisfy(ordinary)
+            ].allSatisfy(ordinary),
+            // The first call that passes the checks above compiles both kernels.
+            kernels.available
         else { return nil }
 
         let flat = indices.flattened()

@@ -2,8 +2,10 @@
 // Embedded Apple MLX sources retain their copyright notices. Source provenance and
 // the MIT license are in docs/benchmarks/gemma4-row-mapped-nax-2026-10-26/.
 #if canImport(Metal)
+import Foundation
 import MLX
 import MLXFast
+import os
 
 enum Gemma4RowMappedNAXKernel {
     // swift-format-ignore
@@ -3994,12 +3996,16 @@ METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(
         let biases: MLXArray
     }
 
+    private static let logger = Logger(subsystem: "darkbloom", category: "Gemma4RowMappedNAX")
+
     /// The route's two kernels. Metal compiles each one when it first runs.
-    final class Kernels: Sendable {
+    final class Kernels: @unchecked Sendable {
         let offsets: MLXFast.MLXFastKernel
         let projection: MLXFast.MLXFastKernel
         /// The production projection uses NAX; a test substitute need not.
         let requiresNAX: Bool
+        private let lock = NSLock()
+        private var compiled: Bool?
 
         init(
             offsets: MLXFast.MLXFastKernel, projection: MLXFast.MLXFastKernel,
@@ -4008,6 +4014,47 @@ METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(
             self.offsets = offsets
             self.projection = projection
             self.requiresNAX = requiresNAX
+        }
+
+        /// Whether Metal compiles both kernels and builds their pipelines. The
+        /// first call finds out; after a failure it logs once and stays false.
+        var available: Bool {
+            lock.withLock {
+                if let compiled { return compiled }
+                let failure = probe()
+                if let failure {
+                    Gemma4RowMappedNAXKernel.logger.error(
+                        "gemma4_row_map_kernels_unavailable fallback=core error=\(failure, privacy: .public)"
+                    )
+                }
+                compiled = failure == nil
+                return failure == nil
+            }
+        }
+
+        /// Runs both kernels on zero rows and zero experts, with pair()'s dtypes and
+        /// argument kinds so that Metal builds the libraries pair() uses. Returns
+        /// nil, or the MLX error.
+        private func probe() -> String? {
+            do {
+                try withError {
+                    let none = MLXArray.zeros([8], dtype: .uint32)
+                    let empty = MLXArray.zeros([8], dtype: .bfloat16)
+                    let offsets = self.offsets(
+                        [none, MLXArray([Int32(0)])], grid: (128, 1, 1),
+                        threadGroup: (128, 1, 1), outputShapes: [[128]], outputDTypes: [.int32])[0]
+                    let params = MLXArray([Int32(0), 0, 2816, 704])
+                    eval(
+                        projection(
+                            [empty, none, empty, empty, none, offsets, params],
+                            template: [("T", DType.bfloat16)],
+                            grid: (128, 1, 1), threadGroup: (128, 1, 1),
+                            outputShapes: [[8]], outputDTypes: [.bfloat16]))
+                }
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
     }
 
