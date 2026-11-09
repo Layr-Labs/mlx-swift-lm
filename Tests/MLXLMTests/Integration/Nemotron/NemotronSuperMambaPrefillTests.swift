@@ -6,20 +6,10 @@ import Testing
 
 @testable import MLXLLM
 
-/// Super's chunked prefill SSD (``NemotronSuperSSDChunked``) against the
-/// `ssmAttn` oracle, and the whole chunked Mamba prefill against the current
-/// path at Super's shapes. NAX GPUs run the native fragment layout; other
-/// GPUs check the same kernel through the generic layout. Both need a Metal
-/// compiler that builds them (`runtimeCompilerSupported`, macOS 27). A
-/// paravirtual GPU's compiler does not build the generic layout, so the suite
-/// first compiles one small scan.
-@Suite(
-    .tags(.integration), .serialized,
-    .enabled(
-        if: NemotronSuperMambaPrefillTests.compilerBuildsTheScan,
-        "needs a Metal compiler that builds the chunked scan (macOS 27, not a paravirtual GPU)"))
-struct NemotronSuperMambaPrefillTests {
-    static let compilerBuildsTheScan: Bool = {
+/// Whether this GPU's Metal compiler builds the chunked scan: one small scan
+/// under MLX's scoped error handler.
+enum NemotronSuperChunkedScanCompiler {
+    static let buildsTheScan: Bool = {
         guard ModelOptNVFP4NAXExperts.runtimeCompilerSupported else { return false }
         let (heads, headDim, groups, stateDim) = (1, 64, 1, 32)
         let xbc = MLXArray.zeros([1, 1, heads * headDim + 2 * groups * stateDim], dtype: .bfloat16)
@@ -41,7 +31,21 @@ struct NemotronSuperMambaPrefillTests {
             return false
         }
     }()
+}
 
+/// Super's chunked prefill SSD (``NemotronSuperSSDChunked``) against the
+/// `ssmAttn` oracle, and the whole chunked Mamba prefill against the current
+/// path at Super's shapes. NAX GPUs run the native fragment layout; other
+/// GPUs check the same kernel through the generic layout. Both need a Metal
+/// compiler that builds them (`runtimeCompilerSupported`, macOS 27). A
+/// paravirtual GPU's compiler does not build the generic layout, so the suite
+/// first compiles one small scan.
+@Suite(
+    .tags(.integration), .serialized,
+    .enabled(
+        if: NemotronSuperChunkedScanCompiler.buildsTheScan,
+        "needs a Metal compiler that builds the chunked scan (macOS 27, not a paravirtual GPU)"))
+struct NemotronSuperMambaPrefillTests {
     @Test(arguments: [
         (37, 64, false), (300, 64, true), (300, 32, true), (2048, 64, true), (2048, 32, true),
         (2000, 64, false), (2000, 32, false),
