@@ -9,6 +9,7 @@ jobs:
   # Chooses a Darkbloom Sandbox for the lint job when the Darkbloom plane
   # grants one, else blacksmith-12vcpu-macos-27.
   route:
+    name: Route Lint
     uses: ./.github/workflows/darkbloom-route.yml
     permissions: {}
     with:

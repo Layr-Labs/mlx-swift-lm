@@ -2,13 +2,15 @@ name: Select Xcode
 description: >-
   Selects Xcode 27.2, release build 27B52 (macOS SDK 27.2, Apple Swift 6.4.2),
   and checks that it has Swift 6.4 or newer. It uses the image default when
-  that is 27.2 (27B52), else an installed Xcode that is. When no installed
-  Xcode is 27.2 (27B52), it selects another 27.2 build, for example a release
-  candidate, and prints a warning that names it. It fails when no installed
-  Xcode is 27.2. A new Xcode on the runner image cannot change CI without a
-  pull request. The selection is DEVELOPER_DIR in $GITHUB_ENV, so it holds
-  for the rest of the job only and needs no sudo (Darkbloom runners have
-  none). The step also prints the Metal toolchain of the selected Xcode.
+  that is 27.2 (27B52), else an installed Xcode that is. On a runner without
+  27B52 it accepts any other 27.2 build, a beta or release candidate included
+  (blacksmith-12vcpu-macos-27 has only 27.2 beta 3), and prints a warning
+  that names the build. The first such Xcode found wins (the image default,
+  then /Applications in glob order), so a new runner image can change the
+  build those runners use. It fails when no installed Xcode is 27.2. The
+  selection is DEVELOPER_DIR in $GITHUB_ENV, so it holds for the rest of the
+  job only and needs no sudo (Darkbloom runners have none). The step also
+  prints the Metal toolchain of the selected Xcode.
 outputs:
   version:
     description: The Xcode version and build, for example 27.2-27B52. Cache keys use it.
@@ -35,10 +37,12 @@ runs:
         echo "  default: Xcode ${version:-unknown} (${build:-unknown})"
         exact=""
         other=""
+        other_build=""
         if [ "$version" = "$want_version" ] && [ "$build" = "$want_build" ]; then
           exact="$(xcode-select -p)"
         elif [ "$version" = "$want_version" ]; then
           other="$(xcode-select -p)"
+          other_build="$build"
         fi
         if [ -z "$exact" ]; then
           for app in /Applications/Xcode*.app; do
@@ -50,6 +54,7 @@ runs:
               break
             elif [ "$version" = "$want_version" ] && [ -z "$other" ]; then
               other="$app/Contents/Developer"
+              other_build="$build"
             fi
           done
         fi
@@ -57,7 +62,7 @@ runs:
           selected="$exact"
         elif [ -n "$other" ]; then
           selected="$other"
-          echo "::warning title=Xcode $want_build not installed::No installed Xcode reports Xcode $want_version ($want_build). This job uses $selected."
+          echo "::warning title=Xcode $want_version ($other_build) instead of $want_build::No installed Xcode reports Xcode $want_version ($want_build). This job uses Xcode $want_version ($other_build) at $selected."
         else
           echo "::error::No installed Xcode reports Xcode $want_version."
           exit 1
