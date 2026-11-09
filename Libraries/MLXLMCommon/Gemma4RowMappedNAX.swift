@@ -11,6 +11,12 @@ enum Gemma4RowMappedNAX {
     static let requested =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_ROW_MAP", default: "1"] == "1"
 
+    #if canImport(Metal)
+    /// Tests substitute kernels here; production never sets it.
+    @TaskLocal static var kernels: Gemma4RowMappedNAXKernel.Kernels =
+        Gemma4RowMappedNAXKernel.production
+    #endif
+
     private static func ordinary(_ array: MLXArray) -> Bool {
         var identity: UInt = 0
         var ordinary = false
@@ -55,8 +61,9 @@ enum Gemma4RowMappedNAX {
             let gateBiases = gate.biases, let upBiases = up.biases,
             MLXProcessStreams.isOnDefaultGPUStream
         else { return nil }
+        let kernels = Self.kernels
         // Read the core's actual OS/architecture/build gate after CPU refusal.
-        guard GPU.gemma4ExpertQMMDiagnostics().naxAvailable,
+        guard !kernels.requiresNAX || GPU.gemma4ExpertQMMDiagnostics().naxAvailable,
             [
                 x, indices, gate.weight, gate.scales, gateBiases,
                 up.weight, up.scales, upBiases,
@@ -72,7 +79,7 @@ enum Gemma4RowMappedNAX {
         let pair = Gemma4RowMappedNAXKernel.pair(
             tokenRows: tokenRows, sortedExperts: sorted, rowMap: rowMap,
             gate: .init(weight: gate.weight, scales: gate.scales, biases: gateBiases),
-            up: .init(weight: up.weight, scales: up.scales, biases: upBiases))
+            up: .init(weight: up.weight, scales: up.scales, biases: upBiases), kernels: kernels)
         CBv2StepProfiler.recordEvent("v2.gemma4.nax.row_map")
         return (pair.gate, pair.up, sorted, argSort(order))
         #else

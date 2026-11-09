@@ -3994,10 +3994,30 @@ METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(
         let biases: MLXArray
     }
 
+    /// The route's two kernels. Metal compiles each one when it first runs.
+    final class Kernels: Sendable {
+        let offsets: MLXFast.MLXFastKernel
+        let projection: MLXFast.MLXFastKernel
+        /// The production projection uses NAX; a test substitute need not.
+        let requiresNAX: Bool
+
+        init(
+            offsets: MLXFast.MLXFastKernel, projection: MLXFast.MLXFastKernel,
+            requiresNAX: Bool
+        ) {
+            self.offsets = offsets
+            self.projection = projection
+            self.requiresNAX = requiresNAX
+        }
+    }
+
+    static let production = Kernels(
+        offsets: offsetKernel, projection: projection, requiresNAX: true)
+
     // The caller validates the full route before entering this known-shape kernel.
     static func pair(
         tokenRows: MLXArray, sortedExperts: MLXArray, rowMap: MLXArray,
-        gate: Bank, up: Bank
+        gate: Bank, up: Bank, kernels: Kernels = production
     ) -> (gate: MLXArray, up: MLXArray) {
         let rows = sortedExperts.size
         precondition(rows >= 512 && rows <= 16384 && rows % 8 == 0)
@@ -4009,13 +4029,13 @@ METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(
             precondition(bank.scales.shape == [128, 704, 44] && bank.scales.dtype == .bfloat16)
             precondition(bank.biases.shape == bank.scales.shape && bank.biases.dtype == .bfloat16)
         }
-        let offsets = offsetKernel(
+        let offsets = kernels.offsets(
             [sortedExperts, MLXArray([Int32(rows)])], grid: (128, 1, 1),
             threadGroup: (128, 1, 1), outputShapes: [[128]], outputDTypes: [.int32])[0]
         let params = MLXArray([Int32(rows), 128, 2816, 704])
         let tiles = min(rows, (rows + 63) / 64 + 127)
         func run(_ bank: Bank) -> MLXArray {
-            projection(
+            kernels.projection(
                 [tokenRows, bank.weight, bank.scales, bank.biases, rowMap, offsets, params],
                 template: [("T", DType.bfloat16)],
                 grid: (11 * 128, tiles, 1), threadGroup: (128, 1, 1),

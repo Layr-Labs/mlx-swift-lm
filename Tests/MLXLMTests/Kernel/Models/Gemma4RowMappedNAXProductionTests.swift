@@ -683,5 +683,92 @@ extension KernelTests {
             report.completed = true
         }
     }
+
+    /// Runs on every GPU, without the opt-in: a substitute projection kernel
+    /// stands in for the NAX one and needs no NAX device.
+    @Suite(
+        "Gemma4 row-map route with a kernel that does not compile", .serialized,
+        .enabled(if: Gemma4RowMappedNAX.requested))
+    struct Gemma4RowMappedNAXCompileFailureTests {
+        typealias O = Gemma4RowMapProductionOracle
+
+        static func substitute(_ name: String, source: String) -> Gemma4RowMappedNAXKernel.Kernels {
+            .init(
+                offsets: Gemma4RowMappedNAXKernel.production.offsets,
+                projection: MLXFast.metalKernel(
+                    name: "gemma4_rowmap_test_\(name)",
+                    inputNames: ["x", "w", "scales", "biases", "row_map", "offsets", "params"],
+                    outputNames: ["y"], source: source),
+                requiresNAX: false)
+        }
+
+        /// The custom kernels that `actual`'s graph has beyond `expected`'s:
+        /// three when the route builds its pair.
+        static func routeKernels(_ actual: MLXArray, _ expected: MLXArray) -> Int {
+            O.customNodes(graphDescription([actual])) - O.customNodes(graphDescription([expected]))
+        }
+
+        @Test func requestsKeepTheCoreGraph() throws {
+            let banks = O.banks()
+            let candidate = try O.model(banks)
+            let reference = try O.model(banks, original: true)
+            let input = O.inputs()
+            let broken = Self.substitute("compile_failure", source: "not_a_metal_function();")
+            for fused in [false, true] {
+                for request in 0 ..< 2 {
+                    let label = "fused \(fused), request \(request)"
+                    let a = Gemma4RowMappedNAX.$kernels.withValue(broken) {
+                        O.call(candidate, input, fused: fused)
+                    }
+                    let b = O.call(reference, input, fused: fused)
+                    #expect(Self.routeKernels(a, b) == 0, "\(label): the route built the pair")
+                    let actual = O.outcome { [a] }
+                    let expected = O.outcome { [b] }
+                    switch (actual, expected) {
+                    case (.arrays, .arrays):
+                        #expect(
+                            a.shape == b.shape && a.dtype == b.dtype && O.bytes(a) == O.bytes(b),
+                            "\(label): bytes differ from the core graph")
+                    case (.error(let message), _):
+                        Issue.record("\(label): the request failed: \(message)")
+                    case (_, .error(let message)):
+                        Issue.record("\(label): the core graph failed: \(message)")
+                    }
+                }
+            }
+
+            // The substitute does fail to compile when it runs.
+            let flat = input.1.flattened()
+            let order = argSort(flat)
+            let direct = O.outcome {
+                let pair = Gemma4RowMappedNAXKernel.pair(
+                    tokenRows: input.0.reshaped([-1, 1, 2816]), sortedExperts: flat[order],
+                    rowMap: order.floorDivide(8),
+                    gate: .init(
+                        weight: banks[0].weight, scales: banks[0].scales, biases: banks[0].biases),
+                    up: .init(
+                        weight: banks[1].weight, scales: banks[1].scales, biases: banks[1].biases),
+                    kernels: broken)
+                return [pair.gate, pair.up]
+            }
+            guard case .error(let message) = direct else {
+                Issue.record("the substitute kernel compiled")
+                return
+            }
+            #expect(message.contains("Unable to build metal library"), "\(message)")
+        }
+
+        @Test func substituteThatCompilesTakesTheRoute() throws {
+            let banks = O.banks()
+            let candidate = try O.model(banks)
+            let reference = try O.model(banks, original: true)
+            let input = O.inputs()
+            let empty = Self.substitute("empty", source: "")
+            let a = Gemma4RowMappedNAX.$kernels.withValue(empty) { O.call(candidate, input) }
+            #expect(
+                Self.routeKernels(a, O.call(reference, input)) == 3,
+                "the route refused a kernel that compiles")
+        }
+    }
 }
 #endif
