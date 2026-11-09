@@ -33,6 +33,13 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
         case randomPayload
     }
 
+    private enum Scope: String, CaseIterable {
+        case everySample
+        /// Only samples that are not key frames, so decoding starts clean and
+        /// meets the corruption in the middle of the stream.
+        case deltaFramesOnly
+    }
+
     private struct Track {
         let format: CMFormatDescription
         let samples: [CMSampleBuffer]
@@ -63,16 +70,18 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
             XCTAssertGreaterThan(clean.frames, 0, name)
             var failed = 0
             for corruption in Corruption.allCases {
-                let result = try await decode(try await clip(track, corruption))
-                let line =
-                    "\(name) \(corruption.rawValue), hardware decoder \(hardware): "
-                    + "\(result.frames) of \(clean.frames) frames, "
-                    + (result.failure?.description ?? "reader completed")
-                print("corrupt clip: \(line)")
-                if result.failure != nil { failed += 1 }
-                XCTAssertFalse(
-                    result.failure?.isTransient ?? false,
-                    "a corrupt clip gave a transient decoder code: \(line)")
+                for scope in Scope.allCases {
+                    let result = try await decode(try await clip(track, corruption, scope))
+                    let line =
+                        "\(name) \(corruption.rawValue) \(scope.rawValue), hardware decoder \(hardware): "
+                        + "\(result.frames) of \(clean.frames) frames, "
+                        + (result.failure?.description ?? "reader completed")
+                    print("corrupt clip: \(line)")
+                    if result.failure != nil { failed += 1 }
+                    XCTAssertFalse(
+                        result.failure?.isTransient ?? false,
+                        "a corrupt clip gave a transient decoder code: \(line)")
+                }
             }
             XCTAssertGreaterThan(failed, 0, "\(name): no corrupt clip made the reader fail")
         }
@@ -149,8 +158,10 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
     }
 
     /// A QuickTime clip of `track`'s samples, written without decoding, each sample
-    /// corrupted by `corruption` when one is given.
-    private func clip(_ track: Track, _ corruption: Corruption?) async throws -> Data {
+    /// corrupted by `corruption` within `scope` when one is given.
+    private func clip(_ track: Track, _ corruption: Corruption?, _ scope: Scope = .everySample)
+        async throws -> Data
+    {
         let url = temporaryURL()
         defer { try? FileManager.default.removeItem(at: url) }
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -169,7 +180,7 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
             CMFormatDescriptionGetMediaSubType(track.format) == kCMVideoCodecType_HEVC ? 2 : 1
         for (index, sample) in track.samples.enumerated() {
             var bytes = try sampleBytes(sample)
-            if let corruption {
+            if let corruption, scope == .everySample || !isSync(sample) {
                 bytes = Self.corrupt(
                     bytes, corruption, lengthSize: lengthSize, headerSize: headerSize, seed: index)
             }
@@ -330,12 +341,7 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
                 sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1,
                 sampleSizeArray: &size, sampleBufferOut: &sample), noErr)
         let copy = try XCTUnwrap(sample)
-        let attachments =
-            CMSampleBufferGetSampleAttachmentsArray(original, createIfNecessary: false)
-            as? [[String: Any]]
-        let notSync =
-            attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool ?? false
-        if notSync,
+        if !isSync(original),
             let target = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true)
         {
             let dictionary = unsafeBitCast(
@@ -345,6 +351,13 @@ final class CorruptClipDecoderCodesTests: XCTestCase {
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
         return copy
+    }
+
+    private func isSync(_ sample: CMSampleBuffer) -> Bool {
+        let attachments =
+            CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+            as? [[String: Any]]
+        return !(attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool ?? false)
     }
 
     private func waitUntilReady(_ input: AVAssetWriterInput, of writer: AVAssetWriter) async throws
