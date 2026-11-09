@@ -130,13 +130,19 @@ jobs:
         # restored objects of a file whose content did not change. The
         # checkout gives every file a new modification time.
         # SwiftPM gives the C and C++ files to the compiler in CC, here
-        # through ccache.
+        # through ccache. A runner without ccache and Homebrew builds
+        # without it.
         run: |
-          command -v ccache > /dev/null || brew install ccache
-          ccache --zero-stats > /dev/null
-          wrapper=$RUNNER_TEMP/ccache-clang
-          printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
-          chmod +x "$wrapper"
+          command -v ccache > /dev/null || ! command -v brew > /dev/null || brew install ccache
+          wrapper=$(xcrun -f clang)
+          if command -v ccache > /dev/null; then
+            ccache --zero-stats > /dev/null
+            wrapper=$RUNNER_TEMP/ccache-clang
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
+            chmod +x "$wrapper"
+          else
+            echo "::warning title=No ccache::This runner has no ccache and no Homebrew. The C and C++ files build without ccache."
+          fi
           start=$(date +%s)
           # Swift 6.4 defaults to Swift Build; every SwiftPM call here uses the native
           # build system, so --skip-build and --show-bin-path find these products.
@@ -144,8 +150,10 @@ jobs:
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-          ccache --show-stats -v
-          grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
+          if command -v ccache > /dev/null; then
+            ccache --show-stats -v
+            grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
+          fi
           # The test jobs use the same package versions. Package.resolved
           # stays in .build, so the cache paths do not change.
           cp Package.resolved .build/fork-tests-Package.resolved
@@ -225,8 +233,13 @@ jobs:
 
       - name: Build the full Metal library
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        # Xcode 27 can ship without the Metal toolchain component. The step
+        # downloads it when the metal compiler does not run.
         run: |
-          xcrun -sdk macosx metal --version
+          if ! xcrun --no-cache -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun --no-cache -sdk macosx metal --version
+          fi
           start=$(date +%s)
           swift package resolve
           scripts/build-metallib.sh "$RUNNER_TEMP/metallib/mlx.metallib"

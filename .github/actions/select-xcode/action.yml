@@ -1,12 +1,14 @@
 name: Select Xcode
 description: >-
   Selects Xcode 27.2, release build 27B52 (macOS SDK 27.2, Apple Swift 6.4.2),
-  and checks that it has Swift 6.3 or newer. When no installed Xcode is 27.2
-  (27B52), it selects another 27.2 build, for example a release candidate, and
-  prints a warning that names it. It fails when no installed Xcode is 27.2. A
-  new Xcode on the runner image cannot change CI without a pull request.
-  mlx-swift declares swift-tools-version 6.3. The step also prints the Metal
-  toolchain of the selected Xcode.
+  and checks that it has Swift 6.4 or newer. It uses the image default when
+  that is 27.2 (27B52), else an installed Xcode that is. When no installed
+  Xcode is 27.2 (27B52), it selects another 27.2 build, for example a release
+  candidate, and prints a warning that names it. It fails when no installed
+  Xcode is 27.2. A new Xcode on the runner image cannot change CI without a
+  pull request. The selection is DEVELOPER_DIR in $GITHUB_ENV, so it holds
+  for the rest of the job only and needs no sudo (Darkbloom runners have
+  none). The step also prints the Metal toolchain of the selected Xcode.
 outputs:
   version:
     description: The Xcode version and build, for example 27.2-27B52. Cache keys use it.
@@ -19,21 +21,38 @@ runs:
       run: |
         want_version="27.2"
         want_build="27B52"
+        # xcode_version [DEVELOPER_DIR] prints "<version> <build>" of that
+        # Xcode, or of the default Xcode when no directory is given.
+        xcode_version() {
+          if [ -n "${1:-}" ]; then
+            DEVELOPER_DIR="$1" xcodebuild -version 2>/dev/null
+          else
+            xcodebuild -version 2>/dev/null
+          fi | awk 'NR == 1 { v = $2 } /^Build version/ { b = $3 } END { print v, b }'
+        }
+        echo "Default developer directory: $(xcode-select -p 2>&1)"
+        read -r version build <<< "$(xcode_version || true)"
+        echo "  default: Xcode ${version:-unknown} (${build:-unknown})"
         exact=""
         other=""
-        for app in /Applications/Xcode*.app; do
-          [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] || continue
-          version=""
-          build=""
-          read -r version build < <(DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version 2>/dev/null \
-            | awk 'NR == 1 { v = $2 } /^Build version/ { b = $3 } END { print v, b }') || true
-          echo "  $app: Xcode ${version:-unknown} (${build:-unknown})"
-          if [ "$version" = "$want_version" ] && [ "$build" = "$want_build" ] && [ -z "$exact" ]; then
-            exact="$app"
-          elif [ "$version" = "$want_version" ] && [ -z "$other" ]; then
-            other="$app"
-          fi
-        done
+        if [ "$version" = "$want_version" ] && [ "$build" = "$want_build" ]; then
+          exact="$(xcode-select -p)"
+        elif [ "$version" = "$want_version" ]; then
+          other="$(xcode-select -p)"
+        fi
+        if [ -z "$exact" ]; then
+          for app in /Applications/Xcode*.app; do
+            [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] || continue
+            read -r version build <<< "$(xcode_version "$app/Contents/Developer" || true)"
+            echo "  $app: Xcode ${version:-unknown} (${build:-unknown})"
+            if [ "$version" = "$want_version" ] && [ "$build" = "$want_build" ]; then
+              exact="$app/Contents/Developer"
+              break
+            elif [ "$version" = "$want_version" ] && [ -z "$other" ]; then
+              other="$app/Contents/Developer"
+            fi
+          done
+        fi
         if [ -n "$exact" ]; then
           selected="$exact"
         elif [ -n "$other" ]; then
@@ -43,13 +62,14 @@ runs:
           echo "::error::No installed Xcode reports Xcode $want_version."
           exit 1
         fi
-        sudo xcode-select -s "$selected/Contents/Developer"
+        echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
+        export DEVELOPER_DIR="$selected"
         xcodebuild -version
         swift --version
         xcodebuild -showComponent MetalToolchain || echo "xcodebuild -showComponent MetalToolchain failed"
         read -r major minor <<< "$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p')"
-        if ! (( major > 6 || (major == 6 && minor >= 3) )); then
-          echo "::error::$selected has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
+        if ! (( major > 6 || (major == 6 && minor >= 4) )); then
+          echo "::error::$selected has Swift $major.$minor. This fork's CI needs Swift 6.4 or newer."
           exit 1
         fi
         echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
