@@ -230,7 +230,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 /// Compiled GELU-gated GLU product (`geluApprox(gate) * up`), fusing the tanh
 /// GELU and the element-wise multiply into one shapeless kernel. Uses the
 /// Power-free `x * x * x` GELU so it is safe under `compile(shapeless: true)`.
-private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+package let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, up: MLXArray) -> MLXArray in
         (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
@@ -497,6 +497,33 @@ open class SwitchGLU: Module {
     /// per projection. Identical index values, so identical outputs. Plain
     /// affine `QuantizedSwitchLinear` banks only; opt-in per model.
     public var suppliesHostRowIndices = false
+
+    /// Current arrays for the stock Gemma GeGLU decode graph, in a fixed order.
+    /// Only the existing affine BF16 route is admitted; adapters, custom modules,
+    /// fused layouts and other precision paths retain their ordinary execution.
+    package func gemma4DecodeCompilationState()
+        -> (parameters: [MLXArray], modules: [Module])?
+    {
+        guard type(of: self) == SwitchGLU.self, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            isGeluActivation, activationProduct == nil, !mimoV26NAXGather,
+            gateUpProj == nil, let gateProj, let upProj
+        else { return nil }
+        var parameters: [MLXArray] = []
+        var modules: [Module] = [self]
+        for projection in [gateProj, upProj, downProj] {
+            guard let quantized = projection as? QuantizedSwitchLinear,
+                type(of: quantized) == QuantizedSwitchLinear.self, !quantized.training,
+                quantized.mode == .affine, quantized.bits == 4, quantized.groupSize == 64,
+                quantized.weight.dtype == .uint32, quantized.scales.dtype == .bfloat16,
+                let biases = quantized.biases, biases.dtype == .bfloat16,
+                quantized.bias == nil, quantized.globalScales == nil
+            else { return nil }
+            parameters += [quantized.weight, quantized.scales, biases]
+            modules.append(quantized)
+        }
+        return (parameters, modules)
+    }
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is

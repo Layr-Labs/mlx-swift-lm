@@ -1,0 +1,791 @@
+{
+  "model": "gemma-4-26b-qat-4bit",
+  "model_revision": "2026-06-08-r1",
+  "provider_base": "f9d1af3d0d3e1838974a5cfdff0a08142977b45e",
+  "stacked_sdk_base": "a63b4c69b73f05ff3e08ed51d22bcbb60a2a1447",
+  "stacked_pr_base_branch": "codex/gemma4-lossless-dispatch-20261025",
+  "mlx_swift_revision": "eedca444432296c52d02b2595564ada936131633",
+  "mlx_core_revision": "ff4bb35b60c3aadafb9e0bd30b6180cef646fb1a",
+  "hardware": "M5 Max, 40 GPU cores, 128GB unified memory",
+  "host_os": "macOS 27.0 26A428",
+  "power_mode": "AC Automatic",
+  "arms": {
+    "A": "Prior dense GeGLU + scoped CB100/512 implementation",
+    "B": "Same implementation plus shape-specialized Gemma FFN compilation"
+  },
+  "artifacts": {
+    "A": {
+      "binary_sha256": "4da61baa2e8cdf5bf06b51973e33eaf1e9f5847e937136ece8f8b5575b7e898b",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    },
+    "B": {
+      "binary_sha256": "fc7b327331e9ebb59c51f6f6b8ae7f5e4865523cc8a6e0387d581dfdbf105117",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    }
+  },
+  "harness": {
+    "comparator_sha256": "3233484149ca84da6a284d8ae35abecf0930e0af1f352820122011d28018f05b",
+    "config_sha256": "502091d7faea437aadd287dddc31da2dbc0567c93ae7568cb51c5b7ba48fb02d",
+    "harness_sha256": "fca6f65986954d94aec09f2d95c3754371ce2492bfc2f7aa1a6035005713cc89",
+    "posture_helper_sha256": "8b7d56e87cebdb1ea1887e7a9b699272d54d0e77038cc4533e4230cccffc1f8f",
+    "runner_sha256": "4f8c8f71aec19923781ad20e220274ac6041b55d6e3a5acca4ff83e6c8e73a3c",
+    "support_sha256": "366159058633a0fc6f74a81d8820fdcf442abdfa351f572e5278922692fbec97"
+  },
+  "parameters": {
+    "requested_context": 8192,
+    "prompt_tokens": 8204,
+    "cached_tokens": 8192,
+    "completion_tokens": 256,
+    "concurrency": 1,
+    "requests_per_leg": 2,
+    "temperature": 0,
+    "seed": 1729,
+    "mtp_acceptance": "exact",
+    "mtp_depth": "unchanged natural adaptive default",
+    "order": "A1 B2 B3 A4",
+    "nominal_idle_seconds_before_cohort": 30
+  },
+  "qualification": {
+    "comparisons": {
+      "AA_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_forward": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_reverse": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "BB_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      }
+    },
+    "experiment_class": "natural_mtp_comparison",
+    "headline_mtp_eligible": true,
+    "note": "No pooled speedup is asserted. Inspect both orderings and stability; synthetic parity is not a universal numerical proof.",
+    "qualified": true,
+    "same_arm_observed_output_stability": true
+  },
+  "comparisons": {
+    "AB_forward": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 105.43276813006258,
+            "before_median": 102.19214304310563,
+            "median_paired_speedup": 1.0316724941212343,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.64758858300047,
+            "before_median": 0.6541675420012325,
+            "median_paired_speedup": 1.010143244245282,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 83.30414608211188,
+            "before_median": 81.10152524658801,
+            "median_paired_speedup": 1.0271291918648766,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      },
+      "evidence_sha256": "285ebed22f2a83915802877f5f709af350b87828e028922f9e65ad150224303f"
+    },
+    "AB_reverse": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 105.48222630163954,
+            "before_median": 102.93688956864986,
+            "median_paired_speedup": 1.024717050427622,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6178420209907927,
+            "before_median": 0.6143643959949259,
+            "median_paired_speedup": 0.9943963667905504,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 84.15820737142067,
+            "before_median": 82.62852253602098,
+            "median_paired_speedup": 1.0185045556819075,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      },
+      "evidence_sha256": "30a5688a5e7b3d76a23bb0454f2dd1c964df0efbe786ee96e5001c79b2d0cd98"
+    },
+    "AA_stability": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 102.93688956864986,
+            "before_median": 102.19214304310563,
+            "median_paired_speedup": 1.0072983355113982,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6143643959949259,
+            "before_median": 0.6541675420012325,
+            "median_paired_speedup": 1.064789296001745,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 82.62852253602098,
+            "before_median": 81.10152524658801,
+            "median_paired_speedup": 1.0188478035514472,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      },
+      "evidence_sha256": "5e1bf78b72a8e4560a6544192939e922e4ea0e47e8875c1477b3398d33b29ef4"
+    },
+    "BB_stability": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 105.48222630163954,
+            "before_median": 105.43276813006258,
+            "median_paired_speedup": 1.0005475040022773,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6178420209907927,
+            "before_median": 0.64758858300047,
+            "median_paired_speedup": 1.0481539459880072,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 84.15820737142067,
+            "before_median": 83.30414608211188,
+            "median_paired_speedup": 1.0103016627528374,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      },
+      "evidence_sha256": "01de27521587dcc4eb8bfd32c7667ebb323a29bb4f3c21f88ec480e2ca8e2a7a"
+    }
+  },
+  "per_leg_memory": {
+    "1-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 21523904120,
+      "sampled_max_physical_footprint_bytes": 21473671040,
+      "sampled_max_rss_bytes": 18018729984,
+      "samples": 30,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 30
+    },
+    "2-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 21546776256,
+      "sampled_max_physical_footprint_bytes": 21512074776,
+      "sampled_max_rss_bytes": 17924194304,
+      "samples": 29,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 29
+    },
+    "3-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18850362712,
+      "sampled_max_physical_footprint_bytes": 18850346328,
+      "sampled_max_rss_bytes": 17484546048,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    },
+    "4-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18820986176,
+      "sampled_max_physical_footprint_bytes": 18820986176,
+      "sampled_max_rss_bytes": 17453416448,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    }
+  },
+  "c4_rejected": {
+    "qualification": {
+      "comparisons": {
+        "AA_stability": {
+          "excluded": 7,
+          "observed_output_parity": false,
+          "qualified_timing_pairs": 1
+        },
+        "AB_forward": {
+          "excluded": 8,
+          "observed_output_parity": false,
+          "qualified_timing_pairs": 0
+        },
+        "AB_reverse": {
+          "excluded": 4,
+          "observed_output_parity": false,
+          "qualified_timing_pairs": 4
+        },
+        "BB_stability": {
+          "excluded": 7,
+          "observed_output_parity": false,
+          "qualified_timing_pairs": 1
+        }
+      },
+      "experiment_class": "natural_mtp_comparison",
+      "headline_mtp_eligible": true,
+      "note": "No pooled speedup is asserted. Inspect both orderings and stability; synthetic parity is not a universal numerical proof.",
+      "qualified": false,
+      "same_arm_observed_output_stability": false
+    },
+    "qualification_sha256": "e3b16d63f682650d10c27ac0dc0fae7ac9a86567b822be35fe174af2df141661",
+    "claim": "No C4 speedup. Same-arm outputs differ in 7 of 8 rows in both arms; surviving row timing is not a qualified cohort result."
+  },
+  "capabilities": {
+    "initial": {
+      "completed_cases": 12,
+      "expected_cases": 12,
+      "skipped": [],
+      "smoke_passed": true,
+      "baseline_comparison": {
+        "differences": [
+          {
+            "fields": [
+              "output_sha256",
+              "completion_tokens"
+            ],
+            "name": "reasoning_on"
+          }
+        ],
+        "observed_output_parity": false,
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "fixture_sha256": "55bf77e4d57b6096177785cbf6c6c5f9009ceb2c31c8402cc41ed4d2216f4c61",
+      "text_interleave_output_parity": true,
+      "media_steering_outputs_differ": {
+        "image": true,
+        "video": true
+      },
+      "cases": [
+        {
+          "name": "text_before_media",
+          "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+          "completion_tokens": 7,
+          "validation_failures": []
+        },
+        {
+          "name": "reasoning_off",
+          "output_sha256": "e36c4c8ced789cdd43800dc4f963b489ce6ad37d8afcffb24b6af08f673a7bea",
+          "completion_tokens": 4,
+          "validation_failures": []
+        },
+        {
+          "name": "reasoning_on",
+          "output_sha256": "9134c2482044c55b48dad628000a6e0324d3b06733be702e26437415ce59e68a",
+          "completion_tokens": 298,
+          "validation_failures": []
+        },
+        {
+          "name": "tools_auto",
+          "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+          "completion_tokens": 26,
+          "validation_failures": []
+        },
+        {
+          "name": "tools_required",
+          "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+          "completion_tokens": 26,
+          "validation_failures": []
+        },
+        {
+          "name": "json_object",
+          "output_sha256": "379e391cac38ab754a32a1f6b8c32a819d57ca30961422f2e40b06cf874b2d15",
+          "completion_tokens": 18,
+          "validation_failures": []
+        },
+        {
+          "name": "json_schema",
+          "output_sha256": "4bcda4c87952fa4f81f703e8be44dbdc62dd1c9fca1df9558b31de9b6f344bbf",
+          "completion_tokens": 15,
+          "validation_failures": []
+        },
+        {
+          "name": "image_red",
+          "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "image_blue",
+          "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "video_red",
+          "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "video_blue",
+          "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "text_after_media",
+          "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+          "completion_tokens": 7,
+          "validation_failures": []
+        }
+      ],
+      "evidence_sha256": "12b71b72b59ba6e547acb2e4a9aa906803b1cf668f5213d4eeb22ebb3df18adf"
+    },
+    "repeat": {
+      "completed_cases": 12,
+      "expected_cases": 12,
+      "skipped": [],
+      "smoke_passed": true,
+      "baseline_comparison": {
+        "differences": [],
+        "observed_output_parity": true,
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "fixture_sha256": "55bf77e4d57b6096177785cbf6c6c5f9009ceb2c31c8402cc41ed4d2216f4c61",
+      "text_interleave_output_parity": true,
+      "media_steering_outputs_differ": {
+        "image": true,
+        "video": true
+      },
+      "cases": [
+        {
+          "name": "text_before_media",
+          "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+          "completion_tokens": 7,
+          "validation_failures": []
+        },
+        {
+          "name": "reasoning_off",
+          "output_sha256": "e36c4c8ced789cdd43800dc4f963b489ce6ad37d8afcffb24b6af08f673a7bea",
+          "completion_tokens": 4,
+          "validation_failures": []
+        },
+        {
+          "name": "reasoning_on",
+          "output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+          "completion_tokens": 344,
+          "validation_failures": []
+        },
+        {
+          "name": "tools_auto",
+          "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+          "completion_tokens": 26,
+          "validation_failures": []
+        },
+        {
+          "name": "tools_required",
+          "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+          "completion_tokens": 26,
+          "validation_failures": []
+        },
+        {
+          "name": "json_object",
+          "output_sha256": "379e391cac38ab754a32a1f6b8c32a819d57ca30961422f2e40b06cf874b2d15",
+          "completion_tokens": 18,
+          "validation_failures": []
+        },
+        {
+          "name": "json_schema",
+          "output_sha256": "4bcda4c87952fa4f81f703e8be44dbdc62dd1c9fca1df9558b31de9b6f344bbf",
+          "completion_tokens": 15,
+          "validation_failures": []
+        },
+        {
+          "name": "image_red",
+          "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "image_blue",
+          "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "video_red",
+          "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "video_blue",
+          "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+          "completion_tokens": 2,
+          "validation_failures": []
+        },
+        {
+          "name": "text_after_media",
+          "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+          "completion_tokens": 7,
+          "validation_failures": []
+        }
+      ],
+      "evidence_sha256": "093d1ab593163f6941e500ab031cb08f644029a140f3ec84eae957f36c9e3c5f"
+    },
+    "same_provider_reasoning_repeats": {
+      "evidence_sha256": "ec04a26f8dbb506f55108c3b7cba1876b93796b9613cfd479b608e25379d29a7",
+      "cases": [
+        {
+          "name": "reasoning_on",
+          "output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+          "completion_tokens": 344,
+          "http_status": 200,
+          "failures": []
+        },
+        {
+          "name": "reasoning_on",
+          "output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+          "completion_tokens": 344,
+          "http_status": 200,
+          "failures": []
+        },
+        {
+          "name": "reasoning_on",
+          "output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+          "completion_tokens": 344,
+          "http_status": 200,
+          "failures": []
+        }
+      ]
+    }
+  },
+  "tests": {
+    "synthetic_on": {
+      "passed": 11,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 0.847,
+      "requested": "1",
+      "effective": true
+    },
+    "synthetic_off": {
+      "passed": 11,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 0.33,
+      "requested": "0",
+      "effective": false
+    },
+    "actual_checkpoint": {
+      "layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "comparisons": 690,
+      "suite_seconds": 3.528,
+      "test_summary": {
+        "result": "Passed",
+        "passedTests": 1,
+        "failedTests": 0,
+        "skippedTests": 0,
+        "totalTestCount": 1,
+        "runtimeWarnings": []
+      },
+      "shapes": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          7,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          3,
+          2
+        ],
+        [
+          4,
+          2
+        ]
+      ],
+      "amplitudes": [
+        0,
+        0.25,
+        4
+      ],
+      "tied_router_shapes": [
+        [
+          1,
+          2
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "comparison": "Native Data, dtype, shape and trace-selection checks. Existing CB limits for eager reference and scoped CB100 for compiled candidate. B4S2 retains eager fallback.",
+      "test_binary_sha256": "2fb185cf2c79c12c30a27975977dee7ee076569e0b7f51997095ce3934f56f36",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45",
+      "source_sha256": "ddcd118611563e93182d5e19f831b7c370d49f03d0af4d8e8eacce25e0711cf5",
+      "log_sha256": "a2fa53615f01662f15e9a910550fec9b04e971641a9007b591793d30d250aa0d",
+      "config_sha256": "29910322dd085f45c8f95c6c0f1611b20f722d6f6c8394321b34817e98a972fa",
+      "index_sha256": "5455e83705bbdd4e3702c7d4f9d49d4900e84533036628f74500538075dd5c80"
+    }
+  },
+  "source_sha256": {
+    "Libraries/MLXLLM/Models/Gemma4Text.swift": "d21e6bf62729a79971925da4dd792c6b8972f12e3cc6072c04de3c260587d1da",
+    "Libraries/MLXLLM/Models/Gemma4CompiledFeedforward.swift": "40b76891caebadca2b36f32aba7e87cfe48b78dc68992d88e1f5a1ff44a03b4f",
+    "Libraries/MLXLMCommon/SwitchLayers.swift": "1bbcb091f15589151537145f735de80f604e3f746dd3f76a054073489af2cdc5",
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift": "88158e25e770948912c10ab53dd44305d9e11f0eab4562ca4a648213fda60bc0",
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift": "26822ad10faabd11baef7e04cc8f6240f2a436d6243864bd79da6c147b186bbc"
+  },
+  "limits": [
+    "Two synthetic requests per C1 leg; no pooled, universal or C4 speedup.",
+    "HTTP post-first-generated-frame decode proxy, not engine token timestamps.",
+    "Thermal/low-power snapshots do not establish continuous state.",
+    "All-row within-shape byte parity is distinct from cross-shape adaptive-MTP output stability.",
+    "Initial reasoning output variant is preserved; later exact repeats do not establish its cause.",
+    "Other chips, cluster integration, cold prefill and full-model training are unqualified.",
+    "No peak MLX allocation exposed; OS process memory is a separate sampled/lifetime measure."
+  ],
+  "review_branch_checks": {
+    "new_composition_symbol_graph_build": true,
+    "new_composition_test_binary_build": false,
+    "full_package_tests": false,
+    "docc_for_ffn_delta": true,
+    "format_idempotence": true,
+    "reason": "The five original tested source files were copied, then reviewed formatting-only changes were recorded. DocC compiled the new branch symbol graphs and passed all11 library targets. Numerical test binaries retain their saved pre-format provenance; full-package CI and Xcode26 CI formatting remain pending."
+  },
+  "validated_source_sha256": {
+    "Libraries/MLXLLM/Models/Gemma4Text.swift": "be83c0f13ff39c3b653f3b52ff6b0dd5fb3e82cec74c51fa995a4886db61ca1a",
+    "Libraries/MLXLLM/Models/Gemma4CompiledFeedforward.swift": "a827fad276115d901de6c5ef862d367f278fd4c3f6acc4b7cd2bfd028599a55c",
+    "Libraries/MLXLMCommon/SwitchLayers.swift": "1bbcb091f15589151537145f735de80f604e3f746dd3f76a054073489af2cdc5",
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift": "88158e25e770948912c10ab53dd44305d9e11f0eab4562ca4a648213fda60bc0",
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift": "ddcd118611563e93182d5e19f831b7c370d49f03d0af4d8e8eacce25e0711cf5"
+  },
+  "formatting": {
+    "toolchain": "Installed Xcode 27 toolchain; swift format --version reports main",
+    "scope": "Five changed Swift files only",
+    "changes": "Whitespace and one array trailing comma only; reviewed against saved validated originals. Current source bytes differ from the tested binary sources.",
+    "validated_to_formatted": {
+      "Libraries/MLXLLM/Models/Gemma4Text.swift": {
+        "validated_sha256": "be83c0f13ff39c3b653f3b52ff6b0dd5fb3e82cec74c51fa995a4886db61ca1a",
+        "formatted_sha256": "d21e6bf62729a79971925da4dd792c6b8972f12e3cc6072c04de3c260587d1da",
+        "format_only": true
+      },
+      "Libraries/MLXLLM/Models/Gemma4CompiledFeedforward.swift": {
+        "validated_sha256": "a827fad276115d901de6c5ef862d367f278fd4c3f6acc4b7cd2bfd028599a55c",
+        "formatted_sha256": "40b76891caebadca2b36f32aba7e87cfe48b78dc68992d88e1f5a1ff44a03b4f",
+        "format_only": true
+      },
+      "Libraries/MLXLMCommon/SwitchLayers.swift": {
+        "validated_sha256": "1bbcb091f15589151537145f735de80f604e3f746dd3f76a054073489af2cdc5",
+        "formatted_sha256": "1bbcb091f15589151537145f735de80f604e3f746dd3f76a054073489af2cdc5",
+        "format_only": true
+      },
+      "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift": {
+        "validated_sha256": "88158e25e770948912c10ab53dd44305d9e11f0eab4562ca4a648213fda60bc0",
+        "formatted_sha256": "88158e25e770948912c10ab53dd44305d9e11f0eab4562ca4a648213fda60bc0",
+        "format_only": true
+      },
+      "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift": {
+        "validated_sha256": "ddcd118611563e93182d5e19f831b7c370d49f03d0af4d8e8eacce25e0711cf5",
+        "formatted_sha256": "26822ad10faabd11baef7e04cc8f6240f2a436d6243864bd79da6c147b186bbc",
+        "format_only": true
+      }
+    },
+    "ci_style_idempotence": "Passed using the installed Xcode27 formatter; second format-in-place pass left all five file hashes unchanged.",
+    "strict_lint": "Failed only on pre-existing uppercase locals K and L outside the FFN delta. These names also occur in the published base; CI uses formatter idempotence, not strict lint.",
+    "xcode26_ci": "Pending"
+  },
+  "documentation": {
+    "passed": true,
+    "targets": 11,
+    "toolchain": "Installed Xcode27 toolchain",
+    "jobs": 4,
+    "sequential": true,
+    "warnings_as_errors": true,
+    "foundation_models_excluded": "Same SDK-specific exclusion as scripts/verify-docs.sh",
+    "dependency_lock_sha256": "202af58a3546e029200b2bc1aac905e3d6b4cda0c50d1ebdbedb3539d0e3e162",
+    "automatic_dependency_resolution": false,
+    "results": [
+      {
+        "target": "BenchmarkHelpers",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 51.32449658296537,
+        "log_sha256": "e2dc9e694f35bda7d3a3cdde30f6b7d34c533b8f9724184b5c8791e8b083c901",
+        "started_utc": "2026-10-26T09:06:30.167273+00:00",
+        "finished_utc": "2026-10-26T09:07:21.492357+00:00"
+      },
+      {
+        "target": "IntegrationTestHelpers",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 8.208963291952386,
+        "log_sha256": "4a73fe2df7cbe87f7cf5df5cad659c0bb81361f190e4dd6128810f11737879fe",
+        "started_utc": "2026-10-26T09:07:21.539820+00:00",
+        "finished_utc": "2026-10-26T09:07:29.749057+00:00"
+      },
+      {
+        "target": "MLXEmbedders",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 6.275852042017505,
+        "log_sha256": "7e99f5cf6d16e4fff11963d958c5bc5da2593d1c5b885e25a2180ce33b199853",
+        "started_utc": "2026-10-26T09:07:29.792150+00:00",
+        "finished_utc": "2026-10-26T09:07:36.068268+00:00"
+      },
+      {
+        "target": "MLXGuidedGeneration",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 13.048957958002575,
+        "log_sha256": "48af84305ebb075eefc6a8ebaaffb50ba8178fdb8a050b04185ed3b6777d2594",
+        "started_utc": "2026-10-26T09:07:36.111779+00:00",
+        "finished_utc": "2026-10-26T09:07:49.161048+00:00"
+      },
+      {
+        "target": "MLXHuggingFace",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 8.693642416968942,
+        "log_sha256": "4d84d15e383b5fa38e222dba9898e946eb787a618d22785568b8c55905039d3b",
+        "started_utc": "2026-10-26T09:07:49.205191+00:00",
+        "finished_utc": "2026-10-26T09:07:57.899125+00:00"
+      },
+      {
+        "target": "MLXLLM",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 9.953387208050117,
+        "log_sha256": "56fd0de548b43c7af06e2dd07f54c853968d8982ac90cca37314b3e3d3d45cbb",
+        "started_utc": "2026-10-26T09:07:57.945289+00:00",
+        "finished_utc": "2026-10-26T09:08:07.898967+00:00"
+      },
+      {
+        "target": "MLXLMCommon",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 10.976408332993742,
+        "log_sha256": "dc92e51f551ad1620f0121655f9f225cba78dc6453eedfbc2de777e9b003d8d0",
+        "started_utc": "2026-10-26T09:08:07.947015+00:00",
+        "finished_utc": "2026-10-26T09:08:18.923713+00:00"
+      },
+      {
+        "target": "MLXLMServer",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 14.428628207999282,
+        "log_sha256": "6d1bdf770d206a2aa17b60da4be631ac9c2b09c3edcab37fed556df73b552330",
+        "started_utc": "2026-10-26T09:08:18.973395+00:00",
+        "finished_utc": "2026-10-26T09:08:33.402381+00:00"
+      },
+      {
+        "target": "MLXRerankers",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 7.433078584028408,
+        "log_sha256": "8b63bb930b4116335827a9c4e59855863540b4412ee4d32f60f9a77ac52e1df3",
+        "started_utc": "2026-10-26T09:08:33.455571+00:00",
+        "finished_utc": "2026-10-26T09:08:40.888943+00:00"
+      },
+      {
+        "target": "MLXScriptedLM",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 8.749872584012337,
+        "log_sha256": "b4400250519436e62ad0f86ad07e2259eae8ea2ac602751abf732392fbe461c3",
+        "started_utc": "2026-10-26T09:08:40.946613+00:00",
+        "finished_utc": "2026-10-26T09:08:49.696834+00:00"
+      },
+      {
+        "target": "MLXVLM",
+        "passed": true,
+        "exit_code": 0,
+        "wall_seconds": 11.294341333035845,
+        "log_sha256": "d6fa38e1d749b04ff705111b44d4af110cdf65d0aa1abb2ae8f7aea353aae194",
+        "started_utc": "2026-10-26T09:08:49.758643+00:00",
+        "finished_utc": "2026-10-26T09:09:01.053307+00:00"
+      }
+    ],
+    "scope": "All11 required library documentation targets passed for this composed FFN branch. Existing Swift compiler warnings were recorded; no documentation-warning suppression was used."
+  }
+}

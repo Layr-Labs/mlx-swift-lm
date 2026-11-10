@@ -96,6 +96,8 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            Identity-greedy batches skip unused parameter/history tensor construction and the
+            unused all-greedy mask while retaining constraints, transforms and sampler row state.
             An opt-in canonical prefill grid (`canonicalPrefillGridTokens`, default off) makes each
             prompt chunk of a text request one cell that ends at a grid multiple or a message
             boundary (`CBv2CanonicalBoundaryRule`, given by the host or derived from the model's chat
@@ -106,6 +108,8 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/receipt.json"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
@@ -283,6 +287,9 @@ def:
         machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
         recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
         FoundationModels router pass it.
+        A schema node marked `nullable: true` (how a client's nullable parameter reaches the SDK) admits
+        `null`: XML argument conversion turns a model's `null` into JSON null and the validator lets it
+        through the type check (`ToolNullableSchemaTests`; documented in the skill's `tool-calling.md`).
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
@@ -294,6 +301,7 @@ def:
         - "Tests/MLXLMTests/ToolArgumentNormalizationTests.swift"
         - "Tests/MLXLMTests/ToolCall*.swift"
         - "Tests/MLXLMTests/ToolSchemaValidatorTests.swift"
+        - "Tests/MLXLMTests/ToolNullableSchemaTests.swift"
         - "Tests/MLXLMTests/XMLFunctionParserStrictnessTests.swift"
         - "Tests/MLXLMTests/ToolTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
@@ -301,6 +309,7 @@ def:
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
+        - "skills/mlx-swift-lm/references/tool-calling.md"
     - title: "Models"
       description: |
         Production model work in `Libraries/MLXLLM`. Beyond new architectures, each production model
@@ -361,10 +370,19 @@ def:
             attention can run in row parts whose sums are issued as built (`Gemma4TensorParallelPromptParts`,
             off by default: bit-identical on the GPU for two ranks while every op after attention is per-row,
             not on the CPU backend, not exact with more than two ranks, and not enforced).
+            The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
+            dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
+            A separate compiled feed-forward report records bounded S1/S2 FFN reuse, live parameter
+            invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift"
+            - "docs/benchmarks/gemma4-compiled-feedforward-2026-10-26/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.

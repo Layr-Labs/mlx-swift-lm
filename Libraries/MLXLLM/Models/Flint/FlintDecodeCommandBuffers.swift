@@ -4,7 +4,7 @@ import MLX
 import MLXLMCommon
 
 /// Command-buffer limits for Flint's plain decode steps (every row one token;
-/// see ``CBv2DecodeCommandBufferLimitsProviding``). MLX's per-device defaults
+/// see `MLXLMCommon.CBv2DecodeCommandBufferLimitsProviding`). MLX's per-device defaults
 /// commit every 20 (phone), 40 (base/Pro) or 50 (Max/Ultra) operations, or
 /// once a buffer's distinct inputs and outputs exceed 40-50 "MB" — counted in
 /// ELEMENTS, so a single routed-expert bank or `lm_head` read crosses it and
