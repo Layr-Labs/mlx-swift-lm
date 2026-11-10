@@ -215,6 +215,10 @@ final class RecurrentGeometryObservations: @unchecked Sendable {
     }
 }
 
+private func waitForSignal(_ semaphore: DispatchSemaphore, seconds: Double) -> Bool {
+    semaphore.wait(timeout: .now() + seconds) == .success
+}
+
 private final class CompleteCheckpointReceiptLog: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [(CBv2RequestID, [Int])] = []
@@ -227,6 +231,11 @@ private final class CompleteCheckpointReceiptLog: @unchecked Sendable {
         lock.lock()
         entries.append((id, positions))
         lock.unlock()
+    }
+    var positions: [[Int]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.map(\.1)
     }
 }
 
@@ -788,6 +797,216 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
             "a live export manifest must retain its host-memory permit after close")
         gate.resume.signal()
         store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        await engine.shutdown()
+    }
+
+    private func earlyTerminalRequest(_ id: UInt64, receipt: UInt64) -> CBv2Request {
+        var request = CBv2Request(
+            id: .init(id), promptTokens: Array(repeating: 1, count: chunk + 1), maxTokens: 1,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(receipt))
+        request.terminalPrecedesCheckpointPublication = true
+        return request
+    }
+
+    /// Resolves once `retirement` completes; `retired.wait` then tells whether it has.
+    private func observeRetirement(_ retirement: CBv2RequestRetirement) -> DispatchSemaphore {
+        let retired = DispatchSemaphore(value: 0)
+        Task.detached {
+            await retirement.wait()
+            retired.signal()
+        }
+        return retired
+    }
+
+    private func signalled(_ semaphore: DispatchSemaphore, within seconds: Double) async -> Bool {
+        await Task.detached { waitForSignal(semaphore, seconds: seconds) }.value
+    }
+
+    func testTerminalPrecedesPublicationWhenRequestedButOwnershipWaits() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(gate: gate)
+        let (engine, backend) = engine(store)
+        defer { gate.resume.signal() }
+        let receipts = CompleteCheckpointReceiptLog()
+        engine.setCompletePrefixPublicationHandler { receipts.append($0, $1) }
+        let request = earlyTerminalRequest(13, receipt: 1013)
+        let submitted = try engine.submitWithRetirement(request)
+        let retired = observeRetirement(submitted.retirement)
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered, "publication is blocked inside the store")
+        // The consumer finishes while the checkpoint is still being written.
+        // Without the opt-in this times out: the terminal waits for the store.
+        let result = await cbv2SchedCollect(submitted.events, timeoutSeconds: 3)
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertTrue(store.saved.isEmpty)
+        XCTAssertEqual(receipts.count, 0)
+        // Ownership did not move: rows stay charged and the ID stays fenced.
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+        XCTAssertGreaterThan(engine.admissionForTesting.bytesReserved, 0)
+        let early = await signalled(retired, within: 0.3)
+        XCTAssertFalse(early, "retirement waits for publication")
+        XCTAssertThrowsError(
+            try engine.submit(
+                .init(
+                    id: request.id, promptTokens: request.promptTokens, maxTokens: 1,
+                    prefixCacheReceiptID: .init(2013))))
+        gate.resume.signal()
+        let acknowledged = await signalled(retired, within: 10)
+        XCTAssertTrue(acknowledged)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(positions(store), [chunk])
+        XCTAssertEqual(receipts.positions, [[chunk]])
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        // The fence lifts at retirement, not before.
+        let reused = await cbv2SchedCollect(
+            try engine.submit(
+                .init(id: request.id, promptTokens: [2, 3], maxTokens: 1)))
+        XCTAssertEqual(reused.finishReason, .length)
+        await engine.shutdown()
+    }
+
+    /// The default, and an opt-in without a retirement handle, keep the
+    /// terminal after the durable write.
+    func testTerminalStillFollowsPublicationByDefaultAndWithoutARetirementHandle() async throws {
+        for optIn in [false, true] {
+            let gate = CheckpointPublicationGate()
+            let store = CompleteCheckpointFixtureStore(gate: gate)
+            let (engine, _) = engine(store)
+            defer { gate.resume.signal() }
+            var request = earlyTerminalRequest(14, receipt: 1014)
+            request.terminalPrecedesCheckpointPublication = optIn
+            let stream =
+                try optIn ? engine.submit(request) : engine.submitWithRetirement(request).events
+            let finished = DispatchSemaphore(value: 0)
+            let collection = Task { () -> CBv2SchedCollected in
+                let result = await cbv2SchedCollect(stream)
+                finished.signal()
+                return result
+            }
+            let entered = await Task.detached { gate.waitUntilEntered() }.value
+            XCTAssertTrue(entered)
+            let early = await signalled(finished, within: 0.3)
+            XCTAssertFalse(early, "the terminal waits for publication (opt-in \(optIn))")
+            gate.resume.signal()
+            let result = await collection.value
+            XCTAssertEqual(result.finishReason, .length)
+            XCTAssertEqual(positions(store), [chunk], "the terminal follows the durable write")
+            store.finishPublicationCallbacks(engine: engine)
+            await engine.shutdown()
+        }
+    }
+
+    func testCancellationAfterAnEarlyTerminalReleasesOwnershipOnce() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(gate: gate)
+        let (engine, backend) = engine(store)
+        defer { gate.resume.signal() }
+        let receipts = CompleteCheckpointReceiptLog()
+        engine.setCompletePrefixPublicationHandler { receipts.append($0, $1) }
+        let request = earlyTerminalRequest(15, receipt: 1015)
+        let submitted = try engine.submitWithRetirement(request)
+        let retired = observeRetirement(submitted.retirement)
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered)
+        let result = await cbv2SchedCollect(submitted.events, timeoutSeconds: 3)
+        XCTAssertEqual(result.finishReason, .length)
+        // A client disconnect after its terminal: nothing left to cancel, and
+        // the publication still owns the rows.
+        engine.cancel(request.id)
+        engine.cancel(request.id)
+        let early = await signalled(retired, within: 0.3)
+        XCTAssertFalse(early)
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+        gate.resume.signal()
+        let acknowledged = await signalled(retired, within: 10)
+        XCTAssertTrue(acknowledged)
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        XCTAssertEqual(receipts.positions, [[chunk]])
+        // Released exactly once: a second request of the same ID charges and
+        // returns the ledgers to zero again.
+        gate.resume.signal()
+        let again = try engine.submitWithRetirement(earlyTerminalRequest(15, receipt: 2015))
+        let repeated = await cbv2SchedCollect(again.events)
+        XCTAssertEqual(repeated.finishReason, .length)
+        await again.retirement.wait()
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        await engine.shutdown()
+    }
+
+    func testPublicationFailureAfterAnEarlyTerminalReleasesOwnershipOnce() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(gate: gate)
+        let (engine, backend) = engine(store)
+        defer { gate.resume.signal() }
+        let receipts = CompleteCheckpointReceiptLog()
+        engine.setCompletePrefixPublicationHandler { receipts.append($0, $1) }
+        let request = earlyTerminalRequest(16, receipt: 1016)
+        let submitted = try engine.submitWithRetirement(request)
+        let retired = observeRetirement(submitted.retirement)
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered)
+        let result = await cbv2SchedCollect(submitted.events, timeoutSeconds: 3)
+        XCTAssertEqual(result.finishReason, .length, "the client already has its answer")
+        // The store fails the write: completion([]) after the terminal.
+        store.close()
+        let acknowledged = await signalled(retired, within: 10)
+        XCTAssertTrue(acknowledged)
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertTrue(store.saved.isEmpty)
+        XCTAssertTrue(receipts.positions.allSatisfy(\.isEmpty), "a failed write publishes nothing")
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        await engine.shutdown()
+    }
+
+    func testFollowUpBeforePublicationRunsColdAndIdentical() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(gate: gate)
+        let (engine, backend) = engine(store)
+        defer {
+            gate.resume.signal()
+            gate.resume.signal()
+        }
+        var donor = earlyTerminalRequest(17, receipt: 1017)
+        donor.maxTokens = 3
+        let first = try engine.submitWithRetirement(donor)
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered)
+        let cold = await cbv2SchedCollect(first.events, timeoutSeconds: 3)
+        XCTAssertEqual(cold.finishReason, .length)
+        // The follow-up arrives while the donor's checkpoint is still being
+        // written: nothing to stage, so it computes the whole prompt.
+        var followUp = earlyTerminalRequest(18, receipt: 1018)
+        followUp.maxTokens = 3
+        XCTAssertFalse(try store.stage(engine: engine, request: followUp))
+        let second = try engine.submitWithRetirement(followUp)
+        let early = await cbv2SchedCollect(second.events, timeoutSeconds: 3)
+        XCTAssertEqual(early.finishReason, .length)
+        XCTAssertEqual(early.usage?.prefixCachePrefillTokensSaved ?? 0, 0)
+        XCTAssertEqual(early.tokens, cold.tokens)
+        gate.resume.signal()
+        gate.resume.signal()
+        await first.retirement.wait()
+        await second.retirement.wait()
+        store.finishPublicationCallbacks(engine: engine)
+        // After publication the same prompt is a hit with the same output.
+        var later = earlyTerminalRequest(19, receipt: 1019)
+        later.maxTokens = 3
+        XCTAssertTrue(try store.stage(engine: engine, request: later))
+        let third = try engine.submitWithRetirement(later)
+        gate.resume.signal()
+        let warm = await cbv2SchedCollect(third.events)
+        XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, chunk)
+        XCTAssertEqual(warm.tokens, cold.tokens)
+        await third.retirement.wait()
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(backend.bytesReserved, 0)
         XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
         await engine.shutdown()
     }
