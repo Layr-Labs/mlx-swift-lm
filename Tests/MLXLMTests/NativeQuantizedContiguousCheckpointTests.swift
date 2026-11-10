@@ -235,6 +235,117 @@ final class NativeQuantizedContiguousCheckpointTests: XCTestCase {
         }
     }
 
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func increment() { lock.withLock { count += 1 } }
+    }
+
+    private final class NativeStore: CBv2NativeCompletePrefixCache, @unchecked Sendable {
+        let identity: CBv2CompleteCheckpointIdentity
+        init(identity: CBv2CompleteCheckpointIdentity) { self.identity = identity }
+        func takeStaged(
+            requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
+            maximumSequenceLength: Int
+        ) -> CBv2StagedCompleteCheckpoint? { nil }
+        func donate(
+            _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
+            tokens: [Int], cacheSalt: String?,
+            completion: @escaping @Sendable ([Int]) -> Void
+        ) {
+            source.close()
+            completion([])
+        }
+        func close() {}
+        func closeAndWait() async {}
+    }
+
+    /// Every coded row is the reference encoder's bytes for that native row,
+    /// every recent row its native bytes, at any segment boundary.
+    func testCodedExportMatchesRowByRowReferenceAtEverySegmentSize() throws {
+        for dtype: DType in [.bfloat16, .float32] {
+            let kinds = kinds(window: 37)
+            let lossy = codec(kinds: kinds, dtype: dtype, profile: quantization)
+            let exact = codec(kinds: kinds, dtype: dtype, profile: nil)
+            let original = rows(kinds: kinds, dtype: dtype)
+            let coded = try export(codec: lossy, rows: original)
+            defer { coded.close() }
+            let native = try export(codec: exact, rows: original)
+            defer { native.close() }
+            for (index, descriptor) in coded.manifest.tensors.enumerated() {
+                guard descriptor.dtype == .uint8 else { continue }
+                let nativeDescriptor = native.manifest.tensors[index]
+                let rows = try native.readSegment(
+                    tensorIndex: index, byteOffset: 0, maximumBytes: nativeDescriptor.byteCount)
+                let role = try lossy.checkpointRole(
+                    layer: index / 2, position: position, values: index % 2 == 1)
+                XCTAssertEqual(
+                    nativeDescriptor.shape,
+                    [1, role.key.kvHeads, role.position - role.tokenStart, role.width])
+                var expected = Data()
+                for head in 0 ..< role.key.kvHeads {
+                    for token in 0 ..< role.position - role.tokenStart {
+                        let start =
+                            (head * (role.position - role.tokenStart) + token) * role.nativeRowBytes
+                        let row = rows.subdata(in: start ..< start + role.nativeRowBytes)
+                        expected.append(
+                            token < role.packedCount
+                                ? try CBv2NativeCheckpointRowCodec.encode(row, role: role) : row)
+                    }
+                }
+                XCTAssertEqual(expected.count, descriptor.byteCount)
+                for segment in [1, 3, 17, 257, 1021, 20_000, descriptor.byteCount] {
+                    var actual = Data()
+                    while actual.count < descriptor.byteCount {
+                        actual.append(
+                            try coded.readSegment(
+                                tensorIndex: index, byteOffset: actual.count,
+                                maximumBytes: segment))
+                    }
+                    XCTAssertEqual(actual, expected, "\(dtype) tensor \(index) segment \(segment)")
+                }
+            }
+        }
+    }
+
+    /// A segment's coded rows are read from their source a band of a head at
+    /// a time, not one row per read: the publication's native binding is
+    /// checked per read, which cost ~25 us per row on GLM-5.3-Flash.
+    func testNativeBoundExportReadsCodedRowsInBatches() throws {
+        let kinds = kinds(window: 37)
+        let codec = codec(kinds: kinds, dtype: .bfloat16, profile: quantization)
+        let original = rows(kinds: kinds, dtype: .bfloat16)
+        let unbound = try export(codec: codec, rows: original)
+        defer { unbound.close() }
+        let bound = try export(codec: codec, rows: original)
+        defer { bound.close() }
+        let validations = Counter()
+        let store = NativeStore(identity: codec.identity)
+        let work = try CBv2NativeCompletePrefixWork(
+            tracking: .init(engineID: UUID(), contractID: UUID(), supported: true),
+            codec: codec, store: store, request: nil, purpose: .publication, streams: [],
+            duringDrain: false, queue: DispatchQueue(label: "test.native-export"),
+            completionQueue: DispatchQueue(label: "test.native-export.completion"),
+            wake: {}, failure: {}, validateBinding: { validations.increment() })
+        try bound.bindNativeCompletePrefixWork(work)
+        for (index, descriptor) in bound.manifest.tensors.enumerated() {
+            guard descriptor.dtype == .uint8 else { continue }
+            let before = validations.value
+            let data = try bound.readSegment(
+                tensorIndex: index, byteOffset: 0, maximumBytes: descriptor.byteCount)
+            // Two reads per head (coded band, recent band), two checks per read.
+            XCTAssertLessThanOrEqual(
+                validations.value - before, 4 * descriptor.shape[1], "tensor \(index)")
+            XCTAssertEqual(
+                data,
+                try unbound.readSegment(
+                    tensorIndex: index, byteOffset: 0, maximumBytes: descriptor.byteCount))
+        }
+        XCTAssertFalse(work.debugIsFailed)
+        withExtendedLifetime(store) {}
+    }
+
     func testAbsentOrUnsupportedProfilePreservesNativeAsymmetricExport() throws {
         let profiles: [(Int, PagedKVQuantizationConfig?)] = [(64, nil), (96, quantization)]
         for (width, profile) in profiles {
