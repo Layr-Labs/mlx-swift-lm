@@ -1585,6 +1585,12 @@ public class ToolCallProcessor {
         return frameAccepts(call) ? call : nil
     }
 
+    /// Every call of one closed frame: one for most formats, while LFM2 lists
+    /// all of a turn's calls in one frame.
+    private func frameParseCalls(_ content: String) -> [ToolCall] {
+        parser.parseFrame(content: content, tools: tools).filter { frameAccepts($0) }
+    }
+
     private func frameParseEOS(_ content: String) -> [ToolCall] {
         parser.parseEOS(content, tools: tools).filter { frameAccepts($0) }
     }
@@ -1723,9 +1729,10 @@ public class ToolCallProcessor {
 
         toolCallBuffer += chunk
         var leadingToken: String?
-        // Qwen and Flint frames (and every streamed format) keep visible text
-        // that precedes a still-open frame in the same chunk.
-        let keepsLeadingText = qwenStructuredFrames || flintFrames || streaming != nil
+        // Qwen, Flint and LFM2 frames (and every streamed format) keep visible
+        // text that precedes a still-open frame in the same chunk.
+        let keepsLeadingText =
+            qwenStructuredFrames || flintFrames || format == .lfm2 || streaming != nil
 
         switch state {
         case .normal:
@@ -1779,10 +1786,16 @@ public class ToolCallProcessor {
                 }
                 toolCallBuffer = String(toolCallBuffer[..<endRange.upperBound])
 
-                // Parse the tool call using the parser
+                // Parse every call in the completed frame (one for most
+                // formats; LFM2 lists all of a turn's calls in one frame).
                 let failedBuffer = toolCallBuffer
-                let parsedCall = frameParse(toolCallBuffer)
-                completeCall(parsedCall, failedBuffer: failedBuffer, into: &segments)
+                let parsedCalls = frameParseCalls(toolCallBuffer)
+                if parsedCalls.isEmpty {
+                    completeCall(nil, failedBuffer: failedBuffer, into: &segments)
+                }
+                for parsedCall in parsedCalls {
+                    completeCall(parsedCall, failedBuffer: failedBuffer, into: &segments)
+                }
 
                 state = .normal
                 activeEndTags = nil
