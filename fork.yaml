@@ -96,6 +96,12 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            An opt-in canonical prefill grid (`canonicalPrefillGridTokens`, default off) makes each
+            prompt chunk of a text request one cell that ends at a grid multiple or a message
+            boundary (`CBv2CanonicalBoundaryRule`, given by the host or derived from the model's chat
+            template and checked on rendered two-turn prompts), so prompts that start with the same
+            tokens are prefilled in the same chunks. `EngineV2.submitContinuation` prefills a known
+            next-turn prefix while the engine is idle; any other submission cancels it.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
