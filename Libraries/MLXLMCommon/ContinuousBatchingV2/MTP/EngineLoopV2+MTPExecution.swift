@@ -179,7 +179,10 @@ extension EngineLoopV2 {
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
         ) throws -> Bool {
-            guard let state = try mtpTakeHistoryState(for: row.rec) else { return false }
+            guard
+                let state = try mtpTakeHistoryState(
+                    for: row.rec, range: row.start ..< row.start + row.count)
+            else { return false }
             retainNativeWork([], owners: [state])
             let observationDrafter = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             func retainObservationFence() {
@@ -509,7 +512,7 @@ extension EngineLoopV2 {
             }
             if let observedHidden,
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden),
-                row.samples, mtpSeedsCarryFromPrefill
+                row.samples, mtpSeedsCarryFromPrefill, mtpBasicEligible(rec)
             {
                 // The final prompt row's hidden produced the first token: the
                 // exact pair a seed step would otherwise recompute.
@@ -635,11 +638,15 @@ extension EngineLoopV2 {
     }
 
     /// Detach (or create) the request's persistent assistant state for one
-    /// committed target observation; nil when the row owns no history.
+    /// committed target observation; nil when the row owns no history. A row
+    /// that cannot speculate owns history only over a prompt `range` that can
+    /// leave a prefix checkpoint (`mtpRecordsPromptHistory`).
     func mtpTakeHistoryState(
-        for rec: CBv2ScheduledRequest
+        for rec: CBv2ScheduledRequest, range: Range<Int>? = nil
     ) throws -> (any CBv2MTPRequestState)? {
-        guard let mtp, mtp.tracksPersistentHistory, mtpBasicEligible(rec) else { return nil }
+        guard let mtp, mtp.tracksPersistentHistory,
+            mtpBasicEligible(rec) || range.map({ mtpRecordsPromptHistory(rec, range: $0) }) == true
+        else { return nil }
         return try mtp.takeOrMakeAssistantState(
             for: rec.id,
             maximumSequenceLength: rec.request.promptTokens.count
