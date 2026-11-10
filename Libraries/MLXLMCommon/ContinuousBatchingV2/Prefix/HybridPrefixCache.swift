@@ -105,7 +105,8 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         // position a cold-run chunk end (a grid multiple or a message boundary).
         guard position > 0, chunkSize > 1,
             canonical
-                || CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize)
+                || CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(
+                    position, chunkSize: chunkSize)
         else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
         // Bound, target-only media; QSA side state unless the model's only

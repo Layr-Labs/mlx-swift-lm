@@ -836,8 +836,14 @@ public enum CBv2SpeculationFallback: Sendable, Equatable {
 /// assistant message's opening sequence (`<|im_start|>assistant\n`,
 /// `<|start|>assistant`), and right after the closing sequence that ends that
 /// assistant message (`<|im_end|>\n`; `<|end|>`, `<|call|>`, `<|return|>`).
-/// The scan reads left to right, so each boundary depends only on the tokens
-/// before it, and every longer prompt with the same prefix has it too.
+/// A template that writes nothing after an assistant message closes it with
+/// the first token of the next message.
+///
+/// Each boundary is decided from the tokens before it alone, whatever the
+/// patterns are. Two prompts that share their first `p` tokens therefore have
+/// the same boundaries up to `p`, so a prefill that resumes from a state kept
+/// at one runs the same chunks as a cold prefill. A rule that does not fit
+/// the template loses reuse and nothing else.
 public struct CBv2CanonicalBoundaryRule: Sendable, Equatable {
     public var open: [Int]
     public var close: [[Int]]
@@ -848,32 +854,35 @@ public struct CBv2CanonicalBoundaryRule: Sendable, Equatable {
     }
 
     /// Sorted, distinct boundary positions in `(0, tokens.count]`.
+    ///
+    /// A position is a boundary when `open` ends there or, inside an assistant
+    /// message, a `close` ends there, and the match starts at or after the
+    /// previous boundary. No decision reads a token at or after the position.
     public func boundaries(in tokens: [Int]) -> [Int] {
-        guard !open.isEmpty else { return [] }
-        func matches(_ pattern: [Int], at index: Int) -> Bool {
-            guard index + pattern.count <= tokens.count else { return false }
-            for (offset, token) in pattern.enumerated() where tokens[index + offset] != token {
+        guard !open.isEmpty, !tokens.isEmpty else { return [] }
+        var result: [Int] = []
+        var consumed = 0
+        var inAssistant = false
+        func ends(_ pattern: [Int], at end: Int) -> Bool {
+            let start = end - pattern.count
+            guard start >= consumed, tokens[end - 1] == pattern[pattern.count - 1] else {
+                return false
+            }
+            for offset in 0 ..< pattern.count - 1 where tokens[start + offset] != pattern[offset] {
                 return false
             }
             return true
         }
-        var result: [Int] = []
-        var index = 0
-        var inAssistant = false
-        while index < tokens.count {
-            if matches(open, at: index) {
-                index += open.count
-                result.append(index)
+        for end in 1 ... tokens.count {
+            if ends(open, at: end) {
                 inAssistant = true
-                continue
-            }
-            if inAssistant, let pattern = close.first(where: { matches($0, at: index) }) {
-                index += pattern.count
-                result.append(index)
+            } else if inAssistant, close.contains(where: { ends($0, at: end) }) {
                 inAssistant = false
+            } else {
                 continue
             }
-            index += 1
+            result.append(end)
+            consumed = end
         }
         return result
     }
