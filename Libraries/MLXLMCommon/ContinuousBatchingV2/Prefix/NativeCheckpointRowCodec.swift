@@ -10,6 +10,9 @@ import MLX
 /// export retains history here.
 enum CBv2NativeCheckpointRowCodec {
     static let scratchBytes = 64 << 10
+    /// Native rows export reads from its source at once (whole rows, at least
+    /// one), charged on top of `scratchBytes`.
+    static let exportBatchBytes = 256 << 10
 
     static func encode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
         try data.withUnsafeBytes { try encode($0, role: role, decoder: nil) }

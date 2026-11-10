@@ -40,10 +40,13 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
         guard byteOffset >= 0, byteOffset < bytes, maximumBytes > 0,
             maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
-        // Reserve before the first CPU row read/allocation. The donor's own
-        // native completion owner remains responsible for its immutable roots.
+        let batchRows = max(
+            1, CBv2NativeCheckpointRowCodec.exportBatchBytes / max(1, role.nativeRowBytes))
+        // Reserve before the first CPU row read/allocation, one batch of native
+        // rows included. The donor's own native completion owner remains
+        // responsible for its immutable roots.
         let scratch = try admission.reserveTransient(
-            bytes: CBv2NativeCheckpointRowCodec.scratchBytes)
+            bytes: CBv2NativeCheckpointRowCodec.scratchBytes + batchRows * role.nativeRowBytes)
         defer { scratch.release() }
         let count = min(maximumBytes, bytes - byteOffset)
         let packedBytes = role.packedCount * role.packedRowBytes
@@ -59,22 +62,37 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
                 let packed = inHead < packedBytes
                 let inBand = packed ? inHead : inHead - packedBytes
                 let rowBytes = packed ? role.packedRowBytes : role.nativeRowBytes
-                let token = inBand / rowBytes + (packed ? 0 : role.packedCount)
+                let bandRows = packed ? role.packedCount : role.nativeCount
+                let firstRow = inBand / rowBytes
                 let inRow = inBand % rowBytes
+                // One source read covers consecutive rows of this head's band:
+                // the read's fixed cost (native binding checks, evaluation, a
+                // buffer) is paid per batch, not per row.
+                let neededEnd = min(bandRows * rowBytes, inBand + count - copied)
+                let rows = min(batchRows, (neededEnd + rowBytes - 1) / rowBytes - firstRow)
+                let token = firstRow + (packed ? 0 : role.packedCount)
                 let native = try source.readSegment(
                     descriptor: nativeDescriptor,
                     byteOffset: (head * tokenCount + token) * role.nativeRowBytes,
-                    maximumBytes: role.nativeRowBytes, nativeWork: nativeWork)
-                let row = packed ? try encoder.encode(native) : native
-                guard row.count == rowBytes else {
+                    maximumBytes: rows * role.nativeRowBytes, nativeWork: nativeWork)
+                guard native.count == rows * role.nativeRowBytes else {
                     throw CBv2CompleteCheckpointError.incompleteTransfer
                 }
-                let length = min(count - copied, rowBytes - inRow)
-                row.withUnsafeBytes { source in
-                    destination.baseAddress!.advanced(by: copied).copyMemory(
-                        from: source.baseAddress!.advanced(by: inRow), byteCount: length)
+                for index in 0 ..< rows {
+                    let start = native.startIndex + index * role.nativeRowBytes
+                    let nativeRow = native[start ..< start + role.nativeRowBytes]
+                    let row = packed ? try encoder.encode(nativeRow) : nativeRow
+                    guard row.count == rowBytes else {
+                        throw CBv2CompleteCheckpointError.incompleteTransfer
+                    }
+                    let skip = index == 0 ? inRow : 0
+                    let length = min(count - copied, rowBytes - skip)
+                    row.withUnsafeBytes { source in
+                        destination.baseAddress!.advanced(by: copied).copyMemory(
+                            from: source.baseAddress!.advanced(by: skip), byteCount: length)
+                    }
+                    copied += length
                 }
-                copied += length
             }
         }
         return result
