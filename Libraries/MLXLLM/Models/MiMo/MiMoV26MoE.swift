@@ -25,6 +25,8 @@ final class MiMoV26Router: Module {
     let config: MiMoV26Configuration
     let operandDType: DType
     var useFusedDecodeRouter = MiMoV26DecodeRouter.enabledByEnvironment
+    /// Sees each selection's expert indices; set only by `observeRoutes`.
+    var routeObserver: ((MLXArray) -> Void)?
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var correctionBias: MLXArray
 
@@ -54,10 +56,9 @@ final class MiMoV26Router: Module {
                     ?? matmul(row.asType(operandDType).asType(.float32), matrix)
                 return select(logits)
             }
-            return (
-                concatenated(routed.map(\.indices), axis: 1),
-                concatenated(routed.map(\.weights), axis: 1)
-            )
+            let indices = concatenated(routed.map(\.indices), axis: 1)
+            routeObserver?(indices)
+            return (indices, concatenated(routed.map(\.weights), axis: 1))
         }
         // Quantize operands to the declared router precision, but do not round
         // the dot-product result to BF16 before sigmoid. The reference CUDA
@@ -69,7 +70,9 @@ final class MiMoV26Router: Module {
             ?? matmul(
                 x.asType(operandDType).asType(.float32),
                 weight.asType(operandDType).asType(.float32).T)
-        return select(logits)
+        let routed = select(logits)
+        routeObserver?(routed.indices)
+        return routed
     }
 
     private func select(_ logits: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
@@ -138,5 +141,16 @@ final class MiMoV26MoE: Module, UnaryLayer {
         return .init(
             output: (expertOutput * routed.weights[.ellipsis, .newAxis])
                 .sum(axis: -2).asType(x.dtype), route: .disabled)
+    }
+}
+
+extension MiMoV26TextModel {
+    /// Hands each routed layer's index and lazy selected experts (`[B, L, K]`) to `observer`;
+    /// nil stops. Observation only: no forward changes.
+    public func observeRoutes(_ observer: ((Int, MLXArray) -> Void)?) {
+        for (index, layer) in model.layers.enumerated() {
+            guard let moe = layer.mlp as? MiMoV26MoE else { continue }
+            moe.gate.routeObserver = observer.map { observe in { observe(index, $0) } }
+        }
     }
 }

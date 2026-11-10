@@ -3,7 +3,7 @@ import MLXNN
 
 /// A row-parallel projection of a channel-sharded Qwen MoE layer whose
 /// unrounded FP32 partial can travel in the routed experts' collective
-/// (`Qwen35TensorParallelSwitchLinear.carrying`): the shared expert's down
+/// (`TensorParallelSwitchLinear.carrying`): the shared expert's down
 /// projection. The partial must be exactly the one the projection's own
 /// forward would sum across ranks.
 public protocol Qwen35TensorParallelPackedPartial: AnyObject {
@@ -11,10 +11,16 @@ public protocol Qwen35TensorParallelPackedPartial: AnyObject {
     func qwen35TensorParallelPartial(_ x: MLXArray) -> MLXArray
 }
 
-/// A channel-sharded Qwen expert down projection. The collective receives
-/// unrounded FP32 expert outputs, before the owning SwitchGLU restores route
-/// order and applies router weights. Shared-expert gating stays downstream.
-public final class Qwen35TensorParallelSwitchLinear: QuantizedSwitchLinear {
+/// The name Qwen's routed-expert tensor parallel was built against.
+public typealias Qwen35TensorParallelSwitchLinear = TensorParallelSwitchLinear
+
+/// An expert projection whose outputs are sums of FP32 partials: its SwitchGLU keeps the
+/// unsort and weighted sum, so each expert row is summed and rounded before router weighting.
+public protocol SwitchLinearPartialSum: AnyObject {}
+
+/// A channel-sharded expert down projection (Qwen 3.5, Gemma 4) whose collective sums unrounded
+/// FP32 expert rows; another branch's FP32 partial may ride in it (`carrying`).
+public final class TensorParallelSwitchLinear: QuantizedSwitchLinear, SwitchLinearPartialSum {
     private final class Reduction {
         let sum: (MLXArray) -> MLXArray
         init(_ sum: @escaping (MLXArray) -> MLXArray) { self.sum = sum }

@@ -230,7 +230,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 /// Compiled GELU-gated GLU product (`geluApprox(gate) * up`), fusing the tanh
 /// GELU and the element-wise multiply into one shapeless kernel. Uses the
 /// Power-free `x * x * x` GELU so it is safe under `compile(shapeless: true)`.
-private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+package let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, up: MLXArray) -> MLXArray in
         (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
@@ -498,6 +498,33 @@ open class SwitchGLU: Module {
     /// affine `QuantizedSwitchLinear` banks only; opt-in per model.
     public var suppliesHostRowIndices = false
 
+    /// Current arrays for the stock Gemma GeGLU decode graph, in a fixed order.
+    /// Only the existing affine BF16 route is admitted; adapters, custom modules,
+    /// fused layouts and other precision paths retain their ordinary execution.
+    package func gemma4DecodeCompilationState()
+        -> (parameters: [MLXArray], modules: [Module])?
+    {
+        guard type(of: self) == SwitchGLU.self, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            isGeluActivation, activationProduct == nil, !mimoV26NAXGather,
+            gateUpProj == nil, let gateProj, let upProj
+        else { return nil }
+        var parameters: [MLXArray] = []
+        var modules: [Module] = [self]
+        for projection in [gateProj, upProj, downProj] {
+            guard let quantized = projection as? QuantizedSwitchLinear,
+                type(of: quantized) == QuantizedSwitchLinear.self, !quantized.training,
+                quantized.mode == .affine, quantized.bits == 4, quantized.groupSize == 64,
+                quantized.weight.dtype == .uint32, quantized.scales.dtype == .bfloat16,
+                let biases = quantized.biases, biases.dtype == .bfloat16,
+                quantized.bias == nil, quantized.globalScales == nil
+            else { return nil }
+            parameters += [quantized.weight, quantized.scales, biases]
+            modules.append(quantized)
+        }
+        return (parameters, modules)
+    }
+
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
     /// nil (the custom-activation path): they let SiLU/GELU custom activations use
@@ -603,7 +630,7 @@ open class SwitchGLU: Module {
 
     /// The expert down projection, for an owning block that packs another
     /// projection's partial into its collective
-    /// (`Qwen35TensorParallelSwitchLinear.carrying`).
+    /// (`TensorParallelSwitchLinear.carrying`).
     public var downProjection: SwitchLinear { downProj }
 
     /// Structural twin with the requested gate/up topology: same
@@ -769,20 +796,28 @@ open class SwitchGLU: Module {
         return projection(x, indices, sortedIndices: sortedIndices)
     }
 
+    /// `float32Rows` gives the down projection an exact FP32 widening of its input, so its rows
+    /// are stored as FP32 and never rounded.
+    /// `hintsSorted: false` still sorts 64 or more assignments, but only for
+    /// weight locality: the gathers keep their unsorted M=1 route.
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, float32Rows: Bool = false, hintsSorted: Bool = true
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         if admitsFusedRoutes,
             let result = MiMoV26DecodeExperts.tryProject(
-                x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested)
+                x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested,
+                float32Rows: float32Rows)
         {
             return (MLX.expandedDimensions(result.output, axis: -2), nil, false)
+        }
+        func downInput(_ activated: MLXArray) -> MLXArray {
+            float32Rows ? activated.asType(.float32) : activated
         }
 
         // #4029: same route sort/inverse as gatherSort, without materializing
         // repeated activation rows. Fallback below retains the original graph.
         if admitsFusedRoutes, mimoV26NAXGather, MiMoV26NAXGateUp.rowMapRequested,
-            MiMoV26NAXGateUp.activationRequested, indices.size >= 64,
+            MiMoV26NAXGateUp.activationRequested, hintsSorted, indices.size >= 64,
             isSiluActivation, activationProduct != nil, gateUpProj == nil,
             let gateProj, let upProj
         {
@@ -796,7 +831,7 @@ open class SwitchGLU: Module {
                 sorted: true, rowMap: rowMap)
             {
                 return (
-                    projectExpert(downProj, activated, sorted, sortedIndices: true),
+                    projectExpert(downProj, downInput(activated), sorted, sortedIndices: true),
                     argSort(order), true
                 )
             }
@@ -805,6 +840,7 @@ open class SwitchGLU: Module {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         x = transformInput(x)
         let doSort = indices.size >= 64
+        let hint = doSort && hintsSorted
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -814,13 +850,13 @@ open class SwitchGLU: Module {
 
         // Native MiMo's known default SiLU only. Custom activations, fused
         // stored projections and all non-NAX/unsupported layouts fall through.
-        if admitsFusedRoutes, mimoV26NAXGather, isSiluActivation, activationProduct != nil,
-            gateUpProj == nil, let gateProj, let upProj,
+        if admitsFusedRoutes, mimoV26NAXGather, hintsSorted, isSiluActivation,
+            activationProduct != nil, gateUpProj == nil, let gateProj, let upProj,
             let activated = MiMoV26NAXGateUp.tryActivation(
                 x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
         {
             return (
-                projectExpert(downProj, activated, idx, sortedIndices: doSort),
+                projectExpert(downProj, downInput(activated), idx, sortedIndices: doSort),
                 doSort ? inverseOrder : nil, doSort
             )
         }
@@ -830,14 +866,14 @@ open class SwitchGLU: Module {
         let hostRows = !doSort && suppliesHostRowIndices
         if let gateUpProj {
             let xGateUp = projectExpert(
-                gateUpProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                gateUpProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            if mimoV26NAXGather,
+            if mimoV26NAXGather, hintsSorted,
                 let pair = MiMoV26NAXGateUp.tryProjection(
                     x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
             {
@@ -845,9 +881,9 @@ open class SwitchGLU: Module {
                 xUp = pair.up
             } else {
                 xUp = projectExpert(
-                    upProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                    upProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
                 xGate = projectExpert(
-                    gateProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                    gateProj, x, idx, sortedIndices: hint, hostRowIndices: hostRows)
             }
         }
 
@@ -864,7 +900,8 @@ open class SwitchGLU: Module {
         activated = transformHidden(activated)
 
         x = projectExpert(
-            downProj, activated, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+            downProj, downInput(activated), idx, sortedIndices: hint,
+            hostRowIndices: hostRows)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -887,10 +924,13 @@ open class SwitchGLU: Module {
         case .generic, .mimoV26FP32:
             return false
         case .gemma4ProductionGeGLU:
+            // A down projection that sums partials (tensor parallel or its
+            // split-sum oracle) keeps the unsort and weighted sum below.
             return inputDims == 2816
                 && hiddenDims == 704
                 && numExperts == 128
                 && gateUpProj == nil
+                && !(downProj is any SwitchLinearPartialSum)
                 && activationProduct == nil
                 && isGeluActivation
                 && x.ndim == 2
@@ -972,7 +1012,30 @@ open class SwitchGLU: Module {
     }
 
     open func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var projected = projectExperts(x, indices)
+        expertRows(x, indices, float32Rows: false)
+    }
+
+    /// The expert rows `[..., K, H]` stored as FP32: a tensor-parallel rank's half-width rows,
+    /// summed across ranks before their one rounding.
+    package func float32ExpertRows(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        expertRows(x, indices, float32Rows: true)
+    }
+
+    /// `callAsFunction`'s expert rows `[rows, K, H]` for `[rows, hidden]` in which every row keeps
+    /// the bytes of its own one-row call, while all rows share one dispatch per projection (as
+    /// `callAndWeightedReduceRows`, without the top-K reduction): a tensor-parallel rank's
+    /// registered prompt chunk, whose rows' partials are summed across ranks before weighting.
+    package func expertRowsByRow(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        var projected = projectExperts(x, indices, hintsSorted: false)
+        if let inverseOrder = projected.inverseOrder {
+            projected.output = scatterUnsort(
+                x: projected.output, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return MLX.squeezed(projected.output, axis: -2)
+    }
+
+    private func expertRows(_ x: MLXArray, _ indices: MLXArray, float32Rows: Bool) -> MLXArray {
+        var projected = projectExperts(x, indices, float32Rows: float32Rows)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
@@ -1141,6 +1204,26 @@ open class SwitchGLU: Module {
         return unfused(MLX.squeezed(experts, axis: -2))
     }
 
+    // Only the stock production-shape GeGLU evaluation contract can bypass expansion.
+    // Subclass hooks, adapters, other activations and every transform retain the
+    // complete original projectExperts graph.
+    private func projectGemma4RowMappedExperts(
+        _ x: MLXArray, _ indices: MLXArray
+    ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool)? {
+        guard Gemma4RowMappedNAX.requested, admitsFusedRoutes, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            isGeluActivation, activationProduct == nil, gateUpProj == nil,
+            !mimoV26NAXGather, let gateProj, let upProj,
+            Gemma4RowMappedNAX.supportsDownProjection(downProj),
+            let pair = Gemma4RowMappedNAX.tryPair(
+                x, indices: indices, gate: gateProj, up: upProj)
+        else { return nil }
+        let activated = compiledGeGLU(pair.gate, pair.up)
+        let output = projectExpert(downProj, activated, pair.sorted, sortedIndices: true)
+        return (output, pair.inverseOrder, true)
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, only the exact sorted production Gemma
@@ -1155,6 +1238,19 @@ open class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
+        if isProductionPrefill, let projected = projectGemma4RowMappedExperts(x, indices) {
+            if fuseSortedReduction, supportsWeightedExpertUnsort(x, indices, weights: weights),
+                projected.sorted, let inverseOrder = projected.inverseOrder,
+                projected.output.ndim == 3, projected.output.dim(-2) == 1,
+                projected.output.dim(-1) == 2816, projected.output.dtype == .bfloat16
+            {
+                return weightedExpertUnsort(
+                    sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+                    inverseOrder: inverseOrder, weights: weights)
+            }
+            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+        }
+
         guard fuseSortedReduction && isProductionPrefill,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
@@ -1176,6 +1272,21 @@ open class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// `callAndWeightedReduce` for `[rows, hidden]` in which every row keeps the
+    /// bytes of its own one-row call, while all rows share one dispatch per
+    /// projection.
+    ///
+    /// Assignments are grouped by expert for weight locality, but the gathers
+    /// are not told so: each (row, expert) pair stays a native M=1 gathered
+    /// product. Rows return to their order before the top-K reduction. The
+    /// Qwen4 profile's tiled expert kernels pick a route by assignment count,
+    /// so this guarantee does not cover them.
+    package func callAndWeightedReduceRows(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
+    ) -> MLXArray {
+        weightedExpertSum(expertRowsByRow(x, indices), weights)
     }
 }
 

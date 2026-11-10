@@ -140,7 +140,11 @@ enum MiMoV26DecodeExpertMetal {
           }
         """
 
-    static let down = """
+    static let down = downSource(output: "T")
+
+    /// The down projection storing each FP32 sum as `output`; `T` rounds it to the activation dtype.
+    static func downSource(output: String) -> String {
+        """
         constexpr int VPT = 16;
           uint pid = threadgroup_position_in_grid.x;
           uint rb = threadgroup_position_in_grid.y;
@@ -204,7 +208,7 @@ enum MiMoV26DecodeExpertMetal {
               for (int r = 0; r < RPS; r++) {
                 float v = simd_sum(acc[j][r]);
                 if (lane == 0) {
-                  T value = static_cast<T>(v);
+                  \(output) value = static_cast<\(output)>(v);
                   uint first = (members[j] / TOPK) * TOPK;
                   for (uint q = first; q < first + TOPK; q++) {
                     if (inds[q] == e) {
@@ -216,4 +220,5 @@ enum MiMoV26DecodeExpertMetal {
             }
           }
         """
+    }
 }

@@ -51,6 +51,14 @@ final class MiMoV26Attention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
     ) -> MLXArray {
+        oProj(attend(x, mask: mask, cache: cache))
+    }
+
+    /// The attended rows `[B, L, heads * valueHeadDim]` that `o_proj` projects.
+    func attend(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         var q = qProj(x).reshaped(batch, length, geometry.queryHeads, geometry.headDim)
             .transposed(0, 2, 1, 3)
@@ -72,6 +80,6 @@ final class MiMoV26Attention: Module {
             ?? MLXFast.scaledDotProductAttention(
                 queries: q, keys: k, values: v, scale: scale, mask: mask,
                 sinks: attentionSinkBias)
-        return oProj(attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+        return attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
     }
 }

@@ -96,10 +96,14 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            Identity-greedy batches skip unused parameter/history tensor construction and the
+            unused all-greedy mask while retaining constraints, transforms and sampler row state.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/receipt.json"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
@@ -242,8 +246,21 @@ def:
         Prompt-cache loading recovers unpopulated layers from existing class metadata and rejects
         malformed state/metadata before nonthrowing setters; `PromptCacheValidationTests` covers
         empty, mixed and nested states, legacy files, malformed input and continuation boundaries.
+        A video reader pass that does not complete throws `VideoReaderFailure`, which keeps the reader
+        status and the domain and code of its error chain, and runs once more with a new reader over the
+        same asset (`VideoReaderRetry`). The GLM 5.3, MiMo V2.6 and Qwen4 video decoders use it, and so
+        do the audio readers of the MiMo V2.6 audiovisual decoder (LPCM and AAC) and `UserInput.Audio`,
+        whose failures carry medium `.audio`. `VideoReaderRetryTests` fails data requests of the in-memory
+        resource loader partway through a clip until a reader pass fails, and ends readers partway through
+        `VideoReaderRetry.nextSample`'s test hook; `AudioReaderRetryTests` and the MiMo audio tests end
+        audio readers the same way (`ReaderPassFaults.swift`). `CorruptClipDecoderCodesTests` decodes
+        H.264 and HEVC clips with corrupt NAL units and checks that none gives a transient code.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
+        - "Tests/MLXLMTests/VideoReaderRetryTests.swift"
+        - "Tests/MLXLMTests/CorruptClipDecoderCodesTests.swift"
+        - "Tests/MLXLMTests/AudioReaderRetryTests.swift"
+        - "Tests/MLXLMTests/ReaderPassFaults.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
         - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
@@ -264,6 +281,9 @@ def:
         machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
         recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
         FoundationModels router pass it.
+        A schema node marked `nullable: true` (how a client's nullable parameter reaches the SDK) admits
+        `null`: XML argument conversion turns a model's `null` into JSON null and the validator lets it
+        through the type check (`ToolNullableSchemaTests`; documented in the skill's `tool-calling.md`).
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
@@ -275,6 +295,7 @@ def:
         - "Tests/MLXLMTests/ToolArgumentNormalizationTests.swift"
         - "Tests/MLXLMTests/ToolCall*.swift"
         - "Tests/MLXLMTests/ToolSchemaValidatorTests.swift"
+        - "Tests/MLXLMTests/ToolNullableSchemaTests.swift"
         - "Tests/MLXLMTests/XMLFunctionParserStrictnessTests.swift"
         - "Tests/MLXLMTests/ToolTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
@@ -282,6 +303,7 @@ def:
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
+        - "skills/mlx-swift-lm/references/tool-calling.md"
     - title: "Models"
       description: |
         Production model work in `Libraries/MLXLLM`. Beyond new architectures, each production model
@@ -336,10 +358,32 @@ def:
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
             Explicit cluster decode scopes preserve singleton packed projection, expert and
             unscaled normalization arithmetic independently for each request row.
+            A tensor-parallel rank's registered prompt chunk runs every token's experts in one shared
+            dispatch per projection (`SwitchGLU.expertRowsByRow`, each (token, expert) pair the native M=1
+            product its own call computes) before the chunk's single packed collective; its work after
+            attention can run in row parts whose sums are issued as built (`Gemma4TensorParallelPromptParts`,
+            off by default: bit-identical on the GPU for two ranks while every op after attention is per-row,
+            not on the CPU backend, not exact with more than two ranks, and not enforced).
+            The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
+            dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
+            A separate compiled feed-forward report records bounded S1/S2 FFN reuse, live parameter
+            invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
+            An automatically enabled, guarded row-mapped NAX route avoids gate/up staging for stock
+            affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
+            If Metal rejects one of its kernels, the route logs once and keeps the core path.
+            Its report separates exact native-state evidence from two-order cold HTTP timing.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift"
+            - "docs/benchmarks/gemma4-compiled-feedforward-2026-10-26/**"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointRowMapProductionTests.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4RowMapCheckpointStateTests.swift"
+            - "docs/benchmarks/gemma4-row-mapped-nax-2026-10-26/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
@@ -442,7 +486,9 @@ def:
             A CBv2 forward may be submitted every few layers as it is built (`Qwen35LayerSubmission.stride`:
             cluster decode steps and tensor-parallel prompt frames), and a bench may observe each layer as
             it is built (`Qwen35LayerSubmission.observer`, diagnostic): evaluation order only, every value
-            unchanged.
+            unchanged. A prompt wavefront (`Qwen35PromptWavefront`) builds consecutive prompt chunks of one
+            request as one graph; `prefillWithHidden` also returns each chunk's last decoder layer rows from
+            that graph, for an MTP assistant's history.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"

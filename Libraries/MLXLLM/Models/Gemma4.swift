@@ -19,6 +19,10 @@ public struct Gemma4Configuration: Codable, Sendable {
     var textConfig: Gemma4TextConfiguration
     var vocabSize: Int = 262144
 
+    /// The text tower's configuration with the root's vocabulary size and
+    /// quantization merged in, as `Gemma4Model` builds it.
+    public var textConfiguration: Gemma4TextConfiguration { textConfig }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"

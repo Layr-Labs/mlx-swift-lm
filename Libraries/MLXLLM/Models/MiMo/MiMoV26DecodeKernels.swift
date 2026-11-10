@@ -94,6 +94,14 @@ enum MiMoV26DecodeKernels {
             let post = addRMS(hidden, attentionOutput, norm: layer.postAttentionNorm)
         else { return nil }
 
+        if let tensorParallel = layer.tensorParallel {
+            // The summed partial is rounded once, then takes the residual add and next norm.
+            let output = layer.tensorParallelFeedForward(
+                post.normalized, tensorParallel, rowLocal: rowLocal)
+            if let added = addRMS(post.residual, output, norm: nextNorm) { return added }
+            let residual = post.residual + output
+            return Result(residual: residual, normalized: nextNorm(residual))
+        }
         if let moe = layer.mlp as? MiMoV26MoE,
             ObjectIdentifier(type(of: moe.switchMLP)) == ObjectIdentifier(SwitchGLU.self),
             moe.gate.config.expertsPerToken <= 32,
