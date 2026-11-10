@@ -141,6 +141,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     var hasNativeCompletionTracking: Bool { nativeShutdownState != nil }
     private let issuedNativeExecutionContract: CBv2NativeExecutionContract?
     private let loop: EngineLoopV2
+    /// Live Exact Turn Continuation requests. The lock also serializes a
+    /// continuation's idle check and registration against the cancellation
+    /// scan an arriving request runs after its own registration.
+    private let continuationLock = NSLock()
+    private var liveContinuations: Set<CBv2RequestID> = []
     private let admission: AdmissionV2
 
     /// Reports the actual admission owner, not a provider capability marker.
@@ -1091,9 +1096,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             residentPrefixBackend: residentPrefixBackend,
             hybridPrefixCache: self.hybridPrefixCache,
             completeCheckpointCapture: self.completeCheckpointCapture,
-            recurrentCheckpointChunkGrid: modelCapabilities
-                .alignsRecurrentCheckpointsToPrefillChunks
-                ? schedulerConfig.prefillChunkSize : nil,
+            recurrentCheckpointChunkGrid: schedulerConfig.canonicalPrefillGridTokens
+                ?? (modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                    ? schedulerConfig.prefillChunkSize : nil),
             causalMediaCheckpoints: modelCapabilities.supportsCausalMediaCheckpointReuse,
             prefixReuseCapability: prefixReuseCapability,
             nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
@@ -1502,6 +1507,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // (The scheduler's own `duplicateRequestID` rejection remains the
         // engine-thread backstop.)
         let stream = try registerSubmission(request)
+        cancelContinuations(forArrivalOf: request)
 
         // Vision requests, HEAVY half: materialize the image embeddings ONCE,
         // here on the submit thread (the one provider call per request —
@@ -1597,6 +1603,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
 
         try requireRequestCanEverFit(request)
         let stream = try registerSubmission(request)
+        cancelContinuations(forArrivalOf: request)
 
         let outcome = await loop.enqueueForFirstTokenDeadline(
             request,
@@ -2230,5 +2237,145 @@ extension EngineV2 {
         case .complex64: return "complex64"
         case .float64: return "float64"
         }
+    }
+}
+
+// MARK: - Exact Turn Continuation
+
+/// The frontier (first-token) logits of one request, captured on the
+/// engine's own prefill path with its prefix cache in force.
+@_spi(Benchmarking)
+public struct CBv2FrontierLogits: Sendable {
+    public let digest: CBv2PrefillLogitDigest
+    /// The vector's raw bytes in the dtype the model produced.
+    public let raw: Data
+}
+
+extension EngineV2 {
+    /// Re-prefill the next turn's known prefix while the engine is idle, so
+    /// the exact resident bank holds that prefix's state when the turn
+    /// arrives. `promptTokens` should end on the canonical grid: the bank
+    /// keeps only grid boundaries. Nothing is submitted (nil) while another
+    /// request is live; the caller tries again at the next idle point. The
+    /// request is prefill-only (its one sampled token is discarded) and has
+    /// the lowest priority, and any later submission cancels it. A cancelled
+    /// continuation still publishes the grid boundaries it finished.
+    public func submitContinuation(
+        id: CBv2RequestID, promptTokens: [Int], cacheSalt: String?
+    ) throws -> AsyncStream<CBv2Event>? {
+        try submitContinuation(
+            CBv2Request(id: id, promptTokens: promptTokens, maxTokens: 1, cacheSalt: cacheSalt))
+    }
+
+    /// As above for a caller-built request (a provider slot that staged its
+    /// durable tier under `prefixCacheReceiptID`). Only the id, prompt, cache
+    /// scope and receipt are kept; the rest is the continuation's own.
+    public func submitContinuation(_ input: CBv2Request) throws -> AsyncStream<CBv2Event>? {
+        guard input.promptTokens.count > 1,
+            hybridPrefixCache != nil || prefixCache != nil || residentPrefixBackend != nil
+                || completePrefixCache != nil
+        else { return nil }
+        var request = CBv2Request(
+            id: input.id, promptTokens: input.promptTokens,
+            sampling: CBv2SamplingParams(temperature: 0), maxTokens: 1, priority: Int.min / 2,
+            cacheSalt: input.cacheSalt, prefixCacheEnabled: true,
+            prefixCacheReceiptID: input.prefixCacheReceiptID)
+        request.isContinuation = true
+        let id = request.id
+        continuationLock.lock()
+        defer { continuationLock.unlock() }
+        guard loop.registeredStreamCount() == 0 else { return nil }
+        let events = try submitOrdinary(request).events
+        liveContinuations.insert(id)
+        return events
+    }
+
+    /// Any other submission cancels the live continuations. It runs after
+    /// the arrival registered its own stream, so a continuation either sees
+    /// the arrival in its idle check or is registered before this scan.
+    private func cancelContinuations(forArrivalOf request: CBv2Request) {
+        guard !request.isContinuation else { return }
+        continuationLock.lock()
+        let ids = liveContinuations
+        liveContinuations.removeAll()
+        continuationLock.unlock()
+        for id in ids { cancel(id) }
+    }
+
+    /// Benchmark seam: start capturing `requestID`'s frontier logits. The loop
+    /// holds one capture hook; callers serialize captures.
+    @_spi(Benchmarking)
+    public func beginFrontierLogitCapture(requestID: CBv2RequestID) -> AnyObject {
+        let box = CBv2FrontierLogitBox()
+        loop.setPrefillFrontierCapture { id, logits in
+            guard id == requestID else { return }
+            box.deliver(logits)
+        }
+        return box
+    }
+
+    /// Benchmark seam: wait for the capture begun above, hash and copy the
+    /// vector on the engine queue, and clear the hook.
+    @_spi(Benchmarking)
+    public func finishFrontierLogitCapture(_ handle: AnyObject, timeout: TimeInterval) throws
+        -> CBv2FrontierLogits
+    {
+        defer { loop.setPrefillFrontierCapture(nil) }
+        guard nativeShutdownState == nil,
+            let box = handle as? CBv2FrontierLogitBox,
+            let captured = box.wait(seconds: timeout)
+        else {
+            throw CBv2PrefillLogitDigestError.prefillProducedNoLogits(seconds: timeout)
+        }
+        return try loop.onEngineQueueSync {
+            let digest = try Self.digest(frontierLogits: captured)
+            let vector = captured.ndim == 2 ? captured[0] : captured
+            return CBv2FrontierLogits(digest: digest, raw: vector.asData(access: .copy).data)
+        }
+    }
+
+    /// Benchmark seam: per-tensor SHA-256 of the resident checkpoint at
+    /// exactly `tokens.count` in the `cacheSalt` scope (full-attention rows
+    /// `[0, p)`, recurrent conv and SSM state), or nil without one.
+    @_spi(Benchmarking)
+    public func residentCheckpointDigests(cacheSalt: String?, tokens: [Int]) -> [String: String]? {
+        guard let arrays = hybridPrefixCache?.checkpointArrays(cacheSalt: cacheSalt, tokens: tokens)
+        else { return nil }
+        return loop.onEngineQueueSync {
+            var result: [String: String] = [:]
+            for (name, array) in arrays {
+                let bytes = array.asData(access: .copy).data
+                result[name] = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            }
+            return result
+        }
+    }
+
+    /// Benchmark seam: the resident bank's counters, if it exists.
+    @_spi(Benchmarking)
+    public var residentBankStats: CBv2HybridPrefixCacheStats? { hybridPrefixCache?.stats }
+
+    /// Benchmark seam: the resident page index's counters, if it exists.
+    @_spi(Benchmarking)
+    public var benchmarkResidentPageStats: String? {
+        (backend as? PagedKVBackend)?.residentPrefixCacheStats.map { "\($0)" }
+    }
+
+    /// Benchmark seam: the scheduler geometry this engine runs.
+    @_spi(Benchmarking)
+    public var benchmarkSchedulerConfig: CBv2SchedulerConfig { schedulerConfig }
+
+    /// Benchmark seam: which prefix tiers this engine hosts.
+    @_spi(Benchmarking)
+    public var benchmarkPrefixTiers: [String] {
+        var tiers: [String] = []
+        if hybridPrefixCache != nil { tiers.append("resident_recurrent_bank") }
+        if prefixCache != nil { tiers.append("snapshot_prefix_cache") }
+        if residentPrefixBackend != nil { tiers.append("resident_paged_blocks") }
+        if (backend as? PagedKVBackend)?.residentPrefixIndex != nil {
+            tiers.append("resident_paged_index")
+        }
+        if completePrefixCache != nil { tiers.append("ssd_complete_checkpoints") }
+        return tiers
     }
 }

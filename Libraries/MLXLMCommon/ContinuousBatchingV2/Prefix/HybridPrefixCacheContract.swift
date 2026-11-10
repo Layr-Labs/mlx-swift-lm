@@ -171,15 +171,30 @@ struct CBv2RecurrentCheckpointGeometry {
     /// has the same partition below and above such a boundary, so a restore
     /// continues it exactly; any other range, a solo stripe included, disarms
     /// the request.
+    ///
+    /// A canonical `partition` (the canonical grid with message boundaries,
+    /// Exact Turn Continuation) takes precedence over both: every range must
+    /// be exactly one canonical cell (the prompt's last range may stop short
+    /// at the prompt end), and only canonical positions, grid multiples and
+    /// message boundaries, are boundaries.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
-        stride: Int = Self.recurrentCheckpointStrideTokens, chunkGrid: Int? = nil
+        stride: Int = Self.recurrentCheckpointStrideTokens, chunkGrid: Int? = nil,
+        partition: CBv2CanonicalPartition? = nil
     ) -> Bool {
         guard isArmed else { return false }
         guard !packed else { return disarm(.packed) }
         guard cap > 0, stride > 0, !range.isEmpty, range.lowerBound == position,
             range.upperBound <= promptLength
         else { return disarm(.geometry) }
+        if let partition {
+            guard range.lowerBound == 0 || partition.isCanonical(range.lowerBound),
+                range.upperBound == partition.cellEnd(from: range.lowerBound, limit: promptLength)
+            else { return disarm(.geometry) }
+            position = range.upperBound
+            chunkSize = cap
+            return partition.isCanonical(position)
+        }
         if let chunkGrid {
             guard chunkGrid > 0, range.lowerBound.isMultiple(of: chunkGrid),
                 range.count == chunkGrid
