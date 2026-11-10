@@ -72,7 +72,9 @@ struct Qwen35CardDefaultCheckpointTests {
     }
 
     /// The same request with the penalty sent as 0: it speculates.
-    static func speculating(_ id: UInt64, cached: Bool = true) -> CBv2Request {
+    static func speculating(
+        _ id: UInt64, prompt: [Int] = prompt, maxTokens: Int = maxTokens, cached: Bool = true
+    ) -> CBv2Request {
         CBv2Request(
             id: .init(id), promptTokens: prompt, sampling: sampling(presencePenalty: 0),
             maxTokens: maxTokens, cacheSalt: "tenant", prefixCacheEnabled: cached,
@@ -340,38 +342,11 @@ struct Qwen35CardDefaultCheckpointTests {
 
         let store = Store(segmentBytes: 4096)
         let (engine, backend) = try Self.engine(fixture, store: store, rows: 2)
-        let loop = engine.loopForTesting
-        func together(cached: Bool) async throws -> (Served, Served, Int) {
-            let mixed = Mixed()
-            let prefillingID = prefilling(cached: cached).id
-            let decodingID = decoding(cached: cached).id
-            loop.onEngineQueueSync {
-                loop.recurrentGeometryObserverForTesting = { [unowned loop] id, _, _, _, phase, _ in
-                    // A prompt range of a step after the other request's
-                    // first decode step.
-                    guard phase == "range", id == prefillingID,
-                        let other = loop.scheduler.record(for: decodingID),
-                        other.generatedTokenCount >= 2
-                    else { return }
-                    mixed.count += 1
-                }
-            }
-            // Admitted together: the long prompt prefills while the short one decodes.
-            let streams = try loop.onEngineQueueSync {
-                [
-                    try engine.submit(decoding(cached: cached)),
-                    try engine.submit(prefilling(cached: cached)),
-                ]
-            }
-            let first = Task { await cbv2CollectControlled(streams[0]) }
-            let second = await cbv2CollectControlled(streams[1])
-            let firstServed = await first.value
-            loop.onEngineQueueSync { loop.recurrentGeometryObserverForTesting = nil }
-            return (firstServed, second, mixed.count)
-        }
-        let off = try await together(cached: false)
+        let off = try await Self.together(
+            engine, decoding: decoding(cached: false), prefilling: prefilling(cached: false))
         #expect(store.saved.isEmpty)
-        let on = try await together(cached: true)
+        let on = try await Self.together(
+            engine, decoding: decoding(cached: true), prefilling: prefilling(cached: true))
         let saved = await Self.archives(store)
         for (run, name) in [(off, "off"), (on, "on")] {
             #expect(run.0.tokens == decodingAlone.tokens, "\(name)")
@@ -389,6 +364,89 @@ struct Qwen35CardDefaultCheckpointTests {
     /// Steps in which one request decodes while the other's prompt prefills.
     final class Mixed: @unchecked Sendable {
         var count = 0
+    }
+
+    /// Admits both requests at once, so `prefilling`'s long prompt prefills
+    /// while `decoding`'s short one decodes. Returns what each emitted and
+    /// how many of `prefilling`'s prompt ranges ran after `decoding`'s first
+    /// decode step.
+    static func together(
+        _ engine: EngineV2, decoding: CBv2Request, prefilling: CBv2Request
+    ) async throws -> (Served, Served, Int) {
+        let loop = engine.loopForTesting
+        let mixed = Mixed()
+        let (prefillingID, decodingID) = (prefilling.id, decoding.id)
+        loop.onEngineQueueSync {
+            loop.recurrentGeometryObserverForTesting = { [unowned loop] id, _, _, _, phase, _ in
+                guard phase == "range", id == prefillingID,
+                    let other = loop.scheduler.record(for: decodingID),
+                    other.generatedTokenCount >= 2
+                else { return }
+                mixed.count += 1
+            }
+        }
+        let streams = try loop.onEngineQueueSync {
+            [try engine.submit(decoding), try engine.submit(prefilling)]
+        }
+        let first = Task { await cbv2CollectControlled(streams[0]) }
+        let second = await cbv2CollectControlled(streams[1])
+        let firstServed = await first.value
+        loop.onEngineQueueSync { loop.recurrentGeometryObserverForTesting = nil }
+        return (firstServed, second, mixed.count)
+    }
+
+    /// A card prompt prefills while a speculating request decodes, so the
+    /// card's prompt chunks share MTP steps with the other request's seed
+    /// and verify work. The card request emits what it emits alone; the
+    /// speculating request emits the same with capture on and off; the
+    /// prompt donates C and 2C, equal to a speculating donor's.
+    @Test(.timeLimit(.minutes(5)), arguments: Target.allCases)
+    func cardPromptBesideSpeculatingDecodeDonates(_ target: Target) async throws {
+        let fixture = try Self.fixture(target)
+        let short = Array(Self.prompt.prefix(9))
+        func decoding(cached: Bool) -> CBv2Request {
+            Self.speculating(41, prompt: short, maxTokens: 24, cached: cached)
+        }
+        func prefilling(cached: Bool) -> CBv2Request {
+            Self.card(42, .cardLogprobs, cached: cached)
+        }
+
+        let (alone, aloneBackend) = try Self.engine(fixture, store: nil, rows: 2)
+        let prefillingAlone = try await cbv2ServeControlled(alone, prefilling(cached: false))
+        Self.released(alone, aloneBackend)
+        await alone.shutdown()
+
+        let referenceStore = Store(segmentBytes: 4096)
+        let (eligible, eligibleBackend) = try Self.engine(fixture, store: referenceStore)
+        _ = try await cbv2ServeControlled(eligible, Self.speculating(43))
+        let reference = await Self.archives(referenceStore)
+        Self.released(eligible, eligibleBackend)
+        await eligible.shutdown()
+
+        let store = Store(segmentBytes: 4096)
+        let (engine, backend) = try Self.engine(fixture, store: store, rows: 2)
+        let off = try await Self.together(
+            engine, decoding: decoding(cached: false), prefilling: prefilling(cached: false))
+        #expect(store.saved.isEmpty)
+        #expect(Self.drafted(engine) > 0, "the speculating request drafts")
+        let on = try await Self.together(
+            engine, decoding: decoding(cached: true), prefilling: prefilling(cached: true))
+        let saved = await Self.archives(store)
+        #expect(on.0.tokens == off.0.tokens, "the speculating request, capture on and off")
+        #expect(on.0.finish == off.0.finish)
+        for (run, name) in [(off, "off"), (on, "on")] {
+            #expect(run.1.tokens == prefillingAlone.tokens, "\(name)")
+            #expect(run.1.logprobBits == prefillingAlone.logprobBits, "\(name)")
+            #expect(run.2 > 0, "\(name): the prompt shared steps with the decode")
+        }
+        #expect(saved.map(\.manifest.position) == Self.positions)
+        #expect(saved.count == reference.count)
+        for (ours, theirs) in zip(saved, reference) {
+            #expect(ours.manifest == theirs.manifest, "position \(ours.manifest.position)")
+            #expect(Self.sameTensors(ours, theirs), "position \(ours.manifest.position)")
+        }
+        Self.released(engine, backend)
+        await engine.shutdown()
     }
 
     /// On the resident bank, the card's request publishes its prompt's
