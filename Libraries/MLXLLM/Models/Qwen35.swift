@@ -2919,6 +2919,41 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
     }
 }
 
+// MARK: - ContinuousBatchingV2 prompt-only output narrowing under MTP
+
+/// Prompt chunk under an inline MTP assistant: the hidden row of every
+/// position, but vocabulary logits only for the frontier's last position
+/// (`cbv2ForwardWithHidden` projected every position). The trunk is
+/// `cbv2RecurrentPrefill`'s, so K/V, recurrent state and hidden history equal
+/// `cbv2ForwardWithHidden`'s, and the logits row equals the MTP-off prompt's.
+extension Qwen35TextModel: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+        switch requirement {
+        case .evaluationOnly:
+            // Small handle whose graph depends on the whole trunk.
+            return (last[0..., 0..., 0 ..< 1], hidden)
+        case .lastPositionLogits:
+            let normalized = model.norm(last)
+            let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
+        }
+    }
+}
+
 extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(
         _ logits: MLXArray
@@ -3221,6 +3256,18 @@ extension Qwen35Model: CBv2RecurrentCaptureMTPForwardable {
         languageModel.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
     }
 }
 

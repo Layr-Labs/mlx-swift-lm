@@ -202,3 +202,15 @@ extension PrismHadamardQwen35: CBv2RecurrentMTPForwardable, CBv2RecurrentCapture
         languageModel.cbv2MTPTopTwo(logits)
     }
 }
+
+extension PrismHadamardQwen35: CBv2RecurrentPrefillHiddenForwardable {
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenForPrefill(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, requirement: requirement)
+    }
+}
