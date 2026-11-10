@@ -275,6 +275,9 @@ def:
         machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
         recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
         FoundationModels router pass it.
+        A schema node marked `nullable: true` (how a client's nullable parameter reaches the SDK) admits
+        `null`: XML argument conversion turns a model's `null` into JSON null and the validator lets it
+        through the type check (`ToolNullableSchemaTests`; documented in the skill's `tool-calling.md`).
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
@@ -286,6 +289,7 @@ def:
         - "Tests/MLXLMTests/ToolArgumentNormalizationTests.swift"
         - "Tests/MLXLMTests/ToolCall*.swift"
         - "Tests/MLXLMTests/ToolSchemaValidatorTests.swift"
+        - "Tests/MLXLMTests/ToolNullableSchemaTests.swift"
         - "Tests/MLXLMTests/XMLFunctionParserStrictnessTests.swift"
         - "Tests/MLXLMTests/ToolTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
@@ -293,6 +297,7 @@ def:
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
+        - "skills/mlx-swift-lm/references/tool-calling.md"
     - title: "Models"
       description: |
         Production model work in `Libraries/MLXLLM`. Beyond new architectures, each production model
