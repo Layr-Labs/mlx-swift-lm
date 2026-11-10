@@ -111,6 +111,11 @@ enum ToolArgumentNormalization {
             // Integer is a subtype of number, so intersections such as
             // allOf(number, integer) still describe an integer.
             if result?.contains("number") == true { result?.insert("integer") }
+            // OpenAPI 3.0 `nullable: true` adds null to this node's own type.
+            // Only a real Boolean counts: a boxed 1 is not `true`.
+            if let marker = schema["nullable"], JSONValue.from(marker) == .bool(true) {
+                result?.insert("null")
+            }
         }
         for key in ["anyOf", "oneOf", "allOf"] where schema[key] != nil {
             guard let branches = schema[key] as? [[String: any Sendable]], !branches.isEmpty else {
