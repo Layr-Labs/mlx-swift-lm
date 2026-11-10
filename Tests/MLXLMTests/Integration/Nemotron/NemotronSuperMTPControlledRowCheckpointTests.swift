@@ -30,11 +30,11 @@ struct NemotronSuperMTPControlledRowCheckpointTests {
     }
 
     /// The speculating owner with a resident bank and the production sampler.
-    static func engine(_ bank: CBv2HybridPrefixCacheConfig = Prefix.bank()) throws
-        -> (EngineV2, CBv2ContiguousKVBackend, CBv2HybridPrefixCache)
-    {
-        let (engine, backend) = Reuse.engine(
-            try Reuse.stack(), bank: bank, sampler: CBv2DefaultSampler())
+    static func engine(
+        _ bank: CBv2HybridPrefixCacheConfig = Prefix.bank(),
+        sampler: any CBv2StepSampler = CBv2DefaultSampler()
+    ) throws -> (EngineV2, CBv2ContiguousKVBackend, CBv2HybridPrefixCache) {
+        let (engine, backend) = Reuse.engine(try Reuse.stack(), bank: bank, sampler: sampler)
         return (engine, backend, try #require(engine.hybridPrefixCache))
     }
 
@@ -198,6 +198,57 @@ struct NemotronSuperMTPControlledRowCheckpointTests {
         await warm.shutdown()
         #expect(warmBackend.bytesReserved == 0)
         #expect(warmBank.stats.retainedBytes == 0)
+    }
+
+    /// A sampled request cannot speculate on an engine whose sampler has no
+    /// target-prefix acceptance (the greedy sampler); it publishes C and 2C
+    /// equal to a temperature-0 donor's, and its tokens do not change.
+    @Test(.timeLimit(.minutes(5)))
+    func sampledRowWithoutTargetPrefixAcceptancePublishesToo() async throws {
+        func sampled(_ id: UInt64, cached: Bool = true) -> CBv2Request {
+            var request = Self.request(id, Reuse.donor, nil, cached: cached)
+            request.sampling.temperature = 0.7
+            request.sampling.seed = 11
+            return request
+        }
+        let plain = try Reuse.plainEngine()
+        let reference = try await cbv2ServeControlled(plain, sampled(1, cached: false))
+        await plain.shutdown()
+
+        let (other, _, otherBank) = try Self.engine(sampler: CBv2GreedySampler())
+        _ = try await cbv2ServeControlled(other, Self.request(2, Reuse.donor, nil))
+        let otherPublished = await Prefix.eventually { otherBank.stats.entries == 1 }
+        #expect(otherPublished)
+
+        let (engine, backend, bank) = try Self.engine(sampler: CBv2GreedySampler())
+        var off = Served()
+        var on = Served()
+        let drafting = try await Reuse.drafting(engine) {
+            off = try await cbv2ServeControlled(engine, sampled(3, cached: false))
+            #expect(bank.stats.entries == 0)
+            on = try await cbv2ServeControlled(engine, sampled(4))
+        }
+        #expect(off.tokens == reference.tokens)
+        #expect(on.tokens == reference.tokens)
+        #expect(on.finish == reference.finish && off.finish == reference.finish)
+        #expect(drafting == [0, 0, 0])
+        #expect(Self.idle(engine))
+
+        let published = await Prefix.eventually { bank.stats.entries == 1 }
+        #expect(published)
+        for position in [Self.chunk, 2 * Self.chunk] {
+            let same = Self.matches(bank, otherBank, prompt: Reuse.donor, position: position)
+            #expect(same, "position \(position)")
+        }
+        let again = try await cbv2ServeControlled(engine, sampled(5))
+        #expect(again.saved == 2 * Self.chunk)
+        #expect(again.tokens == reference.tokens)
+
+        await other.shutdown()
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+        #expect(bank.stats.retainedBytes == 0)
+        #expect(Self.idle(engine))
     }
 
     /// Controlled donors fill the bank through its ordinary budget: entries
