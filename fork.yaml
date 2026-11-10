@@ -360,10 +360,14 @@ def:
             attention can run in row parts whose sums are issued as built (`Gemma4TensorParallelPromptParts`,
             off by default: bit-identical on the GPU for two ranks while every op after attention is per-row,
             not on the CPU backend, not exact with more than two ranks, and not enforced).
+            The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
+            dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.

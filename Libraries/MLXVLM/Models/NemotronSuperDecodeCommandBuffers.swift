@@ -2,7 +2,7 @@ import MLX
 import MLXLMCommon
 
 /// Command-buffer limits for Super's plain decode steps (every row one token;
-/// see ``CBv2DecodeCommandBufferLimitsProviding``). MLX's defaults for this GPU
+/// see `MLXLMCommon.CBv2DecodeCommandBufferLimitsProviding`). MLX's defaults for this GPU
 /// commit every 50 operations or 50 MB of distinct inputs, and the inputs
 /// include the expert banks, so decode committed after almost every MoE
 /// operation and the CPU could not encode ahead of the GPU. The decode scope
