@@ -31,16 +31,21 @@ extension UnitTests {
             #expect(try checkpoint(byModel: ["m": "balanced"]) == .balanced)
             #expect(try checkpoint(environment: [key: "balanced"]) == .balanced)
             #expect(try checkpoint(global: "balanced", byModel: ["m": "k8v8"]) == .k8v8)
-            #expect(try checkpoint(byModel: ["m": "balanced"], environment: [key: "native"]) == .native)
+            #expect(
+                try checkpoint(byModel: ["m": "balanced"], environment: [key: "native"]) == .native)
             // Live execution keeps its own default.
-            #expect(try PagedKVQuantizationPolicy.resolve(
-                modelType: "nemotron_h", global: "balanced", modelID: "m", environment: [:]) == .balanced)
-            #expect(try PagedKVQuantizationPolicy.resolve(
-                modelType: "nemotron_h", modelID: "m", environment: [:]) == .native)
+            #expect(
+                try PagedKVQuantizationPolicy.resolve(
+                    modelType: "nemotron_h", global: "balanced", modelID: "m", environment: [:])
+                    == .balanced)
+            #expect(
+                try PagedKVQuantizationPolicy.resolve(
+                    modelType: "nemotron_h", modelID: "m", environment: [:]) == .native)
         }
 
         @Test(arguments: [
-            "qwen3_5", "gemma4", "gpt_oss", "glm5_next", "nemotron_h_omni", "prism_hadamard_qwen35", "supported",
+            "qwen3_5", "gemma4", "gpt_oss", "glm5_next", "nemotron_h_omni", "prism_hadamard_qwen35",
+            "supported",
         ])
         func otherFamiliesKeepTheirCheckpointDefault(modelType: String) throws {
             #expect(try checkpoint(modelType, global: "balanced") == .balanced)
