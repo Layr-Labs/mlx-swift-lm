@@ -251,6 +251,102 @@ struct NemotronSuperMTPControlledRowCheckpointTests {
         #expect(Self.idle(engine))
     }
 
+    /// Which requests stored a carry, and how far the donor's prompt had been
+    /// planned whenever one did.
+    final class CarryPositions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var carried: Set<CBv2RequestID> = []
+        private var planned: Set<Int> = []
+        func record(_ id: CBv2RequestID, donorPlanned: Int?) {
+            lock.withLock {
+                carried.insert(id)
+                if let donorPlanned { planned.insert(donorPlanned) }
+            }
+        }
+        var stored: Set<CBv2RequestID> { lock.withLock { carried } }
+        /// Carries stored while the donor was part of the way into `prompt`.
+        func during(_ prompt: [Int]) -> Int {
+            lock.withLock { planned.filter { $0 > 0 && $0 < prompt.count }.count }
+        }
+    }
+
+    /// A controlled donor whose prompt prefills in the steps of a speculating
+    /// text request publishes the checkpoints it publishes alone. Neither
+    /// request's tokens change, with capture on or off.
+    @Test(.timeLimit(.minutes(5)), arguments: Control.allCases)
+    func controlledDonorPrefillsBesideSpeculatingText(_ control: Control) async throws {
+        let textReference = try await Self.uncached(
+            Self.request(1, Reuse.conversation, nil, cached: false))
+        let reference = try await Self.uncached(Self.request(2, Reuse.donor, control))
+
+        let (other, _, otherBank) = try Self.engine()
+        _ = try await cbv2ServeControlled(other, Self.request(3, Reuse.donor, nil))
+        let otherPublished = await Prefix.eventually { otherBank.stats.entries == 1 }
+        #expect(otherPublished)
+
+        let (engine, backend, bank) = try Self.engine()
+        let loop = engine.loopForTesting
+        /// The text request is queued first, so the donor's prompt chunks
+        /// share their steps with its speculation.
+        func together(_ id: UInt64, cached: Bool) async throws -> (Served, Served, [Int], Int) {
+            let text = Self.request(id, Reuse.conversation, nil, cached: false)
+            let donor = Self.request(id + 1, Reuse.donor, control, cached: cached)
+            let carries = CarryPositions()
+            let donorID = donor.id
+            loop.onEngineQueueSync {
+                loop.mtp?.carryStoredObserverForTesting = { [unowned loop] carry in
+                    carries.record(
+                        carry.id,
+                        donorPlanned: loop.scheduler.record(for: donorID)?.numComputedTokens)
+                }
+                loop.suspendStepExecutionAtCountForTesting = 0
+            }
+            var textServed = Served()
+            var donorServed = Served()
+            let drafting = try await Reuse.drafting(engine) {
+                let textStream = try engine.submit(text)
+                let donorStream = try engine.submit(donor)
+                loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+                let textTask = Task { await cbv2CollectControlled(textStream) }
+                donorServed = await cbv2CollectControlled(donorStream)
+                textServed = await textTask.value
+            }
+            loop.onEngineQueueSync { loop.mtp?.carryStoredObserverForTesting = nil }
+            #expect(carries.stored == [text.id])
+            return (textServed, donorServed, drafting, carries.during(Reuse.donor))
+        }
+        let off = try await together(10, cached: false)
+        #expect(bank.stats.entries == 0)
+        let on = try await together(20, cached: true)
+        for (run, name) in [(off, "off"), (on, "on")] {
+            #expect(run.0.tokens == textReference.tokens, "\(name)")
+            #expect(run.0.finish == textReference.finish, "\(name)")
+            #expect(run.1.tokens == reference.tokens, "\(name)")
+            #expect(run.1.finish == reference.finish, "\(name)")
+            // The text request speculated in steps of the donor's prompt.
+            #expect(run.2[0] > 0 && run.2[2] > 0 && run.3 > 0, "\(name) \(run.2) \(run.3)")
+        }
+        #expect(on.1.logprobBits == off.1.logprobBits)
+        #expect(on.2 == off.2)
+        #expect(Self.idle(engine))
+
+        let published = await Prefix.eventually { bank.stats.entries == 1 }
+        #expect(published)
+        for position in [Self.chunk, 2 * Self.chunk] {
+            let same = Self.matches(bank, otherBank, prompt: Reuse.donor, position: position)
+            #expect(same, "position \(position)")
+        }
+        let again = try await cbv2ServeControlled(engine, Self.request(30, Reuse.donor, control))
+        #expect(again.saved == 2 * Self.chunk)
+        #expect(again.tokens == reference.tokens)
+
+        await other.shutdown()
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+        #expect(bank.stats.retainedBytes == 0)
+        #expect(Self.idle(engine))
+    }
+
     /// Controlled donors fill the bank through its ordinary budget: entries
     /// stay within the limit, older ones are evicted, every byte is refunded.
     @Test(.timeLimit(.minutes(5)))

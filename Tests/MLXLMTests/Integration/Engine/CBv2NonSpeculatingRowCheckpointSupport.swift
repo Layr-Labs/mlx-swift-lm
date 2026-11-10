@@ -56,8 +56,12 @@ struct CBv2ControlledServed {
 func cbv2ServeControlled(_ engine: EngineV2, _ request: CBv2Request) async throws
     -> CBv2ControlledServed
 {
+    await cbv2CollectControlled(try engine.submit(request))
+}
+
+func cbv2CollectControlled(_ events: AsyncStream<CBv2Event>) async -> CBv2ControlledServed {
     var served = CBv2ControlledServed()
-    for await event in try engine.submit(request) {
+    for await event in events {
         switch event {
         case .delta(_, let tokens, let logprobs):
             served.tokens += tokens
