@@ -19,8 +19,9 @@ public enum PagedKVQuantizationSelection: String, Sendable, Equatable, CaseItera
 
 /// How a selection is named and resolved: the process switch, then a per-model
 /// setting, then the global setting, then the purpose's default (live native,
-/// checkpoint balanced). The provider passes its saved settings; a cluster rank
-/// receives the value its owner resolved in its launch environment.
+/// checkpoint balanced, or native for `nativeCheckpointModelTypes`). The provider
+/// passes its saved settings; a cluster rank receives the value its owner resolved
+/// in its launch environment.
 public enum PagedKVQuantizationPolicy {
     public static let environmentKey = "DARKBLOOM_CBV2_KV_QUANTIZATION"
     public static let checkpointEnvironmentKey = "DARKBLOOM_CBV2_CHECKPOINT_QUANTIZATION"
@@ -76,6 +77,11 @@ public enum PagedKVQuantizationPolicy {
         }
     }
 
+    /// Model types whose complete checkpoints store native rows unless a setting says
+    /// otherwise. Nemotron 3.5 Lightning served without its MTP head keeps the exact
+    /// rows it stored beside that head, so a cache hit's output does not move.
+    public static let nativeCheckpointModelTypes: Set<String> = ["nemotron_h"]
+
     /// MiMo's SDK-owned execution path is excluded before parsing any override.
     public static func resolve(
         modelType: String?, global: String? = nil, byModel: [String: String] = [:],
@@ -93,8 +99,27 @@ public enum PagedKVQuantizationPolicy {
             }
             return .native
         }
-        return try parseSelection(
-            environment[purpose.environmentKey] ?? byModel[modelID] ?? global ?? "",
-            purpose: purpose)
+        let raw = environment[purpose.environmentKey] ?? byModel[modelID]
+        if purpose == .checkpoint, let modelType, nativeCheckpointModelTypes.contains(modelType),
+            isUnset(raw), isUnset(global) || isSavedCheckpointDefault(global)
+        {
+            return .native
+        }
+        return try parseSelection(raw ?? global ?? "", purpose: purpose)
+    }
+
+    private static func normalized(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func isUnset(_ raw: String?) -> Bool {
+        raw.map { normalized($0).isEmpty } ?? true
+    }
+
+    /// A saved provider.toml spells out the previous default, so the global word
+    /// `balanced` is not a choice. `k4v4` names the same profile as one, and a
+    /// per-model setting or the process switch can still say `balanced`.
+    private static func isSavedCheckpointDefault(_ raw: String?) -> Bool {
+        raw.map { normalized($0) == "balanced" } ?? false
     }
 }
