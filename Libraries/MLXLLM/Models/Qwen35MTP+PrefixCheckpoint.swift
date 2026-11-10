@@ -3,10 +3,6 @@ import MLX
 import MLXLMCommon
 
 extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
-    /// Requests that cannot speculate record prompt history too, so their
-    /// checkpoints are the ones a speculating request saves.
-    public var checkpointsNonSpeculatingRows: Bool { true }
-
     private final class PrefixCheckpoint: CBv2MTPPrefixCheckpoint {
         let owner: ObjectIdentifier
         let targetInputCount: Int
