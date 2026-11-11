@@ -194,6 +194,61 @@ struct Qwen35MTPOrdinaryHistoryTests {
         }
     }
 
+    /// Releasing finished steps' events only drops fired event handles. With
+    /// the release off (the old retention), a lone drafting row and a row that
+    /// drafts alone after a batch-gated stretch (consuming that stretch's
+    /// history) give the same tokens, drafts and acceptance.
+    @Test("history event release leaves drafting bit-identical", arguments: [true, false])
+    func historyEventReleaseKeepsDraftingIdentical(ordinary: Bool) async throws {
+        let lone = [
+            CBv2Request(
+                id: .init(951), promptTokens: (2 ... 20).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 24)
+        ]
+        let gated = [
+            CBv2Request(
+                id: .init(952), promptTokens: (1 ... 17).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 24),
+            CBv2Request(
+                id: .init(953), promptTokens: (3 ... 15).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 8),
+        ]
+        let target = try fixture()
+        let (reference, _) = try engine(target, mtpConfig: .init(enabled: false))
+        let expected = [
+            try await runTogether(reference, lone), try await runTogether(reference, gated),
+        ]
+        await reference.shutdown()
+
+        for (requests, expectedTokens) in zip([lone, gated], expected) {
+            var runs: [(tokens: [[Int]], metrics: CBv2MTPMetrics)] = []
+            for disabled in [true, false] {
+                let (candidate, _) = try engine(
+                    target,
+                    mtpConfig: .init(
+                        enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
+                        verificationMode: .serialTarget, ordinaryDecodeHistory: ordinary,
+                        prefillCarry: ordinary))
+                candidate.loopForTesting.onEngineQueueSync {
+                    candidate.loopForTesting.mtpHistoryEventReleaseDisabledForTesting = disabled
+                }
+                let tokens = try await runTogether(candidate, requests)
+                let metrics = try #require(candidate.mtpMetricsSnapshot())
+                await candidate.shutdown()
+                runs.append((tokens, metrics))
+            }
+            let (old, new) = (runs[0], runs[1])
+            #expect(new.tokens == old.tokens)
+            #expect(new.tokens == expectedTokens)
+            #expect(new.metrics.rounds > 0 && new.metrics.draftedTokens > 0)
+            #expect(new.metrics.rounds == old.metrics.rounds)
+            #expect(new.metrics.seedSteps == old.metrics.seedSteps)
+            #expect(new.metrics.draftedTokens == old.metrics.draftedTokens)
+            #expect(new.metrics.acceptedTokens == old.metrics.acceptedTokens)
+            #expect(new.metrics.perPositionAccepted == old.metrics.perPositionAccepted)
+        }
+    }
+
     #if canImport(Metal) && canImport(ObjectiveC)
     /// Each eval's completion event (an `MTLSharedEvent`, a finite
     /// system-wide resource) stays on the arrays the eval computed until
