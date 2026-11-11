@@ -917,8 +917,9 @@ public final class PagedKVPool {
 
     // MARK: - Page lifecycle
 
-    func allocatePage(group key: PagedKVGroupKey) -> Int32 {
-        group(key).allocatePage { [unowned self] handle in
+    /// `hint`: the page the same row layer allocated last, if any.
+    func allocatePage(group key: PagedKVGroupKey, after hint: Int32? = nil) -> Int32 {
+        group(key).allocatePage(after: hint) { [unowned self] handle in
             pageReuseObserver?.pagedKVPool(self, willReuse: handle)
         }
     }
