@@ -96,6 +96,28 @@ extension UnitTests {
             #expect(take(&free, after: 128) == 8)
         }
 
+        /// With no fully free run, the fallback scans the summary words. Emptying
+        /// a word must clear its summary bit, or the scan returns a held page.
+        @Test func theFallbackSkipsAnEmptiedWord() throws {
+            let empty = try PagedKVSegmentLayout(
+                pageBytes: 1, targetBytes: 129, maximumBufferBytes: 1 << 20)
+            let layout = try empty.adding(usablePages: 256, excluding: []).layout
+            #expect(layout.ranges == [0 ..< 129, 129 ..< 258])
+            var free = PagedKVFreePages(layout: empty)
+            free.extend(to: layout)
+            for range in layout.ranges { free.addFresh(range.dropFirst().map { Int32($0) }) }
+            // Hold the first page of every run, so no run is fully free.
+            for range in layout.ranges {
+                for start in stride(from: range.lowerBound + 1, to: range.upperBound, by: 16) {
+                    free.remove(Int32(start))
+                }
+            }
+            // Empty word 0 (pages 1...63) and hold page 64, the first page of word 1.
+            for page in Int32(1) ..< 64 where free.contains(page) { free.remove(page) }
+            free.remove(64)
+            #expect(free.next(after: nil) == 66)
+        }
+
         @Test func aRetiredSegmentIsNeverChosen() throws {
             var free = try twoSegments()
             for page in Int32(66) ... 129 { free.remove(page) }
