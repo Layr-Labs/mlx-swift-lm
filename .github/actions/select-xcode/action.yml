@@ -4,7 +4,7 @@ description: >-
   and checks that it has Swift 6.4 or newer. It uses the image default when
   that is 27.2 (27B52), else an installed Xcode that is. On a runner without
   27B52 it accepts any other 27.2 build, a beta or release candidate included
-  (blacksmith-12vcpu-macos-27 has only 27.2 beta 3), and prints a warning
+  (a runner image can have only a 27.2 beta), and prints a warning
   that names the build. The first such Xcode found wins (the image default,
   then /Applications in glob order), so a new runner image can change the
   build those runners use. It fails when no installed Xcode is 27.2. The

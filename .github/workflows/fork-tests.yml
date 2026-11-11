@@ -15,9 +15,9 @@ name: Fork Tests
 # test runs exactly once.
 #
 # On a pull request the macOS jobs run on a Darkbloom Sandbox when the route
-# job gets one from the Darkbloom plane, else on blacksmith-12vcpu-macos-27.
-# Other runs save the caches that pull requests restore, so they stay on the
-# GitHub-hosted xcode-27 image and do not ask the plane.
+# job gets one from the Darkbloom plane, else on the GitHub-hosted xcode-27
+# image. Other runs save the caches that pull requests restore, so they stay
+# on xcode-27 and do not ask the plane.
 
 on:
   pull_request:
@@ -74,7 +74,7 @@ jobs:
     permissions: {}
     with:
       lanes: |
-        fork-tests macos_arm64 blacksmith-12vcpu-macos-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
+        fork-tests macos_arm64 xcode-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
 
   build:
     name: Build
@@ -92,6 +92,20 @@ jobs:
       # time stamps, so ccache can also ignore the header times.
       CCACHE_SLOPPINESS: modules,include_file_mtime,include_file_ctime,time_macros,pch_defines,system_headers
     steps:
+      # Before every cache step: a Darkbloom Sandbox that the plane gave no
+      # Darkbloom cache would reach GitHub's own Actions cache, so there every
+      # cache step is skipped, as in Layr-Labs/d-inference.
+      - name: Choose this job's Actions cache
+        run: |
+          if [[ ${RUNNER_NAME:-} != darkbloom-* ]]; then
+            echo "Actions cache: this runner's own"
+          elif [[ -n ${DARKBLOOM_CACHE_URL:-} ]]; then
+            echo "Actions cache: the Darkbloom cache at $DARKBLOOM_CACHE_URL"
+          else
+            echo "CI_ACTIONS_CACHE=off" >> "$GITHUB_ENV"
+            echo "::notice title=Actions cache::The plane gave this Darkbloom Sandbox no cache, so every cache step is skipped."
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Test the suite runner scripts
@@ -112,8 +126,9 @@ jobs:
       - name: Restore the build cache
         # The key ends with the commit. A run restores the newest build of
         # the same Xcode, and the build then recompiles only what changed.
-        # The test jobs restore the entry that this job saves.
+        # Later runs restore the entry that this job saves.
         id: cache
+        if: env.CI_ACTIONS_CACHE != 'off'
         uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
@@ -127,6 +142,7 @@ jobs:
 
       - name: Restore the C and C++ compiler cache
         id: ccache
+        if: env.CI_ACTIONS_CACHE != 'off'
         uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
@@ -210,7 +226,8 @@ jobs:
 
       - name: Pack the test products
         # The test and coverage jobs run these products. The Actions cache
-        # cannot hand them over: Blacksmith's cache refuses this repository.
+        # cannot hand them over: a Darkbloom Sandbox has no cache or a cache
+        # of its own host only.
         run: .github/scripts/test-products.sh pack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Upload the test products
@@ -226,7 +243,7 @@ jobs:
         # The next build restores this entry. An exact hit means that the
         # entry already exists. Pull requests, which may run on a Darkbloom
         # Sandbox, only restore caches.
-        if: ${{ github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
@@ -236,7 +253,7 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Save the C and C++ compiler cache
-        if: ${{ github.event_name != 'pull_request' && steps.ccache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.ccache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
@@ -250,6 +267,20 @@ jobs:
       contents: read
     timeout-minutes: 30
     steps:
+      # Before every cache step: a Darkbloom Sandbox that the plane gave no
+      # Darkbloom cache would reach GitHub's own Actions cache, so there every
+      # cache step is skipped, as in Layr-Labs/d-inference.
+      - name: Choose this job's Actions cache
+        run: |
+          if [[ ${RUNNER_NAME:-} != darkbloom-* ]]; then
+            echo "Actions cache: this runner's own"
+          elif [[ -n ${DARKBLOOM_CACHE_URL:-} ]]; then
+            echo "Actions cache: the Darkbloom cache at $DARKBLOOM_CACHE_URL"
+          else
+            echo "CI_ACTIONS_CACHE=off" >> "$GITHUB_ENV"
+            echo "::notice title=Actions cache::The plane gave this Darkbloom Sandbox no cache, so every cache step is skipped."
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Select Xcode
@@ -271,6 +302,7 @@ jobs:
         # The library changes only when the mlx-swift pin, the Xcode or the
         # build script changes.
         id: cache
+        if: env.CI_ACTIONS_CACHE != 'off'
         uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
@@ -296,7 +328,7 @@ jobs:
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Save the Metal library
-        if: ${{ github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Hand the Fork Tests build from the build job to the test and coverage jobs
 # as an artifact, as Layr-Labs/d-inference does (scripts/ci-test-products.py).
-# The Actions cache cannot do it: Blacksmith's cache refuses this repository.
+# The Actions cache cannot do it: a Darkbloom Sandbox has no cache or a cache
+# of its own host only.
 #
 #   .github/scripts/test-products.sh pack ARCHIVE     (build job, after the build)
 #   .github/scripts/test-products.sh unpack ARCHIVE   (test job, after checkout)

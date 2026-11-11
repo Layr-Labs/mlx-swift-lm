@@ -7,14 +7,14 @@ permissions:
 
 jobs:
   # Chooses a Darkbloom Sandbox for the lint job when the Darkbloom plane
-  # grants one, else blacksmith-12vcpu-macos-27.
+  # grants one, else the GitHub-hosted xcode-27 image.
   route:
     name: Route Lint
     uses: ./.github/workflows/darkbloom-route.yml
     permissions: {}
     with:
       lanes: |
-        lint macos_arm64 blacksmith-12vcpu-macos-27
+        lint macos_arm64 xcode-27
 
   lint:
     needs: route
