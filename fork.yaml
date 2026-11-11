@@ -113,7 +113,9 @@ def:
             `.causal` SDPA call instead, `CBv2AttentionV1.usesFusedCausalPrefill`),
             segment dispatch plans/caches, native KV dtype probing, a decode profiler, and prefix-block
             sharing (`PrefixBlocks/`: block index, free queue, page handles, resident-prefix plan
-            validation). Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
+            validation). The page allocator (`PagedKVFreePages`) reuses uncached pages before cached
+            ones and keeps each row layer's pages in 16-page runs in few segments, spreading row layers
+            over segments, so the segmented decode keeps one dispatch per layer through busy runs. Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
             checkpoint storage. Optional token-local affine K4/V4, K8/V4 and K8/V8 pages use
             signed block Hadamard keys and direct mixed packed/native online attention. Original
             recent128 and pending/speculative rows retain separately charged native owners until
@@ -980,7 +982,7 @@ def:
         The Fork Tests workflow runs them before it stages the Metal library.
         `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
-        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
+        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process, the page allocator's tiers and placement, and the decode dispatches per step over busy-provider arrival and retirement traces.
         `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
         `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorFrameStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
         `TestTokenizer.swift` keeps the random test tokenizer that upstream removed (a86ee6a7); many fork tests use it.

@@ -954,9 +954,9 @@ public final class PagedKVPool {
         return group(handle.group).refCounts[Int(handle.page)]
     }
 
-    /// Move a generation-valid, zero-ref page to the immediate-reuse end after
-    /// its final cache alias disappears. Active pages are classified when
-    /// their last owner releases them instead.
+    /// Make a generation-valid, zero-ref page uncached (reused before any
+    /// cached page) after its final cache alias disappears. Active pages are
+    /// classified when their last owner releases them instead.
     func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
         groups[handle.group]?.reclassifyAsUncached(handle)
     }

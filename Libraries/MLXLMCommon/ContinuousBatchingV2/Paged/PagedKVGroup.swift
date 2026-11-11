@@ -208,7 +208,7 @@ final class PagedKVGroup {
     /// Release in caller-supplied eviction order. vLLM frees a request's
     /// page tables tail-first; cached pages append in that same order so a
     /// branch suffix is reused before its more valuable ancestors. Uncached
-    /// pages prepend for immediate reuse.
+    /// pages are reused before any cached page.
     func release<S: Sequence>(
         _ pages: S, isCached: (PagedKVPageHandle) -> Bool
     ) where S.Element == Int32 {
