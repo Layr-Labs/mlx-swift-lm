@@ -153,7 +153,7 @@ reason. This source API addition requires callers that constructed the old bare
 | `invalid_in_flight_assignment` | A launched assignment has invalid counts or no matching projected work. |
 | `inconsistent_token_cursor` | Confirmed token cursors cannot be reconstructed from launched work. |
 | `unowned_pending_sample` | A pending sample has no owning launched assignment. |
-| `multimodal_work` | Text-token counts do not bound the multimodal work. |
+| `multimodal_work` | A row with bidirectional media blocks still has prompt work: text-token counts do not bound it. Once it has sampled from its whole prompt and is decode-ready, it is priced as an ordinary decode row. |
 | `invalid_prefix_reservation` | Prefix preview or projected capacity reservation cannot be represented. |
 | `invalid_projection_assignment` | A projected step assignment cannot be represented. |
 | `invalid_projection_transition` | A projected row advance or finalization cannot be represented. |
