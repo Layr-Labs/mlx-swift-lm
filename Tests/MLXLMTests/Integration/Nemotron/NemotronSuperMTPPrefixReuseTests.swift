@@ -53,7 +53,8 @@ struct NemotronSuperMTPPrefixReuseTests {
     /// The owner's policy: one whole prompt chunk per step beside every
     /// request's verify row.
     static func engine(
-        _ stack: NemotronSuperMTPFixture.Stack, bank: CBv2HybridPrefixCacheConfig
+        _ stack: NemotronSuperMTPFixture.Stack, bank: CBv2HybridPrefixCacheConfig,
+        sampler: any CBv2StepSampler = CBv2GreedySampler()
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         var config = CBv2SchedulerConfig(
             maxConcurrentRequests: rows, maxBatchedTokensPerStep: chunk + rows * (1 + depth),
@@ -67,7 +68,7 @@ struct NemotronSuperMTPPrefixReuseTests {
             layerKinds: stack.target.cbv2LayerKinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(
                 caches: stack.target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) }),
-            sampler: CBv2GreedySampler(), schedulerConfig: config,
+            sampler: sampler, schedulerConfig: config,
             admissionConfig: .init(watermarkFraction: 0), hybridPrefixCache: bank,
             mtpDrafter: stack.assistant,
             mtpConfig: .init(

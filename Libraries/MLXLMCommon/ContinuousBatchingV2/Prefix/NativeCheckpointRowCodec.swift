@@ -4,12 +4,19 @@ import MLX
 /// Import payload scratch is at most 44 KiB: two 16 KiB batches (including CoW),
 /// a 2 KiB partial row, two 2 KiB native rows (including CoW), and 2 KiB each for
 /// Float scratch, rotation factors and preparation/SIMD temporaries. The 64 KiB
-/// charge also covers container overhead and an encoder's row buffers: export's
-/// prepared encoder or the reference encoder's row-local temporaries. Input and
-/// sink-retained output belong to the caller's IO budget; neither import nor
-/// export retains history here.
+/// charge also covers container overhead and encoders' row buffers: export's
+/// prepared encoders (under 7 KiB each, at most `exportCodingWorkers`) or the
+/// reference encoder's row-local temporaries. Input and sink-retained output
+/// belong to the caller's IO budget; neither import nor export retains history
+/// here.
 enum CBv2NativeCheckpointRowCodec {
     static let scratchBytes = 64 << 10
+    /// Native rows export reads from its source at once (whole rows, at least
+    /// one), charged with their coded rows on top of `scratchBytes`.
+    static let exportBatchBytes = 256 << 10
+    /// Cores that code one batch: a quarter of the active ones, one to four.
+    static let exportCodingWorkers = min(
+        4, max(1, ProcessInfo.processInfo.activeProcessorCount / 4))
 
     static func encode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
         try data.withUnsafeBytes { try encode($0, role: role, decoder: nil) }
@@ -149,6 +156,8 @@ final class CBv2PreparedNativeCheckpointRowEncoder {
         self.bits = bits
         groupSize = config.groupSize
         let rotation = role.values ? 0 : config.resolvedRotationBlockSize(headDim: role.width)
+        // The rotation runs eight lanes at a time; a valid profile's blocks hold 32 or more.
+        guard rotation % 8 == 0 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         self.rotation = rotation
         if rotation == 0 {
             signs = []
@@ -164,35 +173,44 @@ final class CBv2PreparedNativeCheckpointRowEncoder {
         encoded = [UInt8](repeating: 0, count: role.packedRowBytes)
     }
 
-    /// Same operations in the same order as `PagedKVQuantizationReference.encode`.
     func encode(_ data: Data) throws -> Data {
-        guard data.count == role.nativeRowBytes else {
+        var result = Data(count: role.packedRowBytes)
+        try data.withUnsafeBytes { native in
+            try result.withUnsafeMutableBytes { try encode(native, into: $0) }
+        }
+        return result
+    }
+
+    /// Same operations in the same order as `PagedKVQuantizationReference.encode`.
+    func encode(
+        _ native: UnsafeRawBufferPointer, into destination: UnsafeMutableRawBufferPointer
+    ) throws {
+        guard native.count == role.nativeRowBytes, destination.count == role.packedRowBytes
+        else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
         let width = role.width
         let dtype = role.key.dtype
         try scratch.withUnsafeMutableBufferPointer { row in
-            data.withUnsafeBytes { bytes in
-                for index in 0 ..< width {
-                    switch dtype {
-                    case .float16:
-                        row[index] = Float(
-                            Float16(
-                                bitPattern: bytes.loadUnaligned(
-                                    fromByteOffset: index * 2, as: UInt16.self
-                                ).littleEndian))
-                    case .bfloat16:
-                        row[index] = Float(
-                            bitPattern: UInt32(
-                                bytes.loadUnaligned(
-                                    fromByteOffset: index * 2, as: UInt16.self
-                                ).littleEndian) << 16)
-                    default:
-                        row[index] = Float(
-                            bitPattern: bytes.loadUnaligned(
-                                fromByteOffset: index * 4, as: UInt32.self
-                            ).littleEndian)
-                    }
+            for index in 0 ..< width {
+                switch dtype {
+                case .float16:
+                    row[index] = Float(
+                        Float16(
+                            bitPattern: native.loadUnaligned(
+                                fromByteOffset: index * 2, as: UInt16.self
+                            ).littleEndian))
+                case .bfloat16:
+                    row[index] = Float(
+                        bitPattern: UInt32(
+                            native.loadUnaligned(
+                                fromByteOffset: index * 2, as: UInt16.self
+                            ).littleEndian) << 16)
+                default:
+                    row[index] = Float(
+                        bitPattern: native.loadUnaligned(
+                            fromByteOffset: index * 4, as: UInt32.self
+                        ).littleEndian)
                 }
             }
             guard row.allSatisfy(\.isFinite) else {
@@ -211,28 +229,57 @@ final class CBv2PreparedNativeCheckpointRowEncoder {
         } catch {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        return Data(encoded)
+        encoded.withUnsafeBytes { destination.copyMemory(from: $0) }
     }
 
+    /// Eight lanes at a time, every element takes the scalar butterflies'
+    /// additions in the same order; the first three stages stay in registers
+    /// as in the decoder's inverse.
     private func rotate(_ row: UnsafeMutableBufferPointer<Float>) {
-        let normalization = 1 / Float(rotation).squareRoot()
-        for base in stride(from: 0, to: role.width, by: rotation) {
-            for index in 0 ..< rotation { row[base + index] *= signs[index] }
-            var width = 1
-            while width < rotation {
-                for start in stride(from: 0, to: rotation, by: 2 * width) {
-                    for index in 0 ..< width {
-                        let lo = base + start + index
-                        let hi = lo + width
-                        let a = row[lo]
-                        let b = row[hi]
-                        row[lo] = a + b
-                        row[hi] = a - b
-                    }
+        let normalization = SIMD8<Float>(repeating: 1 / Float(rotation).squareRoot())
+        let values = UnsafeMutableRawBufferPointer(row)
+        func store(_ value: SIMD8<Float>, _ offset: Int) {
+            CBv2PreparedNativeCheckpointRowDecoder.storeVector(value, to: values, at: offset)
+        }
+        signs.withUnsafeBytes { signs in
+            for base in stride(from: 0, to: role.width, by: rotation) {
+                for start in stride(from: 0, to: rotation, by: 8) {
+                    let offset = (base + start) * 4
+                    let input =
+                        values.loadUnaligned(fromByteOffset: offset, as: SIMD8<Float>.self)
+                        * signs.loadUnaligned(fromByteOffset: start * 4, as: SIMD8<Float>.self)
+                    let sums = input.evenHalf + input.oddHalf
+                    let differences = input.evenHalf - input.oddHalf
+                    let a = SIMD4(sums[0], differences[0], sums[2], differences[2])
+                    let b = SIMD4(sums[1], differences[1], sums[3], differences[3])
+                    let secondSums = a + b
+                    let secondDifferences = a - b
+                    let lo = SIMD4(
+                        secondSums[0], secondSums[1], secondDifferences[0], secondDifferences[1])
+                    let hi = SIMD4(
+                        secondSums[2], secondSums[3], secondDifferences[2], secondDifferences[3])
+                    store(SIMD8(lowHalf: lo + hi, highHalf: lo - hi), offset)
                 }
-                width *= 2
+                var width = 8
+                while width < rotation {
+                    for start in stride(from: 0, to: rotation, by: 2 * width) {
+                        for index in stride(from: 0, to: width, by: 8) {
+                            let lo = (base + start + index) * 4
+                            let hi = lo + width * 4
+                            let a = values.loadUnaligned(fromByteOffset: lo, as: SIMD8<Float>.self)
+                            let b = values.loadUnaligned(fromByteOffset: hi, as: SIMD8<Float>.self)
+                            store(a + b, lo)
+                            store(a - b, hi)
+                        }
+                    }
+                    width *= 2
+                }
+                for start in stride(from: 0, to: rotation, by: 8) {
+                    let offset = (base + start) * 4
+                    let input = values.loadUnaligned(fromByteOffset: offset, as: SIMD8<Float>.self)
+                    store(input * normalization, offset)
+                }
             }
-            for index in 0 ..< rotation { row[base + index] *= normalization }
         }
     }
 
@@ -260,13 +307,20 @@ final class CBv2PreparedNativeCheckpointRowEncoder {
                 let scale = hi / levels - lo / levels
                 store(scale, at: dataBytes + group * 4)
                 store(lo, at: dataBytes + (groups + group) * 4)
-                for index in start ..< start + groupSize {
-                    let raw = scale == 0 ? 0 : (row[index] / scale - lo / scale).rounded()
-                    let code = UInt8(max(0, min(levels, raw)))
-                    if bits == 4 {
-                        bytes[index / 2] |= code << ((index & 1) * 4)
-                    } else {
-                        bytes[index] = code
+                // A zero scale codes every element 0: the bytes are already 0.
+                guard scale != 0 else { continue }
+                let offset = lo / scale
+                if bits == 4 {
+                    for index in stride(from: start, to: start + groupSize, by: 2) {
+                        let low = (row[index] / scale - offset).rounded()
+                        let high = (row[index + 1] / scale - offset).rounded()
+                        bytes[index / 2] =
+                            UInt8(max(0, min(levels, low))) | UInt8(max(0, min(levels, high))) << 4
+                    }
+                } else {
+                    for index in start ..< start + groupSize {
+                        bytes[index] = UInt8(
+                            max(0, min(levels, (row[index] / scale - offset).rounded())))
                     }
                 }
             }
@@ -553,7 +607,7 @@ final class CBv2PreparedNativeCheckpointRowDecoder {
     }
 
     @inline(__always)
-    private static func storeVector<Vector: SIMD>(
+    fileprivate static func storeVector<Vector: SIMD>(
         _ value: Vector, to destination: UnsafeMutableRawBufferPointer, at offset: Int
     ) {
         // A byte copy makes no SIMD-alignment or memory-binding assumptions.

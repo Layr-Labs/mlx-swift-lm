@@ -230,7 +230,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 /// Compiled GELU-gated GLU product (`geluApprox(gate) * up`), fusing the tanh
 /// GELU and the element-wise multiply into one shapeless kernel. Uses the
 /// Power-free `x * x * x` GELU so it is safe under `compile(shapeless: true)`.
-private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+package let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, up: MLXArray) -> MLXArray in
         (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
@@ -497,6 +497,33 @@ open class SwitchGLU: Module {
     /// per projection. Identical index values, so identical outputs. Plain
     /// affine `QuantizedSwitchLinear` banks only; opt-in per model.
     public var suppliesHostRowIndices = false
+
+    /// Current arrays for the stock Gemma GeGLU decode graph, in a fixed order.
+    /// Only the existing affine BF16 route is admitted; adapters, custom modules,
+    /// fused layouts and other precision paths retain their ordinary execution.
+    package func gemma4DecodeCompilationState()
+        -> (parameters: [MLXArray], modules: [Module])?
+    {
+        guard type(of: self) == SwitchGLU.self, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            isGeluActivation, activationProduct == nil, !mimoV26NAXGather,
+            gateUpProj == nil, let gateProj, let upProj
+        else { return nil }
+        var parameters: [MLXArray] = []
+        var modules: [Module] = [self]
+        for projection in [gateProj, upProj, downProj] {
+            guard let quantized = projection as? QuantizedSwitchLinear,
+                type(of: quantized) == QuantizedSwitchLinear.self, !quantized.training,
+                quantized.mode == .affine, quantized.bits == 4, quantized.groupSize == 64,
+                quantized.weight.dtype == .uint32, quantized.scales.dtype == .bfloat16,
+                let biases = quantized.biases, biases.dtype == .bfloat16,
+                quantized.bias == nil, quantized.globalScales == nil
+            else { return nil }
+            parameters += [quantized.weight, quantized.scales, biases]
+            modules.append(quantized)
+        }
+        return (parameters, modules)
+    }
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -1177,6 +1204,26 @@ open class SwitchGLU: Module {
         return unfused(MLX.squeezed(experts, axis: -2))
     }
 
+    // Only the stock production-shape GeGLU evaluation contract can bypass expansion.
+    // Subclass hooks, adapters, other activations and every transform retain the
+    // complete original projectExperts graph.
+    private func projectGemma4RowMappedExperts(
+        _ x: MLXArray, _ indices: MLXArray
+    ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool)? {
+        guard Gemma4RowMappedNAX.requested, admitsFusedRoutes, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            isGeluActivation, activationProduct == nil, gateUpProj == nil,
+            !mimoV26NAXGather, let gateProj, let upProj,
+            Gemma4RowMappedNAX.supportsDownProjection(downProj),
+            let pair = Gemma4RowMappedNAX.tryPair(
+                x, indices: indices, gate: gateProj, up: upProj)
+        else { return nil }
+        let activated = compiledGeGLU(pair.gate, pair.up)
+        let output = projectExpert(downProj, activated, pair.sorted, sortedIndices: true)
+        return (output, pair.inverseOrder, true)
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, only the exact sorted production Gemma
@@ -1191,6 +1238,19 @@ open class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
+        if isProductionPrefill, let projected = projectGemma4RowMappedExperts(x, indices) {
+            if fuseSortedReduction, supportsWeightedExpertUnsort(x, indices, weights: weights),
+                projected.sorted, let inverseOrder = projected.inverseOrder,
+                projected.output.ndim == 3, projected.output.dim(-2) == 1,
+                projected.output.dim(-1) == 2816, projected.output.dtype == .bfloat16
+            {
+                return weightedExpertUnsort(
+                    sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+                    inverseOrder: inverseOrder, weights: weights)
+            }
+            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+        }
+
         guard fuseSortedReduction && isProductionPrefill,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {

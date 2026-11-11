@@ -140,6 +140,14 @@ public struct CBv2Request: Sendable {
     /// step without raising caps. Token sequence, sampling and hit identity
     /// remain governed by their existing contracts.
     public var prefixCheckpointTargetTokens: Int?
+    /// Deliver the consumer terminal without waiting for this request's
+    /// complete-checkpoint publication. Rows, reservations and the stream
+    /// generation (which fences ID reuse) are still released only after
+    /// publication, so a caller must hold capacity until the retirement
+    /// acknowledgement. Honoured only by submissions that return one
+    /// (`submitWithRetirement`, first-token deadline admission); plain
+    /// `submit` and the native complete-prefix path ignore it.
+    public var terminalPrecedesCheckpointPublication = false
     /// Numeric, once-only prompt-completion observation. Runs on the engine
     /// queue after actual prefix adoption and prompt computation; it must not block.
     /// Independent of terminal success, output delivery, and billable usage.
@@ -949,8 +957,9 @@ public struct CBv2SchedulerConfig: Sendable {
         self.enablePrefixCache = enablePrefixCache
     }
 
-    /// A request's ordinary chunk cap. First-token projection never prices a
-    /// block-bearing row (`multimodalWork`), so only scheduling consults it.
+    /// A request's ordinary chunk cap. First-token projection prices a
+    /// block-bearing row only once it is decode-ready past its prompt
+    /// (`multimodalWork`), so only scheduling consults it.
     func plainPrefillChunkSize(hasBidirectionalBlocks: Bool) -> Int {
         guard hasBidirectionalBlocks, let ceiling = bidirectionalMediaPrefillChunkCeiling,
             ceiling > 0

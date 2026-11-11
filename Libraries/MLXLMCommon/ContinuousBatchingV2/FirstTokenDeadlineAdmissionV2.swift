@@ -483,8 +483,14 @@ extension SchedulerV2 {
                 return .unbounded(reason: .unownedPendingSample)
             }
             // Multimodal token counts are not a safe service-work proxy: image
-            // spans can carry model-specific superlinear work.
-            guard rec.cancelRequested || rec.multimodalBlocks.isEmpty else {
+            // spans can carry model-specific superlinear work, and block rows
+            // chunk differently. Once such a row has sampled from its whole
+            // prompt and is decode-ready, its work is ordinary decode.
+            guard
+                rec.cancelRequested || rec.multimodalBlocks.isEmpty
+                    || confirmedComputed
+                        >= max(rec.request.promptTokens.count, rec.tokens.count - 1)
+            else {
                 return .unbounded(reason: .multimodalWork)
             }
             rows[rec.id] = CBv2ProjectionRow(
