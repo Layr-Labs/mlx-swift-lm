@@ -22,25 +22,18 @@ enum CBv2MTPHistoryEvents {
     /// and evaluation are unchanged: only the handle of a fired event is
     /// dropped, as MLX itself does when it next reads the array. Lazy arrays
     /// and unfinished work are left as they are.
-    ///
-    /// Returns how many arrays were not available (lazy, or still running).
-    @discardableResult
-    static func release(_ arrays: [MLXArray]) -> Int {
-        var pending = 0
+    static func release(_ arrays: [MLXArray]) {
         for array in arrays {
             var available = false
-            if _mlx_array_is_available(&available, array.ctx) != 0 || !available {
-                pending += 1
-            }
+            _ = _mlx_array_is_available(&available, array.ctx)
         }
-        return pending
     }
 }
 
 extension EngineLoopV2 {
     /// `CBv2MTPHistoryEvents.release` for a finalized step's history arrays.
     func releaseMTPHistoryEvents(_ arrays: [MLXArray]) {
-        guard !arrays.isEmpty, !mtpHistoryEventReleaseDisabledForTesting else { return }
+        guard !mtpHistoryEventReleaseDisabledForTesting else { return }
         CBv2MTPHistoryEvents.release(arrays)
     }
 }
