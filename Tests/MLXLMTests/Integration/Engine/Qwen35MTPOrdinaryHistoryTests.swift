@@ -193,4 +193,44 @@ struct Qwen35MTPOrdinaryHistoryTests {
             }
         }
     }
+
+    #if canImport(Metal) && canImport(ObjectiveC)
+    /// Each eval's completion event (an `MTLSharedEvent`, a finite
+    /// system-wide resource) stays on the arrays the eval computed until
+    /// they are waited on or read again. History keeps views of every
+    /// committed step's token and hidden arrays while a batch-gated row
+    /// cannot draft. Two rows decode together between the two holds, on
+    /// chained ordinary history and on unchained MTP-step observation (the
+    /// path of the other request-stateful assistants): the live count must
+    /// not grow with the steps.
+    @Test("batch-gated rows keep no Metal event per decode step", arguments: [true, false])
+    func batchGatedHistoryKeepsNoEventPerStep(ordinary: Bool) async throws {
+        _ = try #require(MetalSharedEventCounter.live, "needs a Metal device")
+        let (candidate, _) = try engine(
+            try fixture(),
+            mtpConfig: .init(
+                enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
+                verificationMode: .serialTarget, ordinaryDecodeHistory: ordinary,
+                prefillCarry: ordinary))
+        let requests = [
+            CBv2Request(
+                id: .init(941), promptTokens: (1 ... 17).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 48),
+            CBv2Request(
+                id: .init(942), promptTokens: (3 ... 15).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 48),
+        ]
+        let steps = 12 ... 36
+        let sample = try #require(
+            await MetalSharedEventCounter.sampleBatchGatedStretch(
+                candidate, requests: requests, steps: steps))
+
+        #expect(sample.outputs.map(\.count) == [48, 48])
+        #expect((sample.metrics?.skippedRows["batch_gate"] ?? 0) > 0)
+        // The old retention kept about one event per step between the holds.
+        #expect(
+            sample.late - sample.early <= 4,
+            "live Metal shared events \(sample.early) -> \(sample.late) over \(steps)")
+    }
+    #endif
 }
