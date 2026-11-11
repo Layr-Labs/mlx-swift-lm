@@ -2,27 +2,22 @@ import Foundation
 
 /// The free pages of one paged-KV group and the choice of the next page.
 ///
-/// Free pages come in two tiers. A zero-ref page that a prefix-cache alias
-/// still names is "cached": it waits in eviction order (`PagedBlockFreeQueue`)
-/// and is taken only when no uncached page is free. Every other free page is
-/// "uncached" and is placed by address.
+/// A zero-ref page that a prefix-cache alias still names is "cached": it waits
+/// in eviction order and is taken only when no other page is free. Every other
+/// free page is "uncached" and placed by address.
 ///
-/// Placement keeps each row layer's pages in few segments, because the
-/// segmented decode binds at most `PagedSegmentDispatchPlan.maximumBindings`
-/// segments per dispatch: once a layer's partitions touch more segments than
-/// one dispatch binds, the decode issues one dispatch per bucket instead of
-/// one per layer. Each segment's usable pages split into aligned runs of
-/// `runPages`, one decode partition at the usual page size. A row layer
-/// - continues in the run of the page it took last;
-/// - then takes a fully free run in that page's segment;
-/// - then a fully free run in the segment with the most pages in fully free
-///   runs (lowest address on a tie), so concurrent row layers spread over
-///   segments instead of interleaving in the same ones;
-/// - and only when no run is fully free, the lowest free page.
+/// The segmented decode binds at most `PagedSegmentDispatchPlan.maximumBindings`
+/// segments per dispatch, so a layer whose partitions touch more segments needs
+/// more dispatches. Each segment's usable pages split into aligned runs of
+/// `runPages` (one partition at 16-token pages). A row layer takes:
+/// - the next free page in the run of the page it took last;
+/// - else a fully free run in that page's segment;
+/// - else a fully free run in the segment with the most pages in fully free
+///   runs, so row layers that start together use different segments;
+/// - else the lowest free page.
 ///
-/// `PagedKVGroup` owns refcounts and generations; this type only orders the
-/// free pages. Page choice never changes what a page holds or who may read
-/// it, only where a row's next tokens are stored.
+/// `PagedKVGroup` owns refcounts and generations. Placement changes only where
+/// a row's next tokens are stored, never what a page holds or who reads it.
 struct PagedKVFreePages {
     static let runPages = PagedSegmentDispatchPlan.maximumBindings - 1
 
@@ -122,13 +117,7 @@ struct PagedKVFreePages {
             }
             if fullRunPages[segment] > 0 { return firstFullRun(in: segment) }
         }
-        var roomiest: Int?
-        for segment in segments.indices where fullRunPages[segment] > 0 {
-            if roomiest.map({ fullRunPages[segment] > fullRunPages[$0] }) ?? true {
-                roomiest = segment
-            }
-        }
-        if let roomiest { return firstFullRun(in: roomiest) }
+        if let segment = roomiestSegment() { return firstFullRun(in: segment) }
         return lowestUncached()
     }
 
@@ -217,10 +206,20 @@ struct PagedKVFreePages {
         return nil
     }
 
+    /// The segment with the most pages in fully free runs; the lowest on a tie.
+    private func roomiestSegment() -> Int? {
+        var roomiest: Int?
+        for segment in segments.indices
+        where fullRunPages[segment] > (roomiest.map { fullRunPages[$0] } ?? 0) {
+            roomiest = segment
+        }
+        return roomiest
+    }
+
     private func firstFullRun(in segment: Int) -> Int32 {
-        for run in firstRun[segment] ..< firstRun[segment + 1]
-        where runFree[run] == runBounds(run, in: segment).count {
-            return Int32(runBounds(run, in: segment).lowerBound)
+        for run in firstRun[segment] ..< firstRun[segment + 1] {
+            let bounds = runBounds(run, in: segment)
+            if runFree[run] == bounds.count { return Int32(bounds.lowerBound) }
         }
         preconditionFailure("segment \(segment) counts a fully free run it does not have")
     }
