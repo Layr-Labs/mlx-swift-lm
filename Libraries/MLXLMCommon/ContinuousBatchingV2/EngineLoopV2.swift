@@ -1168,6 +1168,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// or planning more work; admission closures on the same queue still run.
     /// nil in production. Set and clear only through `onEngineQueueSync`.
     var suspendStepExecutionAtCountForTesting: Int?
+    /// Test seam: true restores the old retention of finished steps' Metal
+    /// events by assistant history (`CBv2MTPHistoryEvents`), for A/B tests.
+    /// false in production. Set only through `onEngineQueueSync`.
+    var mtpHistoryEventReleaseDisabledForTesting = false
     /// Test seam: observes every computed range the recurrent capture pass
     /// sees. Called on the engine queue with (request, range, planned chunk
     /// cap, packed, phase, outcome). `phase` is "range" for every computed

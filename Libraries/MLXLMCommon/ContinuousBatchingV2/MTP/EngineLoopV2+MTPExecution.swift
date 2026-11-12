@@ -35,6 +35,9 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
+    /// The observed token and hidden arrays (and carries), all evaluation
+    /// targets of this step.
+    let committedObservationArrays: [MLXArray]
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
     let prefillCarryTopTwoValues: MLXArray?
 }
@@ -211,7 +214,9 @@ extension EngineLoopV2 {
             retainObservationFence()
             committedObservationRows.append(
                 .init(id: row.rec.id, assistantState: state))
-            committedObservationEvalTargets.append(hidden)
+            // Both arrays are evaluated with this step, so history's views of
+            // them drop the step's Metal event at finalize.
+            committedObservationEvalTargets.append(contentsOf: [tokens, hidden])
             return true
         }
         if !decodeRows.isEmpty {
@@ -633,6 +638,7 @@ extension EngineLoopV2 {
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
+            committedObservationArrays: committedObservationEvalTargets,
             prefillCarries: prefillCarries,
             prefillCarryTopTwoValues: prefillCarryTopTwoValues)
     }

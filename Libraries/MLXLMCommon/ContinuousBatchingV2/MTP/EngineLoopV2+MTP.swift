@@ -117,6 +117,7 @@ extension EngineLoopV2 {
                     seedHidden: graph.seedHidden,
                     seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                     committedObservationRows: graph.committedObservationRows,
+                    committedObservationArrays: graph.committedObservationArrays,
                     prefillCarries: graph.prefillCarries,
                     prefillCarryTopTwoValues: graph.prefillCarryTopTwoValues)
             }
