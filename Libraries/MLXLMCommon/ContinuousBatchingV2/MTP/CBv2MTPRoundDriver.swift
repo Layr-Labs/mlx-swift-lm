@@ -172,6 +172,9 @@ final class CBv2MTPRoundInFlight {
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
+    /// Those observations' token and hidden arrays (and carries), all
+    /// evaluated with this step.
+    let committedObservationArrays: [MLXArray]
     /// Final prompt chunks whose last pre-norm hidden row [1, 1, H] becomes
     /// the request's first carry once its first token is confirmed.
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
@@ -196,6 +199,7 @@ final class CBv2MTPRoundInFlight {
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
         committedObservationRows: [CommittedObservationRow],
+        committedObservationArrays: [MLXArray],
         prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)],
         prefillCarryTopTwoValues: MLXArray?
     ) {
@@ -204,6 +208,7 @@ final class CBv2MTPRoundInFlight {
         self.seedHidden = seedHidden
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
+        self.committedObservationArrays = committedObservationArrays
         self.prefillCarries = prefillCarries
         self.prefillCarryTopTwoValues = prefillCarryTopTwoValues
     }

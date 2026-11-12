@@ -54,6 +54,9 @@ extension EngineLoopV2 {
     /// transition is never observed twice.
     func finalizeMTPOrdinaryHistory(_ step: CBv2InFlightStep) {
         guard let mtp, let history = step.mtpOrdinaryHistory else { return }
+        // History keeps views of these two arrays for many steps; the step
+        // has finished, so they need not keep its Metal event.
+        releaseMTPHistoryEvents([history.tokens, history.hidden])
         for (id, index, preemptions) in history.rows {
             // A chained plan may preempt a row of this in-flight step; its
             // history was released and restarts with the recompute.

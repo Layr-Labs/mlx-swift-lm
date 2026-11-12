@@ -100,6 +100,13 @@ extension EngineLoopV2 {
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
         guard let mtp, let round = step.mtpRound else { return }
+        // Assistant history and carries keep views of these arrays after this
+        // finished step; they need not keep its Metal event.
+        defer {
+            releaseMTPHistoryEvents(
+                round.committedObservationArrays + [round.seedHidden].compactMap { $0 }
+                    + (round.verify.map { [$0.draftIDs, $0.lastHidden] } ?? []))
+        }
         var nativeCommitHeld = false
         if let tracking = nativeShutdownState {
             guard tracking.beginCommit() else { return }
