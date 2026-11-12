@@ -583,7 +583,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
                 table.count < reservedPages,
                 "[PagedSequenceKV] allocation past reservation (\(reservedPages) pages) — "
                     + "admission accounting bug")
-            table.append(pool.allocatePage(group: groupKey))
+            table.append(pool.allocatePage(group: groupKey, after: table.last))
             tableVersion += 1
         }
         return table[slotIndex]
