@@ -81,7 +81,8 @@ extension KernelTests {
         }
 
         static func dense(_ shape: Shape, seed: UInt64) -> MLXArray {
-            let weight = (MLXRandom.normal([shape.outputs, shape.inputs], key: MLXRandom.key(seed))
+            let weight =
+                (MLXRandom.normal([shape.outputs, shape.inputs], key: MLXRandom.key(seed))
                 * 0.02).asType(.bfloat16)
             eval(weight)
             return weight
@@ -105,9 +106,21 @@ extension KernelTests {
         static func rowExact(
             _ x: MLXArray, _ weight: NVFP4, scalarRows: Int? = nil, tensorScale: MLXArray? = nil
         ) -> MLXArray {
-            let saved = ModelOptWeightOnlyNVFP4RowExact.scalarRows
-            defer { ModelOptWeightOnlyNVFP4RowExact.scalarRows = saved }
-            if let scalarRows { ModelOptWeightOnlyNVFP4RowExact.scalarRows = scalarRows }
+            let saved = (
+                ModelOptWeightOnlyNVFP4RowExact.scalarRows,
+                ModelOptWeightOnlyNVFP4RowExact.scalarMaximumOutputs
+            )
+            defer {
+                (
+                    ModelOptWeightOnlyNVFP4RowExact.scalarRows,
+                    ModelOptWeightOnlyNVFP4RowExact.scalarMaximumOutputs
+                ) = saved
+            }
+            // An explicit split is for every shape.
+            if let scalarRows {
+                ModelOptWeightOnlyNVFP4RowExact.scalarRows = scalarRows
+                ModelOptWeightOnlyNVFP4RowExact.scalarMaximumOutputs = .max
+            }
             return ModelOptWeightOnlyNVFP4RowExact.product(
                 x, weight: weight.words, blockScales: weight.scales, tensorScale: tensorScale)
         }
@@ -286,7 +299,12 @@ extension KernelTests {
                     for rows in [2, 8, 16] {
                         let expected = Array(alone[0 ..< rows])
                         #expect(Self.rowBits(try layer.rowExactForward(x[0 ..< rows])) == expected)
-                        #expect(Self.rowBits(Self.fp8SeparateCast(layer, x[0 ..< rows])) == expected)
+                        #expect(
+                            Self.rowBits(Self.fp8SeparateCast(layer, x[0 ..< rows])) == expected)
+                        #expect(
+                            Self.rowBits(
+                                Self.fp8SeparateCast(layer, x[0 ..< rows], geometry: (2, 1)))
+                                == expected)
                     }
                 }
                 if shape.counts[.bf16] != nil {
@@ -403,8 +421,14 @@ extension KernelTests {
                         ("graph", false, { try! layer.graphForward($0) }),
                         ("row-exact", true, { try! layer.rowExactForward($0) }),
                         ("row-exact-cast", true, { fp8SeparateCast(layer, $0) }),
-                        ("row-exact-cast-tm2", true, { fp8SeparateCast(layer, $0, geometry: (2, 1)) }),
-                        ("row-exact-cast-tm8", true, { fp8SeparateCast(layer, $0, geometry: (8, 1)) }),
+                        (
+                            "row-exact-cast-tm2", true,
+                            { fp8SeparateCast(layer, $0, geometry: (2, 1)) }
+                        ),
+                        (
+                            "row-exact-cast-tm8", true,
+                            { fp8SeparateCast(layer, $0, geometry: (8, 1)) }
+                        ),
                     ], Double(shape.outputs * shape.inputs)
                 )
             case .bf16:
@@ -414,9 +438,11 @@ extension KernelTests {
                         ("mlx", false, { matmul($0, weight.transposed()) }),
                         (
                             "row-exact", true,
-                            { $0.dim(0) == 1
-                                ? matmul($0, weight.transposed())
-                                : ModelOptRowExact.matmul($0, weight) }
+                            {
+                                $0.dim(0) == 1
+                                    ? matmul($0, weight.transposed())
+                                    : ModelOptRowExact.matmul($0, weight)
+                            }
                         ),
                     ], Double(weight.nbytes)
                 )
@@ -429,11 +455,18 @@ extension KernelTests {
         @Test(.enabled(if: wants("time")))
         func projectionTimes() throws {
             print("BENCH device \(GPU.deviceInfo().architecture)")
+            // The fixed cost of one evaluation, which a cell shares among its calls.
+            let small = Self.input(rows: 1, width: 16, seed: 3)
+            let empty = Self.measure(depth: 1) { small + 1 }
+            print(
+                String(
+                    format: "BENCH one evaluation of a 16-element add: median %.3f ms (p10 %.3f)",
+                    empty.median, empty.p10))
             // (format, path, rows) -> milliseconds of all modules of a step.
             var medians: [String: Double] = [:]
             var minima: [String: Double] = [:]
             for shape in Self.selectedShapes() {
-                let depth = shape.outputs > 100_000 ? 2 : 8
+                let depth = shape.outputs > 100_000 ? 4 : 32
                 for format in [Format.nvfp4, .fp8, .bf16] {
                     guard let count = shape.counts[format] else { continue }
                     let (paths, bytes) = try Self.paths(format, shape)
@@ -503,13 +536,21 @@ extension KernelTests {
             let cases: [(String, Int, String, String, String)] = [
                 ("stock one row (MLX nvfp4, graph fp8, MLX bf16)", 1, "mlx", "graph", "mlx"),
                 ("exact one row", 1, "row-exact", "graph", "mlx"),
-                ("exact 2 rows", 2, "row-exact", "row-exact-cast", "row-exact"),
-                ("exact 4 rows", 4, "row-exact", "row-exact-cast", "row-exact"),
-                ("exact 8 rows", 8, "row-exact", "row-exact-cast", "row-exact"),
-                ("exact 8 rows, fp8 cast inside", 8, "row-exact", "row-exact", "row-exact"),
-                ("exact 8 rows, per-row nvfp4", 8, "mlx-per-row", "row-exact", "row-exact"),
+                ("exact one row, fp8 cast apart", 1, "row-exact", "row-exact-cast", "mlx"),
+                ("exact 2 rows", 2, "row-exact", "row-exact-cast-tm2", "row-exact"),
+                ("exact 4 rows", 4, "row-exact", "row-exact-cast-tm2", "row-exact"),
+                ("exact 8 rows", 8, "row-exact", "row-exact-cast-tm2", "row-exact"),
+                (
+                    "exact 8 rows, fp8 cast apart, 4 rows a thread", 8, "row-exact",
+                    "row-exact-cast", "row-exact"
+                ),
+                ("exact 8 rows, fp8 as it is", 8, "row-exact", "row-exact", "row-exact"),
+                (
+                    "exact 8 rows, fp8 as it is, per-row nvfp4", 8, "mlx-per-row", "row-exact",
+                    "row-exact"
+                ),
                 ("not exact 8 rows (MLX nvfp4, graph fp8, MLX bf16)", 8, "mlx", "graph", "mlx"),
-                ("exact 16 rows", 16, "row-exact", "row-exact-cast", "row-exact"),
+                ("exact 16 rows", 16, "row-exact", "row-exact-cast-tm2", "row-exact"),
             ]
             // Two passes, so that load from other processes shows as a difference.
             for pass in 1 ... 2 {
@@ -518,7 +559,8 @@ extension KernelTests {
                         rows: rows, nvfp4: nvfp4, fp8: fp8, bf16: bf16, modules)
                     print(
                         String(
-                            format: "STEP pass %d %@: median %.2f ms (min %.2f, p10 %.2f, p90 %.2f)",
+                            format:
+                                "STEP pass %d %@: median %.2f ms (min %.2f, p10 %.2f, p90 %.2f)",
                             pass, label, stats.median, stats.minimum, stats.p10, stats.p90))
                 }
             }
@@ -625,7 +667,9 @@ extension KernelTests {
                 for dtype in [DType.bfloat16, .float32] {
                     let x = Self.input(rows: 16, width: shape.inputs, seed: 11).asType(dtype)
                     eval(x)
-                    let mlx = (0 ..< 16).map { Self.rowBits(Self.mlxNVFP4(x[$0 ..< $0 + 1], weight))[0] }
+                    let mlx = (0 ..< 16).map {
+                        Self.rowBits(Self.mlxNVFP4(x[$0 ..< $0 + 1], weight))[0]
+                    }
                     let counts = [1, 2, 3, 5, 7, 8, 11, 16]
                     let mlxSame = counts.map { Self.rowBits(Self.mlxNVFP4(x[0 ..< $0], weight)) }
                     var first: [[[UInt16]]]?
@@ -730,7 +774,9 @@ extension KernelTests {
                 outputShapes: Array(repeating: [groups, 64], count: 4),
                 outputDTypes: Array(repeating: .float32, count: 4))
             let bits = outputs.map { $0.view(dtype: .uint32).asArray(UInt32.self) }
-            for (index, name) in ["fma ascending k", "fma descending k", "mul then add"].enumerated() {
+            for (index, name) in ["fma ascending k", "fma descending k", "mul then add"]
+                .enumerated()
+            {
                 let differing = zip(bits[0], bits[index + 1]).filter { $0 != $1 }.count
                 print("PROBE mma vs \(name): \(differing)/\(bits[0].count) elements differ")
             }

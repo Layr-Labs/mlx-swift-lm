@@ -48,6 +48,10 @@ public enum ModelOptWeightOnlyNVFP4RowExact {
     /// Rows the scalar kernel takes (0: none). Tests and benchmarks set it.
     nonisolated(unsafe) static var scalarRows = scalarKernelMeasured ? 1 : 0
 
+    /// Most outputs the scalar kernel takes: measured faster than the matrix
+    /// kernel for one row at 19,968 outputs and slower at 202,048.
+    nonisolated(unsafe) static var scalarMaximumOutputs = 65536
+
     nonisolated(unsafe) private static let unit = MLXArray([Float(1)])
 
     static let header = """
@@ -403,7 +407,7 @@ public enum ModelOptWeightOnlyNVFP4RowExact {
                 tensorScale: tensorScale)
             return padded[.ellipsis, 0 ..< outputs]
         }
-        let scalar = rows <= scalarRows
+        let scalar = rows <= scalarRows && outputs <= scalarMaximumOutputs
         let kernel = scalar ? scalarKernel : matrixKernel
         let (tile, simdgroups) = scalar ? (16, 2) : (32, 8)
         let tiles = (outputs + tile - 1) / tile
