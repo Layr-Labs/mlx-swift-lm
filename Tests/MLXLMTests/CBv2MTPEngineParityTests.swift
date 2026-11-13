@@ -93,6 +93,26 @@ private final class CBv2MTPNoopConstraint: CBv2TokenConstraint, @unchecked Senda
     }
 }
 
+private final class CBv2MTPPathConstraint: CBv2TokenConstraint, Sendable {
+    let mode: CBv2TokenConstraintMode = .required
+    let initialState = 0
+    let fallbackTokenID = 0
+    let path: [Int]
+    var maxTokens: Int { path.count }
+
+    init(_ path: [Int]) { self.path = path }
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        guard path.indices.contains(state), remainingTokens > 0 else { return [] }
+        return [path[state]]
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        guard path.indices.contains(state), tokenID == path[state] else { return nil }
+        return state + 1
+    }
+}
+
 @Suite("CBv2MTPEngineParity", .serialized)
 struct CBv2MTPEngineParityTests {
     private let vocabSize = 256
@@ -188,7 +208,8 @@ struct CBv2MTPEngineParityTests {
         fixedDepth: Int? = nil,
         sampler: CBv2StepSampler = CBv2DefaultSampler(),
         verificationMode: CBv2MTPVerificationMode = .serialTarget,
-        maxAutomaticRectangularTokens: Int = 8
+        maxAutomaticRectangularTokens: Int = 8,
+        constrainedSpeculation: Bool = false
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? k
@@ -197,7 +218,8 @@ struct CBv2MTPEngineParityTests {
             maxSpeculativeBatch: maxSpeculativeBatch,
             fixedDraftTokens: depth,
             verificationMode: verificationMode,
-            maxAutomaticRectangularTokens: maxAutomaticRectangularTokens)
+            maxAutomaticRectangularTokens: maxAutomaticRectangularTokens,
+            constrainedSpeculation: constrainedSpeculation)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target),
             layerKinds: kinds,
@@ -275,6 +297,42 @@ struct CBv2MTPEngineParityTests {
         #expect(metrics.rounds == 0)
         #expect(metrics.seedSteps == 0)
         #expect(metrics.proposedTokens == 0)
+    }
+
+    @Test(.tags(.integration))
+    func grammarMTPMatchesConstrainedNonSpeculativeOracleInMixedBatch() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = [3, 7, 11, 19, 23]
+        let path = [41, 42, 81, 82, 121, 122, 161, 162, 201, 202, 241, 242]
+        var constrained = request(id: 991, prompt: prompt, maxTokens: path.count)
+        constrained.tokenConstraint = CBv2MTPPathConstraint(path)
+        let ordinary = request(id: 992, prompt: prompt, maxTokens: path.count)
+
+        let oracle = makeEngine(target: fixture.target, drafter: nil)
+        let expectedConstrained = try await run(oracle, constrained)
+        let expectedOrdinary = try await run(oracle, ordinary)
+        await oracle.shutdown()
+        #expect(expectedConstrained.tokens == path)
+
+        let engine = makeEngine(
+            target: fixture.target,
+            drafter: CBv2ParityScriptedDrafter(
+                script: path, promptLength: prompt.count, offset: 0,
+                vocabSize: vocabSize, target: fixture.target),
+            constrainedSpeculation: true)
+        let constrainedStream = try engine.submit(constrained)
+        let ordinaryStream = try engine.submit(ordinary)
+        let actualConstrained = await cbv2SchedCollect(constrainedStream)
+        let actualOrdinary = await cbv2SchedCollect(ordinaryStream)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(actualConstrained.tokens == expectedConstrained.tokens)
+        #expect(actualConstrained.finishReason == expectedConstrained.finishReason)
+        #expect(actualOrdinary.tokens == expectedOrdinary.tokens)
+        #expect(actualOrdinary.finishReason == expectedOrdinary.finishReason)
+        #expect(metrics.rounds > 0)
+        #expect(metrics.acceptedTokens > 0)
     }
 
     @Test func b1ParityAcrossRaggedPromptLengths() async throws {
