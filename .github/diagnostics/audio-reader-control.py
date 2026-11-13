@@ -199,7 +199,7 @@ def main():
         failures = [phase for phase, verdict in verdicts.items() if verdict['classification'] != 'passed']
         if failures:
             raise SystemExit('FAILED: ' + ', '.join(phase + '=' + verdicts[phase]['classification'] for phase in failures))
-    
+
     else:
         raise SystemExit('identity | pins | tests')
 
