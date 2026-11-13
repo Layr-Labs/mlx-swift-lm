@@ -217,6 +217,12 @@ The package also reads the OpenAPI 3.0 `nullable` marker. A Boolean `true`
 beside an explicit `type` lets that node accept `null`. Every other keyword on
 the node still applies.
 
+A Gemma 4 value written without the `<|"|>` marker, such as `zip:01000`, is
+read by its parameter's schema, at any depth: a parameter that admits a string
+but not the value's JSON type keeps the written text (`"01000"`, `"1.10"`,
+`"true"`). Other parameters, and calls without a schema, keep the JSON reading
+(`1000`). Marker-quoted values are always strings.
+
 ## Format Resolution
 
 When a model is loaded, the factories resolve the format in this order:

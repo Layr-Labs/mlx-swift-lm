@@ -286,6 +286,9 @@ def:
         A schema node marked `nullable: true` (how a client's nullable parameter reaches the SDK) admits
         `null`: XML argument conversion turns a model's `null` into JSON null and the validator lets it
         through the type check (`ToolNullableSchemaTests`; documented in the skill's `tool-calling.md`).
+        Gemma 4's strict reader keeps each unmarked scalar's text, so a parameter whose schema admits a
+        string but not the scalar's JSON type reads `zip:01000` as "01000", as vLLM does
+        (`ToolArgumentNormalization.bareLiteral`).
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
