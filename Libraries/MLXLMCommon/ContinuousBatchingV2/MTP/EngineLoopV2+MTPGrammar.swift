@@ -19,8 +19,9 @@ struct CBv2MTPGrammarPrefix {
 
 extension EngineLoopV2 {
     /// Mask each committed position with the ordinary sampler. `nextState`
-    /// may intern states, so discarded drafts must never advance it.
-    func mtpConstrainedPrefixes(
+    /// may intern states, so discarded drafts must never advance it. Returned
+    /// tokens have already been confirmed and must commit even before an error.
+    func mtpSampleAndConfirmConstrainedPrefixes(
         logits: MLXArray, rows: [CBv2MTPGrammarRow], draftPacket: [Int32], depth: Int,
         commonLimit: Int, independentWidths: Bool
     ) -> [CBv2RequestID: CBv2MTPGrammarPrefix] {

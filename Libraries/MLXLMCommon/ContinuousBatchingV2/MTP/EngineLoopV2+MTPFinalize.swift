@@ -338,7 +338,7 @@ extension EngineLoopV2 {
 
         if let logits = verify.constraintLogits {
             let grammarRows = outcomes.filter { $0.rec.request.tokenConstraint != nil }
-            let prefixes = mtpConstrainedPrefixes(
+            let prefixes = mtpSampleAndConfirmConstrainedPrefixes(
                 logits: logits,
                 rows: grammarRows.map {
                     CBv2MTPGrammarRow(
