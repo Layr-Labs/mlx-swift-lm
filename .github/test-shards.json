@@ -279,7 +279,9 @@
       "extra": true,
       "metallib": false,
       "filters": [
-        "GemmaReopenedThoughtConformanceTests"
+        "GemmaReopenedThoughtConformanceTests",
+        "Gemma4NonStreamingTests",
+        "Gemma4StreamingTests"
       ],
       "env": {
         "DARKBLOOM_GEMMA_REOPENED_THOUGHTS": "1"
