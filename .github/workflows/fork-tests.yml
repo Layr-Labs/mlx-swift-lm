@@ -129,6 +129,14 @@ jobs:
       contents: read
     timeout-minutes: 5
     steps:
+    - name: Require a native Linux ARM64 runner
+      run: |
+        if [[ "${RUNNER_NAME:-}" != darkbloom-* || "$(uname -s)" != Linux || "$(uname -m)" != aarch64 ]]; then
+          echo "::error::This canary requires a native Darkbloom Linux ARM64 runner."
+          exit 1
+        fi
+        printf 'Native runner: %s (%s/%s)
+        ' "$RUNNER_NAME" "$(uname -s)" "$(uname -m)"
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       with:
         ref: 1e736f037b942de83278f0923d61b349d9bff850
@@ -181,6 +189,14 @@ jobs:
       contents: read
     timeout-minutes: 10
     steps:
+    - name: Require a native Linux ARM64 runner
+      run: |
+        if [[ "${RUNNER_NAME:-}" != darkbloom-* || "$(uname -s)" != Linux || "$(uname -m)" != aarch64 ]]; then
+          echo "::error::This canary requires a native Darkbloom Linux ARM64 runner."
+          exit 1
+        fi
+        printf 'Native runner: %s (%s/%s)
+        ' "$RUNNER_NAME" "$(uname -s)" "$(uname -m)"
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       with:
         ref: 1e736f037b942de83278f0923d61b349d9bff850
