@@ -61,8 +61,8 @@ public struct OnyxTokenStreamDecoder {
 
     public var rejectedToolCallCount: Int { adapter.rejectedToolCallCount }
 
-    /// - Returns: `nil` when the tokenizer does not hold `<|start|>`,
-    ///   `<|message|>`, `<|eom|>` and `<|eot|>` as four different tokens.
+    /// Fails when the tokenizer does not hold `<|start|>`, `<|message|>`,
+    /// `<|eom|>` and `<|eot|>` as four different tokens.
     public init?(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
@@ -139,7 +139,7 @@ public struct OnyxTextStreamDecoder: Sendable {
     private func nextMarker() -> (Range<String.Index>, OnyxControl)? {
         var first: (Range<String.Index>, OnyxControl)?
         for control in OnyxControl.allCases {
-            guard let range = buffer.range(of: control.marker) else { continue }
+            guard let range = buffer.range(of: control.marker, options: .literal) else { continue }
             if first.map({ range.lowerBound < $0.0.lowerBound }) ?? true {
                 first = (range, control)
             }

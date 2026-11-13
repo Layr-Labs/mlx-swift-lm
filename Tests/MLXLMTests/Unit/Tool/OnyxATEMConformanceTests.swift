@@ -629,6 +629,23 @@ extension UnitTests {
             #expect(outcome.content.isEmpty)
         }
 
+        @Test func bareHeaderAtTheStartOfABodyAndAfterAToolFrame() throws {
+            // The reasoning frame is empty, and the second call follows the
+            // first without `<|eom|><|start|>assistant`.
+            let script =
+                " to=self<|message|>to=math.add<|message|>"
+                + Self.block(Self.invoke("math.add", [("a", "1")]))
+                + "\n to=math.mul<|message|>" + Self.block(Self.invoke("math.mul", [("a", "3")]))
+                + "<|eot|>"
+            for width in [1, 3, 17] {
+                let outcome = try Self.run(script, width: width)
+                #expect(outcome.reasoning.isEmpty)
+                #expect(outcome.content.isEmpty)
+                #expect(outcome.names == ["math.add", "math.mul"])
+                #expect(outcome.rejections.isEmpty)
+            }
+        }
+
         @Test func reasoningThatMentionsARecipientStaysReasoning() throws {
             let script =
                 " to=self<|message|>I could send this to=user or to=fs.list later.<|eom|>"
@@ -753,6 +770,33 @@ extension UnitTests {
             }
         }
 
+        @Test func frameWithoutARecipientIsDropped() throws {
+            let outcome = try Self.run(
+                " to=<|message|>lost<|eom|><|start|>assistant to=user<|message|>kept<|eot|>")
+            #expect(outcome.content == "kept")
+            #expect(outcome.reasoning.isEmpty)
+            #expect(outcome.protocolErrors.count == 1)
+        }
+
+        @Test func strayMessageTokenInsideABodyIsSkipped() throws {
+            let outcome = try Self.run(" to=user<|message|>one <|message|>two<|eot|>")
+            #expect(outcome.content == "one two")
+            #expect(outcome.protocolErrors.count == 1)
+        }
+
+        @Test func protocolErrorsHoldNoModelOutput() throws {
+            let scripts = [
+                " to=self<|message|>secret plan<|start|>assistant to=user<|message|>x<|eot|>",
+                " to=user<|message|>a<|eom|>secret words<|start|>secret role<|message|>b<|eot|>",
+                " to=commentary<|message|>secret note<|eom|>", " to=secret",
+            ]
+            for script in scripts {
+                let outcome = try Self.run(script)
+                #expect(!outcome.protocolErrors.isEmpty)
+                #expect(!outcome.protocolErrors.contains { $0.contains("secret") })
+            }
+        }
+
         @Test func toolFrameWithoutACallIsReported() throws {
             let outcome = try Self.run(" to=commentary<|message|>Working on it.<|eom|>")
             #expect(outcome.calls.isEmpty)
@@ -813,6 +857,36 @@ extension UnitTests {
             #expect(decoder.additionalStopTokenIDs == [200_001, 200_008])
             #expect(!decoder.additionalStopTokenIDs.contains(200_007))
             #expect(decoder.receivesStopTokens)
+        }
+
+        /// A client's stop string ends the answer. It is not matched in reasoning.
+        @Test func stopStringsApplyToTheAnswerOnly() throws {
+            let tokenizer = OnyxScriptTokenizer()
+            var decoder = try #require(
+                ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                    tokenizer: tokenizer, tools: nil, stopStrings: ["HALT"],
+                    toolCallPolicy: .init(onyxParsing: .referenceParity)))
+            let script =
+                " to=self<|message|>do not HALT here<|eom|>"
+                + "<|start|>assistant to=user<|message|>before HALT after<|eot|>"
+            var reasoning = ""
+            var content = ""
+            var stopped = false
+            for token in tokenizer.tokens(script, width: 3) {
+                let goesOn = decoder.push(token) { event in
+                    switch event {
+                    case .reasoning(let text): reasoning += text
+                    case .response(let text): content += text
+                    case .stop: stopped = true
+                    default: break
+                    }
+                    return true
+                }
+                if !goesOn { break }
+            }
+            #expect(reasoning == "do not HALT here")
+            #expect(content == "before ")
+            #expect(stopped)
         }
 
         @Test func strictValidationRejectsASchemaViolation() throws {

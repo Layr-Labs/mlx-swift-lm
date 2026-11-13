@@ -85,27 +85,35 @@ struct ATEMReferenceScanner {
         case cutOff(String.Index)
     }
 
-    /// The next `prefix` tag. A tag name ends at whitespace or `>`, so
-    /// `<atem:invokeExtension` is not `<atem:invoke`. A `<` before the closing
-    /// `>` means the text only mentions the tag.
+    /// The next `prefix` tag that starts before `limit`. A tag name ends at
+    /// whitespace or `>`, so `<atem:invokeExtension` is not `<atem:invoke`. A
+    /// `<` before the closing `>` means the text only mentions the tag.
+    ///
+    /// Tags are matched scalar by scalar: a combining mark after a `>` is
+    /// the first scalar of the value, not part of the tag.
     private static func openTag(
-        _ prefix: String, in body: String, from start: String.Index
+        _ prefix: String, in body: String, from start: String.Index,
+        before limit: String.Index? = nil
     ) -> OpenTag {
+        let scalars = body.unicodeScalars
         var searchStart = start
-        while let candidate = body.range(of: prefix, range: searchStart ..< body.endIndex) {
+        while searchStart < (limit ?? scalars.endIndex),
+            let candidate = body.range(
+                of: prefix, options: .literal, range: searchStart ..< (limit ?? scalars.endIndex))
+        {
             searchStart = candidate.upperBound
-            guard candidate.upperBound < body.endIndex else {
+            guard candidate.upperBound < scalars.endIndex else {
                 return .cutOff(candidate.lowerBound)
             }
-            let next = body[candidate.upperBound]
-            guard next.isWhitespace || next == ">" else { continue }
+            let next = scalars[candidate.upperBound]
+            guard next.properties.isWhitespace || next == ">" else { continue }
             var index = candidate.upperBound
-            while index < body.endIndex, body[index] != ">", body[index] != "<" {
-                index = body.index(after: index)
+            while index < scalars.endIndex, scalars[index] != ">", scalars[index] != "<" {
+                index = scalars.index(after: index)
             }
-            guard index < body.endIndex else { return .cutOff(candidate.lowerBound) }
-            if body[index] == ">" {
-                return .tag(candidate.lowerBound ..< body.index(after: index))
+            guard index < scalars.endIndex else { return .cutOff(candidate.lowerBound) }
+            if scalars[index] == ">" {
+                return .tag(candidate.lowerBound ..< scalars.index(after: index))
             }
         }
         return .none
@@ -118,29 +126,35 @@ struct ATEMReferenceScanner {
     ) -> (parameters: [(name: String, value: Substring)], end: String.Index)? {
         var parameters: [(name: String, value: Substring)] = []
         var position = start
-        var close = body.range(of: invokeClose, range: position ..< body.endIndex)
+        var close = literalRange(of: invokeClose, in: body, from: position)
         while true {
             // A close tag inside a value that was just read is part of that value.
             if let found = close, found.lowerBound < position {
-                close = body.range(of: invokeClose, range: position ..< body.endIndex)
+                close = literalRange(of: invokeClose, in: body, from: position)
             }
-            switch openTag(parameterOpen, in: body, from: position) {
-            case .tag(let tag) where close.map({ tag.lowerBound < $0.lowerBound }) ?? true:
+            // Only a parameter that opens before the close belongs to this invoke.
+            switch openTag(parameterOpen, in: body, from: position, before: close?.lowerBound) {
+            case .tag(let tag):
                 guard
-                    let valueEnd = body.range(
-                        of: parameterClose, range: tag.upperBound ..< body.endIndex)
+                    let valueEnd = literalRange(of: parameterClose, in: body, from: tag.upperBound)
                 else { return nil }
                 if let name = attribute("name", in: body[tag]), !name.isEmpty {
                     parameters.append((name, body[tag.upperBound ..< valueEnd.lowerBound]))
                 }
                 position = valueEnd.upperBound
-            case .cutOff(let cut) where close.map({ cut < $0.lowerBound }) ?? true:
+            case .cutOff:
                 return nil
-            default:
+            case .none:
                 guard let close else { return nil }
                 return (parameters, close.upperBound)
             }
         }
+    }
+
+    private static func literalRange(
+        of marker: String, in body: String, from start: String.Index
+    ) -> Range<String.Index>? {
+        body.range(of: marker, options: .literal, range: start ..< body.endIndex)
     }
 
     private static func attribute(_ name: String, in tag: Substring) -> String? {

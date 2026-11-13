@@ -288,6 +288,8 @@ def:
         `MLXModelContainerEngine` reads an `.atem` model's frames from the token ids (`ChannelTokenLoopHandler`)
         and reports reasoning and content as `.parsed`, because `Generation` has no reasoning event.
         The unit tests port the vLLM Muse Glimmer parser cases and its schema value table.
+        `MuseGlimmerOnyxTokenizerLiveTests` runs the token decoder with the published tokenizer when
+        `MUSE_GLIMMER_NVFP4_DIR` names a snapshot directory; it reads no weights.
       globs:
         - "Libraries/MLXLMCommon/Tool/Parsers/ATEMReferenceScanner.swift"
         - "Libraries/MLXLMCommon/Tool/Parsers/OnyxReference*.swift"
@@ -296,6 +298,7 @@ def:
         - "Libraries/MLXLMServer/Runtime/ChannelTokenLoopHandler.swift"
         - "Tests/MLXLMTests/Unit/Tool/ATEMReferenceScannerTests.swift"
         - "Tests/MLXLMTests/Unit/Tool/Onyx*.swift"
+        - "Tests/MLXLMTests/MuseGlimmerOnyx*.swift"
         - "Tests/MLXLMServerTests/Unit/Parsing/OnyxReasoningParserTests.swift"
         - "Tests/MLXLMServerTests/Kernel/Runtime/OnyxContainerEngineTests.swift"
     - title: "Tool calling and parsers"

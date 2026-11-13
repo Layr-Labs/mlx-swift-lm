@@ -11,8 +11,8 @@ struct ChannelTokenLoopHandler: TokenLoopHandler {
 
     private var decoder: any TokenStreamDecoder
 
-    /// - Returns: `nil` when `format` has no token protocol, or the tokenizer
-    ///   lacks its control tokens.
+    /// Fails when `format` has no token protocol, or the tokenizer lacks its
+    /// control tokens.
     init?(
         format: ToolCallFormat, tokenizer: any Tokenizer, stopStrings: Set<String>,
         tools: [[String: any Sendable]]?, toolCallPolicy: ToolCallPolicy

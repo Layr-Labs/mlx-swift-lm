@@ -38,6 +38,26 @@ extension UnitTests {
             #expect(scan.invokes.first?.parameters.first?.value == Substring(value))
         }
 
+        /// A combining mark after a tag is the first scalar of the value.
+        @Test func aValueCanStartAndEndWithACombiningMark() {
+            let value = "\u{301}caf\u{65}\u{301}\u{200D}"
+            let body =
+                "<atem:invoke name=\"a\"><atem:parameter name=\"k\">\(value)</atem:parameter>"
+                + "</atem:invoke>\u{301}"
+            let scan = ATEMReferenceScanner.scan(body)
+            #expect(scan.invokes.map(\.name) == ["a"])
+            #expect(
+                scan.invokes.first?.parameters.first.map { Array($0.value.unicodeScalars) }
+                    == Array(value.unicodeScalars))
+        }
+
+        /// The search for a parameter stops at the invoke's close, so a long
+        /// frame of many invokes is read in one pass.
+        @Test func manyInvokesAreAllRead() {
+            let body = String(repeating: "<atem:invoke name=\"a\"></atem:invoke>\n", count: 20_000)
+            #expect(ATEMReferenceScanner.scan(body).invokes.count == 20_000)
+        }
+
         @Test func tagNamesEndAtWhitespaceOrTheBracket() {
             #expect(Self.names("<atem:invokeExtension name=\"a\"></atem:invoke>").isEmpty)
             let body =
