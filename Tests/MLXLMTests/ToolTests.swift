@@ -2200,8 +2200,7 @@ struct ToolTests {
             + "codes:[007,1.0],labels:{a:007},maybe:null}<tool_call|>"
 
         let call = try #require(parser.parse(content: content, tools: tools))
-        // The strict reader, which constrained output and `strict` tools use,
-        // reads the same values.
+        // The strict reader (`ToolCallProcessor(strictGemma:)`) reads the same values.
         let strictCall = try #require(
             GemmaFunctionParser(strict: true).parse(content: content, tools: tools))
         #expect(strictCall.function.arguments == call.function.arguments)
