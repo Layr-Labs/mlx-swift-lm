@@ -359,6 +359,75 @@ struct MuseGlimmerDFlashStudyTests {
             ])
     }
 
+    /// A block shorter than the trained 16 positions, as llama.cpp drafts
+    /// when fewer tokens are wanted. Not the reference behavior: this only
+    /// measures what it would cost and save.
+    @Test(.enabled(if: MuseGlimmerDFlashStudyTests.enabled))
+    func shorterBlocks() throws {
+        let real = try Real.shared.get()
+        let traces = try MuseGlimmerDFlashTrace.all()
+        try #require(!traces.isEmpty)
+        var reference: [String: [Int: [Int]]] = [:]
+        var rows: [[String: Any]] = []
+        for blockSize in [16, 12, 8] {
+            var configuration = real.configuration
+            configuration.blockSize = blockSize
+            let model = try MuseGlimmerDFlashDraftModel(configuration, dtype: .bfloat16)
+            try model.update(
+                parameters: .unflattened(real.drafter.parameters().flattened()), verify: .all)
+            var drafts: [String: [Int: [Int]]] = [:]
+            var seconds: [Double] = []
+            for trace in traces {
+                let state = model.makeContextState()
+                var perAnchor: [Int: [Int]] = [:]
+                for position in Self.anchors(trace, stride: 1) {
+                    model.commit(
+                        features: try trace.features(state.nextPosition ..< position),
+                        at: state.nextPosition, to: state)
+                    eval(state.arrays)
+                    let start = Date()
+                    let hidden = model.draftBlock(
+                        embeddings: model.blockEmbeddings(
+                            anchor: real.embedding[trace.tokens[position]],
+                            mask: real.embedding[configuration.maskTokenID]),
+                        state: state)
+                    let ids = argMax(real.head(hidden[1 ..< 8, 0...]), axis: -1)
+                    eval(ids)
+                    seconds.append(Date().timeIntervalSince(start))
+                    perAnchor[position] = ints(ids)
+                }
+                drafts[trace.name] = perAnchor
+            }
+            if blockSize == 16 { reference = drafts }
+            var accepted: [Int] = []
+            var equal = 0
+            var tokens = 0
+            for trace in traces {
+                for (position, ids) in drafts[trace.name] ?? [:] {
+                    let expected = reference[trace.name]![position]!
+                    equal += zip(ids, expected).filter { $0 == $1 }.count
+                    tokens += ids.count
+                    if let n = trace.accepted(ids, after: position, limit: Self.engineDepth) {
+                        accepted.append(n)
+                    }
+                }
+            }
+            rows.append([
+                "block_size": blockSize, "anchors": accepted.count,
+                "agreement_first_7_with_block_16": Double(equal) / Double(max(tokens, 1)),
+                "mean_accepted_k7": mean(accepted),
+                "median_block_and_head_7_ms": median(seconds) * 1000,
+            ])
+        }
+        try Real.writeResult(
+            "study-block-length",
+            [
+                "rows": rows,
+                "note": "BF16 drafter, 7 head rows, median wall ms in a debug build; "
+                    + "block 16 is the trained and reference length",
+            ])
+    }
+
     /// Converts the dense drafter to the named variant, writes the artifact,
     /// loads it back through the strict loader and checks the drafts.
     @Test(
