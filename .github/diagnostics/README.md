@@ -3,7 +3,7 @@
 This opt-in diagnostic compares the original strict audio tests and reader
 matrix on one allocated macOS runner. It does not change audio runtime behavior
 or replace the normal full-CI gates. The control source is frozen at
-`76ee2ff71649d8d0982546a88b9ccf8aa04013fc`; all 31 dependency pins must match the
+`0772497bc30f33aa5a3c096dd5ddd5a2a8bc8739`; all 31 dependency pins must match the
 saved graph. The workflow refuses hosted fallback or a different hardware class.
 
 The original control attempt (run 43515385515, control head `3d6cc05e`, source
@@ -20,6 +20,10 @@ invalid or rounded [CMTime arithmetic](https://developer.apple.com/documentation
 it uses no tolerance. Every original PCM/hash/frame/channel/retry/cancel assertion
 remains unchanged. This corrects a diagnostic invariant, not the historical
 audio failure or runtime behavior.
+
+The eight pure timeline fixtures live under `Unit/Common` in `UnitTests`, so
+the existing no-GPU unit selection includes them. The separate class control
+keeps its original seven audio tests and two matrices.
 
 The `audio-reader-control` label triggers the separate workflow only on the
 same-repository `astra/audio-reader-control-a` pull request. Apply it once after

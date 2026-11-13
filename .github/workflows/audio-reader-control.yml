@@ -51,7 +51,7 @@ jobs:
       - name: Checkout frozen diagnostic source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 76ee2ff71649d8d0982546a88b9ccf8aa04013fc
+          ref: 0772497bc30f33aa5a3c096dd5ddd5a2a8bc8739
           path: source
           persist-credentials: false
       - uses: ./source/.github/actions/select-xcode

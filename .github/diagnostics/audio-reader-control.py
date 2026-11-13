@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-SOURCE = '76ee2ff71649d8d0982546a88b9ccf8aa04013fc'
+SOURCE = '0772497bc30f33aa5a3c096dd5ddd5a2a8bc8739'
 RECEIPT = None
 CONTROL = Path('../control/.github/diagnostics')
 FILTER = r'^MLXLMTests\.(AudioReaderRetryTests|MiMoV26EncodedAACAudioTests)/'
@@ -165,7 +165,7 @@ def main():
             'runnerName': os.environ.get('RUNNER_NAME'),
         }
         save('identity.json', identity)
-        if identity['source'] != SOURCE or identity['tree'] != '7bae22208eb081ee1f16e189d224014f1a1df661':
+        if identity['source'] != SOURCE or identity['tree'] != '8a33093b23c7219cdb8fd130c434de29ca80fcea':
             raise SystemExit('NOT RUN: source identity mismatch')
         if (identity['cpu'], identity['cpus'], identity['memory']) != ('Apple M5 Max (Virtual)', '12', '34359738368'):
             raise SystemExit('NOT RUN: allocated hardware differs from observed failing class')
