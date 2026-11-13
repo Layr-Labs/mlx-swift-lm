@@ -217,6 +217,18 @@ The package also reads the OpenAPI 3.0 `nullable` marker. A Boolean `true`
 beside an explicit `type` lets that node accept `null`. Every other keyword on
 the node still applies.
 
+A Gemma 4 value written without the `<|"|>` marker, such as `zip:01000`, is
+read by its parameter's schema, at any depth: a parameter that admits a string
+but not the value's JSON type keeps the written text (`"01000"`, `"1.10"`,
+`"true"`). Other parameters, and calls without a schema, keep the JSON reading
+(`1000`). Marker-quoted values are always strings. Where this differs from
+vLLM's `convert_value`, the SDK keeps the JSON reading: an `enum`- or
+`const`-only schema, a `$ref`, or an `allOf` with an untyped branch (vLLM
+infers the `enum`/`const` types, resolves a local `$ref` and ignores the
+untyped `allOf` branch). Two more differences: an integer too large for
+`Int` reads as a number, so a string-or-integer parameter keeps its text, and
+a `nullable: true` string keeps a bare `null` as null (vLLM returns `"null"`).
+
 ## Format Resolution
 
 When a model is loaded, the factories resolve the format in this order:

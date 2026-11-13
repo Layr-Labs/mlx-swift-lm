@@ -2160,6 +2160,79 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
     }
 
+    @Test("Gemma reads a bare scalar as its parameter's schema declares it")
+    func testGemmaBareScalarsFollowTheSchema() throws {
+        let parser = GemmaFunctionParser()
+        let string: [String: any Sendable] = ["type": "string"]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "lookup",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "zip": string, "version": string, "code": string, "id": string,
+                            "flag": string,
+                            "count": ["type": "integer"] as [String: any Sendable],
+                            "ratio": ["type": "number"] as [String: any Sendable],
+                            "either": ["type": ["string", "integer"]] as [String: any Sendable],
+                            "optional": [
+                                "anyOf": [["type": "string"], ["type": "null"]]
+                                    as [[String: any Sendable]]
+                            ] as [String: any Sendable],
+                            "address": [
+                                "type": "object",
+                                "properties": ["zip": string] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "codes": ["type": "array", "items": string] as [String: any Sendable],
+                            "labels": ["type": "object", "additionalProperties": string]
+                                as [String: any Sendable],
+                            "maybe": ["type": "string", "nullable": true] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let content =
+            "<|tool_call>call:lookup{zip:01000,version:1.10,code:007,id:12345678901234567890,"
+            + "flag:true,count:3,ratio:1.10,either:01000,optional:null,address:{zip:02134},"
+            + "codes:[007,1.0],labels:{a:007},maybe:null}<tool_call|>"
+
+        let call = try #require(parser.parse(content: content, tools: tools))
+        // The strict reader (`ToolCallProcessor(strictGemma:)`) reads the same values.
+        let strictCall = try #require(
+            GemmaFunctionParser(strict: true).parse(content: content, tools: tools))
+        #expect(strictCall.function.arguments == call.function.arguments)
+
+        // A string parameter keeps the text the model wrote.
+        #expect(call.function.arguments["zip"] == .string("01000"))
+        #expect(call.function.arguments["version"] == .string("1.10"))
+        #expect(call.function.arguments["code"] == .string("007"))
+        #expect(call.function.arguments["id"] == .string("12345678901234567890"))
+        #expect(call.function.arguments["flag"] == .string("true"))
+        #expect(call.function.arguments["address"] == .object(["zip": .string("02134")]))
+        #expect(call.function.arguments["codes"] == .array([.string("007"), .string("1.0")]))
+        #expect(call.function.arguments["labels"] == .object(["a": .string("007")]))
+        // Other types, and unions that admit the JSON reading, keep the reading.
+        #expect(call.function.arguments["count"] == .int(3))
+        #expect(call.function.arguments["ratio"] == .double(1.1))
+        #expect(call.function.arguments["either"] == .int(1000))
+        #expect(call.function.arguments["optional"] == .null)
+        #expect(call.function.arguments["maybe"] == .null)
+
+        // A marker-quoted value is a string, whatever its parameter's type.
+        let quoted = try #require(
+            parser.parse(
+                content: #"<|tool_call>call:lookup{count:<|"|>3<|"|>}<tool_call|>"#, tools: tools))
+        #expect(quoted.function.arguments["count"] == .string("3"))
+
+        // Without a schema a bare scalar stays its JSON reading.
+        let untyped = try #require(
+            parser.parse(content: "<|tool_call>call:lookup{zip:01000}<tool_call|>", tools: nil))
+        #expect(untyped.function.arguments["zip"] == .int(1000))
+    }
+
     @Test("Test ToolCallFormat Inference from Model Type")
     func testToolCallFormatInference() throws {
         // LFM2 models (prefix matching)
