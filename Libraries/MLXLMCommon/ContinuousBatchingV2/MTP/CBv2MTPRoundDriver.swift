@@ -728,6 +728,20 @@ final class CBv2MTPRoundDriver {
             && usesRequestStatefulDrafter && config.fixedDraftTokens != 0
     }
 
+    /// The drafter declared its request state advisory
+    /// (`CBv2MTPAdvisoryHistoryDrafter`) and acceptance is exact, so no
+    /// emitted token depends on that state.
+    var historyIsAdvisory: Bool {
+        config.acceptance == .exact
+            && (drafter as? any CBv2MTPAdvisoryHistoryDrafter)?.requestStateIsAdvisory == true
+    }
+
+    /// Persistent assistant history that a prefix checkpoint must carry for
+    /// the request that adopts it. Advisory history never has to.
+    var checkpointsRequireAssistantHistory: Bool {
+        tracksPersistentHistory && !historyIsAdvisory
+    }
+
     /// Rows that cannot speculate may run ordinary chainable decode; the
     /// engine feeds their trusted hidden rows to history at finalize.
     var feedsHistoryFromOrdinaryDecode: Bool {
@@ -832,9 +846,12 @@ final class CBv2MTPRoundDriver {
     var shouldApplyMarginalPolicyToPlan: Bool {
         usesMarginalPolicy && !planDecision.isExploration
     }
+    /// `position` is the absolute target position of the observation's first
+    /// hidden row. Only an advisory drafter receives it.
     func observeCommittedTarget(
         id: CBv2RequestID,
         observation: CBv2MTPCommittedTargetObservation,
+        startingAt position: Int? = nil,
         detachedState: any CBv2MTPRequestState
     ) {
         precondition(
@@ -843,7 +860,14 @@ final class CBv2MTPRoundDriver {
         guard let stateful = drafter as? any CBv2MTPRequestStatefulDrafter else {
             preconditionFailure("CBv2 MTP committed observation reached a stateless drafter")
         }
-        stateful.observeCommittedTarget(observation, requestState: detachedState)
+        if let position, historyIsAdvisory,
+            let advisory = stateful as? any CBv2MTPAdvisoryHistoryDrafter
+        {
+            advisory.observeCommittedTarget(
+                observation, startingAt: position, requestState: detachedState)
+        } else {
+            stateful.observeCommittedTarget(observation, requestState: detachedState)
+        }
     }
 
     func marginalDepth(
