@@ -492,7 +492,7 @@ jobs:
             echo "::error::Only the verified hosted-to-native Xcode path bridge is allowed."
             exit 1
           fi
-          /usr/bin/python3 - "$hosted_bundle" <<'PY'
+          /usr/bin/python3 -I -S - "$hosted_bundle" <<'PY'
         import os,sys
         path=sys.argv[1]
         assert os.path.isdir(path) and not os.path.islink(path), 'Preinstalled Xcode must be a real directory'
@@ -502,7 +502,7 @@ jobs:
             echo "::error::Refusing to overwrite an existing Xcode path."
             exit 1
           fi
-          sudo -n /usr/bin/python3 - "$hosted_bundle" "$native_bundle" <<'PY'
+          sudo -n /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
         import os,sys
         # os.symlink fails atomically if any file, directory or symlink already exists.
         os.symlink(sys.argv[1],sys.argv[2])
