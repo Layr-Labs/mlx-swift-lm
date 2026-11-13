@@ -306,6 +306,9 @@ def:
         Gemma 4's strict reader keeps each unmarked scalar's text, so a parameter whose schema admits a
         string but not the scalar's JSON type reads `zip:01000` as "01000", as vLLM does
         (`ToolArgumentNormalization.bareLiteral`).
+        `DARKBLOOM_GEMMA_SCHEMA_COERCION=1` additionally types quoted numeric arguments at frame close;
+        the Gemma streamer withholds those values until the complete parse. Default-off keeps existing
+        string exposure. `GemmaQuotedNumberConformanceTests` runs with the flag off and on.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"

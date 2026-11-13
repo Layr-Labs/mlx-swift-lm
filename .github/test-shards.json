@@ -280,6 +280,24 @@
         "^MLXLMTests\\.CBv2ReasoningBudgetTests/",
         "^MLXLMTests\\.CBv2ReasoningBudgetNativeMiMoTests/"
       ]
+    },
+    {
+      "name": "gemma-quoted-number-enabled",
+      "strict": true,
+      "extra": true,
+      "metallib": false,
+      "filters": [
+        "GemmaQuotedNumberConformanceTests",
+        "GemmaFunctionConstraintParserTests",
+        "ToolCallStreamingTests",
+        "ToolCallStreamingDifferentialTests",
+        "ToolArgumentNormalizationTests",
+        "testGemmaBareScalarsFollowTheSchema"
+      ],
+      "env": {
+        "DARKBLOOM_GEMMA_SCHEMA_COERCION": "1"
+      },
+      "timeout_minutes": 5
     }
   ],
   "shards": [
@@ -1023,6 +1041,11 @@
           ],
           "tests": [
             "MLXLMTests.CBv2PagedKernelTests/decodeBatchCompositionInvariance()"
+          ]
+        },
+        {
+          "groups": [
+            "gemma-quoted-number-enabled"
           ]
         }
       ]
