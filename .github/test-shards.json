@@ -277,7 +277,8 @@
       "name": "native-reasoning-budget",
       "strict": true,
       "filters": [
-        "^MLXLMTests\\.CBv2ReasoningBudgetTests/"
+        "^MLXLMTests\\.CBv2ReasoningBudgetTests/",
+        "^MLXLMTests\\.CBv2ReasoningBudgetNativeMiMoTests/"
       ]
     }
   ],

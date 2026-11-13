@@ -20,10 +20,27 @@ private final class BudgetTransitionModel: CBv2SteppableModel {
     }
 }
 
+private struct BudgetTextTokenizer: MLXLMCommon.Tokenizer {
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [0] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(String.init).joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { Int(token) }
+    func convertIdToToken(_ id: Int) -> String? { String(id) }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [0] }
+}
+
 @Suite("Native reasoning budget", .tags(.integration), .serialized)
 struct CBv2ReasoningBudgetTests {
     private func engine(
         enabled: Bool = true, sampler: any CBv2StepSampler = CBv2DefaultSampler(),
+        detokenizer: any CBv2DetokenizerFactory = CBv2NullDetokenizerFactory(),
         next: [Int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0]
     ) -> EngineV2 {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)]
@@ -31,6 +48,7 @@ struct CBv2ReasoningBudgetTests {
             model: BudgetTransitionModel(next: next), layerKinds: kinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: sampler,
+            detokenizerFactory: detokenizer,
             reasoningBudgetsEnabled: enabled)
     }
 
@@ -210,6 +228,36 @@ struct CBv2ReasoningBudgetTests {
                 maximumTokens: Int.max, openTokenID: 14, closeTokenID: 8,
                 startsInsideThought: true)
         }
+    }
+
+    @Test("No-budget requests have the same output with the engine switch off or on")
+    func noBudgetPreservesOff() async throws {
+        let off = engine(enabled: false)
+        let on = engine()
+        var request = try request()
+        request.reasoningBudget = nil
+        request.sampling = .init(temperature: 0.7, topK: 1, seed: 123)
+        let baseline = await cbv2SchedCollect(try off.submit(request))
+        let optedIn = await cbv2SchedCollect(try on.submit(request))
+        await off.shutdown()
+        await on.shutdown()
+        #expect(baseline.tokens == [1, 2, 3, 4, 5, 6])
+        #expect(optedIn.tokens == baseline.tokens)
+        #expect(optedIn.usage?.completionTokens == baseline.usage?.completionTokens)
+    }
+
+    @Test("A stop string spanning answer tokens keeps its normal holdback and usage")
+    func answerStopString() async throws {
+        let engine = engine(
+            detokenizer: CBv2TextDetokenizerFactory(tokenizer: BudgetTextTokenizer()))
+        var request = try request()
+        request.stopStrings = ["910"]
+        let result = await cbv2SchedCollect(try engine.submit(request))
+        await engine.shutdown()
+        #expect(result.tokens == [1, 2, 8, 9, 10])
+        #expect(result.text == "128")
+        #expect(result.finishReason == .stop)
+        #expect(result.usage?.completionTokens == 5)
     }
 
 }
