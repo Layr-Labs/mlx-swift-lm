@@ -139,7 +139,7 @@ private final class CBv2MTPBranchConstraint: CBv2TokenConstraint, Sendable {
     }
 }
 
-private final class CBv2MTPInterningConstraint: CBv2TokenConstraint, @unchecked Sendable {
+final class CBv2MTPInterningConstraint: CBv2TokenConstraint, @unchecked Sendable {
     let mode: CBv2TokenConstraintMode = .required
     let initialState = 0
     let fallbackTokenID = 0
@@ -440,6 +440,8 @@ struct CBv2MTPEngineParityTests {
         #expect(actualConstrained.finishReason == expectedConstrained.finishReason)
         #expect(actualOrdinary.tokens == expectedOrdinary.tokens)
         #expect(actualOrdinary.finishReason == expectedOrdinary.finishReason)
+        #expect((actualConstrained.usage?.timing.mtpRounds ?? 0) > 0)
+        #expect((actualOrdinary.usage?.timing.mtpRounds ?? 0) > 0)
         #expect(metrics.rounds > 0)
         #expect(metrics.acceptedTokens > 0)
     }
@@ -579,6 +581,7 @@ struct CBv2MTPEngineParityTests {
                 #expect(actual[row].tokens == expected[row].tokens)
                 #expect(actual[row].finishReason == expected[row].finishReason)
                 #expect(grammars[row].confirmedTransitions == paths[row])
+                #expect((actual[row].usage?.timing.mtpRounds ?? 0) > 0)
             }
             #expect(metrics.rounds > 0)
         }
