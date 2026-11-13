@@ -874,6 +874,7 @@ def:
         - "Executables/mlx-server/**"
         - "Tests/MLXLMServerTests/**"
         - "docs/server-request-validation.md"
+        - "skills/mlx-swift-lm/references/generation.md"
     - title: "Benchmarks and measurement"
       description: |
         Nothing here ships to users; it is how the fork proves its numbers. `BenchCBv2` (real-weights
