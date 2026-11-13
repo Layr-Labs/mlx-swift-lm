@@ -221,7 +221,7 @@ extension CBv2StepSampler {
 /// construction (per-row reduction, no cross-row ops). Kept as the
 /// deterministic fallback for scheduler/loop tests; production uses
 /// `CBv2DefaultSampler`.
-public final class CBv2GreedySampler: CBv2StepSampler {
+public final class CBv2GreedySampler: CBv2StepSampler, CBv2FreeSpanSampler {
     private let constraintSampler = CBv2TokenConstraintSampler()
     private var configuredIDs: [CBv2RequestID] = []
 
@@ -258,6 +258,14 @@ public final class CBv2GreedySampler: CBv2StepSampler {
 
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
         constraintSampler.failure(for: id)
+    }
+
+    func confirmedConstraintState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        constraintSampler.confirmedState(for: id, outputTokenCount: outputTokenCount)
+    }
+
+    func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
+        constraintSampler.mask(logits, requestIDs: requestIDs)
     }
 }
 

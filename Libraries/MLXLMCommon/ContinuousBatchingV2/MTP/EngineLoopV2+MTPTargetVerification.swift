@@ -79,6 +79,9 @@ extension EngineLoopV2 {
             }
         let verifyParams = rows.map(\.rec.request.sampling)
         let verifyIDs = rows.map(\.rec.id)
+        let spanSampler =
+            rows.contains { $0.rec.request.tokenConstraint != nil }
+            ? sampler as? any CBv2FreeSpanSampler : nil
         // Per-request output-step index of window position 0: the seed token
         // (already confirmed output) was drawn at index base-1, so position j
         // of the window is output index base + j.
@@ -98,8 +101,11 @@ extension EngineLoopV2 {
         /// columns of `logits`) when typical acceptance needs a decision for
         /// this call; nil otherwise.
         func scoreColumns(
-            _ logits: MLXArray, columnOffset: Int, drafts: MLXArray?
+            _ rawLogits: MLXArray, columnOffset: Int, drafts: MLXArray?
         ) -> (scores: MLXArray, accept: MLXArray?) {
+            let logits =
+                spanSampler?.maskFreeSpanVerification(rawLogits, requestIDs: verifyIDs)
+                ?? rawLogits
             guard useTargetPrefix else {
                 return (argMax(logits, axis: -1).asType(.int32), nil)
             }

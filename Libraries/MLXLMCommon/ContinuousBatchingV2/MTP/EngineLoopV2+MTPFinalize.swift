@@ -279,13 +279,25 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
+            if metadata.freeSpan != nil, let failure = sampler.tokenConstraintFailure(for: id) {
+                step.discard.insert(id)
+                releaseDiscarded(metadata)
+                finishRequest(id, reason: .error(failure))
+                continue
+            }
             let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
             let targets = (0 ..< targetWidth).map {
                 Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
             var accepted = 0
-            if let acceptBase {
+            if let span = metadata.freeSpan {
+                while accepted < k, targets[accepted] == drafts[accepted],
+                    span.continues(with: drafts[accepted])
+                {
+                    accepted += 1
+                }
+            } else if let acceptBase {
                 while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
                     accepted += 1
                 }
@@ -372,6 +384,13 @@ extension EngineLoopV2 {
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
             for token in emitted {
+                if metadata.freeSpan != nil {
+                    sampler.confirmSampledTokens([token], requestIDs: [id])
+                    if let failure = sampler.tokenConstraintFailure(for: id) {
+                        finishReason = .error(failure)
+                        break
+                    }
+                }
                 scheduler.recordSampled(id: id, token: token)
                 kept.append(token)
                 if rec.request.stopTokens.contains(token) {
@@ -461,7 +480,7 @@ extension EngineLoopV2 {
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 // Target KV/recurrent truth is committed first. The assistant

@@ -1497,6 +1497,15 @@
           "rest": true
         }
       ]
+    },
+    {
+      "runs": [
+        {
+          "units": [
+            "MLXLMTests.CBv2FreeSpanTests"
+          ]
+        }
+      ]
     }
   ]
 }

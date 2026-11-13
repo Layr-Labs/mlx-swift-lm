@@ -177,7 +177,8 @@ final class CBv2TokenConstraintSampler {
             rows[id] = row
         }
         let mask = rowMasks.count == 1 ? rowMasks[0] : concatenated(rowMasks, axis: 0)
-        return which(mask, logits, MLXArray(-Float.infinity).asType(logits.dtype))
+        let broadcastMask = logits.ndim == 3 ? mask.expandedDimensions(axis: 1) : mask
+        return which(broadcastMask, logits, MLXArray(-Float.infinity).asType(logits.dtype))
     }
 
     /// `[1, vocab]` bool, true exactly at `allowed`. An out-of-range id
@@ -242,6 +243,13 @@ final class CBv2TokenConstraintSampler {
 
     func failure(for id: CBv2RequestID) -> String? {
         rows[id]?.failure
+    }
+
+    func confirmedState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        guard let row = rows[id], row.failure == nil, row.consumed == outputTokenCount else {
+            return nil
+        }
+        return row.state
     }
 
     func requestDidFinish(_ id: CBv2RequestID) {

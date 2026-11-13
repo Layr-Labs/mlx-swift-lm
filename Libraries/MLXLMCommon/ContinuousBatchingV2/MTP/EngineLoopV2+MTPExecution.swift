@@ -733,7 +733,8 @@ extension EngineLoopV2 {
                     id: row.rec.id, storageRows: state.compactMap { $0 },
                     assistantState:
                         mtp.usesRequestStatefulDrafter
-                        ? mtp.takeAssistantState(for: row.rec.id) : nil))
+                        ? mtp.takeAssistantState(for: row.rec.id) : nil,
+                    freeSpan: mtpFreeSpan(row.rec)))
             if let assistantState = rowMetadata.last?.assistantState,
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {

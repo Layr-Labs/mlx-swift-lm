@@ -25,7 +25,7 @@ extension EngineLoopV2 {
         let samplingEligible =
             sampling.temperature == 0
             || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
-        guard rec.request.tokenConstraint == nil,
+        guard rec.request.tokenConstraint == nil || mtpFreeSpan(rec) != nil,
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,

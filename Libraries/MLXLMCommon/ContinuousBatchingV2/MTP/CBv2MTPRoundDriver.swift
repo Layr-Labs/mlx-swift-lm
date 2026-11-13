@@ -107,6 +107,7 @@ final class CBv2MTPRoundInFlight {
         /// driver for the duration of this in-flight round. This fences its
         /// release behind target/assistant evaluation on cancellation.
         let assistantState: (any CBv2MTPRequestState)?
+        var freeSpan: CBv2MTPFreeSpan? = nil
     }
 
     struct CommittedObservationRow {
