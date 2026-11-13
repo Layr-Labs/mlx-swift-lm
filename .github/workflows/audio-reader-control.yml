@@ -1,0 +1,85 @@
+# Prepared for review only. Not installed, published, or dispatched.
+# Proposed destination: .github/workflows/audio-reader-control.yml
+name: Audio reader control
+on:
+  pull_request:
+    types: [labeled]
+permissions:
+  contents: read
+concurrency:
+  group: audio-reader-control-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+jobs:
+  route:
+    if: >-
+      github.event.label.name == 'audio-reader-control' &&
+      github.head_ref == 'astra/audio-reader-control-a' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: audio-reader-control macos_arm64 xcode-27 1
+  require-class:
+    needs: route
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require an allocated Darkbloom runner
+        env:
+          ROUTES: ${{ needs.route.outputs.routes }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          route = json.loads(os.environ['ROUTES'])['audio-reader-control']
+          expected = ['self-hosted', 'macOS', 'ARM64', 'darkbloom-macos-arm64']
+          if route != expected:
+              raise SystemExit('NOT RUN: required Darkbloom class was not allocated; no fallback execution')
+          PY
+  audio:
+    needs: [route, require-class]
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['audio-reader-control'] }}
+    timeout-minutes: 45
+    env:
+      MLX_ENABLE_TF32: "0"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      DARKBLOOM_AUDIO_DIAGNOSTIC_CONTEXT: isolated
+    steps:
+      - name: Checkout reviewed control files
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout frozen diagnostic source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 154ceccf3b16ad45a19d99344c025f0c12a66ef0
+          path: source
+          persist-credentials: false
+      - uses: ./source/.github/actions/select-xcode
+      - name: Record and require the observed failing class
+        working-directory: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/audio-receipt"
+          python3 ../control/.github/diagnostics/audio-reader-control.py identity
+      - name: Build the frozen source with the control dependency graph
+        working-directory: source
+        run: |
+          cp ../control/.github/diagnostics/audio-reader-control.resolved.json Package.resolved
+          swift build --build-system native --build-tests --enable-code-coverage --disable-index-store
+          python3 ../control/.github/diagnostics/audio-reader-control.py pins
+          scripts/build-metallib.sh "$RUNNER_TEMP/audio-receipt/mlx.metallib"
+          bin=$(swift build --build-system native --show-bin-path)
+          scripts/stage-test-metallib.sh "$RUNNER_TEMP/audio-receipt/mlx.metallib" "$bin"
+          swift test list --build-system native --skip-build > "$RUNNER_TEMP/audio-receipt/tests.txt"
+      - name: Run exactly the matrix and all original audio assertions
+        working-directory: source
+        run: python3 ../control/.github/diagnostics/audio-reader-control.py tests
+      - name: Upload control evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: audio-reader-control-evidence
+          path: ${{ runner.temp }}/audio-receipt
+          retention-days: 7
+          if-no-files-found: warn
