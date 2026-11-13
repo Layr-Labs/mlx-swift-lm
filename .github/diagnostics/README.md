@@ -3,8 +3,23 @@
 This opt-in diagnostic compares the original strict audio tests and reader
 matrix on one allocated macOS runner. It does not change audio runtime behavior
 or replace the normal full-CI gates. The control source is frozen at
-`154ceccf3b16ad45a19d99344c025f0c12a66ef0`; all 31 dependency pins must match the
+`76ee2ff71649d8d0982546a88b9ccf8aa04013fc`; all 31 dependency pins must match the
 saved graph. The workflow refuses hosted fallback or a different hardware class.
+
+The original control attempt (run 43515385515, control head `3d6cc05e`, source
+`154ceccf`) was NOT RUN: the allocator returned `lane_not_enabled`, the class
+guard refused fallback, and no audio test executed. The corrected source pin
+does not authorize or initiate another allocation attempt.
+
+The diagnostic compares exact continuous start, end and coverage, not buffer
+partition arrays. The captured equal-PCM counterexample and one-tick gap,
+overlap and boundary fixtures exercise the same timeline helper. Apple documents
+[presentation order](https://developer.apple.com/documentation/avfoundation/avassetreaderoutput/copynextsamplebuffer())
+for decoded buffers, without promising repeatable partitions. The helper rejects
+invalid or rounded [CMTime arithmetic](https://developer.apple.com/documentation/coremedia/cmtimeadd(_:_:));
+it uses no tolerance. Every original PCM/hash/frame/channel/retry/cancel assertion
+remains unchanged. This corrects a diagnostic invariant, not the historical
+audio failure or runtime behavior.
 
 The `audio-reader-control` label triggers the separate workflow only on the
 same-repository `astra/audio-reader-control-a` pull request. Apply it once after

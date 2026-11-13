@@ -1,4 +1,4 @@
-"""Prepared control runner, not installed or executed on an audio host."""
+"""Bounded audio diagnostic control with exact source and runner identity."""
 import hashlib
 import json
 import os
@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-SOURCE = '154ceccf3b16ad45a19d99344c025f0c12a66ef0'
+SOURCE = '76ee2ff71649d8d0982546a88b9ccf8aa04013fc'
 RECEIPT = None
 CONTROL = Path('../control/.github/diagnostics')
 FILTER = r'^MLXLMTests\.(AudioReaderRetryTests|MiMoV26EncodedAACAudioTests)/'
@@ -165,7 +165,7 @@ def main():
             'runnerName': os.environ.get('RUNNER_NAME'),
         }
         save('identity.json', identity)
-        if identity['source'] != SOURCE or identity['tree'] != 'c69e5ef89404041cc25fa0f558d6600104843d68':
+        if identity['source'] != SOURCE or identity['tree'] != '7bae22208eb081ee1f16e189d224014f1a1df661':
             raise SystemExit('NOT RUN: source identity mismatch')
         if (identity['cpu'], identity['cpus'], identity['memory']) != ('Apple M5 Max (Virtual)', '12', '34359738368'):
             raise SystemExit('NOT RUN: allocated hardware differs from observed failing class')

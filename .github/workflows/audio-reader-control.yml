@@ -1,5 +1,3 @@
-# Prepared for review only. Not installed, published, or dispatched.
-# Proposed destination: .github/workflows/audio-reader-control.yml
 name: Audio reader control
 on:
   pull_request:
@@ -53,7 +51,7 @@ jobs:
       - name: Checkout frozen diagnostic source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 154ceccf3b16ad45a19d99344c025f0c12a66ef0
+          ref: 76ee2ff71649d8d0982546a88b9ccf8aa04013fc
           path: source
           persist-credentials: false
       - uses: ./source/.github/actions/select-xcode
