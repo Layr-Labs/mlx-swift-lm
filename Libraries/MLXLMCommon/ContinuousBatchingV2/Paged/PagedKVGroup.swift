@@ -458,6 +458,23 @@ final class PagedKVGroup {
         trimSegments(retainingUpTo: &none, willRetire: willRetire)
     }
 
+    /// The backing `trimSegments` would retire now, without retiring it.
+    var trimmableSegmentBytes: Int {
+        guard segmentLayout != nil else { return 0 }
+        var remaining = committedUsablePages
+        var bytes = 0
+        for index in segments.keys.sorted(by: >) {
+            guard let segment = segments[index] else { continue }
+            let usable = segment.pages.count - 1
+            guard remaining - usable >= pagesReserved,
+                segment.pages.dropFirst().allSatisfy({ refCounts[$0] == 0 })
+            else { continue }
+            remaining -= usable
+            bytes += segment.allocatedBytes
+        }
+        return bytes
+    }
+
     /// Same retirement, but parks backings that fit `budget` instead of
     /// dropping them. Returns true when any backing was dropped.
     @discardableResult

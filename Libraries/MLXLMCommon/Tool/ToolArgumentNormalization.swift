@@ -95,6 +95,26 @@ enum ToolArgumentNormalization {
         }
     }
 
+    /// Reads an unquoted scalar the model wrote, such as Gemma's `zip:01000`,
+    /// as vLLM's `convert_value` does: its text when the schema admits a
+    /// string but not the type of its JSON `reading`, else the reading. An
+    /// unknown or ambiguous schema keeps the reading.
+    static func bareLiteral(
+        _ text: String, reading: JSONValue, schema: [String: any Sendable]?
+    ) -> JSONValue {
+        guard let schema, let types = declaredTypes(schema, depth: 0), types.contains("string")
+        else { return reading }
+        let type: String
+        switch reading {
+        case .null: type = "null"
+        case .bool: type = "boolean"
+        case .int: type = "integer"
+        case .double: type = "number"
+        default: return reading
+        }
+        return types.contains(type) ? reading : .string(text)
+    }
+
     /// Returns only interpretations every branch describes. Unknown branches
     /// (notably references) prevent coercion rather than being silently ignored.
     private static func declaredTypes(_ schema: [String: any Sendable], depth: Int) -> Set<String>?
