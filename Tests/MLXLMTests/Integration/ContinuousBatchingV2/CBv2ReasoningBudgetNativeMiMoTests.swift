@@ -243,16 +243,34 @@ struct CBv2ReasoningBudgetNativeMiMoTests {
                     maximumTokens: 2, openTokenID: 126, closeTokenID: 127,
                     startsInsideThought: false)
                 let mediaSubmission = try engine.submitWithNativeRetirement(media)
-                if cancel { engine.cancel(media.id) }
-                let mediaResult = await cbv2SchedCollect(mediaSubmission.events)
+                var mediaTokens: [Int] = []
+                var mediaFinish: CBv2FinishReason?
+                var mediaUsage: CBv2Usage?
+                var requestedCancellation = false
+                for await event in mediaSubmission.events {
+                    switch event {
+                    case .delta(_, let tokens, _):
+                        mediaTokens += tokens
+                        if cancel && !requestedCancellation && !tokens.isEmpty {
+                            requestedCancellation = true
+                            engine.cancel(media.id)
+                        }
+                    case .finished(let reason, let usage):
+                        mediaFinish = reason
+                        mediaUsage = usage
+                    }
+                }
                 await mediaSubmission.retirement.wait()
                 if cancel {
-                    #expect(mediaResult.finishReason == .cancelled)
+                    #expect(requestedCancellation)
+                    #expect(mediaTokens.first == 126)
+                    #expect(mediaTokens.count < 128)
+                    #expect(mediaFinish == .cancelled)
                 } else {
-                    #expect(mediaResult.tokens == [126, 21, 21, 127, 21, 21])
-                    #expect(mediaResult.usage?.completionTokens == 6)
-                    #expect(mediaResult.finishReason == .length)
+                    #expect(mediaTokens == [126, 21, 21, 127, 21, 21])
+                    #expect(mediaFinish == .length)
                 }
+                #expect(mediaUsage?.completionTokens == mediaTokens.count)
                 #expect(permit.retirements == 1)
                 #expect(permit.bytes == 0)
                 #expect(throws: (any Error).self) { try engine.submitWithNativeRetirement(media) }
