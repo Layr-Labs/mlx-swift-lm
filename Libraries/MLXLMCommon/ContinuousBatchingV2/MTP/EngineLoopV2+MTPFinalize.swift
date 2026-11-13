@@ -281,12 +281,20 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
+            if metadata.freeSpan != nil, let failure = sampler.tokenConstraintFailure(for: id) {
+                step.discard.insert(id)
+                releaseDiscarded(metadata)
+                finishRequest(id, reason: .error(failure))
+                continue
+            }
             let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
             let targets = (0 ..< targetWidth).map {
                 Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
-            if rec.request.tokenConstraint != nil {
+            // Grammar verification owns constrained rows outside an opted-in
+            // free span; free-span rows keep their pure same-state previews.
+            if rec.request.tokenConstraint != nil, metadata.freeSpan == nil {
                 let limit = min(targetWidth, rec.request.maxTokens - rec.generatedTokenCount)
                 commonEmitted = min(commonEmitted, limit)
                 outcomes.append(
@@ -297,7 +305,13 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
-            if let acceptBase {
+            if let span = metadata.freeSpan {
+                while accepted < k, targets[accepted] == drafts[accepted],
+                    span.continues(with: drafts[accepted])
+                {
+                    accepted += 1
+                }
+            } else if let acceptBase {
                 while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
                     accepted += 1
                 }
@@ -337,7 +351,9 @@ extension EngineLoopV2 {
         }
 
         if let logits = verify.constraintLogits {
-            let grammarRows = outcomes.filter { $0.rec.request.tokenConstraint != nil }
+            let grammarRows = outcomes.filter {
+                $0.rec.request.tokenConstraint != nil && $0.metadata.freeSpan == nil
+            }
             let prefixes = mtpSampleAndConfirmConstrainedPrefixes(
                 logits: logits,
                 rows: grammarRows.map {
@@ -418,6 +434,13 @@ extension EngineLoopV2 {
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
             for (index, token) in emitted.enumerated() {
+                if metadata.freeSpan != nil {
+                    sampler.confirmSampledTokens([token], requestIDs: [id])
+                    if let failure = sampler.tokenConstraintFailure(for: id) {
+                        finishReason = .error(failure)
+                        break
+                    }
+                }
                 scheduler.recordSampled(id: id, token: token)
                 kept.append(token)
                 if index == emitted.count - 1, let failure = outcome.constraintFailure {
@@ -514,7 +537,7 @@ extension EngineLoopV2 {
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 // Target KV/recurrent truth is committed first. The assistant

@@ -25,7 +25,7 @@
 import Foundation
 import MLX
 
-public final class CBv2DefaultSampler: CBv2StepSampler {
+public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
 
     private var pipeline: LogitsPipelineV2?
     private let sampler: SamplerV2
@@ -447,5 +447,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
 
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
         constraintSampler.failure(for: id)
+    }
+
+    func confirmedConstraintState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        constraintSampler.confirmedState(for: id, outputTokenCount: outputTokenCount)
+    }
+
+    func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
+        constraintSampler.mask(logits, requestIDs: requestIDs)
     }
 }

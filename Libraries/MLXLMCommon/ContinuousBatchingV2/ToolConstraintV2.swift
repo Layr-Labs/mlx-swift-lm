@@ -67,6 +67,18 @@ extension CBv2TokenConstraint {
     public var allowsChainedDecode: Bool { false }
 }
 
+/// A grammar with opaque spans that can use MTP without previewing mutable state.
+/// Masks in these spans must be independent of the positive remaining budget.
+public protocol CBv2FreeSpanTokenConstraint: CBv2TokenConstraint {
+    /// Whether this committed state is an opaque span. False keeps ordinary decoding.
+    func isFreeSpan(state: Int) -> Bool
+
+    /// Pure, conservative check: true promises that the token is valid, touches no
+    /// protected boundary, and `nextState` would return this same state. It must
+    /// not intern states or change exhaustion, caches, or subsequent results.
+    func isFreeSpanContinuation(state: Int, tokenID: Int) -> Bool
+}
+
 enum CBv2TokenConstraintFailure {
     static let impossibleState = "tool_constraint_impossible_state"
 }

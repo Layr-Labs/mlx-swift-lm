@@ -48,3 +48,11 @@ All changes are additive; implementations were updated consistently.
   without advancing grammar state. Flag-off ordinary confirmation is unchanged.
   Each grammar position adds a host readback; full-model acceptance and throughput
   need separate hardware qualification.
+- **Grammar verification beside free spans:** with both `DARKBLOOM_CBV2_MTP_GRAMMAR`
+  and `DARKBLOOM_CONSTRAINT_SPANS` on, a row whose committed state is an opted-in free
+  span keeps the pure same-state preview (masked window, drafts accepted only while
+  they keep that state, per-token confirmation at finalize); grammar verification
+  (retained raw logits, ordinary sampler per committed position) owns every other
+  constrained row. A row takes exactly one of the two paths in a round. The free-span
+  window mask applies only when a free-span row is in the batch, and raw logits are
+  retained only when a grammar-verified row is, so each opt-in alone behaves as before.

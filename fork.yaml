@@ -184,6 +184,12 @@ def:
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
             `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
             lifetime beside speculating text rows. Model-specific drafters live under "Models".
+            Opt-in `CBv2FreeSpanTokenConstraint` consumers may draft through pure same-state
+            spans while retaining structural masks, then use ordinary constrained decoding
+            through protected spans. Persistent assistant history crosses those spans without
+            drafting. `DARKBLOOM_CONSTRAINT_SPANS` defaults off; custom samplers stay target-only.
+            With both opt-ins, a row inside a free span keeps the pure same-state preview and
+            its masked window; grammar verification owns constrained rows outside free spans.
             The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
             falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
             so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
