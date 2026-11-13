@@ -481,6 +481,12 @@ jobs:
             *) echo "::error::Refusing an unexpected Xcode developer directory."; exit 1 ;;
           esac
         done
+        /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import json,os,sys
+        for path in sys.argv[1:]:
+            print(json.dumps({'path':path,'realpath':os.path.realpath(path),
+                              'exists':os.path.exists(path),'is_symlink':os.path.islink(path)}))
+        PY
         expected_version=$'Xcode 27.2\nBuild version 27B52'
         actual_version=$(DEVELOPER_DIR="$actual_developer_dir" /usr/bin/xcodebuild -version)
         if [[ "$actual_version" != "$expected_version" ]]; then
@@ -492,25 +498,31 @@ jobs:
             echo "::error::Only the verified hosted-to-native Xcode path bridge is allowed."
             exit 1
           fi
-          /usr/bin/python3 -I -S - "$hosted_bundle" <<'PY'
+          destination_state=$(/usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
         import os,sys
-        path=sys.argv[1]
-        assert os.path.isdir(path) and not os.path.islink(path), 'Preinstalled Xcode must be a real directory'
-        assert os.path.realpath(path)==path, 'Preinstalled Xcode path must resolve exactly'
+        source,destination=sys.argv[1:]
+        assert os.path.isdir(source), 'Verified preinstalled Xcode directory is unavailable'
+        if os.path.lexists(destination):
+            assert os.path.samefile(source,destination), 'Existing Xcode destination is a different installation'
+            print('samefile')
+        else:
+            print('absent')
         PY
-          if [[ -e "$native_bundle" || -L "$native_bundle" ]]; then
-            echo "::error::Refusing to overwrite an existing Xcode path."
-            exit 1
-          fi
-          sudo -n /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+          )
+          if [[ "$destination_state" == absent ]]; then
+            sudo -n /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
         import os,sys
         # os.symlink fails atomically if any file, directory or symlink already exists.
         os.symlink(sys.argv[1],sys.argv[2])
         PY
-          if [[ ! -L "$native_bundle" || "$(/usr/bin/readlink "$native_bundle")" != "$hosted_bundle" ]]; then
-            echo "::error::The Xcode path bridge did not resolve to the verified installation."
-            exit 1
+            echo "Created the missing Xcode path alias."
+          else
+            echo "Reused the equivalent preinstalled Xcode path."
           fi
+          /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import os,sys
+        assert os.path.samefile(sys.argv[1],sys.argv[2]), 'Xcode paths no longer identify the same installation'
+        PY
         fi
         bridged_version=$(DEVELOPER_DIR="$build_developer_dir" /usr/bin/xcodebuild -version)
         if [[ "$bridged_version" != "$expected_version" ]]; then
