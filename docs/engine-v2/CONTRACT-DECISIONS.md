@@ -44,5 +44,7 @@ All changes are additive; implementations were updated consistently.
   constrained rows together and cap their state transitions at the committed
   width. Unconstrained verifier semantics are unchanged. Native-completion
   engines keep constrained rows target-only pending resource-ownership validation.
+  On opted-in ordinary seed/fallback steps, raw non-finite samples terminate
+  without advancing grammar state. Flag-off ordinary confirmation is unchanged.
   Each grammar position adds a host readback; full-model acceptance and throughput
   need separate hardware qualification.
