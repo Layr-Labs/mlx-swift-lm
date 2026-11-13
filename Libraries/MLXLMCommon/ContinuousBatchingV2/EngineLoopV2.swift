@@ -5252,9 +5252,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !step.sampledRows.isEmpty {
             var tokens = host.map(Int.init)
             var ids = step.sampledRows
-            if mtp?.config.constrainedSpeculation == true, nativeShutdownState == nil,
-                !nonFiniteIndices.isEmpty
-            {
+            if grammarMTPEnabled, !nonFiniteIndices.isEmpty {
                 // Opted-in rows can seed or fall back to ordinary decoding.
                 // A failed raw-logit sample must not advance their grammar.
                 let kept = ids.indices.filter { index in

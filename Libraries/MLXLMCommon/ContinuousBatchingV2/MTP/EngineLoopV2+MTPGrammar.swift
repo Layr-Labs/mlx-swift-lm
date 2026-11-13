@@ -18,6 +18,11 @@ struct CBv2MTPGrammarPrefix {
 }
 
 extension EngineLoopV2 {
+    /// The same opt-in governs verification and ordinary seed/fallback state.
+    var grammarMTPEnabled: Bool {
+        mtp?.config.constrainedSpeculation == true && nativeShutdownState == nil
+    }
+
     /// Mask each committed position with the ordinary sampler. `nextState`
     /// may intern states, so discarded drafts must never advance it. Returned
     /// tokens have already been confirmed and must commit even before an error.

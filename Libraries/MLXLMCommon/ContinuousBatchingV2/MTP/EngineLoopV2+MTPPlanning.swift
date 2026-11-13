@@ -25,9 +25,7 @@ extension EngineLoopV2 {
             sampling.temperature == 0
             || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
         let constraintEligible =
-            rec.request.tokenConstraint == nil
-            || (mtp?.config.constrainedSpeculation == true
-                && nativeShutdownState == nil)
+            rec.request.tokenConstraint == nil || grammarMTPEnabled
         guard constraintEligible,
             samplingEligible,
             sampling.topLogprobs == 0,
