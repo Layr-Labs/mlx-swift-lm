@@ -247,6 +247,7 @@ extension EngineLoopV2 {
             /// Accepted drafts plus one, cut at the length bound and a stop token.
             var naturalEmitted: Int
             var constraintFailure: String? = nil
+            var nonFiniteAfterPrefix = false
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -350,12 +351,15 @@ extension EngineLoopV2 {
             for index in outcomes.indices.reversed() {
                 guard let prefix = prefixes[outcomes[index].metadata.id] else { continue }
                 if prefix.nonFinite {
-                    let outcome = outcomes.remove(at: index)
                     nonFiniteVerifyFailures += 1
-                    step.discard.insert(outcome.metadata.id)
-                    releaseDiscarded(outcome.metadata)
-                    finishRequest(outcome.metadata.id, reason: CBv2NonFiniteLogits.finishReason)
-                    continue
+                    if prefix.tokens.isEmpty {
+                        let outcome = outcomes.remove(at: index)
+                        step.discard.insert(outcome.metadata.id)
+                        releaseDiscarded(outcome.metadata)
+                        finishRequest(outcome.metadata.id, reason: CBv2NonFiniteLogits.finishReason)
+                        continue
+                    }
+                    outcomes[index].nonFiniteAfterPrefix = true
                 }
                 outcomes[index].committed = prefix.tokens
                 outcomes[index].targets = prefix.tokens
@@ -453,6 +457,9 @@ extension EngineLoopV2 {
                     finishReason = .length
                     break
                 }
+            }
+            if finishReason == nil && outcome.nonFiniteAfterPrefix {
+                finishReason = CBv2NonFiniteLogits.finishReason
             }
 
             // Correct KV and scheduler state before any terminal release.

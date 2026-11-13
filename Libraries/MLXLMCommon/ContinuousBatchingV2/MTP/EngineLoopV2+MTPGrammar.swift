@@ -30,14 +30,21 @@ extension EngineLoopV2 {
         let limit = independentWidths ? depth + 1 : commonLimit
         for column in 0 ..< limit {
             var active: [Int] = []
+            var failedAtColumn = false
             for index in rows.indices where !prefixes[index].finished {
                 if rows[index].nonFinite[column] {
                     prefixes[index].nonFinite = true
                     prefixes[index].finished = true
+                    failedAtColumn = true
                 } else {
                     active.append(index)
                 }
             }
+            // Earlier columns have already advanced the grammar. Commit that
+            // prefix even on failure, and stop common-width peers BEFORE they
+            // confirm a token that reconciliation would later discard. At
+            // column zero the failed row has no prefix and can simply retire.
+            if failedAtColumn && column > 0 && !independentWidths { break }
             guard !active.isEmpty else { break }
             let contexts = active.map { rows[$0].context }
             let ids = contexts.map(\.id)
