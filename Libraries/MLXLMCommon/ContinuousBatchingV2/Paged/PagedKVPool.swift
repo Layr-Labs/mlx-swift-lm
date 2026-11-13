@@ -1298,6 +1298,47 @@ extension PagedKVPool {
         }
     }
 
+    /// Whole free segments an issued GLM pool could return now: what
+    /// `trimSegments` would retire. Metadata only.
+    var issuedNativeReleasableBytes: Int {
+        guard nativeModelBinding?.isGLM5Next == true else { return 0 }
+        return groups.values.reduce(0) { $0 + $1.trimmableSegmentBytes }
+    }
+
+    /// Returns an issued GLM pool's free segments to the allocator and refunds
+    /// their physical floor, as `trimFreeSegments` does for other pools. A
+    /// native pool skips that trim (no native wait under commit), so without
+    /// this its backing only grows: every complete-checkpoint import attaches
+    /// new segments, and the free ones stay charged until the pool retires.
+    /// Once that floor nears the grant, a lone request cannot reserve its
+    /// state and first step's scratch beside it and fails as capacity.
+    ///
+    /// Same order as `retireIssuedNativePool`, without retiring the pool:
+    /// engine queue only, outside the native outcome commit, between steps,
+    /// with no attention work and no native loan but the pool's own lifetime
+    /// loan. Segments holding an in-use or reserved page stay, exactly as
+    /// `trimSegments` keeps them. Returns the bytes released.
+    func releaseIssuedNativeFreeSegments() throws -> Int {
+        guard let binding = nativeModelBinding, binding.isGLM5Next, !binding.poolRetired,
+            issuedNativeReleasableBytes > 0, binding.canStartPoolRetirement,
+            activeAttentionWork == nil, attentionWorkOwners.isEmpty,
+            groups.values.allSatisfy({ $0.deferredFrees.isEmpty }),
+            residentPrefixQuarantineIsAbsent
+        else { return 0 }
+        let before = bytesMaterialized
+        let operation = try binding.beginWork(nativeData: false)
+        retainNativePoolBacking(in: operation)
+        // A failed drain has already failed the native runtime.
+        try operation.requiredDrain()
+        // Backing references remain on the operation while these metadata maps
+        // and actual M coverage are detached OUTSIDE commit.
+        for group in groups.values { group.trimSegments { _ in } }
+        let remaining = bytesMaterialized
+        guard operation.finish({ physicalLease?.release(to: remaining) }) else { return 0 }
+        if remaining < before { retainedSegmentsTouchedNanos = Self.uptimeNanos() }
+        return before - remaining
+    }
+
     private var residentPrefixQuarantineIsAbsent: Bool {
         // The constructor refuses a resident prefix index for this profile.
         pageReuseObserver == nil
