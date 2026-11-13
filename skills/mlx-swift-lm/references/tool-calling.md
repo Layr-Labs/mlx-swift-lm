@@ -232,7 +232,9 @@ streamed JSON agrees with the completed call. Callers still validate the complet
 call against their schema. Unsupported container schemas (including references,
 pattern properties and tuple prefixes) preserve quoted descendants. A numeric
 render type beside a union is insufficient to convert a string: the union
-branches must independently establish a numeric reading. Unset or `0` retains the previous parser and streaming
+branches must independently establish a numeric reading. Nested `anyOf`,
+`oneOf` or `allOf` combinations preserve quoted text because render types can
+narrow branches at several levels. Unset or `0` retains the previous parser and streaming
 behavior. Set the variable before starting the server; it is read once per
 process.
 

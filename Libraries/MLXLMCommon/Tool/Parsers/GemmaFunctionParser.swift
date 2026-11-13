@@ -11,6 +11,15 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     static func numericReading(_ text: String, schema: [String: any Sendable]?) -> JSONValue? {
         guard schemaCoercionEnabled else { return nil }
+        // Nested combinators can carry render types at multiple levels.
+        // Preserve quoted text rather than infer the caller's original union.
+        let combinators = ["anyOf", "oneOf", "allOf"]
+        if combinators.contains(where: { keyword in
+            let branches = schema?[keyword] as? [[String: any Sendable]] ?? []
+            return branches.contains { branch in combinators.contains { branch[$0] != nil } }
+        }) {
+            return nil
+        }
         let value = ToolArgumentNormalization.normalize(.string(text), schema: schema)
         switch value {
         case .int, .double: break

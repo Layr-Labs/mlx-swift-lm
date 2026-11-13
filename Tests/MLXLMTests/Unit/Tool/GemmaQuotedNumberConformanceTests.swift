@@ -88,6 +88,18 @@ extension UnitTests {
                 (#"{}"#, "3", .string("3")),
                 (#"{"type":"boolean"}"#, "true", .string("true")),
                 (
+                    #"{"type":"integer","nullable":true,"anyOf":[{"type":"integer","anyOf":[{"type":"integer"},{"type":"string"}]},{"type":"null"}]}"#,
+                    "003", .string("003")
+                ),
+                (
+                    #"{"type":"integer","allOf":[{"type":"integer","anyOf":[{"type":"integer"},{"type":"string"}]}]}"#,
+                    "003", .string("003")
+                ),
+                (
+                    #"{"type":"integer","anyOf":[{"type":"integer","allOf":[{"type":"integer"}]},{"type":"null"}]}"#,
+                    "3", .string("3")
+                ),
+                (
                     #"{"type":"integer","anyOf":[{"type":"integer"},{"type":"string"}]}"#, "003",
                     .string("003")
                 ),
