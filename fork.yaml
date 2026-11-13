@@ -933,7 +933,19 @@ def:
         asymmetric payload required by the explicit native historical-retention CI selector.
         `AGENTS.md` names the swift-format that CI uses: the one of the Xcode 27.2 that
         `.github/actions/select-xcode` selects.
+
+        The disabled native CodeQL workflow scans Actions, C/C++ and Python with
+        the pinned CodeQL 2.27.4 ARM64 bundle and their existing default suites.
+        It requires `CODEQL_NATIVE=on` after an operator switches default setup
+        to advanced setup. The separate GitHub-hosted publisher validates the
+        same run's bounded, fingerprinted SARIF bundle, then uploads the original
+        category identities without checking out or executing repository code.
+        `docs/ci-codeql-native.md` records activation and rollback gates.
       globs:
+        - ".github/scripts/codeql_artifacts.py"
+        - ".github/scripts/codeql_artifacts_test.py"
+        - ".github/workflows/codeql-native.yml"
+        - "docs/ci-codeql-native.md"
         - "AGENTS.md"
         - ".pre-commit-config.yaml"
         - "scripts/check_forkdiff.py"
