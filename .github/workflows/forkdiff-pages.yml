@@ -57,6 +57,7 @@ jobs:
 
       - name: Build forkdiff
         run: |
+          git update-ref refs/heads/main HEAD
           mkdir -p tmp/pages
           go run github.com/protolambda/forkdiff@v0.1.1 \
             -repo . -fork fork.yaml -out tmp/pages/index.html
