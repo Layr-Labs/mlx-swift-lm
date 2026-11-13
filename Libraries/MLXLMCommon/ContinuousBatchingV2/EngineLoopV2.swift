@@ -2951,6 +2951,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             if paused {
                 scheduler.pause(id)
                 scheduler.record(for: id)?.recordPaused(now: now)
+                // A paused row must not keep its last step's whole recurrent
+                // batch alive while the other lanes move on.
+                recurrentStates[id]?.setPaused(true)
                 // Arm the backpressure lease and suspend the progress lease:
                 // a request blocked on a slow consumer is not an engine stall.
                 if var lease = leasesByID[id] {
@@ -2960,6 +2963,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             } else {
                 scheduler.resume(id)
                 scheduler.record(for: id)?.recordResumed(now: now)
+                recurrentStates[id]?.setPaused(false)
                 // Clear the backpressure lease and grant a fresh progress
                 // window — the paused interval was not the engine's fault.
                 if var lease = leasesByID[id] {

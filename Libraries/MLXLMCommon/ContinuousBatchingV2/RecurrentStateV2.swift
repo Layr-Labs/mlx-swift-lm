@@ -287,6 +287,72 @@ public enum CBv2RecurrentBatchCarry {
     }
 }
 
+/// Owned recurrent rows for a request that has stopped stepping.
+///
+/// A request's committed state is a one-row view of its last step's batched
+/// new-state tensors, and an MLX view keeps the whole allocation alive. While
+/// the request steps, that lasts one step. A request paused by backpressure
+/// would keep the batch of every lane it last stepped with alive until it
+/// resumes. A paused request therefore copies its own row out, when it is
+/// paused and on every plain commit that settles while it stays paused. The
+/// copy is a one-row gather: the same bits, no floating arithmetic.
+/// `DARKBLOOM_RECURRENT_REOWN_ON_PAUSE=0` turns the rule off; `=always`
+/// applies it to every request on every plain commit (measurement only).
+public enum CBv2RecurrentRowOwnership {
+    public enum Mode: Sendable { case off, onPause, always }
+
+    public static let mode: Mode = {
+        switch ProcessInfo.processInfo.environment["DARKBLOOM_RECURRENT_REOWN_ON_PAUSE"] {
+        case "0": return .off
+        case "always": return .always
+        default: return .onPause
+        }
+    }()
+
+    private final class Counts: @unchecked Sendable {
+        let lock = NSLock()
+        var layers = 0
+        var pauses = 0
+    }
+    private static let counts = Counts()
+
+    static func ownedRow(_ x: MLXArray) -> MLXArray {
+        take(x, MLXArray([Int32(0)]), axis: 0)
+    }
+
+    static func record(layers: Int) {
+        counts.lock.lock()
+        counts.layers += layers
+        counts.lock.unlock()
+    }
+
+    static func recordPause() {
+        counts.lock.lock()
+        counts.pauses += 1
+        counts.lock.unlock()
+    }
+
+    /// Layer states copied out since the last reset (a count only; for
+    /// benchmarks and tests).
+    public static func snapshotCount(reset: Bool = false) -> Int {
+        counts.lock.lock()
+        defer { counts.lock.unlock() }
+        let value = counts.layers
+        if reset { counts.layers = 0 }
+        return value
+    }
+
+    /// Pauses of requests with recurrent state since the last reset, in every
+    /// mode (a count only; for benchmarks and tests).
+    public static func snapshotPauses(reset: Bool = false) -> Int {
+        counts.lock.lock()
+        defer { counts.lock.unlock() }
+        let value = counts.pauses
+        if reset { counts.pauses = 0 }
+        return value
+    }
+}
+
 /// One layer's compact representation of a rectangular recurrent verify.
 /// The replay closure is invoked only for a strict accepted prefix. Full
 /// acceptance may lazily materialize an exact final state; rollback discards
@@ -403,6 +469,8 @@ public final class CBv2RecurrentRequestState {
     /// committed generation or release. Inspection only (allocation checks).
     public var retainedTransitionArrays: [MLXArray] { committedTransitionRetainedRoots }
     private var pending: [Generation] = []
+    /// True while the request is paused (`CBv2RecurrentRowOwnership`).
+    private var ownsCommittedRows = CBv2RecurrentRowOwnership.mode == .always
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
     public private(set) var isReleased = false
@@ -602,6 +670,7 @@ public final class CBv2RecurrentRequestState {
             }
             clearOlderTransitionRetention()
             committed = first.layers
+            if ownsCommittedRows { reownCommittedRows() }
         }
         pending.removeFirst()
     }
@@ -617,6 +686,35 @@ public final class CBv2RecurrentRequestState {
     /// Test/integration inspection of the latest visible state.
     public func state(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
         pending.last?.layers[modelLayerIndex] ?? committed[modelLayerIndex]
+    }
+
+    /// The engine paused or resumed this request (backpressure). While it is
+    /// paused its committed rows are owned copies (`CBv2RecurrentRowOwnership`).
+    public func setPaused(_ paused: Bool) {
+        if paused { CBv2RecurrentRowOwnership.recordPause() }
+        let mode = CBv2RecurrentRowOwnership.mode
+        guard mode != .off else { return }
+        ownsCommittedRows = paused || mode == .always
+        if paused { reownCommittedRows() }
+    }
+
+    private func reownCommittedRows() {
+        // A settled verify window accounts for its own backing; leave it.
+        guard !isReleased, !committed.isEmpty, committedTransitionRetainedRoots.isEmpty,
+            committedTransitionGeneration == nil
+        else { return }
+        var owned: [Int: CBv2RecurrentLayerState] = [:]
+        var roots: [MLXArray] = []
+        for (index, state) in committed {
+            let conv = state.conv.map(CBv2RecurrentRowOwnership.ownedRow)
+            let ssm = state.ssm.map(CBv2RecurrentRowOwnership.ownedRow)
+            owned[index] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+            if let conv { roots.append(conv) }
+            if let ssm { roots.append(ssm) }
+        }
+        eval(roots)
+        committed = owned
+        CBv2RecurrentRowOwnership.record(layers: owned.count)
     }
 
     /// The engine has stopped and synchronized a failed planned cohort. No

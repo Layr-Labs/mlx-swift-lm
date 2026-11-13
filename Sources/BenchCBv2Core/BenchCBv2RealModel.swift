@@ -633,12 +633,80 @@ actor TokenCounter {
     func add(_ n: Int) { count += n }
 }
 
+/// Bench-only scripted slow consumer. `BENCH_SLOW_CONSUMER=k:N`: in a cell of
+/// two or more requests, request k's consumer stops reading after N tokens,
+/// so its event buffer fills and the engine pauses it on backpressure exactly
+/// as it pauses a slow client. It reads again once every other request of the
+/// cell has finished and a short quiet window has passed; MLX's active memory
+/// is read in that window, when the paused request is the only one alive.
+/// The pause and resume points are counted in tokens, not time, so two runs
+/// step the same batches. Byte counts only.
+final class BenchSlowConsumerGate: @unchecked Sendable {
+    let request: Int
+    let afterTokens: Int
+    private let lock = NSLock()
+    private var othersRunning: Int
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var _parked = false
+    private var _quietActiveBytes = 0
+
+    var parked: Bool { lock.withLock { _parked } }
+    var quietActiveBytes: Int { lock.withLock { _quietActiveBytes } }
+
+    init?(cellRequests: Int) {
+        guard let raw = ProcessInfo.processInfo.environment["BENCH_SLOW_CONSUMER"] else {
+            return nil
+        }
+        let parts = raw.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 2, cellRequests > 1, parts[0] >= 0, parts[0] < cellRequests,
+            parts[1] > 0
+        else { return nil }
+        request = parts[0]
+        afterTokens = parts[1]
+        othersRunning = cellRequests - 1
+    }
+
+    /// The slow request's consumer waits here until the gate opens.
+    func park() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeNow = lock.withLock { () -> Bool in
+                _parked = true
+                if opened { return true }
+                waiter = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    /// Another request of the cell has finished.
+    func otherFinished() async {
+        let last = lock.withLock { () -> Bool in
+            othersRunning -= 1
+            return othersRunning == 0
+        }
+        guard last else { return }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let bytes = MLX.Memory.activeMemory
+        let parkedConsumer = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            _quietActiveBytes = bytes
+            opened = true
+            defer { waiter = nil }
+            return waiter
+        }
+        parkedConsumer?.resume()
+    }
+}
+
 func collectV2(
-    _ stream: AsyncStream<CBv2Event>, submittedAt: Double, counter: TokenCounter? = nil
+    _ stream: AsyncStream<CBv2Event>, submittedAt: Double, counter: TokenCounter? = nil,
+    slowConsumer gate: BenchSlowConsumerGate? = nil, index: Int = -1
 ) async -> RunResult {
     var r = RunResult()
     r.submittedAt = submittedAt
     var last: Double?
+    var parked = false
     for await event in stream {
         let now = CFAbsoluteTimeGetCurrent()
         switch event {
@@ -654,6 +722,10 @@ func collectV2(
                 r.tokens.append(contentsOf: tokens)
                 if let logprobs { r.logprobs.append(contentsOf: logprobs) }
                 if let counter { await counter.add(tokens.count) }
+                if let gate, index == gate.request, !parked, r.tokens.count >= gate.afterTokens {
+                    parked = true
+                    await gate.park()
+                }
             }
             r.text += text
         case .finished(let reason, let usage):
@@ -664,6 +736,7 @@ func collectV2(
         }
     }
     if r.finishedAt == 0 { r.finishedAt = CFAbsoluteTimeGetCurrent() }
+    if let gate, index != gate.request { await gate.otherFinished() }
     return r
 }
 
@@ -689,7 +762,7 @@ func benchOutputDigest(_ r: RunResult) -> String {
 
 func runV2Request(
     engine: EngineV2, id: UInt64, promptTokens: [Int], maxTokens: Int, stopTokens: Set<Int>,
-    topLogprobs: Int = 0
+    topLogprobs: Int = 0, slowConsumer: BenchSlowConsumerGate? = nil, index: Int = -1
 ) async throws -> RunResult {
     let submittedAt = CFAbsoluteTimeGetCurrent()
     let stream = try engine.submit(
@@ -697,7 +770,8 @@ func runV2Request(
             id: CBv2RequestID(id), promptTokens: promptTokens,
             sampling: CBv2SamplingParams(temperature: 0, topLogprobs: topLogprobs),
             maxTokens: maxTokens, stopTokens: stopTokens))
-    return await collectV2(stream, submittedAt: submittedAt)
+    return await collectV2(
+        stream, submittedAt: submittedAt, slowConsumer: slowConsumer, index: index)
 }
 
 func qwen35CampaignConstructionProfile(
@@ -1141,6 +1215,9 @@ func runV2Cell(
     let digestLogprobs =
         ProcessInfo.processInfo.environment["BENCH_OUTPUT_DIGEST"] == "1" ? 4 : 0
     _ = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
+    _ = CBv2RecurrentRowOwnership.snapshotCount(reset: true)
+    _ = CBv2RecurrentRowOwnership.snapshotPauses(reset: true)
+    let slowConsumer = BenchSlowConsumerGate(cellRequests: promptLengths.count)
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -1148,7 +1225,13 @@ func runV2Cell(
             group.addTask { @Sendable in
                 let r = try? await runV2Request(
                     engine: engine, id: UInt64(1000 + i), promptTokens: prompt,
-                    maxTokens: steps, stopTokens: [], topLogprobs: digestLogprobs)
+                    maxTokens: steps, stopTokens: [], topLogprobs: digestLogprobs,
+                    slowConsumer: slowConsumer, index: i)
+                // A refused submit never reaches the consumer loop: count it
+                // as finished so the slow request cannot wait on it forever.
+                if r == nil, let slowConsumer, i != slowConsumer.request {
+                    await slowConsumer.otherFinished()
+                }
                 return (i, r ?? RunResult())
             }
         }
@@ -1162,7 +1245,16 @@ func runV2Cell(
     let carry = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
     print(
         "    recurrent batch carry: enabled=\(CBv2RecurrentBatchCarry.enabled) "
-            + "carried=\(carry.carried) joined=\(carry.joined)")
+            + "carried=\(carry.carried) joined=\(carry.joined) "
+            + "reown=\(CBv2RecurrentRowOwnership.mode) "
+            + "reowned=\(CBv2RecurrentRowOwnership.snapshotCount(reset: true)) "
+            + "pauses=\(CBv2RecurrentRowOwnership.snapshotPauses(reset: true))")
+    if let slowConsumer {
+        print(
+            "    slow consumer: request=\(slowConsumer.request) "
+                + "after=\(slowConsumer.afterTokens) parked=\(slowConsumer.parked) "
+                + "quiet-window active bytes=\(slowConsumer.quietActiveBytes)")
+    }
     for (i, r) in results.enumerated() {
         print(
             "    digest req \(i): tokens=\(r.tokens.count) logprobs=\(r.logprobs.count) "
