@@ -230,7 +230,9 @@ numbers and non-integral integer values retain their original text. Numeric
 marker values are withheld from argument deltas until the completed parse, so
 streamed JSON agrees with the completed call. Callers still validate the completed
 call against their schema. Unsupported container schemas (including references,
-pattern properties and tuple prefixes) preserve quoted descendants. Unset or `0` retains the previous parser and streaming
+pattern properties and tuple prefixes) preserve quoted descendants. A numeric
+render type beside a union is insufficient to convert a string: the union
+branches must independently establish a numeric reading. Unset or `0` retains the previous parser and streaming
 behavior. Set the variable before starting the server; it is read once per
 process.
 

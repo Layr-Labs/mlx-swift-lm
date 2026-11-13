@@ -11,11 +11,23 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     static func numericReading(_ text: String, schema: [String: any Sendable]?) -> JSONValue? {
         guard schemaCoercionEnabled else { return nil }
-        switch ToolArgumentNormalization.normalize(.string(text), schema: schema) {
-        case .int(let value): return .int(value)
-        case .double(let value): return .double(value)
+        let value = ToolArgumentNormalization.normalize(.string(text), schema: schema)
+        switch value {
+        case .int, .double: break
         default: return nil
         }
+        // Gemma templates receive a single render type beside union branches.
+        // That type must not turn a string-admitting union into numeric-only.
+        if var union = schema, union["type"] != nil,
+            union["anyOf"] != nil || union["oneOf"] != nil
+        {
+            union.removeValue(forKey: "type")
+            switch ToolArgumentNormalization.normalize(.string(text), schema: union) {
+            case .int, .double: break
+            default: return nil
+            }
+        }
+        return value
     }
 
     /// Unsupported container constraints cannot establish a quoted child's type.

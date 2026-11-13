@@ -87,6 +87,19 @@ extension UnitTests {
                 (##"{"$ref":"#/$defs/count"}"##, "3", .string("3")),
                 (#"{}"#, "3", .string("3")),
                 (#"{"type":"boolean"}"#, "true", .string("true")),
+                (
+                    #"{"type":"integer","anyOf":[{"type":"integer"},{"type":"string"}]}"#, "003",
+                    .string("003")
+                ),
+                (
+                    #"{"type":"string","anyOf":[{"type":"string"},{"type":"integer"}]}"#, "003",
+                    .string("003")
+                ),
+                (
+                    #"{"type":"integer","oneOf":[{"type":"integer"},{"type":"string"}]}"#, "003",
+                    .string("003")
+                ),
+                (#"{"type":"integer","anyOf":[{"type":"integer"},{"type":"null"}]}"#, "3", .int(3)),
             ]
             for (schema, text, converted) in cases {
                 let specs = try #require(
