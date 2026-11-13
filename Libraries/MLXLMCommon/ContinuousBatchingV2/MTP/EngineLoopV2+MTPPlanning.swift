@@ -37,7 +37,10 @@ extension EngineLoopV2 {
         let constraintEligible =
             rec.request.tokenConstraint == nil || grammarMTPEnabled
             || mtpSpanConstraint(rec) != nil
-        guard constraintEligible,
+        // A reasoning budget keeps the whole request target-only: no drafts
+        // and no assistant history.
+        guard rec.request.reasoningBudget == nil,
+            constraintEligible,
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,

@@ -94,6 +94,9 @@ public protocol CBv2StepSampler: AnyObject {
     /// request-id retirement. EngineV2 rejects constrained requests unless
     /// the installed sampler opts in.
     var supportsTokenConstraints: Bool { get }
+    /// Implements confirmed-token thought budgets, including retirement and failure reporting.
+    var supportsReasoningBudgets: Bool { get }
+    func reasoningBudgetFailure(for id: CBv2RequestID) -> String?
 
     func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
@@ -196,6 +199,8 @@ public protocol CBv2StepSampler: AnyObject {
 
 extension CBv2StepSampler {
     public var supportsTokenConstraints: Bool { false }
+    public var supportsReasoningBudgets: Bool { false }
+    public func reasoningBudgetFailure(for id: CBv2RequestID) -> String? { nil }
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
@@ -3050,6 +3055,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
+            // Thought counts require the preceding token to be confirmed first.
+            ids.allSatisfy({ scheduler.record(for: $0)?.request.reasoningBudget == nil }),
             // Constraint state advances from the host-confirmed token. A
             // constrained row chains only when both its constraint and the
             // sampler opt in: N+1 is then masked speculatively and redrawn
@@ -5363,6 +5370,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishPlainRow(id, reason: CBv2NonFiniteLogits.finishReason)
                 continue
             }
+            if let failure = sampler.reasoningBudgetFailure(for: id) {
+                finishPlainRow(id, reason: .error(failure))
+                continue
+            }
             finalizedPlainWork = true
             finalizedPlainRowCount += 1
             let token = Int(host[i])
@@ -6322,7 +6333,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             promptTokens: rec.request.promptTokens,
             outputTokens: Array(rec.tokens.dropFirst(rec.request.promptTokens.count)),
             tokenConstraint: rec.request.tokenConstraint,
-            maxTokens: rec.request.maxTokens)
+            maxTokens: rec.request.maxTokens,
+            reasoningBudget: rec.request.reasoningBudget)
     }
 
     // MARK: Boundary housekeeping
