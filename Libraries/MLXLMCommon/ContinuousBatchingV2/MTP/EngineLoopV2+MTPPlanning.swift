@@ -318,7 +318,6 @@ extension EngineLoopV2 {
         return plan.assignments.contains { assignment in
             guard let rec = scheduler.record(for: assignment.id),
                 mtpBasicEligible(rec)
-                    || mtpRecordsPromptHistory(rec, range: Self.mtpPlannedRange(rec, assignment))
             else { return false }
             // Prompt rows acquire their KV state inside execution. Absence
             // here is not ineligibility; route them through the hidden-returning
@@ -337,43 +336,12 @@ extension EngineLoopV2 {
             return false
         }
         return plan.assignments.allSatisfy { assignment in
-            guard let rec = scheduler.record(for: assignment.id) else { return true }
-            guard mtpBasicEligible(rec) else {
-                return !mtpRecordsPromptHistory(
-                    rec, range: Self.mtpPlannedRange(rec, assignment))
-            }
+            guard let rec = scheduler.record(for: assignment.id), mtpBasicEligible(rec)
+            else { return true }
             guard let state = kvStates[assignment.id] else { return false }
             return !Self.mtpStorageEligible(state)
                 || (assignment.numTokens == 1 && rec.generatedTokenCount > 0
                     && rec.numComputedTokens == rec.tokens.count)
         }
-    }
-
-    /// The token range a plan assigned (the scheduler already advanced it).
-    private static func mtpPlannedRange(
-        _ rec: CBv2ScheduledRequest, _ assignment: (id: CBv2RequestID, numTokens: Int)
-    ) -> Range<Int> {
-        rec.numComputedTokens - assignment.numTokens ..< rec.numComputedTokens
-    }
-
-    /// A request that cannot speculate still records the assistant's prompt
-    /// history over `range` when that prompt can leave a prefix checkpoint.
-    /// The history is a function of the prompt alone, and a checkpoint
-    /// without it could not be restored by a request that speculates. Only a
-    /// first-pass text prompt of a drafter that opted in
-    /// (`checkpointsNonSpeculatingRows`); such a row never drafts or stores a
-    /// carry, and `beginMTPPlan` releases its state once it is decode-ready.
-    func mtpRecordsPromptHistory(_ rec: CBv2ScheduledRequest, range: Range<Int>) -> Bool {
-        guard let mtp, mtp.tracksPersistentHistory,
-            hybridPrefixCache != nil || completeCheckpointCapture?.codec.assistant != nil,
-            (mtp.drafter as? any CBv2MTPPrefixCheckpointDrafter)?.checkpointsNonSpeculatingRows
-                == true,
-            rec.request.prefixCacheEnabled, !rec.request.hasOutOfBandCheckpointInput,
-            rec.preemptionCount == 0
-        else { return false }
-        // The final prompt token alone is a decode row whose state is released.
-        let promptCount = rec.request.promptTokens.count
-        return range.upperBound < promptCount
-            || (range.upperBound == promptCount && range.count > 1)
     }
 }
