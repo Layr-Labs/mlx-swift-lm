@@ -127,6 +127,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public var acceptsLogprobRows: Bool {
         nativeShutdownState == nil || issuedNativeExecutionContract?.supportsLogprobCapture == true
     }
+    /// Whether `submit` accepts a request with a `tokenConstraint` (the
+    /// sampler must support constraints too): an untracked engine always does,
+    /// a native-tracked engine only when its issued contract qualifies them.
+    public var acceptsTokenConstraints: Bool {
+        nativeShutdownState == nil
+            || issuedNativeExecutionContract?.supportsTokenConstraints == true
+    }
     /// A sealed failure only, never a positive drain/refund assertion. Allows
     /// the existing host fault registry to refuse other native admissions
     /// immediately after a failed warm preparation, without another fence.
@@ -1229,7 +1236,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 "encoded cluster media requires the native cluster worker")
         }
         if nativeShutdownState != nil,
-            request.positionState != nil || request.tokenConstraint != nil
+            request.positionState != nil
+                || (request.tokenConstraint != nil && !acceptsTokenConstraints)
                 || (request.sampling.topLogprobs != 0 && !acceptsLogprobRows)
         {
             throw CBv2NativeShutdownError.unsupportedConsumer

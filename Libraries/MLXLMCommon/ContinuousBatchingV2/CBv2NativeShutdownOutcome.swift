@@ -97,6 +97,13 @@ public struct CBv2NativeExecutionContract: Sendable {
             || profile == "glm5_next_native_paged_rectangular_mtp_v1"
             || profile == "glm5_next_native_paged_full_state_rectangular_mtp_v1"
     }
+    /// GLM page-bank profiles mask a token-constrained row as on a generic
+    /// engine, for the reason logprob rows are captured there: every target row
+    /// samples with the engine's ordinary sampler, and a constrained row never
+    /// drafts or verifies (`EngineLoopV2.mtpBasicEligible`). The constraint's
+    /// host callbacks run between steps, as on any engine. MiMo profiles are not
+    /// qualified.
+    public var supportsTokenConstraints: Bool { supportsLogprobCapture }
     /// Separate permission of the same ticket: the GLM page bank verifies one
     /// captured rectangular window per round, optionally with its complete
     /// prefix store (a distinct profile, so checkpoint identities differ).
