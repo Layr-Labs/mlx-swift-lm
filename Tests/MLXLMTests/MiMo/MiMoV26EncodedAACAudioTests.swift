@@ -105,6 +105,17 @@ final class MiMoV26EncodedAACAudioTests: XCTestCase {
         XCTAssertEqual(ender.ended, 2)
         XCTAssertEqual(passes.retrying, [true, false])
     }
+    func testAudioReaderDiagnosticMatrix() async throws {
+        let data = try XCTUnwrap(Data(base64Encoded: Self.fixture))
+        try await AudioReaderDiagnosticProbe.run(
+            source: .memory(data), label: "mimo-aac",
+            settings: [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false,
+                AVLinearPCMIsBigEndianKey: false,
+            ])
+    }
+
     // Original synthetic black video + 440 Hz tone, 1 s, H.264 + stereo AAC.
     // AVAssetReader performs real decompression, including container priming.
     private static let fixture = [

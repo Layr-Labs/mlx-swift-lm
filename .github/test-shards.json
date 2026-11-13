@@ -272,6 +272,19 @@
       ],
       "strict": true,
       "own_process": true
+    },
+    {
+      "name": "audio-reader-diagnosis-isolated",
+      "strict": true,
+      "extra": true,
+      "own_process": true,
+      "filters": [
+        "(AudioReaderRetryTests|MiMoV26EncodedAACAudioTests)/test(AudioReaderDiagnosticMatrix|UserInputAudioRetryAfterAFailedReaderPassKeepsTheSamples|FailedAACReaderPassIsDecodedAgainWithTheSameOutput)"
+      ],
+      "env": {
+        "DARKBLOOM_AUDIO_DIAGNOSTIC_CONTEXT": "isolated"
+      },
+      "timeout_minutes": 10
     }
   ],
   "shards": [
@@ -616,6 +629,11 @@
     {
       "estimated_seconds": 465,
       "runs": [
+        {
+          "groups": [
+            "audio-reader-diagnosis-isolated"
+          ]
+        },
         {
           "groups": [
             "native-quantized-checkpoints"

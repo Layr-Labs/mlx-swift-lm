@@ -257,11 +257,15 @@ def:
         `VideoReaderRetry.nextSample`'s test hook; `AudioReaderRetryTests` and the MiMo audio tests end
         audio readers the same way (`ReaderPassFaults.swift`). `CorruptClipDecoderCodesTests` decodes
         H.264 and HEVC clips with corrupt NAL units and checks that none gives a transient code.
+        Temporary raw-PCM diagnostics compare fault-free and retried AAC reads, asset reuse and
+        retained-reader lifetime in both ordinary shards and an additional isolated process.
+        Existing bit/hash, frame, channel, cancellation and retry assertions remain unchanged.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Tests/MLXLMTests/VideoReaderRetryTests.swift"
         - "Tests/MLXLMTests/CorruptClipDecoderCodesTests.swift"
         - "Tests/MLXLMTests/AudioReaderRetryTests.swift"
+        - "Tests/MLXLMTests/AudioReaderDiagnosticProbe.swift"
         - "Tests/MLXLMTests/ReaderPassFaults.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
