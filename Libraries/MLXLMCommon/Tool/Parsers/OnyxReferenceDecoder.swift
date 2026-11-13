@@ -357,11 +357,13 @@ struct OnyxReferenceDecoder: Sendable {
         return word.hasPrefix("to=") && !word.contains("<")
     }
 
-    /// Whether the first text of a stream can still be its header.
+    /// Whether the first text of a stream can still be its header: `to=…`
+    /// with nothing but whitespace around it.
     private static func canBecomeHeader(_ text: String) -> Bool {
-        let header = text.drop(while: \.isWhitespace)
-        if header.isEmpty { return true }
-        return canBecomeBareHeader(header) && !header.contains(where: \.isWhitespace)
+        let fields = text.split(whereSeparator: \.isWhitespace)
+        guard let field = fields.first else { return true }
+        return fields.count == 1 && canBecomeBareHeader(field)
+            && (field.hasPrefix("to=") || text.last?.isWhitespace != true)
     }
 
     /// Where the part of a body starts that must wait: its trailing

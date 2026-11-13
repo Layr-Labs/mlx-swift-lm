@@ -724,6 +724,20 @@ extension UnitTests {
             #expect(outcome.protocolErrors.count == 1)
         }
 
+        @Test func whitespaceAroundTheFirstHeaderIsFraming() throws {
+            for script in ["\n to=self \n<|message|>plan<|eom|>", "to=self<|message|>plan<|eom|>"] {
+                for width in [1, 3, 17] {
+                    let outcome = try Self.run(script, width: width)
+                    #expect(outcome.reasoning == "plan")
+                    #expect(outcome.content.isEmpty)
+                }
+            }
+            // A word that only starts like a header is content.
+            #expect(try Self.run("to do: nothing").content == "to do: nothing")
+            #expect(try Self.run("to=x and more").content == "to=x and more")
+            #expect(try Self.run("  today").content == "  today")
+        }
+
         @Test func endOfTextEndsAnOpenFrameWithoutLeaking() throws {
             let outcome = try Self.run(" to=user<|message|>answer<|end_of_text|>")
             #expect(outcome.content == "answer")

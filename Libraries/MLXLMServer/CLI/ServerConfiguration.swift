@@ -137,8 +137,8 @@ public enum MLXServerCLI {
               --host <host>                Bind host (default: 127.0.0.1)
               --port <port>                Bind port (default: 8080)
               --model-type <type>          Hint for automatic tool-call parser selection
-              --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony
-              --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony
+              --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony, atem
+              --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony, onyx
               --embedding-model <id>       Optional embedding model id for /v1/embeddings
               --list-routes                Print the server route manifest
           -h, --help                       Print this help

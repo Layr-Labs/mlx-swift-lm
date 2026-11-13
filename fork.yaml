@@ -269,6 +269,35 @@ def:
         - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
         - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
+    - title: "Muse Glimmer: Onyx frames and ATEM tool calls"
+      description: |
+        Upstream reads Muse Glimmer output strictly (`OnyxStreamAdapter`, `ATEMToolCallParser`): one invoke
+        for each tool frame, the invoke name equal to the frame's recipient, fail-closed value typing, and
+        nothing from a frame that generation leaves open. Those two files are unchanged and stay the default.
+        `ToolCallPolicy.onyxParsing = .referenceParity` selects the reading that vLLM, SGLang and llama.cpp
+        share. `OnyxReferenceDecoder` reads the frames and `ATEMReferenceScanner` the calls: one call for each
+        complete invoke in order, a doubled tool name `X.X` as the declared tool `X`, values typed by the tool
+        schema (a string keeps its bytes, other values decode as JSON, a value that does not fit goes to the
+        validation policy), no call from an invoke that the token limit cut off, a frame that ends at a bare
+        `to=...<|message|>` header, and output without a frame as content. An undeclared tool is still
+        rejected, and a client schema nested past a fixed depth is read as untyped.
+        `OnyxReferenceStreamAdapter` compares the control tokens as ids, so text that spells a marker cannot
+        open a frame. `OnyxTokenStreamDecoder` and `OnyxTextStreamDecoder` are the public decoders for a host
+        with token ids or with marker-visible text. `ToolCallFormat.infer(from:)` maps `muse_glimmer` to `.atem`.
+        In the server, `ReasoningParserFormat.onyx` splits marker-visible text into reasoning and content, and
+        `MLXModelContainerEngine` reads an `.atem` model's frames from the token ids (`ChannelTokenLoopHandler`)
+        and reports reasoning and content as `.parsed`, because `Generation` has no reasoning event.
+        The unit tests port the vLLM Muse Glimmer parser cases and its schema value table.
+      globs:
+        - "Libraries/MLXLMCommon/Tool/Parsers/ATEMReferenceScanner.swift"
+        - "Libraries/MLXLMCommon/Tool/Parsers/OnyxReference*.swift"
+        - "Libraries/MLXLMCommon/Tool/Parsers/OnyxStreamDecoders.swift"
+        - "Libraries/MLXLMServer/Parsing/StreamingOnyxReasoningParser.swift"
+        - "Libraries/MLXLMServer/Runtime/ChannelTokenLoopHandler.swift"
+        - "Tests/MLXLMTests/Unit/Tool/ATEMReferenceScannerTests.swift"
+        - "Tests/MLXLMTests/Unit/Tool/Onyx*.swift"
+        - "Tests/MLXLMServerTests/Unit/Parsing/OnyxReasoningParserTests.swift"
+        - "Tests/MLXLMServerTests/Kernel/Runtime/OnyxContainerEngineTests.swift"
     - title: "Tool calling and parsers"
       description: |
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
