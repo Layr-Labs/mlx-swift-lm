@@ -868,6 +868,10 @@ def:
         `response_format` (`json_object` / `json_schema`); streaming reasoning parsers (think tags,
         Gemma 4, Harmony); streamed tool-call handling; a batched engine adapter over CBv2 and a
         runtime `setMaxNumSeqs` for adaptive concurrency.
+        `DARKBLOOM_GEMMA_REOPENED_THOUGHTS=1` routes reopened Gemma thought spans into reasoning,
+        absorbs stray channel-close markers, and preserves opaque tool payloads in streamed and
+        collected output. Default-off retains the existing parsing behavior; the Gemma conformance
+        unit suite runs in separate enabled and disabled processes.
         Responses input replay retains reasoning and adjacent function calls in one assistant turn,
         preserving tool arguments and explicit message/result boundaries.
         Collected think-tag parsing keeps unclosed generated or prompt-seeded blocks in reasoning;
@@ -890,6 +894,7 @@ def:
         - "Executables/mlx-server/**"
         - "Tests/MLXLMServerTests/**"
         - "docs/server-request-validation.md"
+        - "skills/mlx-swift-lm/references/generation.md"
     - title: "Benchmarks and measurement"
       description: |
         Nothing here ships to users; it is how the fork proves its numbers. `BenchCBv2` (real-weights

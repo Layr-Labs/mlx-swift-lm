@@ -139,3 +139,13 @@ let (tokenStream, tokenTask) = try generateTokensTask(
 - Prefer `ChatSession` for standard chat UX.
 - Prefer `generateTask`/`generateTokensTask` when consumers may stop early.
 - Use raw token APIs only when you need token IDs directly.
+
+## Gemma 4 reasoning channels
+
+`DARKBLOOM_GEMMA_REOPENED_THOUGHTS=1` makes the Gemma 4 reasoning parser
+recognize each reopened `<|channel>thought` span and absorb unmatched
+`<channel|>` markers. Collected and streaming parsing use the same state
+machine. Tool-call payloads stay opaque, including channel-looking text inside
+quoted arguments. Set the variable before server startup; it is read once per
+process. Unset or `0` keeps the existing channel handling. This switch changes
+text parsing only; it does not enable model reasoning or alter token sampling.
