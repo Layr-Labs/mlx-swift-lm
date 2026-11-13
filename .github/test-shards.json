@@ -272,6 +272,19 @@
       ],
       "strict": true,
       "own_process": true
+    },
+    {
+      "name": "gemma-reopened-thought-enabled",
+      "strict": true,
+      "extra": true,
+      "metallib": false,
+      "filters": [
+        "GemmaReopenedThoughtConformanceTests"
+      ],
+      "env": {
+        "DARKBLOOM_GEMMA_REOPENED_THOUGHTS": "1"
+      },
+      "timeout_minutes": 5
     }
   ],
   "shards": [
@@ -1015,6 +1028,11 @@
           ],
           "tests": [
             "MLXLMTests.CBv2PagedKernelTests/decodeBatchCompositionInvariance()"
+          ]
+        },
+        {
+          "groups": [
+            "gemma-reopened-thought-enabled"
           ]
         }
       ]
