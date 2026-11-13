@@ -52,7 +52,8 @@ struct CBv2GrammarNonFiniteTests {
 
     private func engine(
         speculating: Bool, mode: CBv2MTPVerificationMode, independentWidths: Bool,
-        pauseAfterFirstDraft: Bool = false, nativeTracking: Bool = false
+        pauseAfterFirstDraft: Bool = false, nativeTracking: Bool = false,
+        constrainedSpeculation: Bool = true, maxSpeculativeBatch: Int = 2
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let target = Target()
         let kind = CBv2NonFiniteLogitsTests.kind
@@ -70,8 +71,9 @@ struct CBv2GrammarNonFiniteTests {
             admissionConfig: .init(watermarkFraction: 0),
             mtpDrafter: drafter,
             mtpConfig: .init(
-                enabled: speculating, maxDraftTokens: 2, fixedDraftTokens: 2,
-                verificationMode: mode, constrainedSpeculation: true),
+                enabled: speculating, maxDraftTokens: 2,
+                maxSpeculativeBatch: maxSpeculativeBatch, fixedDraftTokens: 2,
+                verificationMode: mode, constrainedSpeculation: constrainedSpeculation),
             nativeCompletionTracking: nativeTracking)
         if pauseAfterFirstDraft {
             drafter?.onFirstPrepare = { [weak candidate] in
@@ -82,11 +84,23 @@ struct CBv2GrammarNonFiniteTests {
         return (candidate, storage)
     }
 
+    /// Admit the entire mixed batch before any row can seed or finish alone.
+    private func submitTogether(_ requests: [CBv2Request], to engine: EngineV2) throws
+        -> [AsyncStream<CBv2Event>]
+    {
+        let loop = engine.loopForTesting
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = loop.stepCount }
+        defer { loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil } }
+        return try requests.map { try engine.submit($0) }
+    }
+
     @Test(.timeLimit(.minutes(2)), arguments: [false, true])
     func nonFiniteFailureKeepsConfirmedPrefixAndNeighbor(independentWidths: Bool) async throws {
-        // Late fault, first-column fault, and a poisoned suffix discarded at
-        // the first grammar mismatch. The last case must never report NaN.
-        for path in [Array(4 ... 11), Array(5 ... 12), [4, 5, 8, 9, 10, 11, 12, 13]] {
+        // Late verify, first verify column, ordinary seed, and an unconsumed
+        // poisoned suffix. The last case must never report NaN.
+        for path in [
+            Array(4 ... 11), Array(5 ... 12), Array(6 ... 13), [4, 5, 8, 9, 10, 11, 12, 13],
+        ] {
             for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
                 let paths = [path, Array(21 ... 28)]
                 var expected: [CBv2SchedCollected] = []
@@ -126,15 +140,16 @@ struct CBv2GrammarNonFiniteTests {
                 let (candidate, storage) = engine(
                     speculating: true, mode: mode, independentWidths: independentWidths)
                 let grammars = paths.map(CBv2MTPInterningConstraint.init)
-                let streams = try paths.indices.map { row in
+                let requests = paths.indices.map { row in
                     var request = CBv2Request(
                         id: CBv2RequestID(UInt64(row + 1)),
                         promptTokens: [1, 2, paths[row][0] - 1],
                         sampling: .init(temperature: 0), maxTokens: paths[row].count,
                         stopTokens: [0])
                     request.tokenConstraint = grammars[row]
-                    return try candidate.submit(request)
+                    return request
                 }
+                let streams = try submitTogether(requests, to: candidate)
                 async let first = cbv2SchedCollect(streams[0])
                 async let second = cbv2SchedCollect(streams[1])
                 let actual = await [first, second]
@@ -191,12 +206,10 @@ struct CBv2GrammarNonFiniteTests {
                 let (candidate, storage) = engine(
                     speculating: true, mode: mode, independentWidths: independentWidths)
                 let grammars = paths.map(CBv2MTPInterningConstraint.init)
-                let streams = try paths.indices.map { row in
-                    try candidate.submit(
-                        request(
-                            UInt64(row + 1), grammar: grammars[row],
-                            stop: row == 0 ? stop : nil))
+                let requests = paths.indices.map { row in
+                    request(UInt64(row + 1), grammar: grammars[row], stop: row == 0 ? stop : nil)
                 }
+                let streams = try submitTogether(requests, to: candidate)
                 async let first = cbv2SchedCollect(streams[0])
                 async let second = cbv2SchedCollect(streams[1])
                 let actual = await [first, second]
@@ -213,6 +226,57 @@ struct CBv2GrammarNonFiniteTests {
                 #expect(storage.bytesReserved == 0)
             }
         }
+    }
+
+    @Test(.timeLimit(.minutes(2)), arguments: [false, true])
+    func ordinaryFallbackConfirmsOnlyFiniteTokensWhenGrammarMTPIsOptedIn(optedIn: Bool)
+        async throws
+    {
+        let (oracle, oracleStorage) = engine(
+            speculating: false, mode: .serialTarget, independentWidths: false)
+        let oracleGrammar = CBv2MTPInterningConstraint(Array(5 ... 12))
+        let expected = await cbv2SchedCollect(try oracle.submit(request(1, grammar: oracleGrammar)))
+        #expect(expected.tokens == [5, 6])
+        #expect(expected.finishReason == CBv2NonFiniteLogits.finishReason)
+        #expect(oracleGrammar.confirmedTransitions == [5, 6, 7])
+        await oracle.shutdown()
+        #expect(oracleStorage.bytesReserved == 0)
+
+        // Two live rows exceed the configured speculative batch cap. The
+        // poison must therefore be consumed by ordinary finalization.
+        let (candidate, storage) = engine(
+            speculating: true, mode: .serialTarget, independentWidths: false,
+            constrainedSpeculation: optedIn, maxSpeculativeBatch: 1)
+        let grammar = CBv2MTPInterningConstraint(Array(5 ... 12))
+        let neighbor = CBv2MTPInterningConstraint(Array(21 ... 28))
+        let streams = try submitTogether(
+            [request(1, grammar: grammar), request(2, grammar: neighbor)], to: candidate)
+        async let first = cbv2SchedCollect(streams[0])
+        async let second = cbv2SchedCollect(streams[1])
+        let (actual, healthy) = await (first, second)
+        #expect(actual.tokens == expected.tokens)
+        #expect(actual.finishReason == expected.finishReason)
+        #expect(actual.usage?.completionTokens == expected.usage?.completionTokens)
+        if optedIn {
+            #expect(grammar.confirmedTransitions == actual.tokens)
+        } else {
+            // Flag-off retains the documented ordinary-path defect.
+            #expect(grammar.confirmedTransitions == [5, 6, 7])
+        }
+        #expect(healthy.tokens == neighbor.path)
+        #expect(healthy.finishReason == .length)
+        #expect(neighbor.confirmedTransitions == healthy.tokens)
+        let failures = candidate.loopForTesting.onEngineQueueSync {
+            (
+                candidate.loopForTesting.nonFiniteSampledFailures,
+                candidate.loopForTesting.nonFiniteVerifyFailures
+            )
+        }
+        #expect(failures.0 == 1)
+        #expect(failures.1 == 0)
+        #expect((actual.usage?.timing.mtpRounds ?? 0) == 0)
+        await candidate.shutdown()
+        #expect(storage.bytesReserved == 0)
     }
 
     @Test(.timeLimit(.minutes(2)), arguments: [false, true])
