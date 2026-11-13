@@ -12,7 +12,7 @@ extension EngineLoopV2 {
     /// pre-sample verify positions with the request's real sampler semantics
     /// (`CBv2StepSampler.mtpVerifySample`): every committed token is then a
     /// genuine target sample, which is exact for the output distribution at
-    /// any temperature/top-p/top-k/min-p. The remaining gates stay: token
+    /// any temperature/top-p/top-k/min-p. The remaining gates stay: non-opt-in
     /// constraints, logprob capture, logit bias, and penalties are stateful
     /// per-position transforms the verify pre-sampler does not reproduce,
     /// and stop strings need the serial detokenizer walk.

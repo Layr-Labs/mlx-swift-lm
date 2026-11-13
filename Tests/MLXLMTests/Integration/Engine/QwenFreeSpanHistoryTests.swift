@@ -176,76 +176,84 @@ func makeQwenFreeSpanFixture() throws -> (Qwen35TextModel, Qwen35InlineMTPAssist
 
 @Suite("Qwen free-span assistant history", .serialized, .tags(.integration))
 struct QwenFreeSpanHistoryTests {
-    @Test(arguments: [false, true], [false, true])
+    @Test(arguments: [false, true], [0, 1])
     func protectedSpanRetainsTheNativeAssistantHistory(
-        ordinaryHistory: Bool, enabled: Bool
+        ordinaryHistory: Bool, initialState: Int
     ) async throws {
-        let (target, native) = try makeQwenFreeSpanFixture()
-        let assistant = ObservedQwenSpanAssistant(native)
-        let kinds = target.cbv2LayerKinds
-        let adapter = CBv2SteppableLanguageModelAdapter(target)
-        let observed = try CBv2NativeKVTypeProbe.run(
-            model: adapter, layerKinds: kinds,
-            caches: target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
-        let backend = try PagedKVBackend(
-            layerKinds: kinds,
-            config: .init(
-                capacityBytes: 64 << 20, maxPrefillChunk: 32,
-                nominalMaxSequenceLength: 512, segmentSizeBytes: 64 << 10,
-                layerDTypes: observed.layerDTypes))
-        let storage = backend.makeLayerCaches()
-        let indices = Dictionary(
-            uniqueKeysWithValues: kinds.enumerated().map {
-                ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
-            })
-        let engine = EngineV2(
-            model: adapter, layerKinds: kinds, backend: backend,
-            cacheProvider: CBv2LayerCacheBank(
-                caches: target.newCacheV2 { index, _ in storage[indices[index]!] }),
-            schedulerConfig: .init(
-                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
-                prefillChunkSize: 32, maxWaiting: 4, enablePrefixCache: false),
-            admissionConfig: .init(watermarkFraction: 0),
-            mtpDrafter: assistant,
-            mtpConfig: .init(
-                enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
-                verificationMode: .serialTarget, ordinaryDecodeHistory: ordinaryHistory,
-                prefillCarry: ordinaryHistory, freeSpanSpeculation: enabled))
-        let result = await cbv2SchedCollect(
-            try engine.submit(
-                .init(
-                    id: .init(42), promptTokens: [1, 2, 3], sampling: .init(temperature: 0),
-                    maxTokens: 20, stopTokens: [63], tokenConstraint: QwenSpanConstraint())))
-        let metrics = try #require(engine.mtpMetricsSnapshot())
-        await engine.shutdown()
-        let expected = [4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]
-        #expect(result.tokens == expected)
-        #expect(result.finishReason == .length)
-        if !enabled {
-            #expect(metrics.rounds == 0 && assistant.starts.isEmpty)
-            return
-        }
-        #expect(metrics.acceptedTokens > 0)
-        let starts = assistant.starts.map {
-            (seed: Int($0.token.item(Int32.self)), history: $0.history)
-        }
-        #expect(starts.contains { (4 ... 8).contains($0.seed) })
-        #expect(starts.contains { $0.seed >= 22 })
-        #expect(!starts.contains { [9, 20, 21].contains($0.seed) })
-        for start in starts {
-            let outputIndex = try #require(expected.firstIndex(of: start.seed))
-            #expect(
-                start.history == 3 + outputIndex - 1,
-                "seed \(start.seed) has \(start.history) trusted transitions")
+        for enabled in [false, true] {
+            let (target, native) = try makeQwenFreeSpanFixture()
+            let assistant = ObservedQwenSpanAssistant(native)
+            let kinds = target.cbv2LayerKinds
+            let adapter = CBv2SteppableLanguageModelAdapter(target)
+            let observed = try CBv2NativeKVTypeProbe.run(
+                model: adapter, layerKinds: kinds,
+                caches: target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
+            let backend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: .init(
+                    capacityBytes: 64 << 20, maxPrefillChunk: 32,
+                    nominalMaxSequenceLength: 512, segmentSizeBytes: 64 << 10,
+                    layerDTypes: observed.layerDTypes))
+            let storage = backend.makeLayerCaches()
+            let indices = Dictionary(
+                uniqueKeysWithValues: kinds.enumerated().map {
+                    ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
+                })
+            let engine = EngineV2(
+                model: adapter, layerKinds: kinds, backend: backend,
+                cacheProvider: CBv2LayerCacheBank(
+                    caches: target.newCacheV2 { index, _ in storage[indices[index]!] }),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                    prefillChunkSize: 32, maxWaiting: 4, enablePrefixCache: false),
+                admissionConfig: .init(watermarkFraction: 0),
+                mtpDrafter: assistant,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
+                    verificationMode: .serialTarget, ordinaryDecodeHistory: ordinaryHistory,
+                    prefillCarry: ordinaryHistory, freeSpanSpeculation: enabled))
+            let result = await cbv2SchedCollect(
+                try engine.submit(
+                    .init(
+                        id: .init(42), promptTokens: [1, 2, 3], sampling: .init(temperature: 0),
+                        maxTokens: 20, stopTokens: [63],
+                        tokenConstraint: QwenSpanConstraint(initialState: initialState))))
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            await engine.shutdown()
+            let expected =
+                initialState == 0
+                ? [4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]
+                : Array(20 ... 39)
+            #expect(result.tokens == expected)
+            #expect(result.finishReason == .length)
+            if !enabled {
+                #expect(metrics.rounds == 0 && assistant.starts.isEmpty)
+                continue
+            }
+            #expect(metrics.acceptedTokens > 0)
+            let starts = assistant.starts.map {
+                (seed: Int($0.token.item(Int32.self)), history: $0.history)
+            }
+            if initialState == 0 { #expect(starts.contains { (4 ... 8).contains($0.seed) }) }
+            #expect(starts.contains { $0.seed >= 22 })
+            #expect(!starts.contains { [9, 20, 21].contains($0.seed) })
+            for start in starts {
+                let outputIndex = try #require(expected.firstIndex(of: start.seed))
+                #expect(
+                    start.history == 3 + outputIndex - 1,
+                    "seed \(start.seed) has \(start.history) trusted transitions")
+            }
         }
     }
 }
 
 private final class QwenSpanConstraint: CBv2FreeSpanTokenConstraint, @unchecked Sendable {
     let mode = CBv2TokenConstraintMode.auto
-    let initialState = 0
+    let initialState: Int
     let maxTokens = 20
     let fallbackTokenID = 63
+
+    init(initialState: Int = 0) { self.initialState = initialState }
 
     func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
         guard remainingTokens > 0 else { return [] }

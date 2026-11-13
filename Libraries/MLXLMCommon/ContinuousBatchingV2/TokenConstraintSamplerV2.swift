@@ -122,8 +122,8 @@ final class CBv2TokenConstraintSampler {
         invalidated.removeAll(keepingCapacity: true)
     }
 
-    /// Apply a per-row boolean mask to `[B, vocab]` logits. The common path
-    /// returns the original array without allocating a mask.
+    /// Apply a per-row mask to `[B, vocab]` or `[B, width, vocab]` logits.
+    /// The unconstrained path returns the original array without a mask.
     ///
     /// `speculative`: every row has exactly one launched-but-unconfirmed
     /// sample (chained decode). Masks use the confirmed state with the
