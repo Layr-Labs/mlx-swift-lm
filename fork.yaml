@@ -58,6 +58,27 @@ def:
         - "ThirdPartyNotices/**"
         - "docs/flint.md"
         - "scripts/generate-flint-oracle.py"
+    - title: "Native Muse Glimmer text decoder"
+      description: |
+        Fork-only text tower for Muse Glimmer 30B under `MLXLLM/Models/MuseGlimmer/`. It runs the
+        arithmetic of upstream's `MLXVLM/Models/MuseGlimmer.swift`, which stays unchanged, with
+        projection slots that hold ModelOpt layers, a ContinuousBatchingV2 attention branch, a
+        prompt-output seam, decode command-buffer limits and complete prefix checkpoints. The
+        model serves only from segmented paged KV: `CBv2ModelCapabilities.requiresPagedKV`
+        (default off, set by no other model) makes the engine refuse a contiguous backend.
+        `MuseGlimmerInstallation` loads NVIDIA's ModelOpt checkpoint from SHA-256-pinned shards:
+        calibrated FP8 projections with saturating activation overflow, weight-only NVFP4
+        projections (`ModelOptWeightOnlyNVFP4Linear` in `MLXLMCommon/Quantization`) and BF16
+        ones, with typed refusals for missing, extra or misshapen tensors. The target side of
+        block drafting (captured residuals, raw embeddings, the head, `MuseGlimmerCBv2Adapter`)
+        is present; the drafter is not. Vision is not wired and the type is not registered in a
+        factory. Tests use tiny synthetic models, except `MuseGlimmerRealArtifactTests`, which
+        run against the real checkpoint and an independent oracle only when
+        `MUSE_GLIMMER_NVFP4_DIR` and `MUSE_GLIMMER_ORACLE_DIR` are set.
+      globs:
+        - "Libraries/MLXLLM/Models/MuseGlimmer/**"
+        - "Tests/MLXLMTests/Integration/MuseGlimmer/**"
+        - "docs/muse-glimmer.md"
     - title: "ContinuousBatchingV2 engine"
       description: |
         The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible
