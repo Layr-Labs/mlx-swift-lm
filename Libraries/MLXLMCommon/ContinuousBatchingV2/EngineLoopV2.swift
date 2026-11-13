@@ -1165,21 +1165,19 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     static let nativeSegmentReleaseEnvironmentKey = "DARKBLOOM_NATIVE_SEGMENT_RELEASE"
 
-    /// Unset: release after 1 s idle. `0`, `off` or `false`: never release
-    /// (the pool keeps its backing until it retires, as before). A positive
-    /// number: the idle seconds.
+    /// Unset: release after 30 s idle, the idle sweep other pools' retained
+    /// segments already use. A positive number below a day: the idle seconds.
+    /// Any other value (`0`, `off`, `-1`, empty, unparseable) never releases:
+    /// the pool keeps its backing until it retires, as before.
     static func nativeSegmentReleaseIdleNanosDefault(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int64 {
-        let defaultNanos: Int64 = 1_000_000_000
-        guard
-            let raw = environment[nativeSegmentReleaseEnvironmentKey]?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
-        else { return defaultNanos }
-        if ["0", "off", "false", "no"].contains(raw) { return -1 }
-        guard let seconds = Double(raw), seconds.isFinite, seconds > 0, seconds < 86_400 else {
-            return defaultNanos
+        guard let raw = environment[nativeSegmentReleaseEnvironmentKey] else {
+            return 30_000_000_000
         }
+        guard let seconds = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            seconds.isFinite, seconds > 0, seconds < 86_400
+        else { return -1 }
         return Int64(seconds * 1e9)
     }
     /// Steps that submitted eager layer-cache inner state (the offset chain +

@@ -1328,16 +1328,24 @@ extension PagedKVPool {
         else { return nil }
         guard issuedNativeReleasableBytes > 0 else { return 0 }
         let before = bytesMaterialized
+        // The lease covers the backing; `release(to:)` may only lower it.
+        if let lease = physicalLease, lease.bytes < before { return nil }
         let operation = try binding.beginWork(nativeData: false)
         retainNativePoolBacking(in: operation)
-        // A failed drain has already failed the native runtime.
-        try operation.requiredDrain()
+        do {
+            try operation.requiredDrain()
+        } catch {
+            // A failed drain has already failed the native runtime.
+            operation.fail()
+            throw error
+        }
         // Backing references remain on the operation while these metadata maps
         // and actual M coverage are detached OUTSIDE commit.
         for group in groups.values { group.trimSegments { _ in } }
         let remaining = bytesMaterialized
-        guard operation.finish({ physicalLease?.release(to: remaining) }) else { return nil }
-        if remaining < before { retainedSegmentsTouchedNanos = Self.uptimeNanos() }
+        // `finish` refuses only after a terminal native fault, which has
+        // already failed every row; the trim stands either way.
+        _ = operation.finish { physicalLease?.release(to: remaining) }
         return before - remaining
     }
 

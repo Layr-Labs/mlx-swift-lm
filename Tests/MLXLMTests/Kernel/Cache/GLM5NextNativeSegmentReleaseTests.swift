@@ -125,15 +125,32 @@ extension KernelTests {
             return MLXArray(values, shape)
         }
 
-        /// The idle-release setting the engine reads at construction.
-        private static func withRelease<T>(_ value: String?, _ body: () throws -> T) rethrows -> T {
-            let key = "DARKBLOOM_NATIVE_SEGMENT_RELEASE"
-            let previous = ProcessInfo.processInfo.environment[key]
-            if let value { setenv(key, value, 1) } else { unsetenv(key) }
-            defer {
-                if let previous { setenv(key, previous, 1) } else { unsetenv(key) }
+        /// `DARKBLOOM_NATIVE_SEGMENT_RELEASE` as the engine parses it. Tests set
+        /// the engine's own field instead of the process environment, which
+        /// suites running in parallel would also read.
+        private static func releaseNanos(_ value: String?) -> Int64 {
+            EngineLoopV2.nativeSegmentReleaseIdleNanosDefault(
+                environment: value.map { [EngineLoopV2.nativeSegmentReleaseEnvironmentKey: $0] }
+                    ?? [:])
+        }
+
+        /// The pool's physical floor as its lease and the admission ledger see
+        /// it, beside the backing the pool's maps hold.
+        private struct Floor: Equatable {
+            let lease: Int
+            let overhead: Int
+            let materialized: Int
+        }
+
+        private func floorOf(_ served: Served) -> Floor {
+            served.engine.loopForTesting.onEngineQueueSync {
+                let pool = served.backend.pool
+                return Floor(
+                    lease: pool.physicalLease?.bytes ?? -1,
+                    overhead: pool.physicalLease?.accountingSnapshot?.physicalFloorOverheadBytes
+                        ?? -1,
+                    materialized: pool.bytesMaterialized)
             }
-            return try body()
         }
 
         /// What `trimSegments` would retire now: whole free segments beyond the
@@ -191,24 +208,25 @@ extension KernelTests {
                     gatheredAttention: limits),
                 processMemoryOwner: process, construction: NativeConstructionScope(),
                 completePrefixCache: store)
-            let engine = Self.withRelease(release) {
-                EngineV2(
-                    model: resources.model, layerKinds: target.cbv2LayerKinds,
-                    backend: resources.backend, cacheProvider: resources.cacheProvider,
-                    sampler: CBv2GreedySampler(),
-                    schedulerConfig: .init(
-                        maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
-                        prefillChunkSize: 32, maxConcurrentPartialPrefills: 1, maxWaiting: 4,
-                        enablePrefixCache: store != nil),
-                    admissionConfig: target.cbv2NativeAdmissionConfig,
-                    completePrefixCache: store, mtpDrafter: assistant,
-                    mtpConfig: .init(
-                        enabled: true, maxDraftTokens: verification.depth,
-                        maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
-                        verificationMode: verification.engineMode),
-                    processMemoryOwner: process, nativeCompletionTracking: true,
-                    nativeExecutionContract: resources.contract)
-            }
+            let engine = EngineV2(
+                model: resources.model, layerKinds: target.cbv2LayerKinds,
+                backend: resources.backend, cacheProvider: resources.cacheProvider,
+                sampler: CBv2GreedySampler(),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                    prefillChunkSize: 32, maxConcurrentPartialPrefills: 1, maxWaiting: 4,
+                    enablePrefixCache: store != nil),
+                admissionConfig: target.cbv2NativeAdmissionConfig,
+                completePrefixCache: store, mtpDrafter: assistant,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: verification.depth,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
+                    verificationMode: verification.engineMode),
+                processMemoryOwner: process, nativeCompletionTracking: true,
+                nativeExecutionContract: resources.contract)
+            let loop = engine.loopForTesting
+            let nanos = Self.releaseNanos(release)
+            loop.onEngineQueueSync { loop.nativeSegmentReleaseIdleNanos = nanos }
             #expect(resources.backend.nativeModelBinding?.isGLM5Next == true)
             #expect(engine.mtpInactiveReason == nil)
             return Served(engine: engine, backend: resources.backend, process: process)
@@ -220,6 +238,19 @@ extension KernelTests {
 
         private func isServed(_ reason: CBv2FinishReason?) -> Bool {
             reason == .length || reason == .stop
+        }
+
+        /// Unset releases after 30 s idle; a positive number sets the seconds;
+        /// any other explicit value is the rollback, never the default.
+        @Test func releaseSettingParsesSecondsAndDisablesEverythingElse() {
+            #expect(Self.releaseNanos(nil) == 30_000_000_000)
+            #expect(Self.releaseNanos("2.5") == 2_500_000_000)
+            #expect(Self.releaseNanos(" 1 ") == 1_000_000_000)
+            for rollback in [
+                "0", "0.0", "-1", "off", "false", "no", "disabled", "", "nan", "86400",
+            ] {
+                #expect(Self.releaseNanos(rollback) < 0, "\(rollback) must disable the release")
+            }
         }
 
         /// An idle engine returns its issued pool's free segments and their
@@ -235,6 +266,9 @@ extension KernelTests {
             #expect(first.tokens.count > 0)
             let returned = await cbv2SchedWait(timeoutSeconds: 60) { committed(served) == 0 }
             #expect(returned, "the idle engine kept \(committed(served)) committed bytes")
+            #expect(
+                floorOf(served) == Floor(lease: 0, overhead: 0, materialized: 0),
+                "lease and admission floor after the release: \(floorOf(served))")
             #expect(served.backend.bytesReserved == 0 && served.backend.bytesInUse == 0)
             let again = await cbv2SchedCollect(
                 try served.engine.submit(
@@ -283,7 +317,9 @@ extension KernelTests {
                 #expect(resumed.tokens == produced.tokens)
                 #expect((resumed.usage?.prefixCachePrefillTokensSaved ?? 0) > 0)
                 _ = await cbv2SchedWait(timeoutSeconds: 60) { committed(consumer) == 0 }
-                floors.append(committed(consumer))
+                let after = floorOf(consumer)
+                #expect(after.lease == after.materialized && after.overhead == after.materialized)
+                floors.append(after.lease)
             }
             #expect(floors == [0, 0, 0], "idle floor after each restore: \(floors)")
             guard case .quiescent = await consumer.engine.shutdownReportingNativeCompletion() else {
@@ -310,7 +346,6 @@ extension KernelTests {
             // Idle release is an hour away: only the refusal path can return them.
             let served = try engine(store: nil, release: "3600")
             let loop = served.engine.loopForTesting
-            let admission = served.engine.admissionForTesting
             let large = await cbv2SchedCollect(
                 try served.engine.submit(
                     .init(
@@ -324,16 +359,8 @@ extension KernelTests {
             let probe = CBv2StepScratchProbe()
             let refusals = Counter()
             let lone = CBv2RequestID(4203)
-            loop.onEngineQueueSync {
-                served.backend.pool.stepScratchReservationObserverForTesting = {
-                    _, requests, _ in
-                    probe.release()
-                    guard requests.contains(lone), Self.freeSegmentBytes(served.backend.pool) > 0
-                    else { return }
-                    refusals.increment()
-                    probe.exhaust(admission)
-                }
-            }
+            let idle = refuseBesideFreeSegments(
+                served, lone: lone, probe: probe, refusals: refusals)
             let result = await cbv2SchedCollect(
                 try served.engine.submit(
                     .init(
@@ -347,6 +374,10 @@ extension KernelTests {
             #expect(refusals.value == 1)
             #expect(
                 result.finishReason == expected.finishReason && result.tokens == expected.tokens)
+            let after = floorOf(served)
+            #expect(
+                after.lease == after.materialized && after.lease < idle.lease,
+                "floor \(idle) before the release, \(after) after")
             #expect(served.backend.bytesReserved == 0 && served.backend.bytesInUse == 0)
             await served.engine.shutdown()
             #expect(served.process.charged == 0)
@@ -380,22 +411,30 @@ extension KernelTests {
             return (served, expected)
         }
 
-        /// Refuse a lone request's step scratch while the pool holds free
-        /// segments: the production floor, at test scale.
+        /// Refuse a lone request's step scratch while the physical floor the
+        /// admission ledger charges still holds the idle pool's backing: the
+        /// production floor, at test scale. Only a refunded lease lets the row
+        /// through; trimming the pool's maps alone does not.
+        @discardableResult
         private func refuseBesideFreeSegments(
             _ served: Served, lone: CBv2RequestID, probe: CBv2StepScratchProbe, refusals: Counter
-        ) {
+        ) -> Floor {
             let admission = served.engine.admissionForTesting
+            let idleFloor = floorOf(served)
+            #expect(idleFloor.lease > 0 && idleFloor.lease == idleFloor.materialized)
+            #expect(idleFloor.overhead > 0, "the idle floor is charged: \(idleFloor)")
             served.engine.loopForTesting.onEngineQueueSync {
                 served.backend.pool.stepScratchReservationObserverForTesting = {
                     _, requests, _ in
                     probe.release()
-                    guard requests.contains(lone), Self.freeSegmentBytes(served.backend.pool) > 0
+                    guard requests.contains(lone),
+                        (served.backend.pool.physicalLease?.bytes ?? 0) >= idleFloor.lease
                     else { return }
                     refusals.increment()
                     probe.exhaust(admission)
                 }
             }
+            return idleFloor
         }
 
         /// Production's timing: three in four failures came within 5 s of the
@@ -406,6 +445,7 @@ extension KernelTests {
             let (served, expected) = try await floorBesideIdleEngine()
             let loop = served.engine.loopForTesting
             let binding = try #require(served.backend.nativeModelBinding)
+            loop.onEngineQueueSync { loop.nativeSegmentReleaseWaitNanos = 120_000_000_000 }
             // Stand-in for a finished request's publication: a live native loan.
             let publication = try loop.onEngineQueueSync {
                 try binding.beginWork(nativeData: false)
@@ -475,7 +515,7 @@ extension KernelTests {
                 return
             }
             #expect(message.hasPrefix(CBv2KVError.capacityExhaustedFinishPrefix))
-            #expect(elapsed >= 0.2 && elapsed < 9, "waited \(elapsed) s (the default wait is 10 s)")
+            #expect(elapsed >= 0.2 && elapsed < 60, "waited \(elapsed) s for a 0.2 s bound")
             #expect(refusals.value >= 2)
             await served.engine.shutdown()
         }
@@ -485,7 +525,6 @@ extension KernelTests {
         @Test func killSwitchKeepsFormerBehavior() async throws {
             let served = try engine(store: nil, release: "0")
             let loop = served.engine.loopForTesting
-            let admission = served.engine.admissionForTesting
             let large = await cbv2SchedCollect(
                 try served.engine.submit(
                     .init(
@@ -493,21 +532,16 @@ extension KernelTests {
                         sampling: .init(temperature: 0), maxTokens: 100)),
                 timeoutSeconds: Self.collectTimeout)
             #expect(isServed(large.finishReason))
-            let held = committed(served)
+            let held = floorOf(served)
             try await Task.sleep(nanoseconds: 300_000_000)
-            #expect(held > 0 && committed(served) == held)
+            #expect(held.lease > 0 && floorOf(served) == held)
 
             let probe = CBv2StepScratchProbe()
+            let refusals = Counter()
             let lone = CBv2RequestID(4402)
-            loop.onEngineQueueSync {
-                served.backend.pool.stepScratchReservationObserverForTesting = {
-                    _, requests, _ in
-                    probe.release()
-                    guard requests.contains(lone), Self.freeSegmentBytes(served.backend.pool) > 0
-                    else { return }
-                    probe.exhaust(admission)
-                }
-            }
+            let idle = refuseBesideFreeSegments(
+                served, lone: lone, probe: probe, refusals: refusals)
+            #expect(idle.lease == held.lease)
             let result = await cbv2SchedCollect(
                 try served.engine.submit(
                     .init(
@@ -525,6 +559,8 @@ extension KernelTests {
                 return
             }
             #expect(message.hasPrefix(CBv2KVError.capacityExhaustedFinishPrefix))
+            #expect(refusals.value == 1)
+            #expect(floorOf(served).lease == held.lease)
             await served.engine.shutdown()
         }
     }
