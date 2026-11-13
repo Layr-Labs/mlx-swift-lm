@@ -12,20 +12,23 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Render and deploy
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        forkdiff-render linux_arm64 ubuntu-latest
+
+  render:
+    name: Render fork diff
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['forkdiff-render'] }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -43,8 +46,9 @@ jobs:
 
       - name: Refuse to publish a stale analysis
         run: |
-          python3 -m pip install --quiet pyyaml
-          python3 scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
+          python3 -m venv "$RUNNER_TEMP/forkdiff-venv"
+          "$RUNNER_TEMP/forkdiff-venv/bin/python" -m pip install --quiet pyyaml
+          "$RUNNER_TEMP/forkdiff-venv/bin/python" scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
@@ -58,6 +62,31 @@ jobs:
             -repo . -fork fork.yaml -out tmp/pages/index.html
           touch tmp/pages/.nojekyll
 
+      - name: Keep the rendered page as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: forkdiff-page
+          path: tmp/pages/index.html
+          retention-days: 30
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: tmp/pages
+
+  deploy:
+    name: Deploy fork diff
+    needs: render
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
       - name: Is GitHub Pages enabled?
         # Pages must be switched on once by a repo admin (Settings → Pages →
         # Source: "GitHub Actions"). The workflow token cannot do that itself
@@ -75,23 +104,9 @@ jobs:
             echo "::notice::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}; built the page but skipped the deploy. Enable it once under Settings → Pages (Source: GitHub Actions) and re-run this workflow."
           fi
 
-      - name: Keep the rendered page as an artifact
-        if: steps.pages.outputs.enabled != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: forkdiff-page
-          path: tmp/pages/index.html
-          retention-days: 30
-
       - name: Setup Pages
         if: steps.pages.outputs.enabled == 'true'
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
-
-      - name: Upload artifact
-        if: steps.pages.outputs.enabled == 'true'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: tmp/pages
 
       - name: Deploy to GitHub Pages
         if: steps.pages.outputs.enabled == 'true'
