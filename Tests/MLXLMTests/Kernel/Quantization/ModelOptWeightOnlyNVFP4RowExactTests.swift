@@ -80,9 +80,11 @@ extension KernelTests {
                 outputs: outputs, inputs: inputs, seed: UInt64(100 + index))
             // Every shape in bfloat16; the other dtypes on two of them.
             for dtype in [DType.bfloat16, .float32, .float16]
-            where dtype == .bfloat16 || [(7, 48), (250, 1040)].contains(where: {
-                $0 == (outputs, inputs)
-            }) {
+            where dtype == .bfloat16
+                || [(7, 48), (250, 1040)].contains(where: {
+                    $0 == (outputs, inputs)
+                })
+            {
                 let x = fixture.activations(rows: 16, dtype: dtype)
                 let alone = (0 ..< 16).map {
                     weightOnlyNVFP4RowWords(fixture.product(x[$0 ..< $0 + 1], scalarRows: 0))[0]
@@ -152,7 +154,8 @@ extension KernelTests {
                 let byte = codes[row * inputs / 2 + k / 2]
                 let code = k % 2 == 0 ? byte & 0xF : byte >> 4
                 let value = magnitudes[Int(code & 7)]
-                return (code & 8 == 0 ? value : -value) * e4m3(scaleCodes[row * inputs / 16 + k / 16])
+                return (code & 8 == 0 ? value : -value)
+                    * e4m3(scaleCodes[row * inputs / 16 + k / 16])
             }
             // Float32 sums of the documented order for one row and output.
             func sum(_ row: Int, _ output: Int) -> Float {
