@@ -292,12 +292,10 @@ func makeV2Engine(
         }
     case .paged:
         // Model-capability veto FIRST, mirroring the production factory:
-        // a model whose capabilities refuse paged KV (hybrid recurrent
-        // trunks — Qwen3.5/3.6 — set `supportsPagedKV: false`) would pass
-        // kernel eligibility (d256 is in the kernel's supported set) and
-        // then hit EngineV2.init's capability PRECONDITION — a process
-        // trap, not the graceful skip this function promises. Throw the
-        // same catchable ineligibility the kernel path uses.
+        // a model whose capabilities refuse paged KV would pass kernel
+        // eligibility and then hit EngineV2.init's capability PRECONDITION
+        // — a process trap, not the graceful skip this function promises.
+        // Throw the same catchable ineligibility the kernel path uses.
         let benchCapabilities =
             (hooks.model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities
             ?? .attentionOnly
@@ -311,12 +309,27 @@ func makeV2Engine(
         // `PagedKVBackend.init` — it throws `backendIneligible` before any
         // dispatch could trap. Gemma-4 global layers (headDim 512 / GQA 8)
         // are eligible via the kernel's head split.
-        let paged = try PagedKVBackend(
+        //
+        // The pool is the serving pool (`PagedKVBackend.segmented`), typed
+        // from the key/value number types the loaded model actually stores
+        // (the probe the serving factory runs). A pool of the default
+        // float16 type refuses every write of a bfloat16 checkpoint
+        // ("paged KV dtype mismatch"), and a model that requires the native
+        // segmented layout (Qwen3.5/3.6/3.8) fails EngineV2.init's
+        // capability precondition on an unsegmented pool.
+        let observed = try CBv2NativeKVTypeProbe.run(
+            model: CBv2SteppableLanguageModelAdapter(hooks.model),
             layerKinds: hooks.layerKinds,
-            config: PagedKVPoolConfig(
-                capacityBytes: kvBytes,
-                maxPrefillChunk: schedulerConfig.prefillChunkSize,
-                nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength))
+            caches: try hooks.buildCaches { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            })
+        let paged = try PagedKVBackend.segmented(
+            admittedGrantBytes: kvBytes,
+            layerKinds: hooks.layerKinds,
+            layerDTypes: observed.layerDTypes,
+            maxPrefillChunk: schedulerConfig.prefillChunkSize,
+            nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength,
+            maxBufferLength: GPU.deviceInfo().maxBufferSize)
         let pagedCaches = paged.makeLayerCaches()
         // Route through newCacheV2 so GPT-OSS primes its sinks probe.
         // newCacheV2 hands the MODEL layer index (kind.modelLayerIndex ??
@@ -1088,7 +1101,9 @@ func runV2Cell(
                 2_048, prefillChunkSize, soloPrefillStripeTokens ?? 0),
             prefillChunkSize: prefillChunkSize,
             soloPrefillStripeTokens: soloPrefillStripeTokens,
-            maxWaiting: 16),
+            // A cell submits `batch` requests at once: a waiting queue of 16
+            // refused every request past the 16th and reported it as zeros.
+            maxWaiting: max(16, batch)),
         kvBytes: kvBytes)
 
     // One shared measured boundary after all warmup. Performance cells arm
