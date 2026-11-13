@@ -145,7 +145,17 @@ struct CBv2ReasoningBudgetNativeMiMoTests {
                     pixels: .init(
                         maximumInputElements: 10000, maximumOutputElements: 10000,
                         maximumWorkingBytes: 1 << 20),
-                    vision: .init(maximumPatches: 64, maximumAttentionScoreElements: 32768)),
+                    vision: .init(maximumPatches: 64, maximumAttentionScoreElements: 32768),
+                    audio: .init(
+                        maximumClips: 1, maximumChannels: 1, maximumSampleRate: 24000,
+                        maximumInputSamples: 48000, maximumResampledSamples: 48000,
+                        maximumResampleCoefficients: 100000, maximumMelFrames: 256,
+                        maximumSegments: 4, maximumPaddedMelFrames: 256,
+                        maximumWorkingElements: 64_000_000,
+                        frontendFrameBlockSize: 8, rvqTileFrames: 8),
+                    audioPatch: .init(
+                        maximumClips: 1, maximumFrames: 256, maximumPatches: 64,
+                        maximumWorkingElements: 16_000_000)),
                 retaining: scope)
             let engine = EngineV2(
                 model: binding.adapter, layerKinds: binding.adapter.layerKinds,
