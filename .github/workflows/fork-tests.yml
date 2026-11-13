@@ -74,6 +74,8 @@ jobs:
     with:
       lanes: |
         fork-tests macos_arm64 xcode-27 ${{ needs.plan.outputs.macos-jobs }}
+        shard-list linux_arm64 ubuntu-latest
+        shard-verify linux_arm64 ubuntu-latest
 
   build:
     name: Build
@@ -350,8 +352,8 @@ jobs:
 
   list:
     name: Check the shard map
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [build, route]
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-list'] }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -437,9 +439,9 @@ jobs:
 
   verify:
     name: Each test ran once
-    needs: [list, test]
+    needs: [list, test, route]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-verify'] }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
