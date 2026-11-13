@@ -1317,14 +1317,16 @@ extension PagedKVPool {
     /// engine queue only, outside the native outcome commit, between steps,
     /// with no attention work and no native loan but the pool's own lifetime
     /// loan. Segments holding an in-use or reserved page stay, exactly as
-    /// `trimSegments` keeps them. Returns the bytes released.
-    func releaseIssuedNativeFreeSegments() throws -> Int {
+    /// `trimSegments` keeps them. Returns the bytes released (0 when nothing
+    /// was free), or nil while other native work keeps the pool busy.
+    func releaseIssuedNativeFreeSegments() throws -> Int? {
         guard let binding = nativeModelBinding, binding.isGLM5Next, !binding.poolRetired,
-            issuedNativeReleasableBytes > 0, binding.canStartPoolRetirement,
-            activeAttentionWork == nil, attentionWorkOwners.isEmpty,
+            binding.canStartPoolRetirement, activeAttentionWork == nil,
+            attentionWorkOwners.isEmpty,
             groups.values.allSatisfy({ $0.deferredFrees.isEmpty }),
             residentPrefixQuarantineIsAbsent
-        else { return 0 }
+        else { return nil }
+        guard issuedNativeReleasableBytes > 0 else { return 0 }
         let before = bytesMaterialized
         let operation = try binding.beginWork(nativeData: false)
         retainNativePoolBacking(in: operation)
@@ -1334,7 +1336,7 @@ extension PagedKVPool {
         // and actual M coverage are detached OUTSIDE commit.
         for group in groups.values { group.trimSegments { _ in } }
         let remaining = bytesMaterialized
-        guard operation.finish({ physicalLease?.release(to: remaining) }) else { return 0 }
+        guard operation.finish({ physicalLease?.release(to: remaining) }) else { return nil }
         if remaining < before { retainedSegmentsTouchedNanos = Self.uptimeNanos() }
         return before - remaining
     }

@@ -1141,27 +1141,37 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var stepScratchRequeues: [CBv2RequestID: Int] = [:]
     /// An issued GLM pool returns its free segments only here
     /// (`PagedKVPool.releaseIssuedNativeFreeSegments`): once the engine has
-    /// been idle this long, and once before a lone row whose step scratch was
-    /// refused is retried. Negative disables both (kill switch
-    /// `DARKBLOOM_NATIVE_SEGMENT_RELEASE=0`). Engine-queue owned.
+    /// been idle this long, and before a lone row whose step scratch was
+    /// refused while the pool held free segments is retried. Negative disables
+    /// both (kill switch `DARKBLOOM_NATIVE_SEGMENT_RELEASE=0`). Engine-queue owned.
     var nativeSegmentReleaseIdleNanos: Int64 = EngineLoopV2.nativeSegmentReleaseIdleNanosDefault()
+    /// How long such a lone row may wait for the release while other native
+    /// work (a finished request's checkpoint publication, a retirement) keeps
+    /// the pool busy, before it fails as it did without the release.
+    var nativeSegmentReleaseWaitNanos: UInt64 = 10_000_000_000
     private var nativeIdleSinceNanos: UInt64?
     private var nativeNextIdleReleaseNanos: UInt64 = 0
     private var nativeSegmentReleaseRequested = false
-    private var nativeSegmentReleaseRetried: Set<CBv2RequestID> = []
+    /// Lone rows waiting for a release, by the instant they started waiting.
+    private var nativeSegmentReleaseWaiters: [CBv2RequestID: UInt64] = [:]
+    /// Lone rows a release has run for: their next refusal fails them.
+    private var nativeSegmentReleaseRanFor: Set<CBv2RequestID> = []
+    /// A waiting lone row's deferred step: the next step starts after a short
+    /// backoff instead of at once, so the wait does not spin the engine queue.
+    private var nativeSegmentReleaseBackoff = false
     /// Releases that returned backing, and the bytes they returned (test/telemetry hook).
     private(set) var nativeSegmentReleaseCount = 0
     private(set) var nativeSegmentReleasedBytes = 0
 
     static let nativeSegmentReleaseEnvironmentKey = "DARKBLOOM_NATIVE_SEGMENT_RELEASE"
 
-    /// Unset: release after 5 s idle. `0`, `off` or `false`: never release
+    /// Unset: release after 1 s idle. `0`, `off` or `false`: never release
     /// (the pool keeps its backing until it retires, as before). A positive
     /// number: the idle seconds.
     static func nativeSegmentReleaseIdleNanosDefault(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int64 {
-        let defaultNanos: Int64 = 5_000_000_000
+        let defaultNanos: Int64 = 1_000_000_000
         guard
             let raw = environment[nativeSegmentReleaseEnvironmentKey]?
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty
@@ -3002,11 +3012,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Process memory pressure reclaims retained free KV segments.
         (backend as? PagedKVBackend)?.pool.releaseRetainedSegmentsIfRequested()
         // A lone row's refused step scratch asked for an issued GLM pool's free
-        // segments before its one retry (`deferStepAfterScratchRefusal`).
+        // segments before its retry (`deferStepAfterScratchRefusal`). While other
+        // native work keeps the pool busy the request stands and the row waits.
         if nativeSegmentReleaseRequested {
-            nativeSegmentReleaseRequested = false
             releaseNativeCommit()
-            releaseIssuedNativeFreeSegments(requiringIdle: false)
+            if releaseIssuedNativeFreeSegments(requiringIdle: false) {
+                nativeSegmentReleaseRequested = false
+                nativeSegmentReleaseRanFor.formUnion(nativeSegmentReleaseWaiters.keys)
+                nativeSegmentReleaseWaiters.removeAll()
+            }
             guard acquireNativeCommit() else { return }
         }
 
@@ -3186,7 +3200,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // the free ones once the engine has idled `nativeSegmentReleaseIdleNanos`.
             if !draining, nativeIdleSegmentReleaseDue() {
                 releaseNativeCommit()
-                releaseIssuedNativeFreeSegments(requiringIdle: true)
+                _ = releaseIssuedNativeFreeSegments(requiringIdle: true)
                 guard acquireNativeCommit() else { return }
             }
             publishGauges()
@@ -3262,7 +3276,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         attachMTPMeasurement(measurement, to: inFlight, chained: false)
         stepCount += 1
         publishGauges()
-        scheduleNextStep()
+        if nativeSegmentReleaseBackoff {
+            // A lone row waits for an issued GLM pool's release: retry shortly.
+            nativeSegmentReleaseBackoff = false
+            engineQueue.asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
+                self?.engineStep()
+            }
+        } else {
+            scheduleNextStep()
+        }
     }
 
     private func scheduleNextStep() {
@@ -3442,9 +3464,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Returns an issued GLM pool's free segments between steps (caller has
     /// released the native commit). Skips, changing nothing, while a step, an
     /// import or export, a retirement or any other native work is still live.
-    private func releaseIssuedNativeFreeSegments(requiringIdle: Bool) {
+    /// Returns whether it ran (true also when nothing was free).
+    private func releaseIssuedNativeFreeSegments(requiringIdle: Bool) -> Bool {
         if requiringIdle {
-            guard !scheduler.hasWork, !gauges.hasPendingSubmissions else { return }
+            guard !scheduler.hasWork, !gauges.hasPendingSubmissions else { return false }
         }
         guard inFlight == nil, pendingDonationReleaseCount == 0, nativePrefixRetiredRows.isEmpty,
             nativePrefixReservations.isEmpty, nativePendingRetirements.isEmpty,
@@ -3452,17 +3475,40 @@ public final class EngineLoopV2: @unchecked Sendable {
             buildingMiMoKeyRangeWork.isEmpty, pendingMiMoKeyRangeByRequest.isEmpty,
             nativeShutdownState?.mayExecute == true,
             let pool = (backend as? PagedKVBackend)?.pool
-        else { return }
+        else { return false }
         do {
-            let released = try pool.releaseIssuedNativeFreeSegments()
+            guard let released = try pool.releaseIssuedNativeFreeSegments() else { return false }
             if released > 0 {
                 nativeSegmentReleaseCount += 1
                 nativeSegmentReleasedBytes += released
             }
+            return true
         } catch {
             // A failed drain already failed the native runtime; nothing here
-            // changed pool metadata before it.
+            // changed pool metadata before it. The waiting rows fail with it.
+            return true
         }
+    }
+
+    /// A lone row whose step scratch was refused while the issued GLM pool held
+    /// free segments: true keeps it, rolled back, for a retry after the
+    /// release. It waits while other native work blocks the release, at most
+    /// `nativeSegmentReleaseWaitNanos`, and is retried once after a release ran.
+    private func keepLoneRowForNativeSegmentRelease(_ id: CBv2RequestID) -> Bool {
+        guard nativeSegmentReleaseIdleNanos >= 0, nativePagedBinding?.isGLM5Next == true,
+            !nativeSegmentReleaseRanFor.contains(id),
+            ((backend as? PagedKVBackend)?.pool.issuedNativeReleasableBytes ?? 0) > 0
+        else { return false }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let since = nativeSegmentReleaseWaiters[id] ?? now
+        guard now &- since <= nativeSegmentReleaseWaitNanos else {
+            nativeSegmentReleaseWaiters.removeValue(forKey: id)
+            return false
+        }
+        nativeSegmentReleaseWaiters[id] = since
+        nativeSegmentReleaseRequested = true
+        nativeSegmentReleaseBackoff = true
+        return true
     }
 
     /// A `CBv2StepScratchRefusal` is thrown only before any row cursor, page
@@ -3524,16 +3570,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         let reason = CBv2FinishReason.error(
             CBv2KVError.capacityExhaustedFinishPrefix + "\(refusal.underlying)")
         if rows.count == 1, requeue.isEmpty, let lone = rows.first {
-            // An issued GLM pool's free segments may hold the bytes: the next
-            // step returns them first and retries this row once. Its rolled-back
-            // step changed nothing, and it keeps its pages and place.
-            if nativeSegmentReleaseIdleNanos >= 0, nativePagedBinding?.isGLM5Next == true,
-                ((backend as? PagedKVBackend)?.pool.issuedNativeReleasableBytes ?? 0) > 0,
-                nativeSegmentReleaseRetried.insert(lone.id).inserted
-            {
-                nativeSegmentReleaseRequested = true
-                return true
-            }
+            // An issued GLM pool's free segments may hold the bytes: a later
+            // step returns them first and retries this row. Its rolled-back step
+            // changed nothing, and it keeps its pages and place.
+            if keepLoneRowForNativeSegmentRelease(lone.id) { return true }
             // Even alone this step cannot reserve its scratch; nothing this
             // engine runs can free more for it.
             finishRequest(lone.id, reason: reason, now: now)
@@ -5675,7 +5715,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
         stepScratchRequeues.removeValue(forKey: id)
-        nativeSegmentReleaseRetried.remove(id)
+        nativeSegmentReleaseWaiters.removeValue(forKey: id)
+        nativeSegmentReleaseRanFor.remove(id)
+        if nativeSegmentReleaseWaiters.isEmpty { nativeSegmentReleaseRequested = false }
         residentPrefixCursorByID.removeValue(forKey: id)
         recurrentCheckpointGeometry.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
