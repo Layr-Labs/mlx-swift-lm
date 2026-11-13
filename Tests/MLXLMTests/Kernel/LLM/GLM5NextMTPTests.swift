@@ -1284,6 +1284,112 @@ extension KernelTests {
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
+        /// A token-constrained row on the protected engine is masked by the
+        /// ordinary sampler: it follows its constraint (never the greedy token
+        /// here), never drafts or verifies, and the next plain request still
+        /// speculates.
+        @Test(arguments: [GLM5NextMTPVerification.serialTarget, .rectangular(depth: 2)])
+        func protectedPagedEngineMasksConstrainedRowsOffSpeculation(
+            verification: GLM5NextMTPVerification
+        ) async throws {
+            let h = try NativeHarness(projectionSign: 1, verification: verification, sampled: true)
+            #expect(h.resources.contract.supportsTokenConstraints && h.engine.acceptsTokenConstraints)
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            let prompt = [1, 2, 3, 4]
+            let plainExpected = try greedy(h.fixture.target, prompt: prompt, count: 6)
+            let forced = plainExpected.map { ($0 + 1) % 16 }
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(1951), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            var tokens: [Int] = []
+            for await event in stream {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            #expect(tokens == forced)
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens == 0)
+
+            let plain = try h.engine.submit(
+                .init(
+                    id: .init(1952), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: 6))
+            var plainTokens: [Int] = []
+            for await event in plain {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(plainTokens == plainExpected)
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens > 0)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("protected GLM constrained rows left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
+            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// Admitted together, a constrained row and a plain row decode in the
+        /// same steps; the constrained row follows its constraint and the plain
+        /// row keeps its exact greedy stream.
+        @Test func protectedPagedEngineServesAConstrainedRowBesideAPlainRow() async throws {
+            let h = try NativeHarness(projectionSign: 1, sampled: true)
+            let prompt = [1, 2, 3, 4]
+            let other = [5, 6, 7]
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 5).map { ($0 + 1) % 16 }
+            let otherExpected = try greedy(h.fixture.target, prompt: other, count: 5)
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+            }
+            let constrainedRow = try h.engine.submit(
+                .init(
+                    id: .init(1961), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            let plainRow = try h.engine.submit(
+                .init(
+                    id: .init(1962), promptTokens: other,
+                    sampling: .init(temperature: 0), maxTokens: 5))
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+            }
+            var tokens: [Int] = []
+            for await event in constrainedRow {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            var plainTokens: [Int] = []
+            for await event in plainRow {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(tokens == forced && plainTokens == otherExpected)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("co-batched GLM constrained row left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// Allows exactly `tokens[state]` at each step.
+        private final class SequenceConstraint: CBv2TokenConstraint, @unchecked Sendable {
+            let mode: CBv2TokenConstraintMode = .auto
+            let initialState = 0
+            let maxTokens: Int
+            let fallbackTokenID: Int
+            let tokens: [Int]
+            init(_ tokens: [Int]) {
+                self.tokens = tokens
+                maxTokens = tokens.count
+                fallbackTokenID = tokens[0]
+            }
+            func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+                tokens.indices.contains(state) ? [tokens[state]] : []
+            }
+            func nextState(state: Int, tokenID: Int) -> Int? {
+                tokens.indices.contains(state) && tokens[state] == tokenID ? state + 1 : nil
+            }
+        }
+
         /// The issued native steppable gives plain decode steps and MTP rounds of
         /// decode and verification rows the op-count-only command buffers
         /// (`EngineLoopV2.withDecodeCommandBuffers`).
