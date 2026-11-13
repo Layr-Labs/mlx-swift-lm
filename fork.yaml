@@ -337,8 +337,11 @@ def:
             KDA cache ingress compacts retained state; full-model and pipeline transactions
             fence current and rollback roots before publication. Lazy pending history and
             allocator slack remain separate consumer admission obligations.
+            The issued GLM pool returns its free segments once the engine idles and before a
+            lone row whose step scratch was refused is retried (`DARKBLOOM_NATIVE_SEGMENT_RELEASE`).
             Registration and activation remain provider decisions.
           globs:
+            - "changelog.d/glm-native-segment-release.md"
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
             - "Libraries/MLXVLM/Models/GLM5Next*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/**"
