@@ -196,3 +196,111 @@ extension CBv2FreeSpanTests {
         }
     }
 }
+
+// Composition of #409 (grammar verification) and #413 (free spans): a row in a
+// free span takes the pure preview, a protected-span row takes grammar
+// verification, and no row takes both in one round (a doubly confirmed token
+// would advance the grammar twice and fail the protected span).
+extension CBv2FreeSpanTests {
+    private func makeSpanTarget() throws -> Gemma4TextModel {
+        let json = #"""
+            {"model_type":"gemma4_text","hidden_size":64,"num_hidden_layers":6,
+             "intermediate_size":128,"num_attention_heads":2,"head_dim":32,
+             "global_head_dim":32,"num_key_value_heads":1,"num_kv_shared_layers":2,
+             "layer_types":["sliding_attention","full_attention","full_attention",
+                            "sliding_attention","sliding_attention","full_attention"],
+             "sliding_window":16,"final_logit_softcapping":30.0,
+             "tie_word_embeddings":false,"vocab_size":256,"vocab_size_per_layer_input":256,
+             "rms_norm_eps":1e-6,"hidden_size_per_layer_input":0,"use_double_wide_mlp":false}
+            """#
+        let target = Gemma4TextModel(
+            try JSONDecoder().decode(
+                Gemma4TextConfiguration.self, from: Data(json.utf8)))
+        stabilizeCBv2MTPGreedyCycleTarget(target)
+        eval(target)
+        return target
+    }
+
+    private func makeSpanEngine(
+        target: Gemma4TextModel, drafter: (any CBv2MTPDrafter)?,
+        mode: CBv2MTPVerificationMode, grammar: Bool, spans: Bool
+    ) -> EngineV2 {
+        let kinds = target.cbv2LayerKinds
+        return EngineV2(
+            model: CBv2SteppableLanguageModelAdapter(target), layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 26)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            mtpDrafter: drafter,
+            mtpConfig: .init(
+                enabled: drafter != nil, maxDraftTokens: 3, fixedDraftTokens: 3,
+                verificationMode: mode, maxAutomaticRectangularTokens: 8,
+                constrainedSpeculation: grammar, freeSpanSpeculation: spans))
+    }
+
+    @Test(arguments: [
+        CBv2MTPVerificationMode.serialTarget, .rectangular, .rectangularExact, .automatic,
+    ])
+    func grammarVerificationAndFreeSpansComposeExactly(mode: CBv2MTPVerificationMode)
+        async throws
+    {
+        let target = try makeSpanTarget()
+        let expected = [4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]
+        for (grammar, spans) in [(true, false), (false, true), (true, true)] {
+            let drafter = SpanDrafter(target: target, tokens: expected)
+            let engine = makeSpanEngine(
+                target: target, drafter: drafter, mode: mode, grammar: grammar, spans: spans)
+            let result = await cbv2SchedCollect(
+                try engine.submit(
+                    .init(
+                        id: .init(3), promptTokens: [1, 2, 3], sampling: .init(temperature: 0),
+                        maxTokens: 20, stopTokens: [255], tokenConstraint: SpanConstraint())))
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            await engine.shutdown()
+            #expect(result.tokens == expected, "grammar \(grammar) spans \(spans)")
+            #expect(result.finishReason == .length, "grammar \(grammar) spans \(spans)")
+            #expect(metrics.acceptedTokens > 0, "grammar \(grammar) spans \(spans)")
+        }
+    }
+
+    @Test(arguments: [
+        CBv2MTPVerificationMode.serialTarget, .rectangular, .rectangularExact, .automatic,
+    ])
+    func composedOptInsKeepMixedBatchRowsExact(mode: CBv2MTPVerificationMode) async throws {
+        let target = try makeSpanTarget()
+        let constrainedPath = [
+            4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+        ]
+        func constrained() -> CBv2Request {
+            .init(
+                id: .init(4), promptTokens: [1, 2, 3], sampling: .init(temperature: 0),
+                maxTokens: 20, stopTokens: [255], tokenConstraint: SpanConstraint())
+        }
+        func ordinary() -> CBv2Request {
+            .init(
+                id: .init(5), promptTokens: [1, 2, 3, 4], sampling: .init(temperature: 0),
+                maxTokens: 20, stopTokens: [255])
+        }
+        let oracle = makeSpanEngine(
+            target: target, drafter: nil, mode: mode, grammar: false, spans: false)
+        let expectedConstrained = await cbv2SchedCollect(try oracle.submit(constrained()))
+        let expectedOrdinary = await cbv2SchedCollect(try oracle.submit(ordinary()))
+        await oracle.shutdown()
+        #expect(expectedConstrained.tokens == constrainedPath)
+
+        let engine = makeSpanEngine(
+            target: target, drafter: SpanDrafter(target: target, tokens: constrainedPath),
+            mode: mode, grammar: true, spans: true)
+        let constrainedStream = try engine.submit(constrained())
+        let ordinaryStream = try engine.submit(ordinary())
+        let actualConstrained = await cbv2SchedCollect(constrainedStream)
+        let actualOrdinary = await cbv2SchedCollect(ordinaryStream)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(actualConstrained.tokens == expectedConstrained.tokens)
+        #expect(actualConstrained.finishReason == expectedConstrained.finishReason)
+        #expect(actualOrdinary.tokens == expectedOrdinary.tokens)
+        #expect(actualOrdinary.finishReason == expectedOrdinary.finishReason)
+        #expect(metrics.rounds > 0)
+    }
+}
