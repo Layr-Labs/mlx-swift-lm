@@ -5,6 +5,7 @@ Common language model code.
 ## Articles
 
 - <doc:continuous-batching>
+- <doc:native-reasoning-budgets>
 - <doc:model-compatibility>
 - <doc:upgrade>
 - <doc:wired-memory>
