@@ -26,6 +26,7 @@ final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
     private let offset: Int
     private let offsetsByStep: [Int]?
     private let vocabSize: Int
+    var supportsTargetPrefixAcceptance: Bool { true }
     let mtpTargetIdentity: ObjectIdentifier?
 
     init(
@@ -99,18 +100,124 @@ private final class CBv2MTPPathConstraint: CBv2TokenConstraint, Sendable {
     let initialState = 0
     let fallbackTokenID = 0
     let path: [Int]
+    let failureAt: Int?
     var maxTokens: Int { path.count }
 
-    init(_ path: [Int]) { self.path = path }
+    init(_ path: [Int], failureAt: Int? = nil) {
+        self.path = path
+        self.failureAt = failureAt
+    }
 
     func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
-        guard path.indices.contains(state), remainingTokens > 0 else { return [] }
+        guard path.indices.contains(state), remainingTokens > 0, state != failureAt else {
+            return []
+        }
         return [path[state]]
     }
 
     func nextState(state: Int, tokenID: Int) -> Int? {
         guard path.indices.contains(state), tokenID == path[state] else { return nil }
         return state + 1
+    }
+}
+
+private final class CBv2MTPBranchConstraint: CBv2TokenConstraint, Sendable {
+    let mode: CBv2TokenConstraintMode = .required
+    let initialState = 0
+    let fallbackTokenID = 0
+    let maxTokens = 12
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        guard remainingTokens > 0 else { return [] }
+        if remainingTokens == 1 { return [254] }
+        return [30 + state * 17, 31 + state * 17]
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        let allowed = allowedTokenIDs(state: state, remainingTokens: maxTokens - state)
+        return allowed.contains(tokenID) ? state + 1 : nil
+    }
+}
+
+private final class CBv2MTPInterningConstraint: CBv2TokenConstraint, @unchecked Sendable {
+    let mode: CBv2TokenConstraintMode = .required
+    let initialState = 0
+    let fallbackTokenID = 0
+    let path: [Int]
+    var maxTokens: Int { path.count }
+    private let lock = NSLock()
+    private var states: [[Int]] = [[]]
+    private var transitions: [Int] = []
+
+    init(_ path: [Int]) { self.path = path }
+
+    var confirmedTransitions: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return transitions
+    }
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard states.indices.contains(state), remainingTokens > 0 else { return [] }
+        let index = states[state].count
+        return path.indices.contains(index) ? [path[index]] : []
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        transitions.append(tokenID)
+        guard states.indices.contains(state) else { return nil }
+        var prefix = states[state]
+        guard path.indices.contains(prefix.count), path[prefix.count] == tokenID else { return nil }
+        prefix.append(tokenID)
+        if let existing = states.firstIndex(of: prefix) { return existing }
+        guard states.count <= maxTokens else { return nil }
+        states.append(prefix)
+        return states.count - 1
+    }
+}
+
+private final class CBv2MTPMixedScriptedDrafter: CBv2MTPDrafter {
+    private final class Cursor: CBv2MTPPreparedCapture {
+        let rows: [(plan: Int, start: Int)]
+        var step = 0
+        init(_ rows: [(plan: Int, start: Int)]) { self.rows = rows }
+    }
+    let mtpTargetIdentity: ObjectIdentifier?
+    let paths: [[Int]]
+    let promptLengths: [Int]
+    let rejectionPositions: [Int]
+
+    init(target: Gemma4TextModel, paths: [[Int]], promptLengths: [Int], rejections: [Int]) {
+        mtpTargetIdentity = ObjectIdentifier(target)
+        self.paths = paths
+        self.promptLengths = promptLengths
+        self.rejectionPositions = rejections
+    }
+
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
+        Cursor(
+            rows.map { row in
+                let plan = promptLengths.indices.last { promptLengths[$0] <= row.anchor + 1 }!
+                return (plan, row.anchor - promptLengths[plan] + 1)
+            })
+    }
+
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        let cursor = prepared as! Cursor
+        defer { cursor.step += 1 }
+        let proposed = cursor.rows.map { row -> Int32 in
+            let index = row.start + cursor.step
+            let path = paths[row.plan]
+            let token = path.indices.contains(index) ? path[index] : 0
+            return Int32(token + (cursor.step == rejectionPositions[row.plan] ? 1 : 0))
+        }
+        return (MLXArray(proposed), hidden)
     }
 }
 
@@ -306,6 +413,7 @@ struct CBv2MTPEngineParityTests {
         let prompt = [3, 7, 11, 19, 23]
         let path = [41, 42, 81, 82, 121, 122, 161, 162, 201, 202, 241, 242]
         var constrained = request(id: 991, prompt: prompt, maxTokens: path.count)
+        constrained.stopTokens = [0]
         constrained.tokenConstraint = CBv2MTPPathConstraint(path)
         let ordinary = request(id: 992, prompt: prompt, maxTokens: path.count)
 
@@ -334,6 +442,146 @@ struct CBv2MTPEngineParityTests {
         #expect(actualOrdinary.finishReason == expectedOrdinary.finishReason)
         #expect(metrics.rounds > 0)
         #expect(metrics.acceptedTokens > 0)
+    }
+
+    @Test(.tags(.integration))
+    func grammarRejectsInvalidDraftsAndMasksBonusTokens() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = [3, 7, 11, 19, 23]
+        let path = [41, 42, 81, 82, 121, 122, 161, 162, 201, 202, 241, 242]
+        var item = request(id: 993, prompt: prompt, maxTokens: path.count)
+        item.stopTokens = [0]
+        item.tokenConstraint = CBv2MTPPathConstraint(path)
+        let oracle = makeEngine(target: fixture.target, drafter: nil)
+        let expected = try await run(oracle, item)
+        await oracle.shutdown()
+        #expect(expected.tokens == path)
+
+        for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
+            for offsets in [[1, 0], [0, 1], [0, 0]] {
+                let engine = makeEngine(
+                    target: fixture.target,
+                    drafter: CBv2ParityScriptedDrafter(
+                        script: expected.tokens, promptLength: prompt.count, offset: 0,
+                        vocabSize: vocabSize, target: fixture.target, offsetsByStep: offsets),
+                    verificationMode: mode, constrainedSpeculation: true)
+                let actual = try await run(engine, item)
+                let metrics = try #require(engine.mtpMetricsSnapshot())
+                await engine.shutdown()
+                #expect(actual.tokens == expected.tokens)
+                #expect(actual.finishReason == expected.finishReason)
+                #expect(actual.usage?.completionTokens == expected.usage?.completionTokens)
+                #expect(metrics.rounds > 0)
+                if offsets == [1, 0] { #expect(metrics.acceptedTokens == 0) }
+                if offsets == [0, 0] { #expect(metrics.acceptedTokens > 0) }
+            }
+        }
+    }
+
+    @Test(.tags(.integration))
+    func grammarSeededSamplingMatchesOracleAndHonorsClosingBudget() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = [3, 7, 11, 19, 23]
+        var item = request(id: 994, prompt: prompt, maxTokens: 12)
+        item.sampling = .init(temperature: 1.3, topP: 0.9, topK: 8, minP: 0.05, seed: 1234)
+        item.stopTokens = [0]
+        item.tokenConstraint = CBv2MTPBranchConstraint()
+        let oracle = makeEngine(target: fixture.target, drafter: nil)
+        let expected = try await run(oracle, item)
+        await oracle.shutdown()
+        #expect(expected.tokens.count == 12)
+        #expect(expected.tokens.last == 254)
+        for offset in [0, 1] {
+            let engine = makeEngine(
+                target: fixture.target,
+                drafter: CBv2ParityScriptedDrafter(
+                    script: expected.tokens, promptLength: prompt.count, offset: offset,
+                    vocabSize: vocabSize, target: fixture.target),
+                verificationMode: .rectangular, constrainedSpeculation: true)
+            let actual = try await run(engine, item)
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            await engine.shutdown()
+            #expect(actual.tokens == expected.tokens)
+            #expect(actual.finishReason == expected.finishReason)
+            #expect(metrics.rounds > 0)
+            if offset == 0 { #expect(metrics.acceptedTokens > 0) }
+        }
+    }
+
+    @Test(.tags(.integration))
+    func grammarFailureAndReusedRequestIDMatchOrdinaryDecode() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = [3, 7, 11, 19, 23]
+        let path = [41, 42, 81, 82, 121, 122, 161, 162, 201, 202, 241, 242]
+        let engine = makeEngine(
+            target: fixture.target,
+            drafter: CBv2ParityScriptedDrafter(
+                script: path, promptLength: prompt.count, offset: 0,
+                vocabSize: vocabSize, target: fixture.target),
+            constrainedSpeculation: true)
+        for failureAt in [Int?(5), nil] {
+            var item = request(id: 995, prompt: prompt, maxTokens: path.count)
+            item.stopTokens = [0]
+            item.tokenConstraint = CBv2MTPPathConstraint(path, failureAt: failureAt)
+            let oracle = makeEngine(target: fixture.target, drafter: nil)
+            let expected = try await run(oracle, item)
+            await oracle.shutdown()
+            let actual = try await run(engine, item)
+            #expect(actual.tokens == expected.tokens)
+            #expect(actual.finishReason == expected.finishReason)
+            #expect(actual.usage?.completionTokens == expected.usage?.completionTokens)
+        }
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(metrics.rounds > 0)
+    }
+
+    @Test(.tags(.integration))
+    func grammarCommonPrefixDoesNotInternDiscardedSuffix() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = [[3, 7, 11, 19, 23], Array(repeating: 9, count: 45)]
+        let paths = [
+            [41, 42, 81, 82, 121, 122, 161, 162, 201, 202, 241],
+            [51, 52, 91, 92, 131, 132, 171],
+        ]
+        for rejections in [[0, 1], [1, 0], [2, 1]] {
+            var expected: [CBv2SchedCollected] = []
+            for row in paths.indices {
+                let oracle = makeEngine(target: fixture.target, drafter: nil)
+                let grammar = CBv2MTPInterningConstraint(paths[row])
+                var item = request(
+                    id: UInt64(996 + row), prompt: prompts[row], maxTokens: paths[row].count)
+                item.stopTokens = [0]
+                item.tokenConstraint = grammar
+                expected.append(try await run(oracle, item))
+                await oracle.shutdown()
+                #expect(grammar.confirmedTransitions == paths[row])
+            }
+            let engine = makeEngine(
+                target: fixture.target,
+                drafter: CBv2MTPMixedScriptedDrafter(
+                    target: fixture.target, paths: paths, promptLengths: prompts.map(\.count),
+                    rejections: rejections),
+                verificationMode: .rectangular, constrainedSpeculation: true)
+            let grammars = paths.map(CBv2MTPInterningConstraint.init)
+            let streams = try paths.indices.map { row in
+                var item = request(
+                    id: UInt64(996 + row), prompt: prompts[row], maxTokens: paths[row].count)
+                item.stopTokens = [0]
+                item.tokenConstraint = grammars[row]
+                return try engine.submit(item)
+            }
+            var actual: [CBv2SchedCollected] = []
+            for stream in streams { actual.append(await cbv2SchedCollect(stream)) }
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            await engine.shutdown()
+            for row in paths.indices {
+                #expect(actual[row].tokens == expected[row].tokens)
+                #expect(actual[row].finishReason == expected[row].finishReason)
+                #expect(grammars[row].confirmedTransitions == paths[row])
+            }
+            #expect(metrics.rounds > 0)
+        }
     }
 
     @Test func b1ParityAcrossRaggedPromptLengths() async throws {
