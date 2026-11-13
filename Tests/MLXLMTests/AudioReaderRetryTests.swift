@@ -68,4 +68,16 @@ final class AudioReaderRetryTests: XCTestCase {
         XCTAssertEqual(ender.ended, 2)
         XCTAssertEqual(passes.retrying, [true, false])
     }
+
+    func testAudioReaderDiagnosticMatrix() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "audio_only", withExtension: "mov"))
+        let processing = UserInput.AudioProcessing()
+        try await AudioReaderDiagnosticProbe.run(
+            source: .file(url), label: "user-input",
+            settings: [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: processing.sampleRate,
+                AVNumberOfChannelsKey: processing.channels, AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true, AVLinearPCMIsNonInterleaved: false,
+            ])
+    }
 }
