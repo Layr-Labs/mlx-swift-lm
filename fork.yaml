@@ -911,7 +911,11 @@ def:
         not the merge-base with upstream, or when a file the fork changes is not described by a section
         above.
 
-        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a GitHub-hosted Mac.
+        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a Mac with Xcode 27.2.
+        On a pull request, its macOS jobs and the Lint job run on a Darkbloom Sandbox when the Darkbloom plane
+        grants one (`.github/workflows/darkbloom-route.yml`), else on the GitHub-hosted `xcode-27` image.
+        `.github/workflows/darkbloom-watchdog.yml` re-runs a run whose routed jobs get no runner.
+        Both files are copies from Layr-Labs/d-inference.
         Parallel jobs then run every test in the package once, in the shards of `.github/test-shards.json`.
         A last job writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
@@ -921,7 +925,10 @@ def:
         `CONTRIBUTING.md` documents the variable.
         `prepare-mimo-native-retention-fixtures.py` creates the closed, offline synthetic
         asymmetric payload required by the explicit native historical-retention CI selector.
+        `AGENTS.md` names the swift-format that CI uses: the one of the Xcode 27.2 that
+        `.github/actions/select-xcode` selects.
       globs:
+        - "AGENTS.md"
         - ".pre-commit-config.yaml"
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"

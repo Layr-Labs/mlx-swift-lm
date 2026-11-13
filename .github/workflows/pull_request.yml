@@ -6,32 +6,34 @@ permissions:
   contents: read
 
 jobs:
+  # Chooses a Darkbloom Sandbox for the lint job when the Darkbloom plane
+  # grants one, else the GitHub-hosted xcode-27 image.
+  route:
+    name: Route Lint
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        lint macos_arm64 xcode-27
+
   lint:
-    runs-on: macos-26
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['lint'] }}
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 2 # the merge commit and the tip of the base branch
 
-      - name: Select the newest release of Xcode 26
-        # Beta and release candidate apps are left out, so a new beta on the
-        # runner image cannot change CI without a pull request.
-        run: |
-          version=$(for app in /Applications/Xcode_26.*.app; do
-            name=${app#/Applications/Xcode_}
-            name=${name%.app}
-            if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
-              echo "$name"
-            fi
-          done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
-          if [ -z "$version" ]; then
-            echo "::error::No release of Xcode 26 is on this runner."
-            exit 1
-          fi
-          sudo xcode-select -s "/Applications/Xcode_$version.app"
-          xcodebuild -version
-          swift format --version
+      - name: Select Xcode
+        # The formatter is the swift-format of the Xcode that this action
+        # selects.
+        uses: ./.github/actions/select-xcode
+
+      - name: Show the formatter version
+        run: swift format --version
 
       - name: Check the format of the Swift files that this pull request changes
         # Runs the formatter of .pre-commit-config.yaml with .swift-format on

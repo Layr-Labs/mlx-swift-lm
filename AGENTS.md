@@ -71,8 +71,8 @@ yourself — I cannot post for you.
   install the skill.
 - `swift test` does not work here. Run unit tests with `xcodebuild test -scheme
   mlx-swift-lm-Package -destination 'platform=macOS' -skipPackagePluginValidation`.
-- Format with `pre-commit run --all-files` before you hand work back. CI pins a
-  specific swift-format version, set in `.github/workflows/pull_request.yml`.
+- Format with `pre-commit run --all-files` before you hand work back. CI uses the
+  swift-format of Xcode 27.2, which `.github/actions/select-xcode` selects.
   Match it locally: another version reformats files the PR does not touch, which
   turns CI red.
 - `pre-commit` walks the whole working directory, so it also reports errors from

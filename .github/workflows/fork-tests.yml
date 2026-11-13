@@ -1,16 +1,23 @@
 name: Fork Tests
 
-# Builds the fork and runs its self-contained Metal test suites on GitHub-hosted
-# Macs. These suites use tiny test models. They need no model weights, no
+# Builds the fork and runs its self-contained Metal test suites on Macs with
+# Xcode 27.2. These suites use tiny test models. They need no model weights, no
 # network access at test time, and no secrets. The workflow also reports the
 # line coverage of the fork's sources.
 #
 # One job builds the package and its tests, and lists the tests. Another job
-# builds the full Metal library at the same time. Both put their products in
-# the Actions cache. The test jobs restore the products and run in parallel.
+# builds the full Metal library at the same time. Both hand their products to
+# the test jobs as artifacts. Runs that are not for a pull request also save
+# them in the Actions cache, for later runs to restore. The test jobs download
+# the products and run in parallel.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
+#
+# On a pull request the macOS jobs run on a Darkbloom Sandbox when the route
+# job gets one from the Darkbloom plane, else on the GitHub-hosted xcode-27
+# image. Other runs save the caches that pull requests restore, so they stay
+# on xcode-27 and do not ask the plane.
 
 on:
   pull_request:
@@ -40,6 +47,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
+      macos-jobs: ${{ steps.matrix.outputs.macos-jobs }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -48,14 +56,33 @@ jobs:
 
       - name: Read the shard numbers
         id: matrix
-        run: echo "shards=$(python3 .github/scripts/test_shards.py matrix)" >> "$GITHUB_OUTPUT"
+        # The macOS jobs are build, metallib, coverage and one test job per
+        # shard. The route asks for that many.
+        run: |
+          shards=$(python3 .github/scripts/test_shards.py matrix)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "macos-jobs=$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
+
+  # Chooses the runner of the macOS jobs. The build's products hold its
+  # absolute workspace path and its Xcode, so the test jobs must run on the
+  # same kind of runner. The jobs therefore share one lane, which the plane
+  # grants whole or not at all. Only pull requests ask.
+  route:
+    name: Route Fork Tests
+    needs: plan
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        fork-tests macos_arm64 xcode-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
 
   build:
     name: Build
-    runs-on: macos-26
+    needs: route
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 90
-    outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -65,6 +92,20 @@ jobs:
       # time stamps, so ccache can also ignore the header times.
       CCACHE_SLOPPINESS: modules,include_file_mtime,include_file_ctime,time_macros,pch_defines,system_headers
     steps:
+      # Before every cache step: a Darkbloom Sandbox that the plane gave no
+      # Darkbloom cache would reach GitHub's own Actions cache, so there every
+      # cache step is skipped, as in Layr-Labs/d-inference.
+      - name: Choose this job's Actions cache
+        run: |
+          if [[ ${RUNNER_NAME:-} != darkbloom-* ]]; then
+            echo "Actions cache: this runner's own"
+          elif [[ -n ${DARKBLOOM_CACHE_URL:-} ]]; then
+            echo "Actions cache: the Darkbloom cache at $DARKBLOOM_CACHE_URL"
+          else
+            echo "CI_ACTIONS_CACHE=off" >> "$GITHUB_ENV"
+            echo "::notice title=Actions cache::The plane gave this Darkbloom Sandbox no cache, so every cache step is skipped."
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Test the suite runner scripts
@@ -85,9 +126,10 @@ jobs:
       - name: Restore the build cache
         # The key ends with the commit. A run restores the newest build of
         # the same Xcode, and the build then recompiles only what changed.
-        # The test jobs restore the entry that this job saves.
+        # Later runs restore the entry that this job saves.
         id: cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.CI_ACTIONS_CACHE != 'off'
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -100,7 +142,8 @@ jobs:
 
       - name: Restore the C and C++ compiler cache
         id: ccache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.CI_ACTIONS_CACHE != 'off'
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
           key: fork-ccache-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ github.sha }}
@@ -130,20 +173,32 @@ jobs:
         # restored objects of a file whose content did not change. The
         # checkout gives every file a new modification time.
         # SwiftPM gives the C and C++ files to the compiler in CC, here
-        # through ccache.
+        # through ccache. Without ccache, and when Homebrew is missing or
+        # cannot install it, the build runs without it.
         run: |
-          command -v ccache > /dev/null || brew install ccache
-          ccache --zero-stats > /dev/null
-          wrapper=$RUNNER_TEMP/ccache-clang
-          printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
-          chmod +x "$wrapper"
+          if ! command -v ccache > /dev/null && command -v brew > /dev/null; then
+            brew install ccache || echo "::warning title=No ccache::brew install ccache failed. The C and C++ files build without ccache."
+          fi
+          wrapper=$(xcrun -f clang)
+          if command -v ccache > /dev/null; then
+            ccache --zero-stats > /dev/null
+            wrapper=$RUNNER_TEMP/ccache-clang
+            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
+            chmod +x "$wrapper"
+          elif ! command -v brew > /dev/null; then
+            echo "::warning title=No ccache::This runner has no ccache and no Homebrew. The C and C++ files build without ccache."
+          fi
           start=$(date +%s)
-          CC=$wrapper swift build --build-tests --enable-code-coverage --disable-index-store \
+          # Swift 6.4 defaults to Swift Build; every SwiftPM call here uses the native
+          # build system, so --skip-build and --show-bin-path find these products.
+          CC=$wrapper swift build --build-system native --build-tests --enable-code-coverage --disable-index-store \
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-          ccache --show-stats -v
-          grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
+          if command -v ccache > /dev/null; then
+            ccache --show-stats -v
+            grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
+          fi
           # The test jobs use the same package versions. Package.resolved
           # stays in .build, so the cache paths do not change.
           cp Package.resolved .build/fork-tests-Package.resolved
@@ -158,7 +213,7 @@ jobs:
         run: |
           set -o pipefail
           start=$(date +%s)
-          swift test list --skip-build > .build/fork-tests-list.txt
+          swift test list --build-system native --skip-build > .build/fork-tests-list.txt
           echo "swift test list took $(( $(date +%s) - start )) s and listed $(wc -l < .build/fork-tests-list.txt) lines"
           cp .build/fork-tests-list.txt "$RUNNER_TEMP/tests.txt"
 
@@ -169,11 +224,27 @@ jobs:
           path: ${{ runner.temp }}/tests.txt
           retention-days: 7
 
+      - name: Pack the test products
+        # The test and coverage jobs run these products. The Actions cache
+        # cannot hand them over: a Darkbloom Sandbox has no cache or a cache
+        # of its own host only.
+        run: .github/scripts/test-products.sh pack "$RUNNER_TEMP/test-products/test-products.tar.zst"
+
+      - name: Upload the test products
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-products
+          path: ${{ runner.temp }}/test-products/test-products.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Save the build cache
-        # The test jobs and the next build restore this entry. An exact hit
-        # means that the entry already exists.
-        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # The next build restores this entry. An exact hit means that the
+        # entry already exists. Pull requests, which may run on a Darkbloom
+        # Sandbox, only restore caches.
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -182,19 +253,34 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Save the C and C++ compiler cache
-        if: ${{ steps.ccache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
   metallib:
     name: Metal library
-    runs-on: macos-26
+    needs: route
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 30
-    outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
     steps:
+      # Before every cache step: a Darkbloom Sandbox that the plane gave no
+      # Darkbloom cache would reach GitHub's own Actions cache, so there every
+      # cache step is skipped, as in Layr-Labs/d-inference.
+      - name: Choose this job's Actions cache
+        run: |
+          if [[ ${RUNNER_NAME:-} != darkbloom-* ]]; then
+            echo "Actions cache: this runner's own"
+          elif [[ -n ${DARKBLOOM_CACHE_URL:-} ]]; then
+            echo "Actions cache: the Darkbloom cache at $DARKBLOOM_CACHE_URL"
+          else
+            echo "CI_ACTIONS_CACHE=off" >> "$GITHUB_ENV"
+            echo "::notice title=Actions cache::The plane gave this Darkbloom Sandbox no cache, so every cache step is skipped."
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Select Xcode
@@ -216,15 +302,25 @@ jobs:
         # The library changes only when the mlx-swift pin, the Xcode or the
         # build script changes.
         id: cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.CI_ACTIONS_CACHE != 'off'
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
           key: fork-metallib-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ steps.pin.outputs.revision }}-${{ hashFiles('scripts/build-metallib.sh') }}
 
       - name: Build the full Metal library
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        # Xcode 27 can ship without the Metal toolchain component. The step
+        # downloads it when the metal compiler does not run. Apple's catalog
+        # fetch fails at times, so it tries 3 times.
         run: |
-          xcrun -sdk macosx metal --version
+          if ! xcrun --no-cache -sdk macosx metal --version; then
+            for attempt in 1 2 3; do
+              xcodebuild -downloadComponent MetalToolchain && break
+              [ "$attempt" = 3 ] || sleep 20
+            done
+            xcrun --no-cache -sdk macosx metal --version
+          fi
           start=$(date +%s)
           swift package resolve
           scripts/build-metallib.sh "$RUNNER_TEMP/metallib/mlx.metallib"
@@ -232,11 +328,19 @@ jobs:
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Save the Metal library
-        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Upload the Metal library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metallib
+          path: ${{ runner.temp }}/metallib/mlx.metallib
+          if-no-files-found: error
+          retention-days: 1
 
   list:
     name: Check the shard map
@@ -260,8 +364,10 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
-    runs-on: macos-26
+    needs: [plan, route, build, metallib]
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -273,25 +379,23 @@ jobs:
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
 
-      - name: Restore the build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download the test products
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: ${{ needs.build.outputs.cache-key }}
-          fail-on-cache-miss: true
+          name: test-products
+          path: ${{ runner.temp }}/test-products
+
+      - name: Unpack the test products
+        run: .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Use the package versions of the build
         run: cp .build/fork-tests-Package.resolved Package.resolved
 
-      - name: Restore the Metal library
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download the Metal library
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: metallib
           path: ${{ runner.temp }}/metallib
-          key: ${{ needs.metallib.outputs.cache-key }}
-          fail-on-cache-miss: true
 
       - name: Run the shard
         # Runs each run of the shard in its own swift test process, also
@@ -367,11 +471,13 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [build, test]
+    needs: [route, build, test]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: macos-26
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -379,15 +485,14 @@ jobs:
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
 
-      - name: Restore the build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download the test products
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: ${{ needs.build.outputs.cache-key }}
-          fail-on-cache-miss: true
+          name: test-products
+          path: ${{ runner.temp }}/test-products
+
+      - name: Unpack the test products
+        run: .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Use the package versions of the build
         run: cp .build/fork-tests-Package.resolved Package.resolved
@@ -405,7 +510,7 @@ jobs:
         # line coverage. It is reported, not enforced.
         timeout-minutes: 15
         run: |
-          bin=$(swift build --show-bin-path)
+          bin=$(swift build --build-system native --show-bin-path)
           binary="$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests"
           profile="$RUNNER_TEMP/default.profdata"
           find "$RUNNER_TEMP/artifacts" -name coverage.profdata -print0 \

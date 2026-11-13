@@ -108,7 +108,7 @@ class RunTests(unittest.TestCase):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
         command = test_shards.run_command(paged, Path("/r"), 1, ["M.Paged/other()", "M.A/testOne"])
-        self.assertEqual(command[:8], ["swift", "test", "--skip-build", "--no-parallel",
+        self.assertEqual(command[:10], ["swift", "test", "--build-system", "native", "--skip-build", "--no-parallel",
                                        "--filter", r"^M\.Paged/other\(\)", "--filter", r"^M\.A/testOne$"])
         self.assertNotIn("--skip", command)
         self.assertIn("/r/events-1.jsonl", command)
@@ -121,7 +121,7 @@ class RunTests(unittest.TestCase):
         units_only = next(r for r in runs if r["units"] == ["M.KernelTests/K1"])
         self.assertFalse(test_shards.needs_exact(units_only))
         command = test_shards.run_command(units_only, Path("/r"), 1, None)
-        self.assertEqual(command[4:6], ["--filter", r"^M\.KernelTests/K1/"])
+        self.assertEqual(command[6:8], ["--filter", r"^M\.KernelTests/K1/"])
 
     def test_strict_group_fails_on_a_skip_or_zero_tests(self):
         groups = [{"name": "paged", "strict": True, "filters": [r"^M\.Paged/"]},
@@ -160,7 +160,7 @@ class RunTests(unittest.TestCase):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
         command = test_shards.run_command(paged, Path("/r"), 2, ["M.A/testOne", "M.free()/F.swift:3:4"])
-        self.assertEqual(command[4:8], ["--filter", r"^M\.A/testOne$", "--filter", r"^M\.free\(\)"])
+        self.assertEqual(command[6:10], ["--filter", r"^M\.A/testOne$", "--filter", r"^M\.free\(\)"])
         self.assertIn("/r/events-2.jsonl", command)
 
     def test_environment_sets_and_unsets_the_group_variables(self):

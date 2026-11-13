@@ -2,20 +2,68 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXRandom
+import Metal
 import Testing
 
 @testable import MLXLLM
+
+/// Whether the suite runs. It needs the macOS 27 Metal compiler. On a
+/// paravirtual GPU (a macOS VM), that compiler does not build the chunked
+/// scan's generic layout, so there the suite first compiles one small scan and
+/// runs only if that works. On a physical GPU it always runs, so a kernel that
+/// does not compile fails the suite.
+enum NemotronSuperChunkedScanGate {
+    static let enabled: Bool =
+        ModelOptNVFP4NAXExperts.runtimeCompilerSupported && (!paravirtualGPU || buildsTheScan)
+
+    private static var paravirtualGPU: Bool {
+        let name = MTLCreateSystemDefaultDevice()?.name ?? ""
+        return name.contains("Paravirtual") || name.contains("(Virtual)")
+            || hardwareModel.hasPrefix("VirtualMac")
+    }
+
+    private static var hardwareModel: String {
+        var size = 0
+        guard sysctlbyname("hw.model", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var model = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.model", &model, &size, nil, 0) == 0 else { return "" }
+        return String(cString: model)
+    }
+
+    private static var buildsTheScan: Bool {
+        let (heads, headDim, groups, stateDim) = (1, 64, 1, 32)
+        let xbc = MLXArray.zeros([1, 1, heads * headDim + 2 * groups * stateDim], dtype: .bfloat16)
+        do {
+            try MLX.withError { errors in
+                let scan = NemotronSuperSSDChunked.scan(
+                    xbc: xbc, dt: MLXArray.zeros([1, 1, heads], dtype: .bfloat16), dtOffset: 0,
+                    heads: heads, headDim: headDim, groups: groups, stateSize: stateDim,
+                    aLog: MLXArray.zeros([heads]), dtBias: MLXArray.zeros([heads]),
+                    D: MLXArray.ones([heads]),
+                    state: MLXArray.zeros([1, heads, headDim, stateDim]),
+                    timeStepLimit: (0, .infinity), outputDType: .bfloat16)
+                eval(scan.y, scan.state)
+                try errors.check()
+            }
+            return true
+        } catch {
+            print("NemotronSuperMambaPrefillTests skipped on a paravirtual GPU: \(error)")
+            return false
+        }
+    }
+}
 
 /// Super's chunked prefill SSD (``NemotronSuperSSDChunked``) against the
 /// `ssmAttn` oracle, and the whole chunked Mamba prefill against the current
 /// path at Super's shapes. NAX GPUs run the native fragment layout; other
 /// GPUs check the same kernel through the generic layout. Both need a Metal
-/// compiler that builds them (`runtimeCompilerSupported`, macOS 27).
+/// compiler that builds them (`runtimeCompilerSupported`, macOS 27); see
+/// ``NemotronSuperChunkedScanGate`` for paravirtual GPUs.
 @Suite(
     .tags(.integration), .serialized,
     .enabled(
-        if: ModelOptNVFP4NAXExperts.runtimeCompilerSupported,
-        "needs the macOS 27 Metal compiler"))
+        if: NemotronSuperChunkedScanGate.enabled,
+        "needs the macOS 27 Metal compiler; on a paravirtual GPU, one that builds the scan"))
 struct NemotronSuperMambaPrefillTests {
     @Test(arguments: [
         (37, 64, false), (300, 64, true), (300, 32, true), (2048, 64, true), (2048, 32, true),
