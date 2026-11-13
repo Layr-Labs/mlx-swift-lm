@@ -46,24 +46,3 @@ extension MuseGlimmerTextModel {
         }
     }
 }
-
-/// Lets the generic adapter drive stateless drafters and offline harnesses.
-/// The capture layers name the last full and the last sliding layer.
-extension MuseGlimmerTextModel: CBv2MTPForwardable {
-    public var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? {
-        guard
-            let full = configuration.layerTypes.lastIndex(
-                of: MuseGlimmerTextModelConfiguration.fullAttention),
-            let sliding = configuration.layerTypes.lastIndex(
-                of: MuseGlimmerTextModelConfiguration.slidingAttention)
-        else { return nil }
-        return CBv2MTPCaptureLayers(full: full, sliding: sliding)
-    }
-
-    public func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
-        -> (logits: MLXArray, lastHidden: MLXArray)
-    {
-        let result = forwardWithMTPHidden(tokens, cache: caches)
-        return (result.logits, result.hidden)
-    }
-}
