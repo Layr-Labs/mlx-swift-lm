@@ -272,6 +272,12 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 toolCallPolicy: toolCallPolicy)
 
         case .atem:
+            // Fork: the policy can select the reading of the reference servers.
+            if toolCallPolicy.onyxParsing == .referenceParity {
+                return OnyxReferenceStreamAdapter(
+                    tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                    toolCallPolicy: toolCallPolicy)
+            }
             return OnyxStreamAdapter(
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
                 toolCallPolicy: toolCallPolicy)
@@ -354,6 +360,10 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         if type == "mimo_v2" { return .mimoV2 }
 
         if ["glm5_next", "glm5_next_text", "glm5_next_mtp"].contains(type) { return .glm5 }
+
+        // Muse Glimmer's Onyx protocol. Exact identity: the format replaces the
+        // whole response protocol, not one payload shape.
+        if type == "muse_glimmer" { return .atem }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2)
         if type == "llama" {

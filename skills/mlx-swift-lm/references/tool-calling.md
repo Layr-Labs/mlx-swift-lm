@@ -257,6 +257,39 @@ ToolCallFormat(toolParserType: "qwen3_coder")        // -> .xmlFunction
 Protocols with token-level framing (`.gptOSS`, `.atem`) are deliberately not
 inferred from templates — they are selected by the models that own them.
 
+### Muse Glimmer (Onyx) Parsing Mode
+
+`muse_glimmer` resolves to `.atem`. Its output is read strictly by default:
+one invoke for each tool frame, the invoke name equal to the frame's
+recipient, and no call from a frame that generation leaves open. Set
+`onyxParsing` to read it the way vLLM, SGLang and llama.cpp do: one call for
+each complete invoke, a doubled name `X.X` as the declared tool `X`, values
+typed by the tool schema, and no call from an invoke the token limit cut off.
+An undeclared tool is rejected in both modes.
+
+```swift
+var parameters = GenerateParameters()
+parameters.toolCallPolicy.onyxParsing = .referenceParity
+```
+
+A host that runs its own engine decodes the response with one of two types.
+Both give reasoning, content, tool calls and rejections as `OnyxStreamEvent`.
+
+```swift
+// Token ids: text that spells a marker cannot forge a frame.
+var decoder = OnyxTokenStreamDecoder(tokenizer: tokenizer, tools: toolSpecs)!
+for token in generatedTokens { handle(decoder.push(token)) }  // stop token included
+handle(decoder.finish())
+
+// Text with the control markers visible, cut anywhere.
+var textDecoder = OnyxTextStreamDecoder(tools: toolSpecs)
+for chunk in chunks { handle(textDecoder.process(chunk)) }
+handle(textDecoder.finish())
+```
+
+`<|eot|>` and `<|end_of_text|>` end generation (`stopTokenIDs`); `<|eom|>`
+ends one message and does not.
+
 ### Explicit Format in Configuration
 
 ```swift
