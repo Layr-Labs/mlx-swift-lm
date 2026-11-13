@@ -5,6 +5,42 @@ import Foundation
 /// Parser for Gemma format: call:name{key:value,k:<escape>str<escape>}
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/function_gemma.py
 public struct GemmaFunctionParser: ToolCallParser, Sendable {
+    /// Opt-in numeric typing; absent or `0` preserves marker strings.
+    static let schemaCoercionEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA_SCHEMA_COERCION"] == "1"
+
+    static func numericReading(_ text: String, schema: [String: any Sendable]?) -> JSONValue? {
+        guard schemaCoercionEnabled else { return nil }
+        switch ToolArgumentNormalization.normalize(.string(text), schema: schema) {
+        case .int(let value): return .int(value)
+        case .double(let value): return .double(value)
+        default: return nil
+        }
+    }
+
+    /// Unsupported container constraints cannot establish a quoted child's type.
+    private static func supportsQuotedChildren(_ schema: [String: any Sendable]?) -> Bool {
+        guard let schema else { return false }
+        return [
+            "$ref", "$dynamicRef", "allOf", "anyOf", "oneOf", "not", "if", "then", "else",
+            "dependentSchemas", "patternProperties",
+        ].allSatisfy { schema[$0] == nil }
+    }
+
+    static func quotedMemberSchema(_ key: String, in schema: [String: any Sendable]?)
+        -> [String: any Sendable]?
+    {
+        guard supportsQuotedChildren(schema) else { return nil }
+        let properties = schema?["properties"] as? [String: any Sendable] ?? [:]
+        if let property = properties[key] { return property as? [String: any Sendable] }
+        return schema?["additionalProperties"] as? [String: any Sendable]
+    }
+
+    static func quotedItemSchema(in schema: [String: any Sendable]?) -> [String: any Sendable]? {
+        guard supportsQuotedChildren(schema), schema?["prefixItems"] == nil else { return nil }
+        return schema?["items"] as? [String: any Sendable]
+    }
+
     private struct ArgumentSchema {
         let names: Set<String>
         let allowsAdditional: Bool
@@ -168,6 +204,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         // bearing bare strings). Required/named output never needs this path:
         // its sampler emits only the strict template language above.
         var arguments: [String: JSONValue] = [:]
+        let parameters = tools.flatMap {
+            ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: $0)
+        }
         // Gemma occasionally omits its string markers. The schema lets us keep
         // a comma in `Boston, MA` while still splitting before `unit:`.
         for pair in splitTopLevel(text, separator: ",") {
@@ -177,7 +216,15 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
                 in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
             guard schema.allowsAdditional || schema.names.contains(key) else { return nil }
-            arguments[key] = JSONValue.from(parseValue(rawValue))
+            let value = JSONValue.from(parseValue(rawValue))
+            let parameter = Self.quotedMemberSchema(key, in: parameters)
+            if case .string(let text) = value,
+                quoteMarkers.contains(where: { rawValue.hasPrefix($0) && rawValue.hasSuffix($0) })
+            {
+                arguments[key] = Self.numericReading(text, schema: parameter) ?? value
+            } else {
+                arguments[key] = value
+            }
         }
         return arguments
     }
@@ -503,16 +550,24 @@ struct GemmaArgumentValueParser {
 
         /// The reading `schema` asks for (`ToolArgumentNormalization.bareLiteral`).
         func value(schema: [String: any Sendable]?) -> JSONValue {
+            value(schema: schema, quotedSchema: schema)
+        }
+
+        private func value(schema: [String: any Sendable]?, quotedSchema: [String: any Sendable]?)
+            -> JSONValue
+        {
             switch self {
             case .string(let text):
-                return .string(text)
+                return GemmaFunctionParser.numericReading(text, schema: quotedSchema)
+                    ?? .string(text)
             case .bare(let text, let reading):
                 return ToolArgumentNormalization.bareLiteral(text, reading: reading, schema: schema)
             case .object(let members):
-                return .object(Self.values(members, schema: schema))
+                return .object(Self.values(members, schema: schema, quotedSchema: quotedSchema))
             case .array(let items):
                 let itemSchema = schema?["items"] as? [String: any Sendable]
-                return .array(items.map { $0.value(schema: itemSchema) })
+                let quotedItem = GemmaFunctionParser.quotedItemSchema(in: quotedSchema)
+                return .array(items.map { $0.value(schema: itemSchema, quotedSchema: quotedItem) })
             }
         }
 
@@ -521,12 +576,20 @@ struct GemmaArgumentValueParser {
         static func values(_ members: [String: Literal], schema: [String: any Sendable]?)
             -> [String: JSONValue]
         {
+            values(members, schema: schema, quotedSchema: schema)
+        }
+
+        private static func values(
+            _ members: [String: Literal], schema: [String: any Sendable]?,
+            quotedSchema: [String: any Sendable]?
+        ) -> [String: JSONValue] {
             let properties = schema?["properties"] as? [String: any Sendable] ?? [:]
             let additional = schema?["additionalProperties"] as? [String: any Sendable]
             var values: [String: JSONValue] = [:]
             for (key, member) in members {
                 values[key] = member.value(
-                    schema: properties[key] as? [String: any Sendable] ?? additional)
+                    schema: properties[key] as? [String: any Sendable] ?? additional,
+                    quotedSchema: GemmaFunctionParser.quotedMemberSchema(key, in: quotedSchema))
             }
             return values
         }

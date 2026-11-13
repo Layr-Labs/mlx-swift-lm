@@ -279,7 +279,11 @@
       "extra": true,
       "metallib": false,
       "filters": [
-        "GemmaQuotedNumberConformanceTests"
+        "GemmaQuotedNumberConformanceTests",
+        "GemmaFunctionConstraintParserTests",
+        "ToolCallStreamingTests",
+        "ToolCallStreamingDifferentialTests",
+        "ToolArgumentNormalizationTests"
       ],
       "env": {
         "DARKBLOOM_GEMMA_SCHEMA_COERCION": "1"
