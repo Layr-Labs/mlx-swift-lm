@@ -578,6 +578,12 @@ public struct CBv2MTPConfig: Sendable {
     /// the first carry, so a round can follow the first token without a
     /// seed step. False keeps the seed step.
     public var prefillCarry: Bool
+    /// Draft only through opted-in grammar spans. Off preserves request-wide exclusion.
+    public var freeSpanSpeculation: Bool
+    /// Explicit opt-in shared with the provider; unset and unknown values are off.
+    public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
+        ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -605,13 +611,15 @@ public struct CBv2MTPConfig: Sendable {
         allowsAdaptiveSerialRounds: Bool = true,
         acceptance: CBv2MTPAcceptance = .exact,
         ordinaryDecodeHistory: Bool = Self.envOrdinaryDecodeHistory,
-        prefillCarry: Bool = Self.envPrefillCarry
+        prefillCarry: Bool = Self.envPrefillCarry,
+        freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
         self.ordinaryDecodeHistory = ordinaryDecodeHistory
         self.prefillCarry = prefillCarry
+        self.freeSpanSpeculation = freeSpanSpeculation
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
