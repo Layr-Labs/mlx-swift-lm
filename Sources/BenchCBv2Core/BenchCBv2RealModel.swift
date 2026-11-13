@@ -667,6 +667,26 @@ func collectV2(
     return r
 }
 
+/// SHA-256 over one request's output: token ids, then for each log-probability
+/// record the token id, the bit pattern of its log-probability and the same
+/// for its top alternatives. A hash only; no ids or text leave the process.
+func benchOutputDigest(_ r: RunResult) -> String {
+    var data = Data()
+    func put<T: FixedWidthInteger>(_ value: T) {
+        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+    }
+    for token in r.tokens { put(Int64(token)) }
+    for record in r.logprobs {
+        put(Int64(record.token))
+        put(record.logprob.bitPattern)
+        for top in record.topLogprobs {
+            put(Int64(top.token))
+            put(top.logprob.bitPattern)
+        }
+    }
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
 func runV2Request(
     engine: EngineV2, id: UInt64, promptTokens: [Int], maxTokens: Int, stopTokens: Set<Int>,
     topLogprobs: Int = 0
@@ -1118,6 +1138,9 @@ func runV2Cell(
         MLX.GPU.clearAndArmGemma4ExpertQMMDiagnostics()
         CBv2StepProfiler.armEvents()
     }
+    let digestLogprobs =
+        ProcessInfo.processInfo.environment["BENCH_OUTPUT_DIGEST"] == "1" ? 4 : 0
+    _ = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -1125,7 +1148,7 @@ func runV2Cell(
             group.addTask { @Sendable in
                 let r = try? await runV2Request(
                     engine: engine, id: UInt64(1000 + i), promptTokens: prompt,
-                    maxTokens: steps, stopTokens: [])
+                    maxTokens: steps, stopTokens: [], topLogprobs: digestLogprobs)
                 return (i, r ?? RunResult())
             }
         }
@@ -1134,6 +1157,17 @@ func runV2Cell(
         return all.sorted { $0.0 < $1.0 }.map(\.1)
     }
     await engine.shutdown()
+    // Hashes and counts only: one digest per request over its token ids and,
+    // with BENCH_OUTPUT_DIGEST=1, the bit patterns of its log-probabilities.
+    let carry = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
+    print(
+        "    recurrent batch carry: enabled=\(CBv2RecurrentBatchCarry.enabled) "
+            + "carried=\(carry.carried) joined=\(carry.joined)")
+    for (i, r) in results.enumerated() {
+        print(
+            "    digest req \(i): tokens=\(r.tokens.count) logprobs=\(r.logprobs.count) "
+                + "sha=\(benchOutputDigest(r))")
+    }
 
     let optimizationProvenance: CellOptimizationProvenance?
     if trackOptimizationProvenance {
