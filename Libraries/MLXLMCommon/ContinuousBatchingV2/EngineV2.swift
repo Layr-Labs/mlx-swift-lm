@@ -160,6 +160,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     private let requiredPositionAxisCount: Int?
     private let supportsPositionedForwarding: Bool
     private let samplerSupportsTokenConstraints: Bool
+    private let reasoningBudgetsEnabled: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
     /// the submit thread (hashing is host work — never on the engine step
@@ -292,7 +293,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         nativeCompletionTracking: Bool = false,
         nativeExecutionContract: CBv2NativeExecutionContract? = nil,
         automaticMiMoPrefill: Bool = false,
-        miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil
+        miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil,
+        reasoningBudgetsEnabled: Bool = CBv2ReasoningBudget.enabled()
     ) {
         // Explicit SDK scheduler choices stay unchanged unless the native
         // factory requests this optional default profile. Commit a wider copy
@@ -308,6 +310,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.supportsPositionedForwarding = Self.modelSupportsPositionedForwarding(model)
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
+        self.reasoningBudgetsEnabled = reasoningBudgetsEnabled
         let modelCapabilities =
             (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
         self.modelCapabilities = modelCapabilities

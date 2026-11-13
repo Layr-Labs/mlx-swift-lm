@@ -132,6 +132,8 @@ public struct CBv2Request: Sendable {
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
     public var tokenConstraint: (any CBv2TokenConstraint)?
+    /// Optional reasoning-only output budget; nil preserves ordinary decoding.
+    public var reasoningBudget: CBv2ReasoningBudget? = nil
     /// Coordinator-observed length, in tokens, of the prefix other prompts
     /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
     /// Historical checkpoint retention keeps the stride-aligned boundary at
