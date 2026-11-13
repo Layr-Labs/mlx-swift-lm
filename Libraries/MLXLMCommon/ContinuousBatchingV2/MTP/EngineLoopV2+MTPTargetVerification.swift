@@ -391,7 +391,7 @@ extension EngineLoopV2 {
                     topTwo.values.reshaped([batch, width, 2]).asType(.float32)
                 )
             }
-            if useTargetPrefix {
+            if useTargetPrefix || spanSampler != nil {
                 let drafts: MLXArray? =
                     typicalDelta != nil
                     ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
