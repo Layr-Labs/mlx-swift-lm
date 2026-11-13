@@ -35,6 +35,9 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     /// evaluated embeddings and spans may capture and restore recurrent
     /// checkpoints in that identity's scope (`permitsHybridCheckpoint`).
     public var supportsCausalMediaCheckpointReuse: Bool
+    /// The model runs only on paged KV storage: the engine refuses any other
+    /// backend instead of serving it from contiguous rows. Default off.
+    public var requiresPagedKV: Bool
 
     public init(
         supportsPrefixReuse: Bool = true,
@@ -46,7 +49,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsMTP: Bool = true,
         supportsCompactRecurrentMTPReplay: Bool = false,
         alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
-        supportsCausalMediaCheckpointReuse: Bool = false
+        supportsCausalMediaCheckpointReuse: Bool = false,
+        requiresPagedKV: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -58,6 +62,7 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
         self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
         self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
+        self.requiresPagedKV = requiresPagedKV
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()
