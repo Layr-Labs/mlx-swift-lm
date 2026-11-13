@@ -20,6 +20,46 @@ private final class BudgetTransitionModel: CBv2SteppableModel {
     }
 }
 
+/// Hold real model work, without supplying a result or changing the sampler.
+private final class BudgetGatedModel: CBv2SteppableModel, @unchecked Sendable {
+    private let model = BudgetTransitionModel()
+    private let condition = NSCondition()
+    private let holdAt: Int
+    private var calls = 0
+    private var held = false
+    private var released = false
+    private var largestBatch = 0
+
+    init(holdAt: Int) { self.holdAt = holdAt }
+    var maximumBatch: Int { condition.withLock { largestBatch } }
+    func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+    func waitUntilHeld() async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while clock.now < deadline {
+            if condition.withLock({ held }) { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        condition.lock()
+        calls += 1
+        largestBatch = max(largestBatch, tokens.dim(0))
+        if calls == holdAt {
+            held = true
+            while !released { condition.wait() }
+        }
+        condition.unlock()
+        return model.forward(tokens: tokens, caches: caches)
+    }
+}
+
 private struct BudgetTextTokenizer: MLXLMCommon.Tokenizer {
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { [0] }
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
@@ -41,11 +81,12 @@ struct CBv2ReasoningBudgetTests {
     private func engine(
         enabled: Bool = true, sampler: any CBv2StepSampler = CBv2DefaultSampler(),
         detokenizer: any CBv2DetokenizerFactory = CBv2NullDetokenizerFactory(),
-        next: [Int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0]
+        next: [Int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0],
+        model: (any CBv2SteppableModel)? = nil
     ) -> EngineV2 {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)]
         return EngineV2(
-            model: BudgetTransitionModel(next: next), layerKinds: kinds,
+            model: model ?? BudgetTransitionModel(next: next), layerKinds: kinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: sampler,
             detokenizerFactory: detokenizer,
@@ -176,12 +217,16 @@ struct CBv2ReasoningBudgetTests {
 
     @Test("Mixed requests and reused IDs keep independent budgets")
     func rowIsolationAndReuse() async throws {
-        let engine = engine()
+        let model = BudgetGatedModel(holdAt: 2)
+        defer { model.release() }
+        let engine = engine(model: model)
         let first = try engine.submit(request(id: 41, budget: 1))
+        #expect(try await model.waitUntilHeld())
         let second = try engine.submit(request(id: 42, budget: 3))
         var ordinary = try request(id: 43)
         ordinary.reasoningBudget = nil
         let third = try engine.submit(ordinary)
+        model.release()
         async let a = cbv2SchedCollect(first)
         async let b = cbv2SchedCollect(second)
         async let c = cbv2SchedCollect(third)
@@ -189,9 +234,31 @@ struct CBv2ReasoningBudgetTests {
         #expect(results.0.tokens == [1, 8, 9, 10, 11, 12])
         #expect(results.1.tokens == [1, 2, 3, 8, 9, 10])
         #expect(results.2.tokens == [1, 2, 3, 4, 5, 6])
+        #expect(model.maximumBatch > 1, "the real model must observe overlapping decode rows")
         let reused = await cbv2SchedCollect(try engine.submit(request(id: 41, budget: 2)))
         await engine.shutdown()
         #expect(reused.tokens == [1, 2, 8, 9, 10, 11])
+    }
+
+    @Test("Cancellation during the closing step retires and a reused ID starts a fresh budget")
+    func cancellationDuringClose() async throws {
+        let model = BudgetGatedModel(holdAt: 3)
+        defer { model.release() }
+        let engine = engine(model: model)
+        let request = try request()
+        let submission = try engine.submitWithRetirement(request)
+        #expect(try await model.waitUntilHeld())
+        engine.cancel(request.id)
+        model.release()
+        let result = await cbv2SchedCollect(submission.events)
+        await submission.retirement.wait()
+        #expect(result.finishReason == .cancelled)
+        // Cancellation completes the in-flight step before dropping the row.
+        #expect(result.tokens == [1, 2] || result.tokens == [1, 2, 8])
+        #expect(result.usage?.completionTokens == result.tokens.count)
+        let reused = await cbv2SchedCollect(try engine.submit(self.request(budget: 1)))
+        await engine.shutdown()
+        #expect(reused.tokens == [1, 8, 9, 10, 11, 12])
     }
 
     @Test("Off and unsupported samplers refuse the control")
@@ -227,6 +294,35 @@ struct CBv2ReasoningBudgetTests {
             try CBv2ReasoningBudget(
                 maximumTokens: Int.max, openTokenID: 14, closeTokenID: 8,
                 startsInsideThought: true)
+        }
+    }
+
+    @Test("The largest supported budget preserves the smaller total output limit")
+    func maximumBudget() async throws {
+        let engine = engine()
+        let result = await cbv2SchedCollect(
+            try engine.submit(request(budget: Int(Int32.max))))
+        await engine.shutdown()
+        #expect(result.tokens == [1, 2, 3, 4, 5, 6])
+        #expect(result.finishReason == .length)
+        #expect(result.usage?.completionTokens == 6)
+    }
+
+    @Test("Budgets immediately above the public bound are refused")
+    func maximumPlusOne() throws {
+        #expect(throws: CBv2ReasoningBudgetError.invalidConfiguration) {
+            try request(budget: Int(Int32.max) + 1)
+        }
+    }
+
+    @Test("Invalid marker identities are rejected before submission")
+    func invalidMarkers() {
+        for (open, close) in [(-1, 8), (14, -1), (8, 8), (Int.max, 8), (14, Int.max)] {
+            #expect(throws: CBv2ReasoningBudgetError.invalidConfiguration) {
+                try CBv2ReasoningBudget(
+                    maximumTokens: 2, openTokenID: open, closeTokenID: close,
+                    startsInsideThought: true)
+            }
         }
     }
 

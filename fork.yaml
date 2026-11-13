@@ -98,6 +98,9 @@ def:
             acceptance packet, so a flagged row or committed verify position emits nothing.
             Identity-greedy batches skip unused parameter/history tensor construction and the
             unused all-greedy mask while retaining constraints, transforms and sampler row state.
+            Opt-in native reasoning budgets count confirmed thought payload tokens, force the
+            validated close marker at N, and continue the same request within its total output
+            limit. Budget rows use target decoding without MTP or chaining.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -202,6 +205,8 @@ def:
           globs:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/Integration/Engine/**"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2ReasoningBudgetTests.swift"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2ReasoningBudgetNativeMiMoTests.swift"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/Native*Checkpoint*"
