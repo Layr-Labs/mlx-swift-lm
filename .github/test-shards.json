@@ -283,7 +283,8 @@
         "GemmaFunctionConstraintParserTests",
         "ToolCallStreamingTests",
         "ToolCallStreamingDifferentialTests",
-        "ToolArgumentNormalizationTests"
+        "ToolArgumentNormalizationTests",
+        "testGemmaBareScalarsFollowTheSchema"
       ],
       "env": {
         "DARKBLOOM_GEMMA_SCHEMA_COERCION": "1"

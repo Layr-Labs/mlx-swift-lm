@@ -199,6 +199,71 @@ extension UnitTests {
             }
         }
 
+        @Test("held numbers agree with completed calls across mixed, nested and duplicate values")
+        func streamedNumbers() throws {
+            guard enabled else { return }
+            let specs = try toolSpecs(
+                #"""
+                [{"function":{"name":"store","parameters":{"type":"object","properties":{
+                  "count":{"type":"integer"},"label":{"type":"string"},
+                  "values":{"type":"array","items":{"type":"number"}}
+                }}}}]
+                """#)
+            let cases: [(String, [String: JSONValue])] = [
+                (
+                    #"label:<|"|>kept<|"|>,count:<|"|>3<|"|>"#,
+                    ["label": .string("kept"), "count": .int(3)]
+                ),
+                (#"count:<|"|>3<|"|>,count:<|"|>4<|"|>"#, ["count": .int(4)]),
+                (
+                    #"values:[<|"|>1.5<|"|>,<|"|>2<|"|>]"#,
+                    ["values": .array([.double(1.5), .int(2)])]
+                ),
+            ]
+            for (arguments, expected) in cases {
+                for width in [1, 3, 1000] {
+                    let processor = ToolCallProcessor(
+                        format: .gemma, tools: specs, streaming: .init(exposesName: { _ in true }))
+                    let frame = Array("<|tool_call>call:store{" + arguments + "}<tool_call|>")
+                    var segments: [ToolCallStreamSegment] = []
+                    for start in stride(from: 0, to: frame.count, by: width) {
+                        segments += processor.processChunkSegments(
+                            String(frame[start ..< min(start + width, frame.count)]))
+                    }
+                    segments += processor.processEOSSegments()
+                    var json = ""
+                    var completed: [ToolCall] = []
+                    for segment in segments {
+                        switch segment {
+                        case .callArguments(let text): json += text
+                        case .callCompleted(let call, let remainder):
+                            completed.append(call)
+                            json += remainder
+                        case .callFailed: Issue.record("held numeric call failed")
+                        default: break
+                        }
+                    }
+                    #expect(completed.count == 1)
+                    #expect(completed.first?.function.arguments == expected)
+                    #expect(
+                        try JSONDecoder().decode([String: JSONValue].self, from: Data(json.utf8))
+                            == expected)
+                }
+            }
+            let processor = ToolCallProcessor(
+                format: .gemma, tools: specs, streaming: .init(exposesName: { _ in true }))
+            let segments =
+                processor.processChunkSegments(#"<|tool_call>call:store{count:<|"|>3"#)
+                + processor.processEOSSegments()
+            for segment in segments {
+                switch segment {
+                case .callCompleted, .callArguments:
+                    Issue.record("truncated numeric argument was exposed")
+                default: break
+                }
+            }
+        }
+
         private func toolSpecs(_ json: String) throws -> [[String: any Sendable]] {
             try #require(
                 JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: any Sendable]])
