@@ -13,6 +13,10 @@ import MLXLMCommon
 /// its scheduler chunks were. It never holds a speculative round; restore
 /// makes a fresh state.
 extension NemotronSuperMTPAssistant: CBv2MTPPrefixCheckpointDrafter {
+    /// Requests that cannot speculate record prompt history too, so their
+    /// checkpoints are the ones a speculating request saves.
+    public var checkpointsNonSpeculatingRows: Bool { true }
+
     final class PrefixCheckpoint: CBv2MTPPrefixCheckpoint {
         let owner: ObjectIdentifier
         let targetInputCount: Int

@@ -917,8 +917,9 @@ public final class PagedKVPool {
 
     // MARK: - Page lifecycle
 
-    func allocatePage(group key: PagedKVGroupKey) -> Int32 {
-        group(key).allocatePage { [unowned self] handle in
+    /// `hint`: the page the same row layer allocated last, if any.
+    func allocatePage(group key: PagedKVGroupKey, after hint: Int32? = nil) -> Int32 {
+        group(key).allocatePage(after: hint) { [unowned self] handle in
             pageReuseObserver?.pagedKVPool(self, willReuse: handle)
         }
     }
@@ -953,9 +954,9 @@ public final class PagedKVPool {
         return group(handle.group).refCounts[Int(handle.page)]
     }
 
-    /// Move a generation-valid, zero-ref page to the immediate-reuse end after
-    /// its final cache alias disappears. Active pages are classified when
-    /// their last owner releases them instead.
+    /// Make a generation-valid, zero-ref page uncached (reused before any
+    /// cached page) after its final cache alias disappears. Active pages are
+    /// classified when their last owner releases them instead.
     func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
         groups[handle.group]?.reclassifyAsUncached(handle)
     }
@@ -1295,6 +1296,57 @@ extension PagedKVPool {
             operation.fail()
             throw error
         }
+    }
+
+    /// Whole free segments an issued GLM pool could return now: what
+    /// `trimSegments` would retire. Metadata only.
+    var issuedNativeReleasableBytes: Int {
+        guard nativeModelBinding?.isGLM5Next == true else { return 0 }
+        return groups.values.reduce(0) { $0 + $1.trimmableSegmentBytes }
+    }
+
+    /// Returns an issued GLM pool's free segments to the allocator and refunds
+    /// their physical floor, as `trimFreeSegments` does for other pools. A
+    /// native pool skips that trim (no native wait under commit), so without
+    /// this its backing only grows: every complete-checkpoint import attaches
+    /// new segments, and the free ones stay charged until the pool retires.
+    /// Once that floor nears the grant, a lone request cannot reserve its
+    /// state and first step's scratch beside it and fails as capacity.
+    ///
+    /// Same order as `retireIssuedNativePool`, without retiring the pool:
+    /// engine queue only, outside the native outcome commit, between steps,
+    /// with no attention work and no native loan but the pool's own lifetime
+    /// loan. Segments holding an in-use or reserved page stay, exactly as
+    /// `trimSegments` keeps them. Returns the bytes released (0 when nothing
+    /// was free), or nil while other native work keeps the pool busy.
+    func releaseIssuedNativeFreeSegments() throws -> Int? {
+        guard let binding = nativeModelBinding, binding.isGLM5Next, !binding.poolRetired,
+            binding.canStartPoolRetirement, activeAttentionWork == nil,
+            attentionWorkOwners.isEmpty,
+            groups.values.allSatisfy({ $0.deferredFrees.isEmpty }),
+            residentPrefixQuarantineIsAbsent
+        else { return nil }
+        guard issuedNativeReleasableBytes > 0 else { return 0 }
+        let before = bytesMaterialized
+        // The lease covers the backing; `release(to:)` may only lower it.
+        if let lease = physicalLease, lease.bytes < before { return nil }
+        let operation = try binding.beginWork(nativeData: false)
+        retainNativePoolBacking(in: operation)
+        do {
+            try operation.requiredDrain()
+        } catch {
+            // A failed drain has already failed the native runtime.
+            operation.fail()
+            throw error
+        }
+        // Backing references remain on the operation while these metadata maps
+        // and actual M coverage are detached OUTSIDE commit.
+        for group in groups.values { group.trimSegments { _ in } }
+        let remaining = bytesMaterialized
+        // `finish` refuses only after a terminal native fault, which has
+        // already failed every row; the trim stands either way.
+        _ = operation.finish { physicalLease?.release(to: remaining) }
+        return before - remaining
     }
 
     private var residentPrefixQuarantineIsAbsent: Bool {

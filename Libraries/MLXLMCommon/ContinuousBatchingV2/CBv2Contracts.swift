@@ -1108,8 +1108,9 @@ public struct CBv2SchedulerConfig: Sendable {
             grid: grid, boundaries: canonicalBoundaryRule?.boundaries(in: promptTokens) ?? [])
     }
 
-    /// A request's ordinary chunk cap. First-token projection never prices a
-    /// block-bearing row (`multimodalWork`), so only scheduling consults it.
+    /// A request's ordinary chunk cap. First-token projection prices a
+    /// block-bearing row only once it is decode-ready past its prompt
+    /// (`multimodalWork`), so only scheduling consults it.
     func plainPrefillChunkSize(hasBidirectionalBlocks: Bool) -> Int {
         guard hasBidirectionalBlocks, let ceiling = bidirectionalMediaPrefillChunkCeiling,
             ceiling > 0

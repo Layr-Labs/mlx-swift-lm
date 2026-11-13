@@ -35,6 +35,9 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
+    /// The observed token and hidden arrays (and carries), all evaluation
+    /// targets of this step.
+    let committedObservationArrays: [MLXArray]
     let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
     let prefillCarryTopTwoValues: MLXArray?
 }
@@ -179,7 +182,10 @@ extension EngineLoopV2 {
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
         ) throws -> Bool {
-            guard let state = try mtpTakeHistoryState(for: row.rec) else { return false }
+            guard
+                let state = try mtpTakeHistoryState(
+                    for: row.rec, range: row.start ..< row.start + row.count)
+            else { return false }
             retainNativeWork([], owners: [state])
             let observationDrafter = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             func retainObservationFence() {
@@ -208,7 +214,9 @@ extension EngineLoopV2 {
             retainObservationFence()
             committedObservationRows.append(
                 .init(id: row.rec.id, assistantState: state))
-            committedObservationEvalTargets.append(hidden)
+            // Both arrays are evaluated with this step, so history's views of
+            // them drop the step's Metal event at finalize.
+            committedObservationEvalTargets.append(contentsOf: [tokens, hidden])
             return true
         }
         if !decodeRows.isEmpty {
@@ -509,7 +517,7 @@ extension EngineLoopV2 {
             }
             if let observedHidden,
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden),
-                row.samples, mtpSeedsCarryFromPrefill
+                row.samples, mtpSeedsCarryFromPrefill, mtpBasicEligible(rec)
             {
                 // The final prompt row's hidden produced the first token: the
                 // exact pair a seed step would otherwise recompute.
@@ -630,16 +638,21 @@ extension EngineLoopV2 {
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
             committedObservationRows: committedObservationRows,
+            committedObservationArrays: committedObservationEvalTargets,
             prefillCarries: prefillCarries,
             prefillCarryTopTwoValues: prefillCarryTopTwoValues)
     }
 
     /// Detach (or create) the request's persistent assistant state for one
-    /// committed target observation; nil when the row owns no history.
+    /// committed target observation; nil when the row owns no history. A row
+    /// that cannot speculate owns history only over a prompt `range` that can
+    /// leave a prefix checkpoint (`mtpRecordsPromptHistory`).
     func mtpTakeHistoryState(
-        for rec: CBv2ScheduledRequest
+        for rec: CBv2ScheduledRequest, range: Range<Int>? = nil
     ) throws -> (any CBv2MTPRequestState)? {
-        guard let mtp, mtp.tracksPersistentHistory, mtpBasicEligible(rec) else { return nil }
+        guard let mtp, mtp.tracksPersistentHistory,
+            mtpBasicEligible(rec) || range.map({ mtpRecordsPromptHistory(rec, range: $0) }) == true
+        else { return nil }
         return try mtp.takeOrMakeAssistantState(
             for: rec.id,
             maximumSequenceLength: rec.request.promptTokens.count

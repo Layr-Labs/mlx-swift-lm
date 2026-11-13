@@ -154,7 +154,12 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             parser.isAtEnd,
             schema.allowsAdditional || parsed.keys.allSatisfy(schema.names.contains)
         {
-            return parsed
+            // A bare scalar is read as its parameter's schema asks, so
+            // `zip:01000` for a string parameter stays "01000".
+            let parameters = tools.flatMap {
+                ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: $0)
+            }
+            return GemmaArgumentValueParser.Literal.values(parsed, schema: parameters)
         }
         if strict { return nil }
 
@@ -485,6 +490,48 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 /// `format_argument(..., escape_keys=False)` macro. The older permissive
 /// parser remains as a fallback only for historical unconstrained auto output.
 struct GemmaArgumentValueParser {
+    /// A value as written. A bare scalar keeps its text beside its JSON
+    /// reading, so a declared schema can still read it as a string.
+    indirect enum Literal {
+        case string(String)
+        case bare(String, JSONValue)
+        case object([String: Literal])
+        case array([Literal])
+
+        /// The schema-blind reading: a bare scalar is its JSON value.
+        var value: JSONValue { value(schema: nil) }
+
+        /// The reading `schema` asks for (`ToolArgumentNormalization.bareLiteral`).
+        func value(schema: [String: any Sendable]?) -> JSONValue {
+            switch self {
+            case .string(let text):
+                return .string(text)
+            case .bare(let text, let reading):
+                return ToolArgumentNormalization.bareLiteral(text, reading: reading, schema: schema)
+            case .object(let members):
+                return .object(Self.values(members, schema: schema))
+            case .array(let items):
+                let itemSchema = schema?["items"] as? [String: any Sendable]
+                return .array(items.map { $0.value(schema: itemSchema) })
+            }
+        }
+
+        /// Each member read with its property's schema, else with
+        /// `additionalProperties`.
+        static func values(_ members: [String: Literal], schema: [String: any Sendable]?)
+            -> [String: JSONValue]
+        {
+            let properties = schema?["properties"] as? [String: any Sendable] ?? [:]
+            let additional = schema?["additionalProperties"] as? [String: any Sendable]
+            var values: [String: JSONValue] = [:]
+            for (key, member) in members {
+                values[key] = member.value(
+                    schema: properties[key] as? [String: any Sendable] ?? additional)
+            }
+            return values
+        }
+    }
+
     private let text: String
     private let rejectDuplicates: Bool
     private var index: String.Index
@@ -499,7 +546,7 @@ struct GemmaArgumentValueParser {
     static func parseCompleteValue(_ text: String) -> JSONValue? {
         var parser = Self(text)
         guard let value = parser.parseValue(), parser.isAtEnd else { return nil }
-        return value
+        return value.value
     }
 
     var isAtEnd: Bool {
@@ -508,10 +555,10 @@ struct GemmaArgumentValueParser {
         return copy.index == text.endIndex
     }
 
-    mutating func parseTopLevelArguments() -> [String: JSONValue]? {
+    mutating func parseTopLevelArguments() -> [String: Literal]? {
         skipWhitespace()
         if index == text.endIndex { return [:] }
-        var output: [String: JSONValue] = [:]
+        var output: [String: Literal] = [:]
         while index < text.endIndex {
             guard let key = parseKey(), consume(":"),
                 let value = parseValue()
@@ -525,7 +572,7 @@ struct GemmaArgumentValueParser {
         return output
     }
 
-    private mutating func parseValue() -> JSONValue? {
+    private mutating func parseValue() -> Literal? {
         skipWhitespace()
         for marker in ["<|\"|>", "<escape>"] where text[index...].hasPrefix(marker) {
             advance(marker.count)
@@ -537,7 +584,7 @@ struct GemmaArgumentValueParser {
             return .string(value)
         }
         if consume("{") {
-            var object: [String: JSONValue] = [:]
+            var object: [String: Literal] = [:]
             skipWhitespace()
             if consume("}") { return .object(object) }
             while true {
@@ -551,7 +598,7 @@ struct GemmaArgumentValueParser {
             }
         }
         if consume("[") {
-            var array: [JSONValue] = []
+            var array: [Literal] = []
             skipWhitespace()
             if consume("]") { return .array(array) }
             while true {
@@ -561,9 +608,9 @@ struct GemmaArgumentValueParser {
                 guard consume(",") else { return nil }
             }
         }
-        if consume("true") { return .bool(true) }
-        if consume("false") { return .bool(false) }
-        if consume("null") { return .null }
+        if consume("true") { return .bare("true", .bool(true)) }
+        if consume("false") { return .bare("false", .bool(false)) }
+        if consume("null") { return .bare("null", .null) }
         if text[index...].hasPrefix("\""), let string = parseJSONString() {
             return .string(string)
         }
@@ -607,7 +654,7 @@ struct GemmaArgumentValueParser {
         return nil
     }
 
-    private mutating func parseNumber() -> JSONValue? {
+    private mutating func parseNumber() -> Literal? {
         let start = index
         while index < text.endIndex {
             let character = text[index]
@@ -619,8 +666,8 @@ struct GemmaArgumentValueParser {
         }
         guard start != index else { return nil }
         let raw = String(text[start ..< index])
-        if let integer = Int(raw) { return .int(integer) }
-        if let number = Double(raw), number.isFinite { return .double(number) }
+        if let integer = Int(raw) { return .bare(raw, .int(integer)) }
+        if let number = Double(raw), number.isFinite { return .bare(raw, .double(number)) }
         return nil
     }
 

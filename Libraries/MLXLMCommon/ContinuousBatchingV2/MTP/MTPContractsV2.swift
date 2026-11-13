@@ -369,7 +369,9 @@ public protocol CBv2MTPRequestResidencyReporting: CBv2MTPRequestState {
 /// Trusted target inputs and corresponding hidden rows at the target/drafter's
 /// declared trained boundary. No cross-family normalization is performed here.
 /// Both arrays remain lazy and device-resident until the engine's existing
-/// finalize fence.
+/// finalize fence. After their step finishes, the engine drops that step's
+/// completion event from the arrays they view (`CBv2MTPHistoryEvents`), so a
+/// drafter may keep lazy views of them across any number of steps.
 public struct CBv2MTPCommittedTargetObservation {
     public let tokens: MLXArray
     public let hidden: MLXArray
