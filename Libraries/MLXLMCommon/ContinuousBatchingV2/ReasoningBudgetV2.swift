@@ -2,7 +2,7 @@ import Foundation
 import MLX
 
 /// An output-token budget for a family's atomic thought markers.
-/// Marker tokens do not spend the budget. The request's total output limit still applies.
+/// The limit is 1...Int32.max. Markers do not spend it; the total output limit still applies.
 public struct CBv2ReasoningBudget: Sendable, Equatable {
     public let maximumTokens: Int
     public let openTokenID: Int
@@ -13,7 +13,8 @@ public struct CBv2ReasoningBudget: Sendable, Equatable {
         maximumTokens: Int, openTokenID: Int, closeTokenID: Int,
         startsInsideThought: Bool
     ) throws {
-        guard maximumTokens > 0, openTokenID >= 0, closeTokenID >= 0,
+        guard maximumTokens > 0, maximumTokens <= Int(Int32.max),
+            openTokenID >= 0, closeTokenID >= 0,
             openTokenID != closeTokenID,
             openTokenID <= Int(Int32.max), closeTokenID <= Int(Int32.max)
         else { throw CBv2ReasoningBudgetError.invalidConfiguration }

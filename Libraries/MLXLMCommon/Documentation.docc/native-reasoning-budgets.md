@@ -6,7 +6,7 @@
 `reasoningBudgetsEnabled: true` to its initializer. Check
 ``CBv2Engine/supportsReasoningBudgets`` before translating a client request.
 
-The family adapter supplies a positive token limit, distinct atomic opening and
+The family adapter supplies a token limit in `1...Int32.max`, distinct atomic opening and
 closing token IDs, and whether its rendered generation prompt already opened a
 thought. Validate marker encode/decode round trips with the loaded tokenizer.
 Do not infer this initial state from user text or historical messages.
