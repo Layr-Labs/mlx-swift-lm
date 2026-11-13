@@ -273,7 +273,7 @@ def:
         - "Tests/MLXLMTests/AudioReaderRetryTests.swift"
         - "Tests/MLXLMTests/AudioReaderDiagnosticProbe.swift"
         - "Tests/MLXLMTests/AudioReaderDiagnosticTimeline.swift"
-        - "Tests/MLXLMTests/AudioReaderDiagnosticTimelineTests.swift"
+        - "Tests/MLXLMTests/Unit/Common/AudioReaderDiagnosticTimelineTests.swift"
         - "Tests/MLXLMTests/ReaderPassFaults.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
