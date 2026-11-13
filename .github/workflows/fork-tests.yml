@@ -466,6 +466,59 @@ jobs:
         persist-credentials: false
     - name: Select Xcode
       uses: ./.github/actions/select-xcode
+    - name: Bridge the verified hosted Xcode installation to the build path
+      env:
+        BUILD_DEVELOPER_DIR: ${{ needs.build.outputs.developer-dir }}
+      run: |
+        set -euo pipefail
+        native_bundle=/Applications/Xcode_27.2.app
+        hosted_bundle=/Applications/Xcode_27.2.0.app
+        actual_developer_dir=${DEVELOPER_DIR:?}
+        build_developer_dir=${BUILD_DEVELOPER_DIR:?}
+        for path in "$actual_developer_dir" "$build_developer_dir"; do
+          case "$path" in
+            /Applications/Xcode_27.2.app/Contents/Developer|/Applications/Xcode_27.2.0.app/Contents/Developer) ;;
+            *) echo "::error::Refusing an unexpected Xcode developer directory."; exit 1 ;;
+          esac
+        done
+        expected_version=$'Xcode 27.2\nBuild version 27B52'
+        actual_version=$(DEVELOPER_DIR="$actual_developer_dir" /usr/bin/xcodebuild -version)
+        if [[ "$actual_version" != "$expected_version" ]]; then
+          echo "::error::The hosted Xcode is not the required 27.2 build 27B52."
+          exit 1
+        fi
+        if [[ "$actual_developer_dir" != "$build_developer_dir" ]]; then
+          if [[ "$actual_developer_dir" != "$hosted_bundle/Contents/Developer" || "$build_developer_dir" != "$native_bundle/Contents/Developer" ]]; then
+            echo "::error::Only the verified hosted-to-native Xcode path bridge is allowed."
+            exit 1
+          fi
+          /usr/bin/python3 - "$hosted_bundle" <<'PY'
+        import os,sys
+        path=sys.argv[1]
+        assert os.path.isdir(path) and not os.path.islink(path), 'Preinstalled Xcode must be a real directory'
+        assert os.path.realpath(path)==path, 'Preinstalled Xcode path must resolve exactly'
+        PY
+          if [[ -e "$native_bundle" || -L "$native_bundle" ]]; then
+            echo "::error::Refusing to overwrite an existing Xcode path."
+            exit 1
+          fi
+          sudo -n /usr/bin/python3 - "$hosted_bundle" "$native_bundle" <<'PY'
+        import os,sys
+        # os.symlink fails atomically if any file, directory or symlink already exists.
+        os.symlink(sys.argv[1],sys.argv[2])
+        PY
+          if [[ ! -L "$native_bundle" || "$(/usr/bin/readlink "$native_bundle")" != "$hosted_bundle" ]]; then
+            echo "::error::The Xcode path bridge did not resolve to the verified installation."
+            exit 1
+          fi
+        fi
+        bridged_version=$(DEVELOPER_DIR="$build_developer_dir" /usr/bin/xcodebuild -version)
+        if [[ "$bridged_version" != "$expected_version" ]]; then
+          echo "::error::The bridged Xcode does not match 27.2 build 27B52."
+          exit 1
+        fi
+        printf 'DEVELOPER_DIR=%s\n' "$build_developer_dir" >> "$GITHUB_ENV"
+        printf 'Verified Xcode 27.2 (27B52): %s -> %s\n' "$actual_developer_dir" "$build_developer_dir"
     - name: Record hosted OS, hardware, Xcode and audio framework
       run: |
         sw_vers
@@ -490,8 +543,11 @@ jobs:
         BUILD_DEVELOPER_DIR: ${{ needs.build.outputs.developer-dir }}
       run: |
         native_workspace=/Users/runner/actions-runner/_work/mlx-swift-lm/mlx-swift-lm
-        expected_developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
-        if [[ "$BUILD_DEVELOPER_DIR" != "$expected_developer_dir" || "$DEVELOPER_DIR" != "$BUILD_DEVELOPER_DIR" ]]; then
+        case "$BUILD_DEVELOPER_DIR" in
+          /Applications/Xcode_27.2.app/Contents/Developer|/Applications/Xcode_27.2.0.app/Contents/Developer) ;;
+          *) echo "::error::Refusing an unexpected build developer directory."; exit 1 ;;
+        esac
+        if [[ "$DEVELOPER_DIR" != "$BUILD_DEVELOPER_DIR" ]]; then
           echo "::error::The hosted audio job must use the shared build's Xcode path."
           exit 1
         fi
