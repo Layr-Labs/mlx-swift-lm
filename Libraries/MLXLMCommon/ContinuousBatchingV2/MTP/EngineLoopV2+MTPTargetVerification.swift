@@ -39,7 +39,7 @@ extension EngineLoopV2 {
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
-        scores: MLXArray, accept: MLXArray?, hidden: MLXArray,
+        scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
@@ -48,6 +48,9 @@ extension EngineLoopV2 {
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+        let hasConstraints = rows.contains { $0.rec.request.tokenConstraint != nil }
+        var constraintColumns: [MLXArray] = []
+        var constraintLogits: MLXArray?
         var scores: MLXArray
         var accept: MLXArray?
         let nonFinite: MLXArray
@@ -256,6 +259,7 @@ extension EngineLoopV2 {
                         mtp.model.forwardWithHidden(tokens: column, caches: caches)
                     }
                 }
+                if hasConstraints { constraintColumns.append(output.logits) }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
                 // Flag the model's logits before a host sampler sees them.
@@ -300,6 +304,7 @@ extension EngineLoopV2 {
                 accept = concatenated(acceptColumnsAccum, axis: 1)
             }
             hidden = concatenated(hiddenColumns, axis: 1)
+            if hasConstraints { constraintLogits = concatenated(constraintColumns, axis: 1) }
 
         } else {
             for cache in serializingCaches {
@@ -368,6 +373,7 @@ extension EngineLoopV2 {
             if let nativePagedWork, let windowWork {
                 try nativePagedWork.closeWindow(windowWork)
             }
+            if hasConstraints { constraintLogits = output.logits }
             // Flag the model's logits before a host sampler sees them.
             nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             if mtp.usesRequestStatefulDrafter {
@@ -418,7 +424,7 @@ extension EngineLoopV2 {
 
         scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
         return (
-            scores, accept, hidden, shortlist, policyTopTwo,
+            scores, accept, hidden, constraintLogits, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
         )
     }

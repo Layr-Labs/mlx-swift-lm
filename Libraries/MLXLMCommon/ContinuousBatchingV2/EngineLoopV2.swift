@@ -5250,8 +5250,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         let tokenProducingRows = step.tokenProducingRows
         step.nonFiniteFailures = Set(nonFiniteIndices.map { step.sampledRows[$0] })
         if !step.sampledRows.isEmpty {
-            sampler.confirmSampledTokens(
-                host.map(Int.init), requestIDs: step.sampledRows)
+            var tokens = host.map(Int.init)
+            var ids = step.sampledRows
+            if grammarMTPEnabled, !nonFiniteIndices.isEmpty {
+                // Opted-in rows can seed or fall back to ordinary decoding.
+                // A failed raw-logit sample must not advance their grammar.
+                let kept = ids.indices.filter { index in
+                    !nonFiniteIndices.contains(index)
+                        || scheduler.record(for: ids[index])?.request.tokenConstraint == nil
+                }
+                tokens = kept.map { tokens[$0] }
+                ids = kept.map { ids[$0] }
+            }
+            sampler.confirmSampledTokens(tokens, requestIDs: ids)
         }
 
         // Recurrent state follows the same one-step-late transaction as KV.

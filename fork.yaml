@@ -170,7 +170,13 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. A rectangular round commits one common width for all rows unless the
+            target-authoritative. `DARKBLOOM_CBV2_MTP_GRAMMAR=1` opts ordinary engines into
+            row-local grammar verification: retain raw target logits and mask/sample only the
+            committed prefix at finalization, never advance grammar over rejected drafts.
+            Unset/off retains target-only constrained rows. Native-completion engines remain
+            target-only for constrained requests. Each committed grammar position adds a bounded
+            host readback; this is not a performance qualification.
+            A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
             plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit

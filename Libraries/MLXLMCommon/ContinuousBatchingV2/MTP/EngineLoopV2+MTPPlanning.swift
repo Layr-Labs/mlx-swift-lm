@@ -12,10 +12,9 @@ extension EngineLoopV2 {
     /// pre-sample verify positions with the request's real sampler semantics
     /// (`CBv2StepSampler.mtpVerifySample`): every committed token is then a
     /// genuine target sample, which is exact for the output distribution at
-    /// any temperature/top-p/top-k/min-p. The remaining gates stay: token
-    /// constraints, logprob capture, logit bias, and penalties are stateful
-    /// per-position transforms the verify pre-sampler does not reproduce,
-    /// and stop strings need the serial detokenizer walk.
+    /// any temperature/top-p/top-k/min-p. Opted-in constrained rows instead
+    /// use the ordinary sampler on their committed prefix at finalization.
+    /// Logprob capture, bias, penalties and stop strings keep their gates.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         // Opted-in native media is target-only for its complete immutable
         // request lifetime, including text tails, preemption and recompute.
@@ -25,7 +24,9 @@ extension EngineLoopV2 {
         let samplingEligible =
             sampling.temperature == 0
             || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
-        guard rec.request.tokenConstraint == nil,
+        let constraintEligible =
+            rec.request.tokenConstraint == nil || grammarMTPEnabled
+        guard constraintEligible,
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
