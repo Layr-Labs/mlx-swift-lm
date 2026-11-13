@@ -40,7 +40,8 @@ struct MuseGlimmerDFlashRealArtifactTests {
         var hard = 0
         for row in 0 ..< rows {
             for k in 0 ..< 5 {
-                maxDifference = max(maxDifference, abs(ours[row * 5 + k] - oracleTopRaw[row * 5 + k]))
+                maxDifference = max(
+                    maxDifference, abs(ours[row * 5 + k] - oracleTopRaw[row * 5 + k]))
             }
             guard drafts[row] != oracleTopIDs[row * 5] else { continue }
             let top = Array(oracleTopIDs[(row * 5) ..< (row * 5 + 5)])
@@ -154,7 +155,8 @@ struct MuseGlimmerDFlashRealArtifactTests {
                 model.commit(
                     features: try trace.features(state.nextPosition ..< position),
                     at: state.nextPosition, to: state)
-                let drafted = real.drafts(model: model, state: state, anchor: trace.tokens[position])
+                let drafted = real.drafts(
+                    model: model, state: state, anchor: trace.tokens[position])
                 let result = compare(
                     logits: drafted.logits, oracleTopIDs: trace.oracleTopIDs[round],
                     oracleTopRaw: trace.oracleTopRaw[round])

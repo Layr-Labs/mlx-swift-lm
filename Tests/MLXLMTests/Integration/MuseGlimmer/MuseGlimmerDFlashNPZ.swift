@@ -7,7 +7,11 @@ import MLX
 /// ZIP of stored `.npy` members. Test input only: little-endian float32,
 /// float64 and int32 arrays in C order.
 struct MuseGlimmerDFlashNPZ {
-    enum Failure: Error { case malformed(String), missing(String), unsupported(String) }
+    enum Failure: Error {
+        case malformed(String)
+        case missing(String)
+        case unsupported(String)
+    }
 
     private let data: Data
     private var members: [String: (offset: Int, size: Int)] = [:]

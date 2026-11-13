@@ -144,7 +144,8 @@ extension KernelTests {
                 // a key exactly `window` behind it.
                 let boundaryInUse = rows + c.blockSize - 1 >= c.slidingWindow
                 let gap = Fixture.maxAbsDifference(inclusive, strict)
-                #expect(boundaryInUse ? gap > Self.discrimination : gap == 0, "rows \(rows) gap \(gap)")
+                #expect(
+                    boundaryInUse ? gap > Self.discrimination : gap == 0, "rows \(rows) gap \(gap)")
                 if boundaryInUse {
                     #expect(Fixture.maxAbsDifference(drafted, strict) > Self.discrimination)
                 }
@@ -251,7 +252,8 @@ extension KernelTests {
             let expected = Reference.block(
                 model: model, features: features, positions: Array(0 ..< 20),
                 embeddings: embeddings, anchor: 20)
-            #expect(Fixture.maxAbsDifference(drafted, expected) < (dtype == .bfloat16 ? 0.08 : 0.02))
+            #expect(
+                Fixture.maxAbsDifference(drafted, expected) < (dtype == .bfloat16 ? 0.08 : 0.02))
         }
 
         @Test func stateAllocatesOnceAtItsDeclaredSize() throws {

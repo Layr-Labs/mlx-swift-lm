@@ -316,6 +316,70 @@ struct MuseGlimmerDFlashEngineTests {
         #expect(backend.bytesReserved == 0)
     }
 
+    /// Target rows that do not fit never stop the engine thread: the
+    /// request ends with an error at the step's fence and the engine serves
+    /// the next one.
+    @Test(.timeLimit(.minutes(3)))
+    func misshapenTargetRowsEndTheRequestNotTheEngine() async throws {
+        let target = MuseGlimmerDFlashTinyTarget()
+        let prompt = Fixture.prompt(Self.promptLength, salt: 11)
+        let expected = try await baseline(target, prompt: prompt, sampling: Fixture.greedy)
+        let scripted = Scripted(
+            try Fixture.drafter(target: target), mode: .right, scripts: [prompt + expected],
+            vocabulary: target.config.vocabSize)
+        let (engine, backend) = try Fixture.engine(target: target, drafter: scripted)
+        target.widensHidden = true
+        let failed = try await run(
+            engine,
+            Fixture.request(1, prompt: prompt, maxTokens: Self.maxTokens, sampling: Fixture.greedy))
+        guard case .error = failed.finishReason else {
+            Issue.record("expected an error finish, got \(String(describing: failed.finishReason))")
+            return
+        }
+        #expect(failed.tokens.isEmpty)
+        target.widensHidden = false
+        let served = try await run(
+            engine,
+            Fixture.request(2, prompt: prompt, maxTokens: Self.maxTokens, sampling: Fixture.greedy))
+        #expect(served.tokens == expected)
+        expectNoState(engine, scripted)
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0 && backend.bytesWired == 0)
+
+        // The same faults on the drafter alone: reported at the fence.
+        let drafter = try Fixture.drafter(target: target)
+        func tokens(_ count: Int) -> MLXArray {
+            MLXArray([Int32](repeating: 3, count: count)).reshaped([1, count])
+        }
+        var state = drafter.makeRequestState()
+        drafter.observeCommittedTarget(
+            .init(tokens: tokens(4), hidden: MLXArray.zeros([1, 4, 192])), requestState: state)
+        #expect(throws: MuseGlimmerDFlashError.state("observation")) {
+            try drafter.requestStateDidFinishEvaluation(state)
+        }
+        #expect(state.committedInputCount == 0)
+        // More draft steps than the round's depth.
+        state = drafter.makeRequestState()
+        drafter.observeCommittedTarget(
+            .init(tokens: tokens(4), hidden: MLXArray.zeros([1, 4, 128])), requestState: state)
+        try drafter.requestStateDidFinishEvaluation(state)
+        for index in 0 ..< 8 {
+            let step = drafter.draftStep(
+                tokens: tokens(1), hidden: MLXArray.zeros([1, 1, 128]), shortlist: nil,
+                requestState: state)
+            #expect(step.tokens.shape == [1] && step.hidden.shape == [1, 1, 64], "step \(index)")
+        }
+        #expect(throws: MuseGlimmerDFlashError.state("draft step")) {
+            try drafter.requestStateDidFinishEvaluation(state)
+        }
+        drafter.discardRound(requestState: state)
+        #expect(state.stagedInputCount == 0)
+        drafter.releaseRequestState(state)
+        #expect(throws: MuseGlimmerDFlashError.self) {
+            try drafter.requestStateDidFinishEvaluation(state)
+        }
+    }
+
     // MARK: Binding and admission
 
     @Test func drafterBindsOnlyToAMatchingTarget() throws {
@@ -374,7 +438,8 @@ struct MuseGlimmerDFlashEngineTests {
         let spec = try #require(drafter.boundedRequestAllocation(limits: limits))
         #expect(spec.resident == [.init(logicalBytes: ring / 2, allocationCount: 2)])
         #expect(spec.resident.allSatisfy { $0.logicalBytesPerToken == 0 })
-        #expect(spec.working.allSatisfy { $0.logicalBytesPerToken == 0 } && spec.hostBytesPerToken == 0)
+        #expect(
+            spec.working.allSatisfy { $0.logicalBytesPerToken == 0 } && spec.hostBytesPerToken == 0)
         // A longer prompt chunk commits no more than one window of rows.
         let longer = try #require(
             drafter.boundedRequestAllocation(

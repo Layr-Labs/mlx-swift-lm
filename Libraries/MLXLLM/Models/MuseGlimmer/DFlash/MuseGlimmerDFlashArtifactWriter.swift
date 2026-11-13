@@ -139,7 +139,8 @@ extension MuseGlimmerDFlashDraftModel {
                 guard array.dtype == activationDType else {
                     throw MuseGlimmerDFlashError.shape(name)
                 }
-                entries.append(Entry(name: name, dtype: denseName, shape: array.shape, array: array))
+                entries.append(
+                    Entry(name: name, dtype: denseName, shape: array.shape, array: array))
             }
         }
         entries.sort { $0.name < $1.name }

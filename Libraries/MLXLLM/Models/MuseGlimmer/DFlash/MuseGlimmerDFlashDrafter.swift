@@ -31,7 +31,7 @@ public protocol MuseGlimmerDFlashTarget: AnyObject {
 /// round return them. Proposals are the argmax of the target's own head, and
 /// the engine keeps one only when it equals the token the target itself
 /// chose, so they change speed and never the output.
-public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
+public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unchecked Sendable {
     public struct Settings: Sendable, Equatable {
         /// Draft tokens per round, at most the engine's tested window of 7
         /// and the block's `blockSize - 1`.
@@ -118,6 +118,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unc
     public var requiresCommittedObservationFence: Bool { true }
     /// The ring is a fixed charge (`boundedRequestAllocation`), not a rate.
     public var requestStateBytesPerToken: Int { 0 }
+    /// The context only decides what is proposed. It is not part of a prefix
+    /// checkpoint; after a restore it starts at the first observed position.
+    public var requestStateIsAdvisory: Bool { true }
+
     // MARK: Request state
 
     final class State: CBv2MTPRequestState {
@@ -132,6 +136,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unc
         var memo: (tokens: MLXArray, hidden: MLXArray)?
         var committedInputCount = 0
         var stagedInputCount = 0
+        /// Why this request cannot continue; reported at the next fence.
+        var refusal: String?
 
         init(owner: ObjectIdentifier, context: MuseGlimmerDFlashContextState) {
             self.owner = owner
@@ -162,12 +168,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unc
         preconditionFailure("Muse Glimmer DFlash requires request-owned state")
     }
 
-    /// Target hidden rows `[1, rows, contextWidth]` as feature rows.
-    private func features(_ hidden: MLXArray) -> MLXArray {
-        precondition(
-            hidden.ndim == 3 && hidden.dim(0) == 1
-                && hidden.dim(2) == model.configuration.contextWidth,
-            "Muse Glimmer DFlash: target hidden must be [1, rows, contextWidth]")
+    /// Target hidden rows `[1, rows, contextWidth]` as feature rows; nil for
+    /// any other shape.
+    private func features(_ hidden: MLXArray) -> MLXArray? {
+        guard hidden.ndim == 3, hidden.dim(0) == 1, hidden.dim(1) > 0,
+            hidden.dim(2) == model.configuration.contextWidth
+        else { return nil }
         return hidden.reshaped([hidden.dim(1), hidden.dim(2)])
     }
 
@@ -193,57 +199,86 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unc
     private func observe(
         _ observation: CBv2MTPCommittedTargetObservation, at position: Int, state s: State
     ) {
-        precondition(s.stagedInputCount == 0, "Muse Glimmer DFlash observed history during a round")
-        let rows = observation.hidden.dim(1)
-        guard rows > 0 else { return }
-        model.commit(features: features(observation.hidden), at: position, to: s.context)
+        guard s.refusal == nil else { return }
+        guard s.stagedInputCount == 0, position >= 0, let rows = features(observation.hidden)
+        else {
+            s.refusal = "observation"
+            return
+        }
+        model.commit(features: rows, at: position, to: s.context)
         // Whatever arrived, the context now ends at its newest row.
         s.awaitsCarry = false
-        s.committedInputCount += rows
+        s.committedInputCount += rows.dim(0)
     }
 
     /// Draft index 0 commits a carry row that is still missing, runs one
     /// block forward and keeps its proposals. Later indices return them.
+    ///
+    /// A call this drafter cannot serve never stops the engine thread: it
+    /// returns a well-formed proposal and the request ends with an error at
+    /// the round's fence (`requestStateDidFinishEvaluation`).
     public func draftStep(
         tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray) {
         let s = state(requestState)
         let c = model.configuration
-        precondition(
-            shortlist == nil && s.stagedInputCount < settings.maximumDraftTokens
-                && tokens.shape == [1, 1],
-            "Muse Glimmer DFlash draft step outside its round")
-        if s.stagedInputCount == 0 {
-            if s.awaitsCarry {
-                model.commit(features: features(hidden), at: s.context.nextPosition, to: s.context)
-                s.awaitsCarry = false
-                s.committedInputCount += 1
-            }
-            let anchor = target.dflashTokenEmbeddings(tokens.asType(.int32))
-                .reshaped([1, c.hiddenSize])
-            let block = model.draftBlock(
-                embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
-                state: s.context)
-            let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
-            let ids = argMax(target.dflashHeadProduct(rows), axis: -1).asType(.int32)
-            s.memo = (ids, rows)
-        }
-        guard let memo = s.memo else {
-            preconditionFailure("Muse Glimmer DFlash draft step without a block")
-        }
         let index = s.stagedInputCount
         s.stagedInputCount += 1
+        if s.refusal == nil, index == 0 {
+            s.refusal = startRound(s, tokens: tokens, hidden: hidden)
+        }
+        guard s.refusal == nil, shortlist == nil, index < settings.maximumDraftTokens,
+            let memo = s.memo
+        else {
+            s.refusal = s.refusal ?? "draft step"
+            s.memo = nil
+            return (
+                MLXArray([Int32(0)]),
+                MLXArray.zeros([1, 1, c.hiddenSize], dtype: model.activationDType)
+            )
+        }
         return (
             memo.tokens[index ..< (index + 1)],
             memo.hidden[index ..< (index + 1), 0...].reshaped([1, 1, c.hiddenSize])
         )
     }
 
+    /// Builds the round's block and memo. Returns why it could not.
+    private func startRound(_ s: State, tokens: MLXArray, hidden: MLXArray) -> String? {
+        let c = model.configuration
+        guard tokens.shape == [1, 1] else { return "seed token" }
+        if s.awaitsCarry {
+            guard let row = features(hidden), row.dim(0) == 1 else { return "carry" }
+            model.commit(features: row, at: s.context.nextPosition, to: s.context)
+            s.awaitsCarry = false
+            s.committedInputCount += 1
+        }
+        let anchor = target.dflashTokenEmbeddings(tokens.asType(.int32))
+        guard anchor.size == c.hiddenSize else { return "embedding" }
+        let block = model.draftBlock(
+            embeddings: model.blockEmbeddings(anchor: anchor, mask: maskEmbedding),
+            state: s.context)
+        let rows = block[1 ..< (1 + settings.maximumDraftTokens), 0...]
+        let logits = target.dflashHeadProduct(rows)
+        guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
+            return "head"
+        }
+        s.memo = (argMax(logits, axis: -1).asType(.int32), rows)
+        return nil
+    }
+
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
         else { return [] }
         return s.arrays
+    }
+
+    /// Ends a request whose target rows or round calls did not fit.
+    public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
+        else { throw MuseGlimmerDFlashError.state("foreign or released") }
+        if let refusal = s.refusal { throw MuseGlimmerDFlashError.state(refusal) }
     }
 
     /// The accepted drafts' trusted target rows become context. The row of
@@ -253,19 +288,24 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPRequestStatefulDrafter, @unc
         committedDraftTokens: MLXArray, committedTargetHidden: MLXArray
     ) {
         let s = state(requestState)
-        let rows = committedTargetHidden.dim(1)
-        precondition(
-            s.stagedInputCount > 0 && confirmedInputTokens >= 1
-                && rows == confirmedInputTokens - 1 && rows <= s.stagedInputCount,
-            "Muse Glimmer DFlash finalize does not match the staged round")
+        defer { clearRound(s) }
+        guard s.refusal == nil else { return }
+        let rows = confirmedInputTokens - 1
+        guard s.stagedInputCount > 0, rows >= 0, rows <= s.stagedInputCount,
+            committedTargetHidden.ndim == 3, committedTargetHidden.dim(1) == rows
+        else {
+            s.refusal = "finalize"
+            return
+        }
         if rows > 0 {
-            model.commit(
-                features: features(committedTargetHidden), at: s.context.nextPosition,
-                to: s.context)
+            guard let accepted = features(committedTargetHidden) else {
+                s.refusal = "accepted rows"
+                return
+            }
+            model.commit(features: accepted, at: s.context.nextPosition, to: s.context)
         }
         s.awaitsCarry = true
         s.committedInputCount += rows
-        clearRound(s)
     }
 
     /// Only the memo belongs to a round: a block never writes the context.
@@ -315,7 +355,8 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             + c.attentionHeads * c.blockSize * keys * 4
             + c.blockSize * size
             * (3 * c.attentionHeads * c.headDimensions + 6 * c.hiddenSize + 3 * c.intermediateSize)
-        let head = settings.maximumDraftTokens * (target.dflashVocabularySize * 4 + c.hiddenSize * 4)
+        let head =
+            settings.maximumDraftTokens * (target.dflashVocabularySize * 4 + c.hiddenSize * 4)
         return c.hiddenLayers * layer + head + c.blockSize * (keys + c.hiddenSize * size)
     }
 

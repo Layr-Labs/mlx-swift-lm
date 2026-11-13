@@ -79,7 +79,11 @@ extension KernelTests {
             let model = try Fixture.model(c, dtype: .bfloat16)
             let first = try temporaryDirectory()
             let second = try temporaryDirectory()
-            defer { [first, second].forEach { try? FileManager.default.removeItem(at: $0) } }
+            defer {
+                for directory in [first, second] {
+                    try? FileManager.default.removeItem(at: directory)
+                }
+            }
             let written = try model.writeArtifact(to: first, source: "test")
             let again = try model.writeArtifact(to: second, source: "test")
             #expect(written.manifest == again.manifest && written.pin == again.pin)

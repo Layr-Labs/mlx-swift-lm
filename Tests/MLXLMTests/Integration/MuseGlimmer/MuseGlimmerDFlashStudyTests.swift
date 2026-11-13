@@ -92,7 +92,8 @@ struct MuseGlimmerDFlashStudyTests {
                 eval(state.arrays)
                 commitSeconds.append(Date().timeIntervalSince(commitStart))
                 let start = Date()
-                let ids = real.drafts(model: model, state: state, anchor: trace.tokens[position]).ids
+                let ids = real.drafts(model: model, state: state, anchor: trace.tokens[position])
+                    .ids
                 eval(ids)
                 seconds.append(Date().timeIntervalSince(start))
                 perAnchor[position] = ints(ids)
@@ -155,7 +156,8 @@ struct MuseGlimmerDFlashStudyTests {
                 "payload_gib": Double(bytes) / Double(1 << 30), "under_2_gib": bytes < 2 << 30,
                 "anchors": anchors, "draft_tokens": tokens,
                 "agreement_15": Double(equal) / Double(max(tokens, 1)),
-                "agreement_first_7": Double(equalFirst) / Double(max(anchors * Self.engineDepth, 1)),
+                "agreement_first_7": Double(equalFirst)
+                    / Double(max(anchors * Self.engineDepth, 1)),
                 "blocks_with_identical_first_7": Double(identicalFirst) / Double(max(anchors, 1)),
                 "mean_accepted_k7": mean(accepted7), "mean_accepted_k15": mean(accepted15),
                 "median_block_ms": median(measured.seconds) * 1000,
@@ -283,6 +285,78 @@ struct MuseGlimmerDFlashStudyTests {
                 "note": "context_rows = most recent committed positions visible to the block; "
                     + "each row compares with the same anchors' drafts over all held rows "
                     + "(at most 2,048)",
+            ])
+    }
+
+    /// Wall time of the drafter's parts on a full context ring: one block
+    /// forward, the seven head rows the engine uses, and context commits.
+    @Test(.enabled(if: MuseGlimmerDFlashStudyTests.enabled))
+    func blockHeadAndCommitTimes() throws {
+        let real = try Real.shared.get()
+        let c = real.configuration
+        let trace = try #require(
+            try MuseGlimmerDFlashTrace.all().max { $0.committed < $1.committed })
+        let position = trace.committed
+        let features = try trace.features(max(0, position - c.slidingWindow) ..< position)
+        eval(features)
+        func time(_ runs: Int = 15, _ body: () -> [MLXArray]) -> Double {
+            for _ in 0 ..< 3 { eval(body()) }
+            var samples: [Double] = []
+            for _ in 0 ..< runs {
+                let start = Date()
+                eval(body())
+                samples.append(Date().timeIntervalSince(start) * 1000)
+            }
+            return median(samples)
+        }
+        var rows: [[String: Any]] = []
+        let names =
+            (Real.environment["MUSE_GLIMMER_DFLASH_TIMING_VARIANTS"]
+            ?? "bf16,q6g64,q5mlp-q8rest,q4g64").split(separator: ",").map(String.init)
+        for name in names {
+            let model = try real.drafterCopy()
+            if let plan = Self.plan(name, c) { try model.quantize(plan) }
+            let state = model.makeContextState()
+            state.restart(at: position - features.dim(0))
+            model.commit(features: features, at: state.nextPosition, to: state)
+            eval(state.arrays)
+            let embeddings = real.blockEmbeddings(anchor: trace.tokens[position], model: model)
+            eval(embeddings)
+            let block = model.draftBlock(embeddings: embeddings, state: state)
+            eval(block)
+            let seven = block[1 ..< 8, 0...]
+            // Commits go to scratch states so the timed ring stays full.
+            func commit(_ count: Int) -> [MLXArray] {
+                let scratch = model.makeContextState()
+                model.commit(features: features[0 ..< count, 0...], at: 0, to: scratch)
+                return scratch.arrays
+            }
+            rows.append([
+                "variant": name, "context_rows": state.count,
+                "block_forward_ms": time {
+                    [model.draftBlock(embeddings: embeddings, state: state)]
+                },
+                "head_7_rows_ms": time { [argMax(real.head(seven), axis: -1)] },
+                "block_and_head_7_ms": time {
+                    let hidden = model.draftBlock(embeddings: embeddings, state: state)
+                    return [argMax(real.head(hidden[1 ..< 8, 0...]), axis: -1)]
+                },
+                "block_and_head_15_ms": time {
+                    let hidden = model.draftBlock(embeddings: embeddings, state: state)
+                    return [argMax(real.head(hidden[1..., 0...]), axis: -1)]
+                },
+                "commit_1_row_ms": time { commit(1) },
+                "commit_8_rows_ms": time { commit(8) },
+                "commit_512_rows_ms": time(5) { commit(min(512, features.dim(0))) },
+                "commit_2048_rows_ms": time(5) { commit(min(2048, features.dim(0))) },
+            ])
+        }
+        try Real.writeResult(
+            "study-timings",
+            [
+                "trace": trace.name, "rows": rows,
+                "note": "median wall ms, debug build, M3 Ultra, GPU lane held; a commit "
+                    + "includes allocating its scratch ring",
             ])
     }
 

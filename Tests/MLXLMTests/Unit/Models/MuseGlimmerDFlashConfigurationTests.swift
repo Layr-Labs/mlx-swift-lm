@@ -132,7 +132,8 @@ extension UnitTests {
             #expect(dense.values.reduce(0) { $0 + $1.byteCount } == 5_111_970_304)
             let formats = try inventory.formats(header: dense)
             #expect(formats.denseDType == "BF16")
-            #expect(formats.formats.count == 36 && formats.formats.values.allSatisfy { $0 == .dense })
+            #expect(
+                formats.formats.count == 36 && formats.formats.values.allSatisfy { $0 == .dense })
         }
 
         @Test func formatsComeFromTheHeader() throws {
@@ -214,8 +215,9 @@ extension UnitTests {
                             mask[query * width + column]
                                 == (abs(anchor + query - position) <= window))
                     }
-                    #expect(mask[(query * width + positions.count) ..< ((query + 1) * width)]
-                        .allSatisfy { $0 })
+                    #expect(
+                        mask[(query * width + positions.count) ..< ((query + 1) * width)]
+                            .allSatisfy { $0 })
                 }
             }
             // A full ring: query 0 sees all 2,048 rows, query i loses i.

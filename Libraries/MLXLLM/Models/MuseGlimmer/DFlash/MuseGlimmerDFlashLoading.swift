@@ -173,7 +173,8 @@ extension MuseGlimmerDFlashDraftModel {
     static func verifiedConfiguration(
         directory: URL, pin: MuseGlimmerDFlashArtifactPin
     ) throws -> MuseGlimmerDFlashConfiguration {
-        let url = directory.appendingPathComponent(MuseGlimmerDFlashArtifactPin.configurationFileName)
+        let url = directory.appendingPathComponent(
+            MuseGlimmerDFlashArtifactPin.configurationFileName)
         let values = try? url.resourceValues(forKeys: [
             .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
         ])

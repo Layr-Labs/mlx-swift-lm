@@ -24,6 +24,8 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
     let lmHead: Linear
     /// Rows of every forward `[batch, length]`, in call order.
     private(set) var forwardShapes: [[Int]] = []
+    /// Hands the MTP seam hidden rows one tap wider than declared.
+    var widensHidden = false
 
     let layerKinds: [CBv2LayerKind]
     let cbv2SupportsHistoricalAttentionCheckpoint = true
@@ -64,6 +66,7 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
             hidden = block.forwardV2(hidden, cache: caches[index])
             if Self.tapLayers.contains(index) { taps.append(hidden) }
         }
+        if widensHidden { taps.append(hidden) }
         return (finalNorm(hidden), concatenated(taps, axis: -1))
     }
 
@@ -125,7 +128,7 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
 /// Proposal override for engine tests. The real drafter runs every step and
 /// keeps its own state; only the proposed token is replaced, from the known
 /// continuation of the request, so a test decides where the target accepts.
-final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPRequestStatefulDrafter,
+final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     CBv2MTPBoundedAllocationProviding
 {
     enum Mode: Equatable, Sendable {
@@ -171,6 +174,9 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPRequestStatefulDrafter,
     var commitsAcceptedPrefixPerRow: Bool { native.commitsAcceptedPrefixPerRow }
     var requiresCommittedObservationFence: Bool { native.requiresCommittedObservationFence }
     var requestStateBytesPerToken: Int { native.requestStateBytesPerToken }
+    /// False makes the engine treat this drafter like any other
+    /// request-stateful one.
+    var requestStateIsAdvisory = true
     func boundedRequestAllocation(limits: CBv2MTPAllocationLimits)
         -> CBv2MTPBoundedAllocationSpec?
     {
@@ -248,6 +254,10 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPRequestStatefulDrafter,
 
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
         native.evaluationTargets(for: requestState)
+    }
+
+    func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {
+        try native.requestStateDidFinishEvaluation(requestState)
     }
 
     func finalizeRound(

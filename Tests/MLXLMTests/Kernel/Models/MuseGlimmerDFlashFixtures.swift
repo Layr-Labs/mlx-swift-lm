@@ -148,7 +148,8 @@ enum MuseGlimmerDFlashReference {
             let gate = linear(m, root + "mlp.gate_proj")
             hidden =
                 hidden
-                + linear(gate * sigmoid(gate) * linear(m, root + "mlp.up_proj"), root + "mlp.down_proj")
+                + linear(
+                    gate * sigmoid(gate) * linear(m, root + "mlp.up_proj"), root + "mlp.down_proj")
         }
         return rms(hidden, w("norm.weight"), eps)
     }
