@@ -70,11 +70,6 @@ jobs:
           path: tmp/pages/index.html
           retention-days: 30
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: tmp/pages
-
   deploy:
     name: Deploy fork diff
     needs: render
@@ -105,9 +100,26 @@ jobs:
             echo "::notice::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}; built the page but skipped the deploy. Enable it once under Settings → Pages (Source: GitHub Actions) and re-run this workflow."
           fi
 
+      - name: Download rendered page
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: forkdiff-page
+          path: tmp/pages
+
+      - name: Prepare Pages artifact
+        if: steps.pages.outputs.enabled == 'true'
+        run: touch tmp/pages/.nojekyll
+
       - name: Setup Pages
         if: steps.pages.outputs.enabled == 'true'
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Upload Pages artifact
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: tmp/pages
 
       - name: Deploy to GitHub Pages
         if: steps.pages.outputs.enabled == 'true'
