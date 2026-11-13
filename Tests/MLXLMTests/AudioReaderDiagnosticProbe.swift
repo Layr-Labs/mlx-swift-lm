@@ -29,7 +29,7 @@ enum AudioReaderDiagnosticProbe {
         var frames = 0
         var channels: UInt32 = 0
         var rate = 0.0
-        var timing: [String] = []
+        var timing: [AudioReaderDiagnosticTimeline.Segment] = []
         var hash: String { SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined() }
     }
 
@@ -103,7 +103,11 @@ enum AudioReaderDiagnosticProbe {
                         XCTAssertEqual(candidate.frames, baseline.frames, context)
                         XCTAssertEqual(candidate.channels, baseline.channels, context)
                         XCTAssertEqual(candidate.rate, baseline.rate, context)
-                        XCTAssertEqual(candidate.timing, baseline.timing, context)
+                        let baselineTimeline = AudioReaderDiagnosticTimeline(baseline.timing)
+                        let candidateTimeline = AudioReaderDiagnosticTimeline(candidate.timing)
+                        XCTAssertNotNil(baselineTimeline, "Invalid baseline timeline: \(context)")
+                        XCTAssertNotNil(candidateTimeline, "Invalid candidate timeline: \(context)")
+                        XCTAssertEqual(candidateTimeline, baselineTimeline, context)
                         XCTAssertTrue(
                             candidate.bytes == baseline.bytes, "Raw PCM differs: \(context)")
                         XCTAssertEqual(candidate.hash, baseline.hash, context)
@@ -144,8 +148,7 @@ enum AudioReaderDiagnosticProbe {
             result.frames += CMSampleBufferGetNumSamples(sample)
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             let duration = CMSampleBufferGetDuration(sample)
-            result.timing.append(
-                "\(pts.value)/\(pts.timescale):\(duration.value)/\(duration.timescale)")
+            result.timing.append(.init(start: pts, duration: duration))
             let count = CMBlockBufferGetDataLength(block)
             var bytes = Data(count: count)
             let status = bytes.withUnsafeMutableBytes {

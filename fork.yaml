@@ -263,6 +263,8 @@ def:
         cleanup are checked without replacing existing full-CI gates.
         Temporary raw-PCM diagnostics compare fault-free and retried AAC reads, asset reuse and
         retained-reader lifetime in both ordinary shards and an additional isolated process.
+        Timing diagnostics require exact continuous start, end and coverage rather than identical
+        buffer partitions; captured partitions and one-tick gap/overlap/boundary fixtures cover it.
         Existing bit/hash, frame, channel, cancellation and retry assertions remain unchanged.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
@@ -270,6 +272,8 @@ def:
         - "Tests/MLXLMTests/CorruptClipDecoderCodesTests.swift"
         - "Tests/MLXLMTests/AudioReaderRetryTests.swift"
         - "Tests/MLXLMTests/AudioReaderDiagnosticProbe.swift"
+        - "Tests/MLXLMTests/AudioReaderDiagnosticTimeline.swift"
+        - "Tests/MLXLMTests/AudioReaderDiagnosticTimelineTests.swift"
         - "Tests/MLXLMTests/ReaderPassFaults.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
