@@ -17,6 +17,13 @@ extension EngineLoopV2 {
     /// per-position transforms the verify pre-sampler does not reproduce,
     /// and stop strings need the serial detokenizer walk.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        mtpHistoryEligible(rec)
+            && (rec.request.tokenConstraint == nil || mtpFreeSpan(rec) != nil)
+    }
+
+    /// Protected spans still own trusted history for later free-span rounds.
+    /// Whole-request exclusions apply to both history and drafting.
+    func mtpHistoryEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         // Opted-in native media is target-only for its complete immutable
         // request lifetime, including text tails, preemption and recompute.
         mtp?.registerTargetOnlyMedia(rec.request)
@@ -25,7 +32,7 @@ extension EngineLoopV2 {
         let samplingEligible =
             sampling.temperature == 0
             || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
-        guard rec.request.tokenConstraint == nil || mtpFreeSpan(rec) != nil,
+        guard rec.request.tokenConstraint == nil || mtpSpanConstraint(rec) != nil,
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
@@ -96,7 +103,7 @@ extension EngineLoopV2 {
         for rec: CBv2ScheduledRequest, recordSkips: Bool
     ) -> CBv2MTPPlanAction {
         guard let mtp else { return .none }
-        guard mtpBasicEligible(rec) else { return .none }
+        guard mtpHistoryEligible(rec) else { return .none }
         let depth = mtp.planDepth
         guard let state = kvStates[rec.id] else { return .none }
         guard Self.mtpStorageEligible(state) else {
@@ -105,6 +112,9 @@ extension EngineLoopV2 {
         }
 
         let remainingToLength = rec.request.maxTokens - rec.generatedTokenCount
+        if !mtpBasicEligible(rec) {
+            return mtp.tracksPersistentHistory && remainingToLength > 0 ? .seed : .none
+        }
         if mtp.forceSeedPlan {
             return remainingToLength > 0 ? .seed : .none
         }
@@ -162,7 +172,7 @@ extension EngineLoopV2 {
         let decision = mtp.previewDecision(
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
         let eligible = rows.filter { rec in
-            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+            guard mtpHistoryEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
         }
         guard !eligible.isEmpty else { return false }
@@ -286,7 +296,8 @@ extension EngineLoopV2 {
             if mtpBasicEligible(rec), kvStates[rec.id] != nil, !storageEligible {
                 mtp.recordSkip("kv_unsupported")
             }
-            if !mtpBasicEligible(rec) || !storageEligible
+            let keepsHistory = mtp.tracksPersistentHistory && mtpHistoryEligible(rec)
+            if (!mtpBasicEligible(rec) && !keepsHistory) || !storageEligible
                 || (mtp.planDepth == 0 && !mtp.tracksPersistentHistory)
             {
                 mtp.invalidateCarry(rec.id)
@@ -317,7 +328,7 @@ extension EngineLoopV2 {
         guard mtp.tracksPersistentHistory else { return false }
         return plan.assignments.contains { assignment in
             guard let rec = scheduler.record(for: assignment.id),
-                mtpBasicEligible(rec)
+                mtpHistoryEligible(rec)
                     || mtpRecordsPromptHistory(rec, range: Self.mtpPlannedRange(rec, assignment))
             else { return false }
             // Prompt rows acquire their KV state inside execution. Absence
@@ -338,7 +349,7 @@ extension EngineLoopV2 {
         }
         return plan.assignments.allSatisfy { assignment in
             guard let rec = scheduler.record(for: assignment.id) else { return true }
-            guard mtpBasicEligible(rec) else {
+            guard mtpHistoryEligible(rec) else {
                 return !mtpRecordsPromptHistory(
                     rec, range: Self.mtpPlannedRange(rec, assignment))
             }

@@ -18,9 +18,15 @@ struct CBv2MTPFreeSpan {
 }
 
 extension EngineLoopV2 {
-    func mtpFreeSpan(_ rec: CBv2ScheduledRequest) -> CBv2MTPFreeSpan? {
+    func mtpSpanConstraint(_ rec: CBv2ScheduledRequest) -> (any CBv2FreeSpanTokenConstraint)? {
         guard mtp?.config.freeSpanSpeculation == true, nativeShutdownState == nil,
-            let constraint = rec.request.tokenConstraint as? any CBv2FreeSpanTokenConstraint,
+            sampler is any CBv2FreeSpanSampler
+        else { return nil }
+        return rec.request.tokenConstraint as? any CBv2FreeSpanTokenConstraint
+    }
+
+    func mtpFreeSpan(_ rec: CBv2ScheduledRequest) -> CBv2MTPFreeSpan? {
+        guard let constraint = mtpSpanConstraint(rec),
             let spanSampler = sampler as? any CBv2FreeSpanSampler
         else { return nil }
         // Before the first ordinary sample, only seed planning reads the initial state.
