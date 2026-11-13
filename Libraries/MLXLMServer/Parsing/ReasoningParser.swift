@@ -1,6 +1,7 @@
 // Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
+import MLXLMCommon
 
 public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
     case none
@@ -8,6 +9,9 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
     case qwen3
     case harmony
     case gemma4
+    /// Muse Glimmer's Onyx frames: `to=self` is reasoning, `to=user` and
+    /// output without a frame are content. Tool frames are not content.
+    case onyx
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -26,12 +30,30 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
             self = .harmony
         case "gemma4", "gemma_4", "gemma":
             self = .gemma4
+        case "onyx", "muse_glimmer", "atem":
+            self = .onyx
         default:
             throw DecodingError.dataCorruptedError(
                 in: container,
                 debugDescription: "Unsupported reasoning parser '\(raw)'"
             )
         }
+    }
+}
+
+extension ReasoningParserFormat {
+    /// The format a model's response protocol fixes, or `nil` when the model
+    /// type leaves the choice to the caller.
+    ///
+    /// - Parameters:
+    ///   - modelType: `model_type` of the checkpoint's `config.json`.
+    ///   - toolCallFormat: the tool format the loaded model resolved to.
+    public static func inferred(
+        modelType: String?, toolCallFormat: ToolCallFormat? = nil
+    ) -> ReasoningParserFormat? {
+        if toolCallFormat == .atem { return .onyx }
+        guard let modelType else { return nil }
+        return ToolCallFormat.infer(from: modelType) == .atem ? .onyx : nil
     }
 }
 
@@ -62,7 +84,20 @@ public struct ReasoningParser: Sendable {
             return parseHarmony(text)
         case .gemma4:
             return parseGemma4(text)
+        case .onyx:
+            return parseOnyx(text)
         }
+    }
+
+    /// Frame bodies are kept as written. A reasoning frame that the token
+    /// limit cut off is still reasoning.
+    private func parseOnyx(_ text: String) -> ParsedReasoning {
+        var parser = StreamingOnyxReasoningParser()
+        let pieces = parser.parse(text) + parser.finish()
+        let reasoning = pieces.compactMap(\.reasoningContent).joined()
+        return .init(
+            content: pieces.map(\.content).joined(),
+            reasoningContent: reasoning.isEmpty ? nil : reasoning)
     }
 
     private func parseThinkTags(_ text: String) -> ParsedReasoning {

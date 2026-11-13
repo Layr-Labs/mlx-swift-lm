@@ -52,10 +52,15 @@ public enum MLXServer {
         } else {
             embeddingEngine = nil
         }
+        // A model whose protocol fixes the reasoning channel (Muse Glimmer's
+        // Onyx) selects its parser when none was requested.
+        let loadedToolCallFormat = await model.configuration.toolCallFormat
         let service = MLXOpenAIService(
             engine: engine,
             embeddingEngine: embeddingEngine,
             defaultReasoningParser: configuration.reasoningParser
+                ?? ReasoningParserFormat.inferred(
+                    modelType: configuration.modelType, toolCallFormat: loadedToolCallFormat)
         )
         let app = MLXServerApplication.buildApplication(
             service: service,
