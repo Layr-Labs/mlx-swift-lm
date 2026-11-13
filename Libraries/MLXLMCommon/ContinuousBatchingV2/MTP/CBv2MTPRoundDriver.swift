@@ -135,6 +135,9 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Raw target window retained only when a row has a grammar. Its
+        /// committed prefix is sampled with the ordinary sampler at finalize.
+        var constraintLogits: MLXArray? = nil
         /// Lazy [B, 1+k, K] int32 target top-K ids per verify position, for
         /// shortlisted drafting next round. nil when the drafter did not opt
         /// in or verification ran on the serial oracle.
