@@ -197,11 +197,13 @@ extension EngineLoopV2 {
                 }
             }
             if let carry = row.historyCarry {
+                // The carry's hidden row is the position before this row's first.
                 mtp.observeCommittedTarget(
                     id: row.rec.id,
                     observation: CBv2MTPCommittedTargetObservation(
                         tokens: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
                         hidden: carry.hidden),
+                    startingAt: row.start - 1,
                     detachedState: state)
                 retainObservationFence()
                 committedObservationEvalTargets.append(carry.hidden)
@@ -210,6 +212,7 @@ extension EngineLoopV2 {
                 id: row.rec.id,
                 observation: CBv2MTPCommittedTargetObservation(
                     tokens: tokens, hidden: hidden),
+                startingAt: row.start,
                 detachedState: state)
             retainObservationFence()
             committedObservationRows.append(

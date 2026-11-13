@@ -984,7 +984,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         } else if schedulerConfig.enablePrefixCache,
             (model as? any CBv2HistoricalAttentionCheckpointProviding)?
                 .cbv2SupportsHistoricalAttentionCheckpoint == true,
-            !(mtpDriver?.tracksPersistentHistory ?? false),
+            !(mtpDriver?.checkpointsRequireAssistantHistory ?? false),
             let completePrefixCache, let pagedCheckpointConfig, let segmentedPool,
             (try? CBv2HistoricalAttentionLayout(
                 layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil
