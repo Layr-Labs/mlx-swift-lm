@@ -272,6 +272,13 @@
       ],
       "strict": true,
       "own_process": true
+    },
+    {
+      "name": "native-reasoning-budget",
+      "strict": true,
+      "filters": [
+        "^MLXLMTests\\.CBv2ReasoningBudgetTests/"
+      ]
     }
   ],
   "shards": [
@@ -1245,6 +1252,11 @@
     {
       "estimated_seconds": 465,
       "runs": [
+        {
+          "groups": [
+            "native-reasoning-budget"
+          ]
+        },
         {
           "groups": [
             "cbv2-complete-checkpoint-engine",

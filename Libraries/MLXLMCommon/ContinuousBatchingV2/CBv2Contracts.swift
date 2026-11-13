@@ -1458,6 +1458,8 @@ public struct CBv2ResidentPrefixCandidate: Sendable, Equatable {
 /// internally (EngineV2 is engine-queue + lock confined) rather than being
 /// value-isolated, hence `@unchecked Sendable` conformances downstream.
 public protocol CBv2Engine: AnyObject, Sendable {
+    /// Whether this engine enforces request-owned thought-token budgets.
+    var supportsReasoningBudgets: Bool { get }
     /// Submit a request; events stream until `.finished`.
     /// Throws CBv2KVError.capacityExhausted when admission fails (the
     /// provider maps this to 429/503 exactly as today).
@@ -1543,6 +1545,7 @@ public protocol CBv2Engine: AnyObject, Sendable {
 }
 
 extension CBv2Engine {
+    public var supportsReasoningBudgets: Bool { false }
     public func updateKVBytesCapacity(_ bytes: Int) {}
     public func residentPrefixCandidate(
         for request: CBv2Request

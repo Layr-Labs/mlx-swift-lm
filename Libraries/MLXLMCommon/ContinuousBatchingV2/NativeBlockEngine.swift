@@ -194,6 +194,7 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
     public func submitWithRetirement(_ request: CBv2Request) throws -> (
         events: AsyncStream<CBv2Event>, retirement: CBv2RequestRetirement
     ) {
+        guard request.reasoningBudget == nil else { throw CBv2ReasoningBudgetError.unsupported }
         guard !request.promptTokens.isEmpty, request.maxTokens > 0,
             request.stopStrings.allSatisfy({ !$0.isEmpty })
         else {
