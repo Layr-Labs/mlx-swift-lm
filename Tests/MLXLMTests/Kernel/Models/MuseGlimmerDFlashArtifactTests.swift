@@ -72,6 +72,13 @@ extension KernelTests {
                 pin.configurationSHA256
                     == "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a")
             #expect(pin.configuration == .museGlimmer30B)
+            let quantized = Pin.museGlimmer30BQuantized
+            #expect(quantized.configuration == .museGlimmer30B && quantized != pin)
+            let plan = MuseGlimmerDFlashConfiguration.museGlimmer30B.museGlimmer30BQuantizedPlan
+            #expect(plan.count == 36)
+            #expect(plan["encoder.fc"] == .affine(bits: 8, groupSize: 64))
+            #expect(plan["layers.2.self_attn.q_proj"] == .affine(bits: 8, groupSize: 64))
+            #expect(plan["layers.4.mlp.gate_proj"] == .affine(bits: 5, groupSize: 64))
         }
 
         @Test func denseArtifactRoundTripsAndIsDeterministic() throws {

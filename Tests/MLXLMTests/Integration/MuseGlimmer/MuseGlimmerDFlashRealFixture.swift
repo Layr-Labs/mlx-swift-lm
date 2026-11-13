@@ -22,6 +22,8 @@ final class MuseGlimmerDFlashRealFixture: @unchecked Sendable {
     static let resultsDirectory = environment["MUSE_GLIMMER_DFLASH_RESULTS_DIR"]
     /// Where the quantized artifact is written.
     static let artifactDirectory = environment["MUSE_GLIMMER_DFLASH_ARTIFACT_DIR"]
+    /// The quantized artifact pinned as `museGlimmer30BQuantized`.
+    static let quantizedDirectory = environment["MUSE_GLIMMER_DFLASH_QUANTIZED_DIR"]
 
     static var hasWeights: Bool { targetDirectory != nil && drafterDirectory != nil }
 

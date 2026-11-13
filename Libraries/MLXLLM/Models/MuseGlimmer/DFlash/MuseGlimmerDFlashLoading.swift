@@ -160,6 +160,26 @@ public struct MuseGlimmerDFlashArtifactPin: Sendable, Equatable {
         weightsSHA256: "fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84",
         configurationSHA256: "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a",
         configuration: .museGlimmer30B)
+
+    /// The quantized conversion of `museGlimmer30BBF16` that `writeArtifact`
+    /// produces for the plan `museGlimmer30BQuantizedPlan`: 1,968,222,936
+    /// bytes, under the 2 GiB assistant bound. The conversion is
+    /// deterministic, so these hashes follow from the source artifact.
+    public static let museGlimmer30BQuantized = MuseGlimmerDFlashArtifactPin(
+        weightsSHA256: "38f92e9ada069615c24d89768fa6148336c6608880b1ddf825ae5228e1ea6a87",
+        configurationSHA256: "af24b73c299bffe7537846e42dfd54e43828b0a5f02a06327e168d70db06e2fd",
+        configuration: .museGlimmer30B)
+}
+
+extension MuseGlimmerDFlashConfiguration {
+    /// MLX affine quantization, group 64: the MLP projections at 5 bits,
+    /// the attention projections and `encoder.fc` at 8 bits. Norms stay dense.
+    public var museGlimmer30BQuantizedPlan: [String: MuseGlimmerDFlashProjectionFormat] {
+        Dictionary(
+            uniqueKeysWithValues: MuseGlimmerDFlashInventory(self).projections.map {
+                ($0.path, .affine(bits: $0.path.contains(".mlp.") ? 5 : 8, groupSize: 64))
+            })
+    }
 }
 
 extension MuseGlimmerDFlashDraftModel {

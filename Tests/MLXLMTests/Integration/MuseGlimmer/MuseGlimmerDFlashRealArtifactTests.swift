@@ -136,6 +136,59 @@ struct MuseGlimmerDFlashRealArtifactTests {
         try Real.writeResult("real-oracle-p1-round0", report)
     }
 
+    /// The pinned quantized artifact loads through the strict loader, is what
+    /// the pinned plan gives when applied to the published drafter, and
+    /// drafts the oracle's first block.
+    @Test(
+        .enabled(
+            if: Real.hasWeights && Real.oracleDirectory != nil && Real.quantizedDirectory != nil))
+    func pinnedQuantizedArtifactLoadsAndDrafts() throws {
+        let real = try Real.shared.get()
+        let c = real.configuration
+        let pin = MuseGlimmerDFlashArtifactPin.museGlimmer30BQuantized
+        let loaded = try MuseGlimmerDFlashDraftModel.load(
+            directory: URL(fileURLWithPath: Real.quantizedDirectory!), pin: pin,
+            maximumBytes: 2 << 30)
+        #expect(loaded.artifactPayloadBytes < 2 << 30)
+        #expect(loaded.projectionFormats == c.museGlimmer30BQuantizedPlan)
+        let converted = try real.drafterCopy()
+        try converted.quantize(c.museGlimmer30BQuantizedPlan)
+        let expected = Dictionary(uniqueKeysWithValues: converted.parameters().flattened())
+        for (name, value) in loaded.parameters().flattened() {
+            #expect(value.asData().data == expected[name]?.asData().data, "\(name)")
+        }
+        // The published pin does not accept the quantized artifact.
+        #expect(throws: MuseGlimmerDFlashError.self) {
+            try MuseGlimmerDFlashDraftModel.load(
+                directory: URL(fileURLWithPath: Real.quantizedDirectory!),
+                pin: .museGlimmer30BBF16, maximumBytes: 6 << 30)
+        }
+
+        let directory = URL(fileURLWithPath: Real.oracleDirectory!)
+        let stream = try MuseGlimmerDFlashNPZ(
+            directory.appendingPathComponent("P1_residual_stream.npz"))
+        let fixture = try MuseGlimmerDFlashNPZ(directory.appendingPathComponent("P1_dflash.npz"))
+        let outputs = try stream.array("layer_outputs")
+        let features = concatenated(c.targetLayerIDs.map { outputs[$0] }, axis: -1)
+        let state = loaded.makeContextState()
+        loaded.commit(features: features, at: 0, to: state)
+        let drafted = real.drafts(
+            model: loaded, state: state, anchor: try fixture.ints("r0_anchor")[0])
+        let result = compare(
+            logits: drafted.logits, oracleTopIDs: try fixture.ints("r0_draft_top5_ids"),
+            oracleTopRaw: try fixture.floats("r0_draft_top5_raw_lm_head"))
+        // The first 7 are what the engine uses; the oracle accepts 2 of them.
+        #expect(Array(result.drafts.prefix(2)) == Array(try fixture.ints("r0_draft_ids").prefix(2)))
+        try Real.writeResult(
+            "real-quantized-artifact",
+            [
+                "payload_bytes": loaded.artifactPayloadBytes, "drafts": result.drafts,
+                "oracle_drafts": try fixture.ints("r0_draft_ids"),
+                "mismatches_vs_bf16_oracle": result.mismatches,
+                "max_raw_difference_at_oracle_top5": Double(result.maxRawDifference),
+            ])
+    }
+
     /// Every round of every oracle trace, with the context committed in the
     /// increments the engine would deliver.
     @Test(.enabled(if: Real.hasWeights && Real.traceDirectory != nil))

@@ -40,8 +40,7 @@ struct MuseGlimmerDFlashStudyTests {
             return all { .affine(bits: $0 == "encoder.fc" ? 8 : 4, groupSize: 64) }
         case "q4mlp-q8rest":
             return all { .affine(bits: $0.contains(".mlp.") ? 4 : 8, groupSize: 64) }
-        case "q5mlp-q8rest":
-            return all { .affine(bits: $0.contains(".mlp.") ? 5 : 8, groupSize: 64) }
+        case "q5mlp-q8rest": return c.museGlimmer30BQuantizedPlan
         case "q4mlp-q6rest":
             return all { .affine(bits: $0.contains(".mlp.") ? 4 : 6, groupSize: 64) }
         default: return [:]
