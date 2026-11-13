@@ -1293,7 +1293,8 @@ extension KernelTests {
             verification: GLM5NextMTPVerification
         ) async throws {
             let h = try NativeHarness(projectionSign: 1, verification: verification, sampled: true)
-            #expect(h.resources.contract.supportsTokenConstraints && h.engine.acceptsTokenConstraints)
+            #expect(
+                h.resources.contract.supportsTokenConstraints && h.engine.acceptsTokenConstraints)
             let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
             let prompt = [1, 2, 3, 4]
             let plainExpected = try greedy(h.fixture.target, prompt: prompt, count: 6)
@@ -1322,7 +1323,8 @@ extension KernelTests {
             #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens > 0)
             let outcome = await h.engine.shutdownReportingNativeCompletion()
             guard case .quiescent = outcome else {
-                Issue.record("protected GLM constrained rows left native work unresolved: \(outcome)")
+                Issue.record(
+                    "protected GLM constrained rows left native work unresolved: \(outcome)")
                 return
             }
             #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
@@ -1336,7 +1338,9 @@ extension KernelTests {
             let h = try NativeHarness(projectionSign: 1, sampled: true)
             let prompt = [1, 2, 3, 4]
             let other = [5, 6, 7]
-            let forced = try greedy(h.fixture.target, prompt: prompt, count: 5).map { ($0 + 1) % 16 }
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 5).map {
+                ($0 + 1) % 16
+            }
             let otherExpected = try greedy(h.fixture.target, prompt: other, count: 5)
             h.engine.loopForTesting.onEngineQueueSync {
                 h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
@@ -1364,7 +1368,8 @@ extension KernelTests {
             #expect(tokens == forced && plainTokens == otherExpected)
             let outcome = await h.engine.shutdownReportingNativeCompletion()
             guard case .quiescent = outcome else {
-                Issue.record("co-batched GLM constrained row left native work unresolved: \(outcome)")
+                Issue.record(
+                    "co-batched GLM constrained row left native work unresolved: \(outcome)")
                 return
             }
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
