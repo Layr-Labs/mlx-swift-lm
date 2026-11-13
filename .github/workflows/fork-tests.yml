@@ -17,6 +17,8 @@ name: Fork Tests
 # The macOS jobs run on a Darkbloom Sandbox when the route job gets one from
 # the Darkbloom plane, else on the GitHub-hosted xcode-27 image. Push and
 # manual runs save caches that later jobs on the same runner service restore.
+# Seven audio decoder tests temporarily stay hosted after the unchanged base
+# reproduced strict PCM-bit failures on native macOS. Their assertions remain intact.
 
 on:
   pull_request:
@@ -47,6 +49,7 @@ jobs:
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
       macos-jobs: ${{ steps.matrix.outputs.macos-jobs }}
+      audio-shard: ${{ steps.matrix.outputs.audio-shard }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -55,17 +58,19 @@ jobs:
 
       - name: Read the shard numbers
         id: matrix
-        # The macOS jobs are build, metallib, coverage and one test job per
-        # shard. The route asks for that many.
+        # The native jobs are build, metallib, coverage and four test shards.
+        # The seven-test audio exception uses its separate hosted shard.
         run: |
-          shards=$(python3 .github/scripts/test_shards.py matrix)
-          echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "macos-jobs=$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
+          shards=$(python3 .github/scripts/test_shards.py matrix --runner native)
+          audio_shards=$(python3 .github/scripts/test_shards.py matrix --runner hosted)
+          jq -e 'length == 1' <<< "$audio_shards" > /dev/null
+          printf 'shards=%s\naudio-shard=%s\nmacos-jobs=%s\n' \
+            "$shards" "$(jq -r '.[0]' <<< "$audio_shards")" \
+            "$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
 
-  # Chooses the runner of the macOS jobs. The build's products hold its
-  # absolute workspace path and its Xcode, so the test jobs must run on the
-  # same kind of runner. The jobs therefore share one lane, which the plane
-  # grants whole or not at all.
+  # The native macOS jobs share one lane, granted whole or not at all.
+  # The hosted audio exception reconstructs the build's absolute workspace
+  # and requires the same Xcode path before unpacking its products.
   route:
     name: Route Fork Tests
     needs: plan
@@ -84,6 +89,9 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 90
+    outputs:
+      workspace: ${{ steps.products.outputs.workspace }}
+      developer-dir: ${{ steps.products.outputs.developer-dir }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -232,12 +240,15 @@ jobs:
         run: .github/scripts/test-products.sh pack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
       - name: Report the test-products archive
+        id: products
         run: |
           artifact_path="$RUNNER_TEMP/test-products/test-products.tar.zst"
           artifact_bytes=$(stat -f '%z' "$artifact_path")
           artifact_sha256=$(shasum -a 256 "$artifact_path" | awk '{ print $1 }')
           printf 'Test products: %s bytes, SHA-256 %s\n' "$artifact_bytes" "$artifact_sha256" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'workspace=%s\ndeveloper-dir=%s\n' "$GITHUB_WORKSPACE" "$DEVELOPER_DIR" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Upload the test products
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -437,9 +448,106 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # Temporary decoder exception: the same seven strict tests, products and
+  # coverage reports run on hosted macOS until the native audio issue is fixed.
+  audio:
+    name: Audio decoder tests (hosted exception)
+    needs:
+    - plan
+    - build
+    - metallib
+    runs-on: xcode-27
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Select Xcode
+      uses: ./.github/actions/select-xcode
+    - name: Record hosted OS, hardware, Xcode and audio framework
+      run: |
+        sw_vers
+        uname -m
+        sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+        xcodebuild -version
+        swift -e 'import Foundation; import AVFoundation
+        let bundle = Bundle(for: AVAssetReader.self)
+        guard let version = bundle.object(forInfoDictionaryKey: "CFBundleVersion") else {
+            fatalError("AVFoundation version is unavailable")
+        }
+        print("AVFoundation.bundle=\(bundle.bundlePath)")
+        print("AVFoundation.version=\(version)")'
+    - name: Download the test products
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: test-products
+        path: ${{ runner.temp }}/test-products
+    - name: Restore products at the unchanged build workspace path
+      env:
+        BUILD_WORKSPACE: ${{ needs.build.outputs.workspace }}
+        BUILD_DEVELOPER_DIR: ${{ needs.build.outputs.developer-dir }}
+      run: |
+        native_workspace=/Users/runner/actions-runner/_work/mlx-swift-lm/mlx-swift-lm
+        expected_developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+        if [[ "$BUILD_DEVELOPER_DIR" != "$expected_developer_dir" || "$DEVELOPER_DIR" != "$BUILD_DEVELOPER_DIR" ]]; then
+          echo "::error::The hosted audio job must use the shared build's Xcode path."
+          exit 1
+        fi
+        if [[ "$BUILD_WORKSPACE" == "$GITHUB_WORKSPACE" ]]; then
+          : # The shared build also used the hosted runner workspace.
+        elif [[ "$BUILD_WORKSPACE" == "$native_workspace" ]]; then
+          if [[ -e "$native_workspace" || -L "$native_workspace" ]]; then
+            echo "::error::Refusing an existing canonical build workspace."
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          mkdir -p "$(dirname "$native_workspace")"
+          mkdir "$native_workspace"
+          [[ -O "$native_workspace" ]]
+          cp -a "$GITHUB_WORKSPACE/." "$native_workspace/"
+          [[ $(git -C "$native_workspace" rev-parse HEAD) == "$source_sha" ]]
+        else
+          echo "::error::Refusing an unexpected build workspace."
+          exit 1
+        fi
+        export GITHUB_WORKSPACE="$BUILD_WORKSPACE"
+        printf 'AUDIO_WORKSPACE=%s\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+        cd "$GITHUB_WORKSPACE"
+        .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
+    - name: Use the package versions of the build
+      run: |
+        cp "$AUDIO_WORKSPACE/.build/fork-tests-Package.resolved" "$AUDIO_WORKSPACE/Package.resolved"
+    - name: Download the Metal library
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: metallib
+        path: ${{ runner.temp }}/metallib
+    - name: Run the shard
+      run: |
+        export GITHUB_WORKSPACE="$AUDIO_WORKSPACE"
+        cd "$GITHUB_WORKSPACE"
+        python3 -u .github/scripts/test_shards.py run --shard ${{ needs.plan.outputs.audio-shard }} --results "$RUNNER_TEMP/results/shard-${{ needs.plan.outputs.audio-shard }}" --metallib "$RUNNER_TEMP/metallib/mlx.metallib" --list .build/fork-tests-list.txt
+    - name: Upload the test results
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: shard-${{ needs.plan.outputs.audio-shard }}-results
+        path: ${{ runner.temp }}/results
+        retention-days: 7
+    - name: Upload the crash reports
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: crash-reports-shard-${{ needs.plan.outputs.audio-shard }}
+        path: ~/Library/Logs/DiagnosticReports/*
+        if-no-files-found: warn
+        retention-days: 7
+
   verify:
     name: Each test ran once
-    needs: [list, test, route]
+    needs: [list, test, audio, route]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-verify'] }}
     timeout-minutes: 10
@@ -479,7 +587,7 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [route, build, test]
+    needs: [route, build, test, audio]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}

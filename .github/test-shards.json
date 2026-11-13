@@ -311,7 +311,6 @@
             "MLXLMServerTests.Qwen4ToolFormatTests",
             "MLXLMServerTests.ReasoningParserFormatTests",
             "MLXLMTests.AfMoESlidingMaskTests",
-            "MLXLMTests.AudioReaderRetryTests",
             "MLXLMTests.BaichuanM1WindowMaskTiedHeadTests",
             "MLXLMTests.CBv2AsymmetricCompleteCheckpointTests",
             "MLXLMTests.CBv2AsymmetricContiguousTests",
@@ -1393,7 +1392,6 @@
             "MLXLMTests.MiMoV26AudioTokenizerEncoderTests",
             "MLXLMTests.MiMoV26CausalPositionContractTests",
             "MLXLMTests.MiMoV26DecodeEligibilityTests",
-            "MLXLMTests.MiMoV26EncodedAACAudioTests",
             "MLXLMTests.MiMoV26EncodedAudioDecoderTests",
             "MLXLMTests.MiMoV26FactoryTests",
             "MLXLMTests.MiMoV26FullAudioQualificationTests",
@@ -1531,6 +1529,32 @@
           "rest": true
         }
       ]
+    },
+    {
+      "runner": "hosted",
+      "estimated_seconds": 42,
+      "runs": [
+        {
+          "tests": [
+            "MLXLMTests.AudioReaderRetryTests/testAudioFailureNamesItsMediumAndSharesTheTransientTable",
+            "MLXLMTests.AudioReaderRetryTests/testUserInputAudioRetryAfterAFailedReaderPassKeepsTheSamples",
+            "MLXLMTests.AudioReaderRetryTests/testUserInputAudioThrowsTheReaderFailureWhenBothPassesFail",
+            "MLXLMTests.MiMoV26EncodedAACAudioTests/testAACMetadataBoundsRefuseBeforeDecompressionAndOnPlanReuse",
+            "MLXLMTests.MiMoV26EncodedAACAudioTests/testAACReaderThatFailsTwiceThrowsItsFailure",
+            "MLXLMTests.MiMoV26EncodedAACAudioTests/testActualAACRetainsStereoRateAndCompletePresentedTimeline",
+            "MLXLMTests.MiMoV26EncodedAACAudioTests/testFailedAACReaderPassIsDecodedAgainWithTheSameOutput"
+          ]
+        }
+      ]
     }
+  ],
+  "hosted_tests": [
+    "MLXLMTests.AudioReaderRetryTests/testAudioFailureNamesItsMediumAndSharesTheTransientTable",
+    "MLXLMTests.AudioReaderRetryTests/testUserInputAudioRetryAfterAFailedReaderPassKeepsTheSamples",
+    "MLXLMTests.AudioReaderRetryTests/testUserInputAudioThrowsTheReaderFailureWhenBothPassesFail",
+    "MLXLMTests.MiMoV26EncodedAACAudioTests/testAACMetadataBoundsRefuseBeforeDecompressionAndOnPlanReuse",
+    "MLXLMTests.MiMoV26EncodedAACAudioTests/testAACReaderThatFailsTwiceThrowsItsFailure",
+    "MLXLMTests.MiMoV26EncodedAACAudioTests/testActualAACRetainsStereoRateAndCompletePresentedTimeline",
+    "MLXLMTests.MiMoV26EncodedAACAudioTests/testFailedAACReaderPassIsDecodedAgainWithTheSameOutput"
   ]
 }
