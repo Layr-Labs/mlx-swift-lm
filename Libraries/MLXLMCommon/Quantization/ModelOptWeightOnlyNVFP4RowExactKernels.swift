@@ -29,8 +29,9 @@ import MLX
 /// and reads each weight once for up to 16 rows. The scalar kernel runs the
 /// fused multiply-adds one by one for a single row, where the weight read is
 /// the cost. The two agree only where a multiply-accumulate is that ascending
-/// chain of fused multiply-adds (measured on Apple GPU families 15 and 17);
-/// elsewhere the matrix kernel serves every row count.
+/// chain of fused multiply-adds (measured on Apple GPU families 15 and 17).
+/// The scalar kernel takes one-row calls only where it is also faster
+/// (family 15); elsewhere the matrix kernel serves every row count.
 public enum ModelOptWeightOnlyNVFP4RowExact {
     public static let maximumRows = 16
 
@@ -56,6 +57,13 @@ public enum ModelOptWeightOnlyNVFP4RowExact {
     /// equal to the scalar kernel's chain, bit for bit (M3 Ultra, M5 Ultra).
     static let scalarKernelGenerations: Set<Int> = [15, 17]
 
+    /// The generations where the scalar kernel is also faster for one row,
+    /// so it takes one-row calls by default. On the M5 Ultra (17) it is equal
+    /// but slower: the Muse Glimmer tower's NVFP4 one-row projections took
+    /// 38.3 ms with it against 17.4 ms with the matrix kernel (release, one
+    /// session), so the matrix kernel serves every row count there.
+    static let scalarKernelDefaultGenerations: Set<Int> = [15]
+
     /// The family of the Metal device itself. No environment variable
     /// changes it, so none can select a kernel that was not measured.
     static let deviceFamily = gpuFamily(architecture: GPU.deviceInfo().architecture)
@@ -66,8 +74,12 @@ public enum ModelOptWeightOnlyNVFP4RowExact {
     public static let scalarKernelMeasured =
         deviceGeneration.map { scalarKernelGenerations.contains($0) } ?? false
 
+    /// Rows the scalar kernel takes by default on this device (0: none).
+    static let defaultScalarRows =
+        deviceGeneration.map { scalarKernelDefaultGenerations.contains($0) } ?? false ? 1 : 0
+
     /// Rows the scalar kernel takes (0: none). Tests and benchmarks set it.
-    nonisolated(unsafe) static var scalarRows = scalarKernelMeasured ? 1 : 0
+    nonisolated(unsafe) static var scalarRows = defaultScalarRows
 
     /// Most outputs the scalar kernel takes: measured faster than the matrix
     /// kernel for one row at 19,968 outputs and slower at 202,048.

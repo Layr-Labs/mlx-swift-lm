@@ -302,6 +302,13 @@ extension KernelTests {
                     == (device.map {
                         ModelOptWeightOnlyNVFP4RowExact.scalarKernelGenerations.contains($0)
                     } ?? false))
+            // The scalar kernel takes one row by default only where it is
+            // equal and faster: generation 15, not the M5's 17.
+            #expect(
+                ModelOptWeightOnlyNVFP4RowExact.defaultScalarRows == (device == 15 ? 1 : 0))
+            #expect(
+                ModelOptWeightOnlyNVFP4RowExact.scalarKernelDefaultGenerations.isSubset(
+                    of: ModelOptWeightOnlyNVFP4RowExact.scalarKernelGenerations))
             if let forced = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"],
                 let generation = ModelOptWeightOnlyNVFP4RowExact.gpuGeneration(
                     architecture: forced),
