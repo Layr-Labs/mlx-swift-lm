@@ -15,17 +15,23 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     private let model: ModelContainer
     private let modelType: String?
     private let defaultToolCallParser: String?
+    private let onyxParsing: OnyxParsingMode
 
+    /// `onyxParsing` is how an Onyx model's tool frames are read. The default
+    /// is the library's strict reading; `.referenceParity` is the reading of
+    /// the reference servers and is used only when asked for.
     public init(
         modelID: String,
         model: ModelContainer,
         modelType: String? = nil,
-        defaultToolCallParser: String? = nil
+        defaultToolCallParser: String? = nil,
+        onyxParsing: OnyxParsingMode = .strict
     ) {
         self.modelID = modelID
         self.model = model
         self.modelType = modelType
         self.defaultToolCallParser = defaultToolCallParser
+        self.onyxParsing = onyxParsing
     }
 
     public func availableModels() async throws -> [MLXServerModel] {
@@ -131,13 +137,13 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     /// Generation for a model whose response protocol separates reasoning
     /// from content by frames. The stream reports each channel as `.parsed`,
     /// so reasoning reaches `reasoning_content` and framing never reaches
-    /// content. Tool calls are read as the reference servers read them.
+    /// content. Tool calls are read as `onyxParsing` says.
     private func channelStream(
         input: consuming sending LMInput, parameters: GenerateParameters,
         tools: [[String: any Sendable]]?
     ) async throws -> AsyncThrowingStream<MLXServerGenerationEvent, Error> {
         var parameters = parameters
-        parameters.toolCallPolicy.onyxParsing = .referenceParity
+        parameters.toolCallPolicy.onyxParsing = onyxParsing
         let policy = parameters
         let events = try await model.perform(nonSendable: input) {
             context, input -> AsyncStream<MLXServerGenerationEvent>? in

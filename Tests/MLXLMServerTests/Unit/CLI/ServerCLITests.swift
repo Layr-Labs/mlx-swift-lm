@@ -1,4 +1,5 @@
 import Foundation
+import MLXLMCommon
 import Testing
 
 @testable import MLXLMServer
@@ -114,6 +115,32 @@ extension UnitTests {
             }
             #expect(throws: DecodingError.self) {
                 try parse([], environment: ["MLX_SERVER_REASONING_PARSER": "unknown"])
+            }
+        }
+
+        /// Onyx tool frames are read strictly unless the reference reading is
+        /// asked for by option or environment.
+        @Test
+        func onyxParsingIsStrictUnlessAskedFor() throws {
+            func mode(_ arguments: [String], _ environment: [String: String] = [:]) throws
+                -> OnyxParsingMode?
+            {
+                guard case .run(let configuration) = try parse(arguments, environment: environment)
+                else { return nil }
+                return configuration.onyxParsing
+            }
+            #expect(try mode([]) == .strict)
+            #expect(try mode(["--onyx-parsing", "reference-parity"]) == .referenceParity)
+            #expect(try mode([], ["MLX_SERVER_ONYX_PARSING": "reference-parity"]) == .referenceParity)
+            #expect(
+                try mode(
+                    ["--onyx-parsing", "strict"], ["MLX_SERVER_ONYX_PARSING": "reference-parity"])
+                    == .strict)
+            #expect(throws: MLXServerCLIError.invalidOnyxParsing("loose")) {
+                try parse(["--onyx-parsing", "loose"])
+            }
+            #expect(throws: MLXServerCLIError.missingValue("--onyx-parsing")) {
+                try parse(["--onyx-parsing"])
             }
         }
 

@@ -1,6 +1,7 @@
 // Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
+import MLXLMCommon
 
 public struct MLXServerConfiguration: Sendable, Equatable {
     public var model: String
@@ -11,6 +12,8 @@ public struct MLXServerConfiguration: Sendable, Equatable {
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var embeddingModel: String?
+    /// How an Onyx model's tool frames are read; strict unless asked.
+    public var onyxParsing: OnyxParsingMode
 
     public init(
         model: String,
@@ -20,7 +23,8 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         modelType: String? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
-        embeddingModel: String? = nil
+        embeddingModel: String? = nil,
+        onyxParsing: OnyxParsingMode = .strict
     ) {
         self.model = model
         self.revision = revision
@@ -30,6 +34,7 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.embeddingModel = embeddingModel
+        self.onyxParsing = onyxParsing
     }
 }
 
@@ -44,6 +49,7 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
     case invalidPort(String)
     case unknownOption(String)
     case invalidEngineKind(String)
+    case invalidOnyxParsing(String)
 
     public var errorDescription: String? {
         switch self {
@@ -55,6 +61,8 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
             return "Unknown option '\(option)'"
         case .invalidEngineKind(let value):
             return "Invalid engine kind '\(value)'"
+        case .invalidOnyxParsing(let value):
+            return "Invalid Onyx parsing '\(value)' (strict or reference-parity)"
         }
     }
 }
@@ -74,6 +82,10 @@ public enum MLXServerCLI {
         var reasoningParser: ReasoningParserFormat?
         if let raw = environment["MLX_SERVER_REASONING_PARSER"] {
             reasoningParser = try decodeReasoningParser(raw)
+        }
+        var onyxParsing = OnyxParsingMode.strict
+        if let raw = environment["MLX_SERVER_ONYX_PARSING"] {
+            onyxParsing = try decodeOnyxParsing(raw)
         }
         var index = 1
         while index < arguments.count {
@@ -105,6 +117,9 @@ public enum MLXServerCLI {
                 )
             case "--embedding-model":
                 embeddingModel = try value(after: option, arguments: arguments, index: &index)
+            case "--onyx-parsing":
+                onyxParsing = try decodeOnyxParsing(
+                    try value(after: option, arguments: arguments, index: &index))
             default:
                 if option.hasPrefix("-") {
                     throw MLXServerCLIError.unknownOption(option)
@@ -123,7 +138,8 @@ public enum MLXServerCLI {
                 modelType: modelType,
                 toolCallParser: toolCallParser,
                 reasoningParser: reasoningParser,
-                embeddingModel: embeddingModel
+                embeddingModel: embeddingModel,
+                onyxParsing: onyxParsing
             )
         )
     }
@@ -140,13 +156,14 @@ public enum MLXServerCLI {
               --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony, atem
               --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony, onyx
               --embedding-model <id>       Optional embedding model id for /v1/embeddings
+              --onyx-parsing <mode>        strict (default) or reference-parity, for Onyx tool frames
               --list-routes                Print the server route manifest
           -h, --help                       Print this help
 
         Environment:
           MLX_SERVER_MODEL, MLX_SERVER_REVISION, MLX_SERVER_HOST, MLX_SERVER_PORT,
           MLX_SERVER_MODEL_TYPE, MLX_SERVER_TOOL_CALL_PARSER, MLX_SERVER_REASONING_PARSER,
-          MLX_SERVER_EMBEDDING_MODEL, MLX_SERVER_ENGINE_KIND
+          MLX_SERVER_EMBEDDING_MODEL, MLX_SERVER_ONYX_PARSING, MLX_SERVER_ENGINE_KIND
         """
 
     private static func value(
@@ -160,6 +177,14 @@ public enum MLXServerCLI {
         }
         index = valueIndex
         return arguments[valueIndex]
+    }
+
+    private static func decodeOnyxParsing(_ raw: String) throws -> OnyxParsingMode {
+        switch raw {
+        case "strict": return .strict
+        case "reference-parity", "reference_parity", "referenceParity": return .referenceParity
+        default: throw MLXServerCLIError.invalidOnyxParsing(raw)
+        }
     }
 
     private static func decodeReasoningParser(_ raw: String) throws -> ReasoningParserFormat {

@@ -353,7 +353,10 @@ def:
         with token ids or with marker-visible text. `ToolCallFormat.infer(from:)` maps `muse_glimmer` to `.atem`.
         In the server, `ReasoningParserFormat.onyx` splits marker-visible text into reasoning and content, and
         `MLXModelContainerEngine` reads an `.atem` model's frames from the token ids (`ChannelTokenLoopHandler`)
-        and reports reasoning and content as `.parsed`, because `Generation` has no reasoning event.
+        and reports reasoning and content as `.parsed`, because `Generation` has no reasoning event. The
+        engine reads tool frames strictly; its `onyxParsing` option (`--onyx-parsing reference-parity` or
+        `MLX_SERVER_ONYX_PARSING` in the CLI) selects the reference reading. A rejected call or a protocol
+        error has no OpenAI field, so the handler emits nothing for it.
         The unit tests port the vLLM Muse Glimmer parser cases and its schema value table.
         `MuseGlimmerOnyxTokenizerLiveTests` runs the token decoder with the published tokenizer when
         `MUSE_GLIMMER_NVFP4_DIR` names a snapshot directory; it reads no weights.

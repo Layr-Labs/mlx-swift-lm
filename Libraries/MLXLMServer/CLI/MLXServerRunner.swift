@@ -37,7 +37,8 @@ public enum MLXServer {
             modelID: configuration.model,
             model: model,
             modelType: configuration.modelType,
-            defaultToolCallParser: configuration.toolCallParser
+            defaultToolCallParser: configuration.toolCallParser,
+            onyxParsing: configuration.onyxParsing
         )
 
         let embeddingEngine: MLXEmbedderContainerEngine?
