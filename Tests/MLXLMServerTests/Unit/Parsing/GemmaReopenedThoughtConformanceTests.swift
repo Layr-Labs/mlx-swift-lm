@@ -37,6 +37,15 @@ extension UnitTests {
             #expect(result.reasoningContent == nil)
         }
 
+        @Test("collected output keeps a close with no opener as reasoning unless enabled")
+        func collectedCloseWithoutOpener() {
+            // Enabled, it is a stray marker; a caller that pre-opens the thought
+            // in the prompt must leave the switch off.
+            let result = ReasoningParser(format: .gemma4).parse("Hello<channel|> world")
+            #expect(result.content == (enabled ? "Hello world" : "world"))
+            #expect(result.reasoningContent == (enabled ? nil : "Hello"))
+        }
+
         @Test(
             "channel markers in native tool strings remain argument data", arguments: [1, 3, 1000])
         func toolArgumentMarkers(width: Int) {

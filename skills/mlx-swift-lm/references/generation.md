@@ -147,5 +147,10 @@ recognize each reopened `<|channel>thought` span and absorb unmatched
 `<channel|>` markers. Collected and streaming parsing use the same state
 machine. Tool-call payloads stay opaque, including channel-looking text inside
 quoted arguments. Set the variable before server startup; it is read once per
-process. Unset or `0` keeps the existing channel handling. This switch changes
-text parsing only; it does not enable model reasoning or alter token sampling.
+process. Any value other than `1` (including unset) keeps the existing channel
+handling. Enabled, a `<channel|>` that no `<|channel>` opened is a stray marker
+in collected output too, so text before it stays in the answer; callers that
+pre-open the thought in the prompt should leave the switch off. Enabled, both
+modes drop `<turn|>` and `<eos>` anywhere in answer text and keep them inside
+tool payloads. This switch changes text parsing only; it does not enable model
+reasoning or alter token sampling.
