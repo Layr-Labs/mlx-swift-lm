@@ -3060,11 +3060,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Constraint state advances from the host-confirmed token. A
             // constrained row chains only when both its constraint and the
             // sampler opt in: N+1 is then masked speculatively and redrawn
-            // after N's finalization if N's token changed the mask.
+            // after N's finalization if N's token changed the mask. Never on
+            // a native-tracked engine, whose launches go through the native
+            // work protocol that the redraw does not.
             ids.allSatisfy({ id in
                 guard let constraint = scheduler.record(for: id)?.request.tokenConstraint
                 else { return true }
                 return constraint.allowsChainedDecode && sampler.supportsConstrainedChainedDecode
+                    && nativeShutdownState == nil
             }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(
