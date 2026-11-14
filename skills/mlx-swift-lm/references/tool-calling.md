@@ -221,7 +221,24 @@ A Gemma 4 value written without the `<|"|>` marker, such as `zip:01000`, is
 read by its parameter's schema, at any depth: a parameter that admits a string
 but not the value's JSON type keeps the written text (`"01000"`, `"1.10"`,
 `"true"`). Other parameters, and calls without a schema, keep the JSON reading
-(`1000`). Marker-quoted values are always strings. Where this differs from
+(`1000`). Marker-quoted values remain strings by default. With
+`DARKBLOOM_GEMMA_SCHEMA_COERCION=1`, the Gemma parser converts quoted numeric
+values at frame close when the parameter unambiguously requires an integer or
+number. It uses the existing bounded schema normalization, including nested
+properties and array items; strings, ambiguous or unknown schemas, non-finite
+numbers and non-integral integer values retain their original text. Numeric
+marker values are withheld from argument deltas until the completed parse, so
+streamed JSON agrees with the completed call. Callers still validate the completed
+call against their schema. Unsupported container schemas (including references,
+pattern properties and tuple prefixes) preserve quoted descendants. A numeric
+render type beside a union is insufficient to convert a string: the union
+branches must independently establish a numeric reading. Nested `anyOf`,
+`oneOf` or `allOf` combinations preserve quoted text because render types can
+narrow branches at several levels. Unset or `0` retains the previous parser and streaming
+behavior. Set the variable before starting the server; it is read once per
+process.
+
+Where the bare-value reading differs from
 vLLM's `convert_value`, the SDK keeps the JSON reading: an `enum`- or
 `const`-only schema, a `$ref`, or an `allOf` with an untyped branch (vLLM
 infers the `enum`/`const` types, resolves a local `$ref` and ignores the

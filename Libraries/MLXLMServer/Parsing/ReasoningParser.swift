@@ -132,6 +132,14 @@ public struct ReasoningParser: Sendable {
     }
 
     private func parseGemma4(_ text: String) -> ParsedReasoning {
+        if StreamingGemma4ReasoningParser.reopenedThoughtsEnabled {
+            var parser = StreamingGemma4ReasoningParser()
+            let pieces = parser.parse(text) + parser.finish()
+            let reasoning = pieces.compactMap(\.reasoningContent).joined().trimmedForReasoning
+            return .init(
+                content: pieces.map(\.content).joined().trimmedForReasoning,
+                reasoningContent: reasoning.isEmpty ? nil : reasoning)
+        }
         let channelOpen = "<|channel>"
         let channelClose = "<channel|>"
         let thoughtPrefix = "thought\n"

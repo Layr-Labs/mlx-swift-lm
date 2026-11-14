@@ -520,7 +520,7 @@ extension EngineLoopV2 {
             }
             if let observedHidden,
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden),
-                row.samples, mtpSeedsCarryFromPrefill, mtpBasicEligible(rec)
+                row.samples, mtpSeedsCarryFromPrefill, mtpHistoryEligible(rec)
             {
                 // The final prompt row's hidden produced the first token: the
                 // exact pair a seed step would otherwise recompute.
@@ -606,6 +606,7 @@ extension EngineLoopV2 {
         if let verify {
             asyncEvalTargets.append(verify.acceptancePacket)
             asyncEvalTargets.append(verify.lastHidden)
+            if let logits = verify.constraintLogits { asyncEvalTargets.append(logits) }
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
             }
@@ -648,13 +649,14 @@ extension EngineLoopV2 {
 
     /// Detach (or create) the request's persistent assistant state for one
     /// committed target observation; nil when the row owns no history. A row
-    /// that cannot speculate owns history only over a prompt `range` that can
-    /// leave a prefix checkpoint (`mtpRecordsPromptHistory`).
+    /// temporarily in a protected span retains its history. Other ineligible
+    /// rows only record a prompt `range` that can leave a prefix checkpoint.
     func mtpTakeHistoryState(
         for rec: CBv2ScheduledRequest, range: Range<Int>? = nil
     ) throws -> (any CBv2MTPRequestState)? {
         guard let mtp, mtp.tracksPersistentHistory,
-            mtpBasicEligible(rec) || range.map({ mtpRecordsPromptHistory(rec, range: $0) }) == true
+            mtpHistoryEligible(rec)
+                || range.map({ mtpRecordsPromptHistory(rec, range: $0) }) == true
         else { return nil }
         return try mtp.takeOrMakeAssistantState(
             for: rec.id,
@@ -736,7 +738,8 @@ extension EngineLoopV2 {
                     id: row.rec.id, storageRows: state.compactMap { $0 },
                     assistantState:
                         mtp.usesRequestStatefulDrafter
-                        ? mtp.takeAssistantState(for: row.rec.id) : nil))
+                        ? mtp.takeAssistantState(for: row.rec.id) : nil,
+                    freeSpan: mtpFreeSpan(row.rec)))
             if let assistantState = rowMetadata.last?.assistantState,
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
@@ -873,6 +876,7 @@ extension EngineLoopV2 {
             recurrentEvaluations: target.recurrent,
             policyTopTwoValues: target.policyTopTwo?.values,
             hasAcceptMask: target.accept != nil)
+        result.constraintLogits = target.constraintLogits
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result
