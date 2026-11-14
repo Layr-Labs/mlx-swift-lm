@@ -17,9 +17,9 @@
 // (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
 // (prefill completion into a different set, finish, cancel, join, pause).
 // Token-constrained rows chain only when their constraint and the sampler
-// opt in: N+1 is masked speculatively and, if N's confirmed token changed
-// the mask, redrawn from its retained logits before anything consumes it
-// (`redrawInvalidatedConstrainedSuccessor`).
+// opt in, and never on a native-tracked engine: N+1 is masked speculatively
+// and, if N's confirmed token changed the mask, redrawn from its retained
+// logits before anything consumes it (`redrawInvalidatedConstrainedSuccessor`).
 
 import Cmlx
 import Foundation

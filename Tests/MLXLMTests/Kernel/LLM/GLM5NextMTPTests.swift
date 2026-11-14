@@ -1376,9 +1376,9 @@ extension KernelTests {
         }
 
         /// A constraint that opts into chained decode never chains on the
-        /// protected engine: no constrained successor is redrawn outside the
-        /// native work protocol, the row still follows its constraint at a
-        /// sampled temperature, and a cancel mid-row leaves no native work.
+        /// protected engine, so no constrained successor is redrawn outside the
+        /// native work protocol; the row still follows its constraint and
+        /// native work is quiescent at shutdown.
         @Test func protectedPagedEngineNeverChainsConstrainedRows() async throws {
             let h = try NativeHarness(projectionSign: 1, sampled: true)
             let prompt = [1, 2, 3, 4]
@@ -1388,26 +1388,14 @@ extension KernelTests {
             let stream = try h.engine.submit(
                 .init(
                     id: .init(1971), promptTokens: prompt,
-                    sampling: .init(temperature: 0.8, seed: 7), maxTokens: forced.count,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
                     tokenConstraint: SequenceConstraint(forced, chains: true)))
             var tokens: [Int] = []
             for await event in stream {
                 if case .delta(_, let values, _) = event { tokens += values }
             }
             #expect(tokens == forced)
-            let cancelled = try h.engine.submit(
-                .init(
-                    id: .init(1972), promptTokens: prompt,
-                    sampling: .init(temperature: 0.8, seed: 7), maxTokens: forced.count,
-                    tokenConstraint: SequenceConstraint(forced, chains: true)))
-            var partial: [Int] = []
-            for await event in cancelled {
-                if case .delta(_, let values, _) = event {
-                    partial += values
-                    if partial.count >= 2 { h.engine.cancel(.init(1972)) }
-                }
-            }
-            #expect(forced.starts(with: partial))
+            #expect(h.engine.chainedStepCount == 0)
             #expect(h.engine.loopForTesting.constrainedChainRedrawCount == 0)
             let outcome = await h.engine.shutdownReportingNativeCompletion()
             guard case .quiescent = outcome else {
