@@ -102,8 +102,8 @@ extension EngineLoopV2 {
     }
 
     /// Submit and read back one column under the native work protocol, never
-    /// under finalize's commit lock, which is held again on return. nil: native
-    /// completion is sealed (any failure here seals it), so nothing may commit.
+    /// under finalize's commit lock, which is held again on a non-nil return.
+    /// nil: native completion is sealed (any failure here seals it).
     func mtpNativeGrammarColumn(
         _ sampled: MLXArray, column: Int, step: CBv2InFlightStep, commitHeld: inout Bool
     ) -> [Int]? {

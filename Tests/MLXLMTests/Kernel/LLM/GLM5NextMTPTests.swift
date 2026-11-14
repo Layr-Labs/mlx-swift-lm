@@ -1545,9 +1545,9 @@ extension KernelTests {
             #expect(tracking.debugRetainedRootCount > 0)
         }
 
-        /// One rectangular round verifies a grammar-verified row and a plain row
-        /// together: the sampled constrained row follows its constraint, the
-        /// plain row keeps its exact greedy stream, and both draft.
+        /// Admitted together, a sampled grammar-verified row and a plain row share
+        /// rectangular rounds: the constrained row follows its constraint, the
+        /// plain row keeps its exact greedy stream, and drafting stays active.
         @Test func protectedRectangularEngineBatchesAGrammarVerifiedRowWithAPlainRow()
             async throws
         {
@@ -1581,17 +1581,29 @@ extension KernelTests {
             let prompts = [[1, 2, 3], [5, 6, 7, 8]]
             let forced = try greedy(fixture.target, prompt: prompts[0], count: 8)
             let expectedPlain = try greedy(fixture.target, prompt: prompts[1], count: 8)
+            engine.loopForTesting.onEngineQueueSync {
+                engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+            }
             let constrained = try engine.submit(
                 .init(
                     id: .init(2021), promptTokens: prompts[0],
                     sampling: .init(temperature: 1, seed: 5), maxTokens: forced.count,
                     tokenConstraint: SequenceConstraint(forced)))
-            async let plain = generate(engine, id: 2022, prompt: prompts[1], count: 8)
+            let plain = try engine.submit(
+                .init(
+                    id: .init(2022), promptTokens: prompts[1],
+                    sampling: .init(temperature: 0), maxTokens: 8))
+            engine.loopForTesting.onEngineQueueSync {
+                engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+            }
             var tokens: [Int] = []
             for await event in constrained {
                 if case .delta(_, let values, _) = event { tokens += values }
             }
-            let plainTokens = try await plain
+            var plainTokens: [Int] = []
+            for await event in plain {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
             let metrics = try #require(engine.mtpMetricsSnapshot())
             let outcome = await engine.shutdownReportingNativeCompletion()
             #expect(tokens == forced && plainTokens == expectedPlain)
