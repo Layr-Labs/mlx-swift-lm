@@ -53,6 +53,9 @@ struct PagedAttentionKernelKey: Hashable {
     var partitionTokens: Int
     /// Pass A only: fuse the decode KV write into the kernel.
     var hasWrite: Bool = false
+    /// Pass A only: merge-record heads per round of the side-by-side form
+    /// (`paged_attention_part_side_impl`); 0 is the plain form.
+    var sideHeadsPerRound: Int = 0
 
     var kernelName: String {
         let d: String
@@ -72,6 +75,7 @@ struct PagedAttentionKernelKey: Hashable {
             + "_n\(simdgroups)_t\(partitionTokens)"
             + "_sink\(hasSinks ? 1 : 0)_cap\(hasSoftcap ? 1 : 0)"
             + (hasWrite ? "_w1" : "")
+            + (sideHeadsPerRound > 0 ? "_side\(sideHeadsPerRound)" : "")
     }
 }
 
@@ -119,6 +123,45 @@ enum PagedAttentionMSL {
             threadgroup float red_smem[NSG * HPT * (D + 2)];
             cbv2::paged_attention_part_impl<T, D, S, GQA, HPT, NSG, PTOK, false, HAS_SOFTCAP>(
                 q, q, q, kcache, vcache, tables, seqinfo, params,
+                kvh, maxp, maxpart, q_smem, red_smem, partials, meta,
+                threadgroup_position_in_grid,
+                thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+        """
+
+    /// Side-by-side pass A (`paged_attention_part_side_impl`): one
+    /// threadgroup holds every head group of a kv head. Same inputs and
+    /// outputs as `partBody` / `partBodyNoWrite`.
+    static let partBodySide: String = """
+            const int kvh = kcache_shape[1];
+            const int maxp = tables_shape[1];
+            const int maxpart = threadgroups_per_grid.z;
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0
+                && thread_position_in_grid.z == 0) {
+                fence[0] = wfence[0] + 1;
+            }
+            threadgroup float q_smem[GQA * D];
+            threadgroup float red_smem[NSG * HRED * (D + 2)];
+            const cbv2::PagedSlabAccessor<T> cache{kcache, vcache, (size_t)kvh * S * D};
+            cbv2::paged_attention_part_side_impl<T, D, S, GQA, HPT, NSG, PTOK, HRED, true, HAS_SOFTCAP>(
+                q, knew, vnew, cache, tables, seqinfo, params,
+                kvh, maxp, maxpart, q_smem, red_smem, partials, meta,
+                threadgroup_position_in_grid,
+                thread_position_in_threadgroup,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+        """
+
+    static let partBodySideNoWrite: String = """
+            const int kvh = kcache_shape[1];
+            const int maxp = tables_shape[1];
+            const int maxpart = threadgroups_per_grid.z;
+            threadgroup float q_smem[GQA * D];
+            threadgroup float red_smem[NSG * HRED * (D + 2)];
+            const cbv2::PagedSlabAccessor<T> cache{kcache, vcache, (size_t)kvh * S * D};
+            cbv2::paged_attention_part_side_impl<T, D, S, GQA, HPT, NSG, PTOK, HRED, false, HAS_SOFTCAP>(
+                q, q, q, cache, tables, seqinfo, params,
                 kvh, maxp, maxpart, q_smem, red_smem, partials, meta,
                 threadgroup_position_in_grid,
                 thread_position_in_threadgroup,
@@ -462,6 +505,67 @@ public enum PagedAttentionKernel {
         return nil
     }
 
+    /// Threads of one side-by-side threadgroup at most: the measured shapes
+    /// (27B full attention, Gemma 4 global layers) run 512.
+    static let sideBySideMaxThreads = 512
+
+    /// Exact threadgroup bytes of the side-by-side pass A: every query head
+    /// of the kv head staged, plus NSG merge records of `headsPerRound` heads.
+    public static func sideBySideThreadgroupBytes(
+        headDim: Int, gqa: Int, simdgroups: Int, headsPerRound: Int
+    ) -> Int {
+        let qSmem = gqa * headDim
+        let redSmem = simdgroups * headsPerRound * (headDim + mergeRecordMetaFloats)
+        return (qSmem + redSmem) * MemoryLayout<Float32>.size
+    }
+
+    /// Merge-record heads per round (the kernel's HRED) of the side-by-side
+    /// pass A for one shape: the largest divisor of `headsPerThreadgroup`
+    /// whose buffers fit the threadgroup-memory cap. Nil when a kv head's
+    /// query heads already share one threadgroup, or the form does not fit.
+    public static func sideBySideHeadsPerRound(headDim: Int, gqa: Int) -> Int? {
+        guard ineligibilityReason(headDim: headDim, gqa: gqa) == nil,
+            let nsg = simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa)
+        else { return nil }
+        let hpt = headsPerThreadgroup(headDim: headDim, gqa: gqa)
+        let splits = gqa / hpt
+        guard splits > 1, 32 * nsg * splits <= sideBySideMaxThreads else { return nil }
+        return stride(from: hpt, through: 1, by: -1).first {
+            hpt % $0 == 0
+                && sideBySideThreadgroupBytes(
+                    headDim: headDim, gqa: gqa, simdgroups: nsg, headsPerRound: $0)
+                    <= threadgroupMemoryLimit
+        }
+    }
+
+    /// Attended length from which decode takes the side-by-side pass A. Both
+    /// forms give the same bits; the side-by-side form reads a partition's
+    /// keys and values once per kv head instead of once per head group, which
+    /// pays at long context (measured on an M5 Ultra: per layer 1.08x for
+    /// the 27B shape and 1.22x for Gemma 4 global layers at 65,536 tokens,
+    /// slower for Gemma below 32,768). `DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS`
+    /// sets the length; 0 turns the form off.
+    public static let sideBySideMinimumTokens = sideBySideMinimum(
+        environment: ProcessInfo.processInfo.environment)
+    static let sideBySideEnvironmentKey = "DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS"
+    static let sideBySideDefaultTokens = 49_152
+
+    static func sideBySideMinimum(environment: [String: String]) -> Int {
+        guard let raw = environment[sideBySideEnvironmentKey],
+            let value = Int(raw.trimmingCharacters(in: .whitespaces)), value >= 0
+        else { return sideBySideDefaultTokens }
+        return value
+    }
+
+    /// HRED of the side-by-side pass A for one decode dispatch, or nil for
+    /// the plain form.
+    static func sideBySideForDispatch(
+        headDim: Int, gqa: Int, maxAttendLength: Int, minimumTokens: Int
+    ) -> Int? {
+        guard minimumTokens > 0, maxAttendLength >= minimumTokens else { return nil }
+        return sideBySideHeadsPerRound(headDim: headDim, gqa: gqa)
+    }
+
     private final class KernelCache: @unchecked Sendable {
         private var kernels: [PagedAttentionKernelKey: MLXFast.MLXFastKernel] = [:]
         private let lock = NSLock()
@@ -487,7 +591,8 @@ public enum PagedAttentionKernel {
                         "params", "wfence",
                     ],
                     outputNames: ["partials", "meta", "fence"],
-                    source: PagedAttentionMSL.partBody,
+                    source: key.sideHeadsPerRound > 0
+                        ? PagedAttentionMSL.partBodySide : PagedAttentionMSL.partBody,
                     header: source,
                     ensureRowContiguous: true,
                     mutableInputs: ["kcache", "vcache"]
@@ -499,7 +604,8 @@ public enum PagedAttentionKernel {
                         "q", "kcache", "vcache", "tables", "seqinfo", "params", "wfence",
                     ],
                     outputNames: ["partials", "meta"],
-                    source: PagedAttentionMSL.partBodyNoWrite,
+                    source: key.sideHeadsPerRound > 0
+                        ? PagedAttentionMSL.partBodySideNoWrite : PagedAttentionMSL.partBodyNoWrite,
                     header: source,
                     ensureRowContiguous: true
                 )
@@ -648,7 +754,8 @@ public enum PagedAttentionKernel {
         pageSize: Int,
         writeFence: MLXArray,
         kernelSource: String,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .default,
+        sideBySideMinimumTokens: Int = PagedAttentionKernel.sideBySideMinimumTokens
     ) throws(CBv2PagedKVWriteError) -> (out: MLXArray, nextWriteFence: MLXArray?) {
         var q = queries
         if q.ndim == 4 {
@@ -714,29 +821,36 @@ public enum PagedAttentionKernel {
         // `ceilingDivide`, not `(a + b - 1) / b`: `maxAttendLength` is
         // caller-supplied, and this is the site that motivated the helper.
         let maxParts = ceilingDivide(maxAttendLength, ptok)
+        let side = sideBySideForDispatch(
+            headDim: headDim, gqa: gqa, maxAttendLength: maxAttendLength,
+            minimumTokens: sideBySideMinimumTokens)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
-            partitionTokens: ptok, hasWrite: hasWrite)
+            partitionTokens: ptok, hasWrite: hasWrite, sideHeadsPerRound: side ?? 0)
         let tg = 32 * nsg
+        var partTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", dtype),
+            ("D", headDim),
+            ("S", pageSize),
+            ("GQA", gqa),
+            ("HPT", hpt),
+            ("NSG", nsg),
+            ("PTOK", ptok),
+            ("HAS_SOFTCAP", softcap),
+        ]
+        if let side { partTemplate.append(("HRED", side)) }
         // MLX passes arrays smaller than 8 elements in Metal's constant address
         // space; the merge implementation expects a device pointer. Keep even
         // a one-head/one-partition probe on the same legal interface.
         let metaShape = [max(8, b * queryHeads * maxParts * 2)]
+        // Same grid either way: the side-by-side form's threadgroup holds all
+        // `splits` head groups of a kv head.
         let partOut = kernel(for: partKey, source: kernelSource)(
             partInputs,
-            template: [
-                ("T", dtype),
-                ("D", headDim),
-                ("S", pageSize),
-                ("GQA", gqa),
-                ("HPT", hpt),
-                ("NSG", nsg),
-                ("PTOK", ptok),
-                ("HAS_SOFTCAP", softcap),
-            ],
+            template: partTemplate,
             grid: (kvHeads * splits * tg, b, maxParts),
-            threadGroup: (tg, 1, 1),
+            threadGroup: (side == nil ? tg : tg * splits, 1, 1),
             outputShapes: hasWrite
                 ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
                 : [[b, queryHeads, maxParts, headDim], metaShape],

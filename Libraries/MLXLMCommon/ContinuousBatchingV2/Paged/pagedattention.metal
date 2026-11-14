@@ -485,6 +485,204 @@ inline void paged_attention_part_cached_impl(
     }
 }
 
+// Pass A, side-by-side form (PagedAttentionKernel.sideBySideHeadsPerRound).
+// When HPT < GQA, the plain form launches GQA/HPT threadgroups for each
+// (sequence, kv head, partition), and each one loads the partition's keys
+// and values. This form puts those head groups next to each other in one
+// threadgroup: head group g owns simdgroups [g * NSG, (g + 1) * NSG) and
+// keeps the plain form's token stride, online softmax and simdgroup merge
+// order. The head-group count does not enter a head's arithmetic, so each
+// partial and (m, l) has the plain form's bits. Merge records go through
+// threadgroup memory HRED heads at a time. Dense native callers only: no
+// query rotation, packed basis, mask or visible range.
+template <
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, int HRED, bool HAS_WRITE,
+    bool HAS_SOFTCAP, typename Cache>
+inline void paged_attention_part_side_impl(
+    const device T* q,
+    const device T* knew,
+    const device T* vnew,
+    thread const Cache& cache,
+    const device int32_t* tables,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int maxp,
+    const int maxpart,
+    threadgroup float* q_smem,   // [GQA * D]
+    threadgroup float* red_smem, // [NSG * HRED * (D + 2)]
+    device float* partials,
+    device float* meta,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane
+) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    static_assert(HPT % HRED == 0, "HRED must divide HPT");
+    constexpr int SPLITS = GQA / HPT;  // head groups in this threadgroup
+    constexpr int EPT = D / 32;
+    constexpr int TG = 32 * NSG * SPLITS;
+    constexpr int GROUP_TG = 32 * NSG; // one head group: the plain form's threadgroup
+    constexpr int NSGT = NSG * SPLITS;
+    constexpr int RSTRIDE = D + 2;
+    constexpr int ROUNDS = HPT / HRED;
+
+    const int kv_head = tgpig.x;
+    const int b = tgpig.y;
+    const int part = tgpig.z;
+    const int lin = tpitg.x;
+    const int hgroup = (int)sgitg / NSG;
+    const int sg = (int)sgitg % NSG;
+
+    const device int32_t* info = seqinfo + b * 8;
+    const int attend_start = info[0];
+    const int attend_len = info[1];
+    const int table_len = info[2];
+
+    const int lo = part * PTOK;
+    if (lo >= attend_len) {
+        return;
+    }
+    const int hi = min(attend_len, lo + PTOK);
+
+    const device int32_t* table = tables + (size_t)b * (size_t)maxp;
+    const float softcap = params[0];
+    const float scale = params[1];
+
+    // Fused decode write: head group 0 stores the step's K/V tile, as the
+    // plain form's hgroup-0 threadgroup does (single writer per byte).
+    const size_t tile_src = ((size_t)b * (size_t)kvh + (size_t)kv_head) * D;
+    if (HAS_WRITE && hgroup == 0 && part == (attend_len - 1) / PTOK) {
+        const int wpage = info[3];
+        const int wslot = info[4];
+        const auto page = cache.write_page(wpage);
+        const size_t dst = ((size_t)kv_head * S + (size_t)wslot) * D;
+        page.template write<D, GROUP_TG>(dst, knew + tile_src, vnew + tile_src, lin);
+    }
+
+    // Stage the scaled queries of every query head of this kv head.
+    const int q_head0 = kv_head * GQA;
+    const int64_t qr = (int64_t)(kvh * GQA) * D;
+    const int64_t qh = D;
+    for (int i = lin; i < GQA * D; i += TG) {
+        const int64_t offset = (int64_t)b * qr + (q_head0 + i / D) * qh + (i % D);
+        const float value = float(q[offset]);
+        q_smem[i] = value * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const threadgroup float* group_q = q_smem + (size_t)(hgroup * HPT) * D;
+
+    float m[HPT];
+    float l[HPT];
+    float acc[HPT][EPT];
+#pragma unroll
+    for (int g = 0; g < HPT; g++) {
+        m[g] = -FLT_MAX;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < EPT; e++) {
+            acc[g][e] = 0.0f;
+        }
+    }
+
+    float kf[EPT];
+    float vf[EPT];
+    for (int i = lo + sg; i < hi; i += NSG) {
+        if (HAS_WRITE && i == attend_len - 1) {
+            load_row<T, EPT>(knew + tile_src, lane, kf);
+            load_row<T, EPT>(vnew + tile_src, lane, vf);
+        } else {
+            const int pos = attend_start + i;
+            const int lpage = pos / S;
+            const int slot = pos % S;
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            page.template load<EPT>(base, lane, kf, vf);
+        }
+
+#pragma unroll
+        for (int g = 0; g < HPT; g++) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                partial += group_q[g * D + lane * EPT + e] * kf[e];
+            }
+            float qk = simd_sum(partial);
+            if (HAS_SOFTCAP) {
+                qk = softcap * precise::tanh(qk / softcap);
+            }
+            qk *= M_LOG2E_F;
+
+            const float m_new = max(m[g], qk);
+            const float corr = exp2(m[g] - m_new);
+            const float p = exp2(qk - m_new);
+            l[g] = l[g] * corr + p;
+#pragma unroll
+            for (int e = 0; e < EPT; e++) {
+                acc[g][e] = acc[g][e] * corr + p * vf[e];
+            }
+            m[g] = m_new;
+        }
+    }
+
+    // Publish and merge HRED heads of one head group at a time, the
+    // simdgroup states in index order as in the plain form.
+#pragma unroll
+    for (int hg = 0; hg < SPLITS; hg++) {
+#pragma unroll
+        for (int r = 0; r < ROUNDS; r++) {
+            if (hgroup == hg) {
+                threadgroup float* mine = red_smem + (size_t)(sg * HRED) * RSTRIDE;
+#pragma unroll
+                for (int k = 0; k < HRED; k++) {
+#pragma unroll
+                    for (int e = 0; e < EPT; e++) {
+                        mine[k * RSTRIDE + lane * EPT + e] = acc[r * HRED + k][e];
+                    }
+                    if (lane == 0) {
+                        mine[k * RSTRIDE + D] = m[r * HRED + k];
+                        mine[k * RSTRIDE + D + 1] = l[r * HRED + k];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int k = (int)sgitg; k < HRED; k += NSGT) {
+                float pm = -FLT_MAX;
+                for (int s = 0; s < NSG; s++) {
+                    pm = max(pm, red_smem[(size_t)(s * HRED + k) * RSTRIDE + D]);
+                }
+                float pl = 0.0f;
+                for (int s = 0; s < NSG; s++) {
+                    const float ms = red_smem[(size_t)(s * HRED + k) * RSTRIDE + D];
+                    const float ls = red_smem[(size_t)(s * HRED + k) * RSTRIDE + D + 1];
+                    pl += ls * exp2(ms - pm);
+                }
+
+                const size_t slot =
+                    ((size_t)b * (size_t)(kvh * GQA) + (size_t)(q_head0 + hg * HPT + r * HRED + k))
+                        * (size_t)maxpart
+                    + (size_t)part;
+                device float* prow = partials + slot * D;
+                for (int e = (int)lane; e < D; e += 32) {
+                    float v = 0.0f;
+                    for (int s = 0; s < NSG; s++) {
+                        const float ms = red_smem[(size_t)(s * HRED + k) * RSTRIDE + D];
+                        v += red_smem[(size_t)(s * HRED + k) * RSTRIDE + e] * exp2(ms - pm);
+                    }
+                    prow[e] = v;
+                }
+                if (lane == 0) {
+                    meta[slot * 2] = pm;
+                    meta[slot * 2 + 1] = pl;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
     bool HAS_SOFTCAP>
