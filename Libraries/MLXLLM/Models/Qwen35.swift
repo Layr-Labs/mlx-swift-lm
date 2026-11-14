@@ -1043,8 +1043,7 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             inputs, states: recurrentState.map { $0.inputState(modelLayerIndex: modelLayerIndex) })
         for (row, evaluation) in recurrentState.enumerated() {
             do {
-                try evaluation.stage(
-                    modelLayerIndex: modelLayerIndex, conv: rows[row].conv!, ssm: rows[row].ssm!)
+                try evaluation.stage(modelLayerIndex: modelLayerIndex, state: rows[row])
             } catch {
                 preconditionFailure(
                     "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
@@ -1054,6 +1053,10 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
     }
 
     /// `cbv2Forward` for given input states (nil: zeros); the caller stages the new states.
+    /// When the rows are exactly the previous batched step's rows in order, the
+    /// previous step's batched tensors are taken as they are instead of joining
+    /// their one-row views again (`CBv2RecurrentBatchCarry`): same values, no
+    /// copy of every row's state per layer per step.
     func cbv2Recurrent(_ inputs: MLXArray, states: [CBv2RecurrentLayerState?]) -> (
         output: MLXArray, states: [CBv2RecurrentLayerState]
     ) {
@@ -1063,29 +1066,41 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
 
         let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
-        var convRows: [MLXArray] = []
-        var ssmRows: [MLXArray] = []
-        convRows.reserveCapacity(B)
-        ssmRows.reserveCapacity(B)
-        for state in states {
-            convRows.append(
-                state?.conv
-                    ?? MLXArray.zeros(
-                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
-            ssmRows.append(
-                state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        let convState: MLXArray
+        let ssmState: MLXArray
+        if let carried = CBv2RecurrentBatchCarry.carried(states) {
+            convState = carried.conv
+            ssmState = carried.ssm
+        } else {
+            var convRows: [MLXArray] = []
+            var ssmRows: [MLXArray] = []
+            convRows.reserveCapacity(B)
+            ssmRows.reserveCapacity(B)
+            for state in states {
+                convRows.append(
+                    state?.conv
+                        ?? MLXArray.zeros(
+                            [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+                ssmRows.append(
+                    state?.ssm
+                        ?? MLXArray.zeros(
+                            [1, numVHeads, headVDim, headKDim], dtype: .float32))
+            }
+            convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+            ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
-
-        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         let (out, newConvState, newSsmState) = processChunk(
             qkv: qkv, a: a, b: b,
             convState: convState, ssmState: ssmState, mask: nil)
-        let rows = (0 ..< B).map { row in
-            CBv2RecurrentLayerState(
-                conv: newConvState[row ..< row + 1], ssm: newSsmState[row ..< row + 1])
+        let rows: [CBv2RecurrentLayerState]
+        if CBv2RecurrentBatchCarry.enabled, B > 1 {
+            let origin = CBv2RecurrentBatchOrigin(conv: newConvState, ssm: newSsmState)
+            rows = (0 ..< B).map { CBv2RecurrentLayerState(origin: origin, row: $0) }
+        } else {
+            rows = (0 ..< B).map { row in
+                CBv2RecurrentLayerState(
+                    conv: newConvState[row ..< row + 1], ssm: newSsmState[row ..< row + 1])
+            }
         }
 
         let normedOut = gatedOutputNorm(out, gate: z)

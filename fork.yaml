@@ -101,6 +101,9 @@ def:
             Opt-in native reasoning budgets count confirmed thought payload tokens, force the
             validated close marker at N, and continue the same request within its total output
             limit. Budget rows use target decoding without MTP or chaining.
+            A request paused by backpressure owns copies of its committed recurrent rows
+            (`CBv2RecurrentRowOwnership`), so a one-row view does not keep its last step's whole
+            batch allocated for the pause (`DARKBLOOM_RECURRENT_REOWN_ON_PAUSE=0` turns this off).
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -517,6 +520,10 @@ def:
             unchanged. A prompt wavefront (`Qwen35PromptWavefront`) builds consecutive prompt chunks of one
             request as one graph; `prefillWithHidden` also returns each chunk's last decoder layer rows from
             that graph, for an MTP assistant's history.
+            A decode step takes the batched recurrent state of the step before as it is when every row
+            presents its own row of that state in the same order (`CBv2RecurrentBatchCarry`), instead of
+            joining the rows again in each recurrent layer; any other mix joins as before, with the same
+            values (`DARKBLOOM_RECURRENT_BATCH_CARRY=0` turns the carry off).
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
@@ -525,6 +532,7 @@ def:
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "changelog.d/cluster-model-runtime.md"
+            - "changelog.d/recurrent-batch-carry.md"
             - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2QwenClusterCarrierTests.swift"
             - "Tests/MLXLMTests/Integration/Qwen/**"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
@@ -903,6 +911,9 @@ def:
         `BenchSegmentedDecode`; the Qwen 3.6 A3B campaign (immutable measured prompts, a context
         matrix, prefill/decode receipts), Qwen3-VL 30B-A3B and Gemma 4 / GPT-OSS composed reports,
         MTP throughput scripts, and the onboarding qualification tests for mutable Metal inputs.
+        `BenchCBv2`'s paged arm builds its pool as the serving factory does, a cell queues all its
+        requests, each request's output can be hashed (`BENCH_OUTPUT_DIGEST`), one request can play a
+        slow client (`BENCH_SLOW_CONSUMER`), and the bench applies serving's MLX memory limits.
       globs:
         - "Sources/**"
         - "Plugins/**"
@@ -1062,6 +1073,7 @@ def:
         `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
         `Kernel/Quantization/` tests the ModelOpt NVFP4 and FP8 projections, including the opt-in lazy decode and lazy FP8 helpers, the graph paths against the eager reference, both activation overflow policies, and the Nemotron Super E4M3 codec, FP8 KV cache and rewindable MTP FP8 KV history. `ModelOptGraphBenchmarkTests` times one Super layer of each kind at the dimensions of a real `config.json` only when `MODELOPT_GRAPH_BENCH_CONFIG` is set.
         `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
+        `Kernel/Engine/CBv2RecurrentBatchCarryTests.swift` tests the recurrent batch carry and the re-own rule for paused requests.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 
