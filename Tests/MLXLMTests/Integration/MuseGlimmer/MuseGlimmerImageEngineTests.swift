@@ -246,14 +246,27 @@ struct MuseGlimmerImageEngineTests {
         #expect(!backend.pool.writeValidation.isFaulted && backend.bytesReserved == 0)
     }
 
-    /// Image and text requests share steps; each gets its solo output.
+    /// Image and text requests share steps; each gets its solo output. The
+    /// tower runs exact windows, the numerics the provider serves, so a decode
+    /// row's bytes do not depend on how many rows share the step. With MLX's
+    /// kernels a two-row step gives a row other bytes, and tokens can then
+    /// part at a near tie, as a BF16 text row did on one CI runner. Exact
+    /// windows need projections of more than 64 inputs.
     @Test(.timeLimit(.minutes(6)), arguments: [DType.float32, DType.bfloat16])
     func imageAndTextRequestsTogetherEqualTheirSoloRuns(dtype: DType) async throws {
-        let m = try model(dtype)
+        let hidden = 128
+        let m = try MuseGlimmerFixture.model(
+            MuseGlimmerFixture.pagedText(window: Self.window, hidden: hidden), dtype: dtype)
         let image = ImagePrompt(
-            length: 700, spans: [.init(tokenOffset: 200, length: 300)], hidden: 64, salt: 2,
+            length: 700, spans: [.init(tokenOffset: 200, length: 300)], hidden: hidden, salt: 2,
             seed: 17)
-        let text = ImagePrompt(length: 520, spans: [], hidden: 64, salt: 3, seed: 0)
+        let text = ImagePrompt(length: 520, spans: [], hidden: hidden, salt: 3, seed: 0)
+        // The float32 reference is the eager splice with MLX's kernels. Exact
+        // windows leave a one-row decode step's bytes as they are.
+        var eager: [Int]?
+        if dtype == .float32 { eager = try Self.eagerGreedy(m, image, chunk: 256, steps: 24) }
+        try m.setRowExactWindows(true)
+        #expect(m.verifiesWindowsExactly)
         let inputs = [image.request(1, maxTokens: 24), text.text(2, maxTokens: 24)]
         var solo = [[Int]]()
         for input in inputs {
@@ -263,9 +276,7 @@ struct MuseGlimmerImageEngineTests {
             #expect(result.finishReason == .length)
             solo.append(result.tokens)
         }
-        if dtype == .float32 {
-            #expect(solo[0] == (try Self.eagerGreedy(m, image, chunk: 256, steps: 24)))
-        }
+        if let eager { #expect(solo[0] == eager) }
         let (engine, backend) = try engine(m, chunk: 256)
         let first = try engine.submit(inputs[0])
         let second = try engine.submit(inputs[1])
