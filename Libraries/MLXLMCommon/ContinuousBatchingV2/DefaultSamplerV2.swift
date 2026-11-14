@@ -320,6 +320,15 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         return which(MLXArray(greedyFlags), mode, proposals).reshaped([b, 1])
     }
 
+    /// `mtpCoupledProposal` through the step-sampler seam.
+    public func mtpCoupledDraftProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? {
+        mtpCoupledProposal(
+            logits: logits, params: params, requestIDs: requestIDs, stepBases: stepBases)
+    }
+
     /// Exact acceptance per draft position: keep iff the target token equals
     /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
     private static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {

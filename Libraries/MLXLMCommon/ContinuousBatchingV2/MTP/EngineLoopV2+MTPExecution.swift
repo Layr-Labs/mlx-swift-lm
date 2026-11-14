@@ -222,6 +222,59 @@ extension EngineLoopV2 {
             committedObservationEvalTargets.append(contentsOf: [tokens, hidden])
             return true
         }
+        /// The same for several decode rows, in one batched drafter call. Each
+        /// row hands over its carry (if any) and then its own row, as above;
+        /// every state's roots are retained after that call, its only
+        /// mutation.
+        func observeCommittedTargets(
+            _ items: [(row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray)],
+            drafter batched: any CBv2MTPBatchedRequestDrafter
+        ) throws {
+            var observations: [(id: CBv2RequestID, observation: CBv2MTPRequestObservation)] = []
+            var states: [any CBv2MTPRequestState] = []
+            for item in items {
+                let row = item.row
+                guard
+                    let state = try mtpTakeHistoryState(
+                        for: row.rec, range: row.start ..< row.start + row.count)
+                else { continue }
+                retainNativeWork([], owners: [state])
+                // Restored with the step's other observed rows, also when a
+                // later row fails before the batched call.
+                committedObservationRows.append(
+                    .init(id: row.rec.id, assistantState: state))
+                if let carry = row.historyCarry {
+                    observations.append(
+                        (
+                            row.rec.id,
+                            CBv2MTPRequestObservation(
+                                CBv2MTPCommittedTargetObservation(
+                                    tokens: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
+                                    hidden: carry.hidden),
+                                startingAt: row.start - 1, requestState: state)
+                        ))
+                    committedObservationEvalTargets.append(carry.hidden)
+                }
+                observations.append(
+                    (
+                        row.rec.id,
+                        CBv2MTPRequestObservation(
+                            CBv2MTPCommittedTargetObservation(
+                                tokens: item.tokens, hidden: item.hidden),
+                            startingAt: row.start, requestState: state)
+                    ))
+                committedObservationEvalTargets.append(contentsOf: [item.tokens, item.hidden])
+                states.append(state)
+            }
+            guard !observations.isEmpty else { return }
+            mtp.observeCommittedTargets(observations, drafter: batched)
+            if batched.requiresCommittedObservationFence {
+                for state in states {
+                    committedObservationEvalTargets.append(
+                        contentsOf: batched.evaluationTargets(for: state))
+                }
+            }
+        }
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
@@ -384,12 +437,27 @@ extension EngineLoopV2 {
                     }
                 }
             }
+            var observed: [(row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray)] = []
             for (index, row) in decodeRows.enumerated() {
                 guard let hidden, let source = hiddenIndex[index] else { continue }
-                try observeCommittedTarget(
-                    row: row,
-                    tokens: inputs[index ..< index + 1, 0...],
-                    hidden: hidden[source ..< source + 1, 0..., 0...])
+                observed.append(
+                    (
+                        row, inputs[index ..< index + 1, 0...],
+                        hidden[source ..< source + 1, 0..., 0...]
+                    ))
+            }
+            // Opted-in drafters observe the step's rows in one call; every
+            // other drafter keeps one call per row.
+            if observed.count > 1,
+                let batched = mtp.drafter as? any CBv2MTPBatchedRequestDrafter,
+                batched.batchesRequests
+            {
+                try observeCommittedTargets(observed, drafter: batched)
+            } else {
+                for item in observed {
+                    try observeCommittedTarget(
+                        row: item.row, tokens: item.tokens, hidden: item.hidden)
+                }
             }
         }
 
@@ -668,6 +736,35 @@ extension EngineLoopV2 {
                 ? rec.request.promptTokens : nil)
     }
 
+    /// A sampled row's coupled proposals for this round; nil keeps the
+    /// drafter's own rule. Draft index j is verified against the target's
+    /// draw at output index `generatedTokenCount + j`, the verify path's own
+    /// step base, so the race uses exactly that draw's noise. Only for exact
+    /// target-prefix acceptance, where the emitted token is the target's draw
+    /// whatever is proposed.
+    func mtpCoupledProposalSelection(
+        _ rec: CBv2ScheduledRequest, freeSpan: CBv2MTPFreeSpan?, driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPProposalSelection? {
+        let params = rec.request.sampling
+        guard params.temperature >= LogitsPipelineV2.greedyEpsilon, freeSpan == nil,
+            mtp.targetPrefixAcceptance, sampler.supportsMTPTargetPrefix,
+            mtp.config.acceptance == .exact
+        else { return nil }
+        let sampler = self.sampler
+        let id = rec.id
+        let base = rec.generatedTokenCount
+        return CBv2MTPProposalSelection { logits in
+            guard logits.ndim == 2, logits.dim(0) > 0 else { return nil }
+            let n = logits.dim(0)
+            return sampler.mtpCoupledDraftProposal(
+                logits: logits.reshaped([n, 1, logits.dim(1)]),
+                params: Array(repeating: params, count: n),
+                requestIDs: Array(repeating: id, count: n),
+                stepBases: (0 ..< n).map { base + $0 }
+            )?.reshaped([n])
+        }
+    }
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
@@ -762,10 +859,36 @@ extension EngineLoopV2 {
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+            // Opted-in drafters only; every other drafter's round is unchanged.
+            if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
+                coupled.couplesSampledProposals
+            {
+                for (index, row) in verifyRows.enumerated() {
+                    guard let requestState = rowMetadata[index].assistantState else { continue }
+                    coupled.setProposalSelection(
+                        mtpCoupledProposalSelection(
+                            row.rec, freeSpan: rowMetadata[index].freeSpan, driver: mtp),
+                        requestState: requestState)
+                }
+            }
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }
             var currentHidden = carryHiddens
+            // Opted-in drafters start every row's round in one call; the
+            // per-row index-0 calls below then return what it prepared.
+            if batch > 1, let batched = stateful as? any CBv2MTPBatchedRequestDrafter,
+                batched.batchesRequests
+            {
+                batched.startRounds(
+                    verifyRows.indices.compactMap { index in
+                        rowMetadata[index].assistantState.map {
+                            CBv2MTPRoundSeed(
+                                tokens: currentTokens[index], hidden: currentHidden[index],
+                                shortlist: verifyRows[index].carry!.shortlist, requestState: $0)
+                        }
+                    })
+            }
             for draftIndex in 0 ..< k {
                 var nextRows: [MLXArray] = []
                 var nextHiddens: [MLXArray] = []

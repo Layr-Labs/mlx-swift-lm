@@ -875,6 +875,26 @@ final class CBv2MTPRoundDriver {
         }
     }
 
+    /// `observeCommittedTarget` for several requests in one batched call.
+    /// Positions reach only an advisory drafter, as above.
+    func observeCommittedTargets(
+        _ observations: [(id: CBv2RequestID, observation: CBv2MTPRequestObservation)],
+        drafter: any CBv2MTPBatchedRequestDrafter
+    ) {
+        precondition(
+            observations.allSatisfy { !targetOnlyMediaRequests.contains($0.id) },
+            "media must never observe trained assistant state")
+        let advisory = historyIsAdvisory && drafter is any CBv2MTPAdvisoryHistoryDrafter
+        drafter.observeCommittedTargets(
+            observations.map {
+                advisory || $0.observation.position == nil
+                    ? $0.observation
+                    : CBv2MTPRequestObservation(
+                        $0.observation.observation, startingAt: nil,
+                        requestState: $0.observation.requestState)
+            })
+    }
+
     func marginalDepth(
         for id: CBv2RequestID,
         offeredDepth: Int,
