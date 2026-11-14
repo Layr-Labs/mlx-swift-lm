@@ -172,6 +172,7 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     var maximumSpeculativeBatch: Int? { native.maximumSpeculativeBatch }
     var supportsTargetPrefixAcceptance: Bool { native.supportsTargetPrefixAcceptance }
     var commitsAcceptedPrefixPerRow: Bool { native.commitsAcceptedPrefixPerRow }
+    var batchesVerifyColumnsAsDecodeRows: Bool { native.batchesVerifyColumnsAsDecodeRows }
     var requiresCommittedObservationFence: Bool { native.requiresCommittedObservationFence }
     var requestStateBytesPerToken: Int { native.requestStateBytesPerToken }
     /// False makes the engine treat this drafter like any other

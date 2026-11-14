@@ -28,7 +28,8 @@ struct MuseGlimmerDFlashExactVerifyTests {
     }
 
     private func drafter(
-        _ target: MuseGlimmerTextModel, settings: MuseGlimmerDFlashDrafter.Settings? = nil
+        _ target: MuseGlimmerTextModel, settings: MuseGlimmerDFlashDrafter.Settings? = nil,
+        columnsAsRows: Bool = true
     ) throws -> MuseGlimmerDFlashDrafter {
         let configuration = try MuseGlimmerDFlashConfiguration(
             hiddenSize: MuseGlimmerExactWindowTests.hidden, intermediateSize: 256,
@@ -39,22 +40,26 @@ struct MuseGlimmerDFlashExactVerifyTests {
             target: target,
             model: try MuseGlimmerDFlashFixture.model(
                 configuration, seed: 5, dtype: target.activationDType),
-            settings: settings ?? .verifying(target, maximumSpeculativeRows: 2))
+            settings: settings
+                ?? .verifying(
+                    target, maximumSpeculativeRows: 2,
+                    batchesVerifyColumnsAsDecodeRows: columnsAsRows))
     }
 
     private func engine(
         _ m: MuseGlimmerTextModel, drafter: (any CBv2MTPDrafter)?,
         store: CompleteCheckpointFixtureStore? = nil
-    ) throws -> (EngineV2, PagedKVBackend) {
+    ) throws -> (EngineV2, PagedKVBackend, [PagedLayerCache]) {
         let backend = try PagedKVBackend(
             layerKinds: m.cbv2LayerKinds,
             config: .init(
                 capacityBytes: 256 << 20, dtype: m.activationDType, maxPrefillChunk: Self.chunk,
                 nominalMaxSequenceLength: 2048, segmentSizeBytes: 1 << 20,
                 layerDTypes: m.kvStorageDTypes))
+        let caches = backend.makeLayerCaches()
         let engine = EngineV2(
             model: MuseGlimmerCBv2Adapter(m), layerKinds: m.cbv2LayerKinds, backend: backend,
-            cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+            cacheProvider: CBv2LayerCacheBank(caches: caches),
             schedulerConfig: .init(
                 maxConcurrentRequests: 2, maxBatchedTokensPerStep: Self.chunk,
                 prefillChunkSize: Self.chunk, soloPrefillStripeTokens: Self.chunk, maxWaiting: 4,
@@ -70,7 +75,12 @@ struct MuseGlimmerDFlashExactVerifyTests {
                 engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = Self.chunk
             }
         }
-        return (engine, backend)
+        return (engine, backend, caches)
+    }
+
+    /// Layer calls that attended a round as decode rows.
+    private func decodeRowCalls(_ caches: [PagedLayerCache]) -> Int {
+        caches.map(\.mtpColumnsAsRowsCalls).reduce(0, +)
     }
 
     private func request(
@@ -87,7 +97,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
     }
 
     private func plain(_ m: MuseGlimmerTextModel, _ request: CBv2Request) async throws -> [Int] {
-        let (engine, _) = try engine(m, drafter: nil)
+        let (engine, _, _) = try engine(m, drafter: nil)
         let result = await cbv2SchedCollect(try engine.submit(request))
         await engine.shutdown()
         #expect(result.tokens.count == Self.maxTokens)
@@ -122,21 +132,32 @@ struct MuseGlimmerDFlashExactVerifyTests {
         #expect(exact.maximumSpeculativeRows == 2)
         let d = try drafter(exactTower)
         #expect(d.requiredVerificationMode == .rectangularExact && d.commitsAcceptedPrefixPerRow)
+        // Decode-row attention: on for exact verification unless declined,
+        // never for serial verification, off in a bare `Settings`.
+        #expect(exact.batchesVerifyColumnsAsDecodeRows && d.batchesVerifyColumnsAsDecodeRows)
+        #expect(!serial.batchesVerifyColumnsAsDecodeRows)
+        #expect(!MuseGlimmerDFlashDrafter.Settings().batchesVerifyColumnsAsDecodeRows)
+        #expect(!(try drafter(exactTower, columnsAsRows: false)).batchesVerifyColumnsAsDecodeRows)
     }
 
-    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
-    func outputEqualsTheTargetAloneGreedyAndSampled(dtype: DType) async throws {
+    /// With attention as decode rows and as the column loop.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32], [true, false])
+    func outputEqualsTheTargetAloneGreedyAndSampled(dtype: DType, columnsAsRows: Bool)
+        async throws
+    {
         let m = try target(dtype)
         let prompt = prompt(53, salt: 2)
         for sampling in [Self.greedy, Self.sampled] {
             let expected = try await plain(m, request(prompt, sampling))
             for mode in [Scripted.Mode.native, .right, .wrong(at: 0), .wrong(at: 3)] {
                 let scripted = Scripted(
-                    try drafter(m), mode: mode, scripts: [prompt + expected], vocabulary: 96)
-                let (engine, backend) = try engine(m, drafter: scripted)
+                    try drafter(m, columnsAsRows: columnsAsRows), mode: mode,
+                    scripts: [prompt + expected], vocabulary: 96)
+                let (engine, backend, caches) = try engine(m, drafter: scripted)
                 let result = await cbv2SchedCollect(try engine.submit(request(prompt, sampling)))
                 #expect(result.tokens == expected, "\(mode) \(sampling.temperature)")
                 try expectRectangular(engine)
+                #expect((decodeRowCalls(caches) > 0) == columnsAsRows)
                 let metrics = try #require(engine.mtpMetricsSnapshot())
                 if mode == .right { #expect(metrics.acceptedTokens == metrics.draftedTokens) }
                 await engine.shutdown()
@@ -160,7 +181,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
                 let scripted = Scripted(
                     try drafter(m), mode: mode,
                     scripts: zip(prompts, expected).map { $0 + $1 }, vocabulary: 96)
-                let (engine, backend) = try engine(m, drafter: scripted)
+                let (engine, backend, caches) = try engine(m, drafter: scripted)
                 let first = try engine.submit(request(prompts[0], sampling, id: 1))
                 let second = try engine.submit(request(prompts[1], sampling, id: 2))
                 async let a = cbv2SchedCollect(first)
@@ -170,6 +191,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
                 // Some forward verified both requests.
                 let metrics = try expectRectangular(engine)
                 #expect(metrics.rectangularVerificationRounds < metrics.rounds)
+                #expect(decodeRowCalls(caches) > 0)
                 await engine.shutdown()
                 #expect(backend.bytesReserved == 0)
             }
@@ -182,7 +204,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
         let prompt = prompt(3 * Self.chunk + 5, salt: 4)
         for sampling in [Self.greedy, Self.sampled] {
             let coldStore = CompleteCheckpointFixtureStore(segmentBytes: 4096)
-            let (cold, _) = try engine(m, drafter: try drafter(m), store: coldStore)
+            let (cold, _, _) = try engine(m, drafter: try drafter(m), store: coldStore)
             let expected = await cbv2SchedCollect(
                 try cold.submit(request(prompt, sampling, receipt: 1001)))
             try expectRectangular(cold)
@@ -193,7 +215,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
             let reopened = CompleteCheckpointFixtureStore(archives: coldStore.saved)
             let scripted = Scripted(
                 try drafter(m), mode: .right, scripts: [prompt + expected.tokens], vocabulary: 96)
-            let (warm, _) = try engine(m, drafter: scripted, store: reopened)
+            let (warm, _, _) = try engine(m, drafter: scripted, store: reopened)
             let warmRequest = request(prompt, sampling, receipt: 2002)
             #expect(try reopened.stage(engine: warm, request: warmRequest))
             let restored = await cbv2SchedCollect(try warm.submit(warmRequest))

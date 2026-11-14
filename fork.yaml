@@ -77,6 +77,8 @@ def:
         one-row calls (row-exact weight-only NVFP4, FP8 and BF16 products in pieces of 16 rows,
         block norms below MLX's row-reduction switch), so the engine verifies a round in one
         `rectangularExact` forward; off by default, so the BF16 tower keeps upstream's arithmetic.
+        The drafter's `Settings.verifying` also asks for decode-row attention, one paged decode
+        dispatch per layer for the whole round.
         The shared pieces are additive in `MLXLMCommon/Quantization`:
         `ModelOptWeightOnlyNVFP4RowExact` and `ModelOptRowExact.Schedule` (default `.standard`).
         Vision is not wired and the type is not registered in a factory. Tests use tiny synthetic

@@ -54,30 +54,37 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         public var commitsAcceptedPrefixPerRow: Bool
         /// Separately admitted allowance for allocator and backend scratch.
         public var backendScratchBytes: Int
+        /// A rectangular round attends its (row, column) pairs as rows of one
+        /// paged decode dispatch per layer instead of one per column.
+        public var batchesVerifyColumnsAsDecodeRows: Bool
 
         public init(
             maximumDraftTokens: Int = CBv2MTPConfig.testedMaxDraftTokens,
             verification: CBv2MTPVerificationMode? = nil, maximumSpeculativeRows: Int = 1,
-            commitsAcceptedPrefixPerRow: Bool = false, backendScratchBytes: Int = 0
+            commitsAcceptedPrefixPerRow: Bool = false, backendScratchBytes: Int = 0,
+            batchesVerifyColumnsAsDecodeRows: Bool = false
         ) {
             self.maximumDraftTokens = maximumDraftTokens
             self.verification = verification
             self.maximumSpeculativeRows = maximumSpeculativeRows
             self.commitsAcceptedPrefixPerRow = commitsAcceptedPrefixPerRow
             self.backendScratchBytes = backendScratchBytes
+            self.batchesVerifyColumnsAsDecodeRows = batchesVerifyColumnsAsDecodeRows
         }
 
         /// One-forward exact verification on a target with exact windows,
-        /// each row committing its own prefix; serial verification otherwise.
+        /// each row committing its own prefix and attending its columns as
+        /// decode rows; serial verification otherwise.
         public static func verifying(
             _ target: any MuseGlimmerDFlashTarget, maximumSpeculativeRows: Int = 1,
-            backendScratchBytes: Int = 0
+            backendScratchBytes: Int = 0, batchesVerifyColumnsAsDecodeRows: Bool = true
         ) -> Settings {
             let exact = target.dflashVerifiesWindowsExactly
             return Settings(
                 verification: exact ? .rectangularExact : .serialTarget,
                 maximumSpeculativeRows: exact ? maximumSpeculativeRows : 1,
-                commitsAcceptedPrefixPerRow: exact, backendScratchBytes: backendScratchBytes)
+                commitsAcceptedPrefixPerRow: exact, backendScratchBytes: backendScratchBytes,
+                batchesVerifyColumnsAsDecodeRows: exact && batchesVerifyColumnsAsDecodeRows)
         }
     }
 
@@ -131,6 +138,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
     public var maximumDraftTokens: Int? { settings.maximumDraftTokens }
     public var maximumSpeculativeBatch: Int? { settings.maximumSpeculativeRows }
     public var commitsAcceptedPrefixPerRow: Bool { settings.commitsAcceptedPrefixPerRow }
+    public var batchesVerifyColumnsAsDecodeRows: Bool {
+        settings.verification == .rectangularExact && settings.batchesVerifyColumnsAsDecodeRows
+    }
     /// A proposal is kept only when it equals the token pre-sampled from the
     /// target's own distribution, and that token is what is emitted, so
     /// sampled rows speculate too.

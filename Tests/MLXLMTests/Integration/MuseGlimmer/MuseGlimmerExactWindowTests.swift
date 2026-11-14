@@ -100,16 +100,23 @@ struct MuseGlimmerExactWindowTests {
         }
 
         /// Logits `[B, W, vocab]` of one forward over the selected rows.
-        func forward(_ tokens: [[Int32]], rectangular: Bool) -> MLXArray {
+        func forward(_ tokens: [[Int32]], rectangular: Bool, columnsAsRows: Bool = false)
+            -> MLXArray
+        {
             let input = MLXArray(tokens.flatMap { $0 }).reshaped(tokens.count, -1)
             let logits =
                 rectangular
-                ? CBv2LayerCacheBank(caches: caches).withMTPRectangularVerification {
+                ? CBv2LayerCacheBank(caches: caches).withMTPRectangularVerification(
+                    columnsAsRows: columnsAsRows
+                ) {
                     model(input, cache: caches)
                 } : model(input, cache: caches)
             eval([logits] + caches.flatMap { $0.innerState() })
             return logits
         }
+
+        /// Layer calls attended as decode rows.
+        var columnsAsRowsCalls: Int { caches.map(\.mtpColumnsAsRowsCalls).reduce(0, +) }
 
         func kv(_ row: Int) -> [Data] {
             states[row].flatMap { state -> [Data] in
@@ -126,7 +133,7 @@ struct MuseGlimmerExactWindowTests {
     /// Whether one `[B, W]` window equals each row's `W` one-row steps, in
     /// logits and in the K/V written.
     static func windowEqualsSteps(
-        _ m: MuseGlimmerTextModel, prompts: [[Int32]], width: Int,
+        _ m: MuseGlimmerTextModel, prompts: [[Int32]], width: Int, columnsAsRows: Bool = false,
         sourceLocation: SourceLocation = #_sourceLocation
     ) throws -> Bool {
         let drafts = prompts.indices.map {
@@ -135,7 +142,12 @@ struct MuseGlimmerExactWindowTests {
         let windowed = try Paged(m)
         for prompt in prompts { try windowed.add(prompt, extra: width) }
         windowed.select(Array(prompts.indices))
-        let window = windowed.forward(drafts, rectangular: true)
+        let window = windowed.forward(drafts, rectangular: true, columnsAsRows: columnsAsRows)
+        // Every layer attends a window of two or more columns as decode rows.
+        #expect(
+            windowed.columnsAsRowsCalls
+                == (columnsAsRows && width > 1 ? windowed.caches.count : 0),
+            sourceLocation: sourceLocation)
         let stepped = try Paged(m)
         var same = true
         for (row, prompt) in prompts.enumerated() {
@@ -167,6 +179,35 @@ struct MuseGlimmerExactWindowTests {
                     try Self.windowEqualsSteps(m, prompts: [prompt], width: width),
                     "prompt \(length) width \(width)")
             }
+        }
+    }
+
+    // MARK: Columns as decode rows
+
+    /// Attention as decode rows, one dispatch per layer: the same logits and
+    /// K/V. The prompts cross the window edge and the ring's wrap (256
+    /// tokens here).
+    @Test(arguments: [DType.bfloat16, .float32])
+    func windowsAttendedAsDecodeRowsEqualSteps(dtype: DType) throws {
+        let m = try Self.exact(Self.mixed(dtype: dtype))
+        for length in [3, 15, 16, 31, 70, 250, 260, 520] {
+            let prompt = MuseGlimmerFixture.tokens(length, vocabulary: 96, salt: length)
+            for width in 1 ... 8 {
+                #expect(
+                    try Self.windowEqualsSteps(
+                        m, prompts: [prompt], width: width, columnsAsRows: true),
+                    "prompt \(length) width \(width)")
+            }
+        }
+        let lengths = [250, 3, 15, 260, 16, 31, 70, 520, 9, 47, 100, 255, 2, 33, 129, 64]
+        for (sequences, width) in [(2, 8), (5, 7), (8, 8), (16, 2), (16, 4)] {
+            let prompts = lengths.prefix(sequences).enumerated().map {
+                MuseGlimmerFixture.tokens($0.element, vocabulary: 96, salt: $0.offset)
+            }
+            #expect(
+                try Self.windowEqualsSteps(
+                    m, prompts: prompts, width: width, columnsAsRows: true),
+                "\(sequences) sequences width \(width)")
         }
     }
 

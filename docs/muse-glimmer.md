@@ -116,7 +116,11 @@ replaces, in logits and in the K/V written.
 - Block norms: from 32 rows MLX's row reduction takes another kernel, so exact calls of 32 or
   more rows reduce in pieces of 16.
 - Attention, RoPE, the gate and the softcap already compute each row alone. Under
-  `withMTPRectangularVerification` the paged cache runs attention once per query column.
+  `withMTPRectangularVerification` the paged cache runs attention once per query column, or,
+  when the drafter asks for it (`Settings.verifying` does), once per layer for the whole round:
+  each row first writes its columns' K/V, then every (row, column) pair is one row of a single
+  paged decode dispatch over that column's own range. The decode kernels give a row the same
+  bytes whatever its batchmates, so this equals the column loop.
 - Above 64 rows (prefill) MLX's kernels run unchanged.
 
 The switch is off by default, so the BF16 tower keeps upstream's arithmetic. It checks every
@@ -131,11 +135,14 @@ Tiny synthetic models, no weights:
 
 ```bash
 swift test --build-system native --skip-build \
-  --filter 'MuseGlimmer|ModelOptWeightOnlyNVFP4|ModelOptRowExact'
+  --filter 'MuseGlimmer|ModelOptWeightOnlyNVFP4|ModelOptRowExact|PagedColumnsAsDecodeRows'
 ```
 
-`MuseGlimmerExactWindowTests` compare windows of 1 to 8 tokens, and 2 to 8 requests at once,
-with one-row steps in BF16 and float32, across the sliding window edge and the ring wrap.
+`MuseGlimmerExactWindowTests` compare windows of 1 to 8 tokens, and 2 to 16 requests at once,
+with one-row steps in BF16 and float32, across the sliding window edge and the ring wrap, with
+attention per column and as decode rows. `PagedColumnsAsDecodeRowsTests` check the decode-row
+attention alone at the production head shape: 1 to 16 requests, rounds of 1 to 8 columns,
+prompts across the 2,048-token window and the ring wrap, and rolled-back columns.
 `MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
 output equals the target alone, greedy and sampled, cold and restored, one or two requests.
 
@@ -166,5 +173,4 @@ require the oracle's greedy tokens wherever its top-1 margin is not a near-tie.
 - Vision: upstream's vision classes are private, so loading into them needs a small addition to
   the upstream file.
 - Exact windows set by the installer, and the numerics profile in the checkpoint fingerprint.
-- Attention over a whole verify window in one dispatch: it runs once per query column now.
 - A measured prefill activation bound, load residency accounting and factory registration.
