@@ -208,11 +208,12 @@ extension ModelOptCalibratedLinear {
         }
         let pieces: [MLXArray]
         if rows == 1 && inputDimensions > 64 {
+            let (vectors, activation) = rowExactOperands(
+                input, multipliers: multipliers, overflowBound: overflowBound)
             pieces = vectorRuns(tiles).map { run in
                 ModelOptRowExact.product(
-                    weight[run.rows, 0...], scale: scale, vectors: input,
-                    splitsK: run.splitsK,
-                    activation: (multipliers: multipliers, overflowBound: overflowBound))
+                    weight[run.rows, 0...], scale: scale, vectors: vectors,
+                    splitsK: run.splitsK, activation: activation, schedule: rowExactSchedule)
             }
         } else if rows == 1 {
             let activation = ModelOptActivationKernels.fp8(
@@ -327,11 +328,14 @@ extension ModelOptCalibratedLinear {
         guard rows <= ModelOptRowExact.maximumRows,
             weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
         else { throw Failure.workspaceLimit }
+        let (vectors, activation) = rowExactOperands(
+            input.reshaped(rows, inputDimensions), multipliers: multipliers,
+            overflowBound: overflowBound)
         let pieces = vectorRuns(oneRowTiles).map { run in
             ModelOptRowExact.product(
                 weight[run.rows, 0...], scale: constants.outputScale,
-                vectors: input.reshaped(rows, inputDimensions), splitsK: run.splitsK,
-                activation: (multipliers: multipliers, overflowBound: overflowBound))
+                vectors: vectors, splitsK: run.splitsK, activation: activation,
+                schedule: rowExactSchedule)
         }
         var result = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
         if squaredReLU {
@@ -339,6 +343,21 @@ extension ModelOptCalibratedLinear {
             result = r * r
         }
         return result.reshaped(Array(input.shape.dropLast()) + [outputDimensions])
+    }
+
+    /// The vectors and fused activation cast of a row-exact FP8 product. With
+    /// `rowExactSchedule.separateActivationCast` the cast runs here, once, and
+    /// the product reads cast vectors (the same values).
+    private func rowExactOperands(
+        _ input: MLXArray, multipliers: MLXArray, overflowBound: MLXArray
+    ) -> (vectors: MLXArray, activation: (multipliers: MLXArray, overflowBound: MLXArray)?) {
+        guard rowExactSchedule.separateActivationCast else {
+            return (input, (multipliers: multipliers, overflowBound: overflowBound))
+        }
+        return (
+            ModelOptActivationKernels.fp8(
+                input, multipliers: multipliers, overflowBound: overflowBound), nil
+        )
     }
 
     /// MLX's single-vector product (`gemv`, mlx cb77239b matmul.cpp) reduces
