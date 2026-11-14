@@ -14,10 +14,11 @@ name: Fork Tests
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
 #
-# On a pull request the macOS jobs run on a Darkbloom Sandbox when the route
-# job gets one from the Darkbloom plane, else on the GitHub-hosted xcode-27
-# image. Other runs save the caches that pull requests restore, so they stay
-# on xcode-27 and do not ask the plane.
+# The macOS jobs run on a Darkbloom Sandbox when the route job gets one from
+# the Darkbloom plane, else on the GitHub-hosted xcode-27 image. Push and
+# manual runs save caches that later jobs on the same runner service restore.
+# Seven audio decoder tests temporarily stay hosted after the unchanged base
+# reproduced strict PCM-bit failures on native macOS. Their assertions remain intact.
 
 on:
   pull_request:
@@ -48,6 +49,7 @@ jobs:
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
       macos-jobs: ${{ steps.matrix.outputs.macos-jobs }}
+      audio-shard: ${{ steps.matrix.outputs.audio-shard }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -56,17 +58,19 @@ jobs:
 
       - name: Read the shard numbers
         id: matrix
-        # The macOS jobs are build, metallib, coverage and one test job per
-        # shard. The route asks for that many.
+        # The native jobs are build, metallib, coverage and four test shards.
+        # The seven-test audio exception uses its separate hosted shard.
         run: |
-          shards=$(python3 .github/scripts/test_shards.py matrix)
-          echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "macos-jobs=$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
+          shards=$(python3 .github/scripts/test_shards.py matrix --runner native)
+          audio_shards=$(python3 .github/scripts/test_shards.py matrix --runner hosted)
+          jq -e 'length == 1' <<< "$audio_shards" > /dev/null
+          printf 'shards=%s\naudio-shard=%s\nmacos-jobs=%s\n' \
+            "$shards" "$(jq -r '.[0]' <<< "$audio_shards")" \
+            "$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
 
-  # Chooses the runner of the macOS jobs. The build's products hold its
-  # absolute workspace path and its Xcode, so the test jobs must run on the
-  # same kind of runner. The jobs therefore share one lane, which the plane
-  # grants whole or not at all. Only pull requests ask.
+  # The native macOS jobs share one lane, granted whole or not at all.
+  # The hosted audio exception reconstructs the build's absolute workspace
+  # and requires the same Xcode path before unpacking its products.
   route:
     name: Route Fork Tests
     needs: plan
@@ -74,15 +78,20 @@ jobs:
     permissions: {}
     with:
       lanes: |
-        fork-tests macos_arm64 xcode-27 ${{ github.event_name == 'pull_request' && needs.plan.outputs.macos-jobs || 0 }}
+        fork-tests macos_arm64 xcode-27 ${{ needs.plan.outputs.macos-jobs }}
+        shard-list linux_arm64 ubuntu-latest
+        shard-verify linux_arm64 ubuntu-latest
 
   build:
     name: Build
     needs: route
-    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
     permissions:
       contents: read
     timeout-minutes: 90
+    outputs:
+      workspace: ${{ steps.products.outputs.workspace }}
+      developer-dir: ${{ steps.products.outputs.developer-dir }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -230,8 +239,19 @@ jobs:
         # of its own host only.
         run: .github/scripts/test-products.sh pack "$RUNNER_TEMP/test-products/test-products.tar.zst"
 
+      - name: Report the test-products archive
+        id: products
+        run: |
+          artifact_path="$RUNNER_TEMP/test-products/test-products.tar.zst"
+          artifact_bytes=$(stat -f '%z' "$artifact_path")
+          artifact_sha256=$(shasum -a 256 "$artifact_path" | awk '{ print $1 }')
+          printf 'Test products: %s bytes, SHA-256 %s\n' "$artifact_bytes" "$artifact_sha256" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'workspace=%s\ndeveloper-dir=%s\n' "$GITHUB_WORKSPACE" "$DEVELOPER_DIR" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Upload the test products
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-products
           path: ${{ runner.temp }}/test-products/test-products.tar.zst
@@ -241,8 +261,7 @@ jobs:
 
       - name: Save the build cache
         # The next build restores this entry. An exact hit means that the
-        # entry already exists. Pull requests, which may run on a Darkbloom
-        # Sandbox, only restore caches.
+        # entry already exists. Pull requests only restore caches.
         if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
@@ -262,7 +281,7 @@ jobs:
   metallib:
     name: Metal library
     needs: route
-    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
     permissions:
       contents: read
     timeout-minutes: 30
@@ -344,8 +363,8 @@ jobs:
 
   list:
     name: Check the shard map
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [build, route]
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-list'] }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -365,7 +384,7 @@ jobs:
   test:
     name: Test shard ${{ matrix.shard }}
     needs: [plan, route, build, metallib]
-    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
     permissions:
       contents: read
     timeout-minutes: 45
@@ -429,11 +448,176 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # Temporary decoder exception: the same seven strict tests, products and
+  # coverage reports run on hosted macOS until the native audio issue is fixed.
+  audio:
+    name: Audio decoder tests (hosted exception)
+    needs:
+    - plan
+    - build
+    - metallib
+    runs-on: xcode-27
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Select Xcode
+      uses: ./.github/actions/select-xcode
+    - name: Bridge the verified hosted Xcode installation to the build path
+      env:
+        BUILD_DEVELOPER_DIR: ${{ needs.build.outputs.developer-dir }}
+      run: |
+        set -euo pipefail
+        native_bundle=/Applications/Xcode_27.2.app
+        hosted_bundle=/Applications/Xcode_27.2.0.app
+        actual_developer_dir=${DEVELOPER_DIR:?}
+        build_developer_dir=${BUILD_DEVELOPER_DIR:?}
+        for path in "$actual_developer_dir" "$build_developer_dir"; do
+          case "$path" in
+            /Applications/Xcode_27.2.app/Contents/Developer|/Applications/Xcode_27.2.0.app/Contents/Developer) ;;
+            *) echo "::error::Refusing an unexpected Xcode developer directory."; exit 1 ;;
+          esac
+        done
+        /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import json,os,sys
+        for path in sys.argv[1:]:
+            print(json.dumps({'path':path,'realpath':os.path.realpath(path),
+                              'exists':os.path.exists(path),'is_symlink':os.path.islink(path)}))
+        PY
+        expected_version=$'Xcode 27.2\nBuild version 27B52'
+        actual_version=$(DEVELOPER_DIR="$actual_developer_dir" /usr/bin/xcodebuild -version)
+        if [[ "$actual_version" != "$expected_version" ]]; then
+          echo "::error::The hosted Xcode is not the required 27.2 build 27B52."
+          exit 1
+        fi
+        if [[ "$actual_developer_dir" != "$build_developer_dir" ]]; then
+          if [[ "$actual_developer_dir" != "$hosted_bundle/Contents/Developer" || "$build_developer_dir" != "$native_bundle/Contents/Developer" ]]; then
+            echo "::error::Only the verified hosted-to-native Xcode path bridge is allowed."
+            exit 1
+          fi
+          destination_state=$(/usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import os,sys
+        source,destination=sys.argv[1:]
+        assert os.path.isdir(source), 'Verified preinstalled Xcode directory is unavailable'
+        if os.path.lexists(destination):
+            assert os.path.samefile(source,destination), 'Existing Xcode destination is a different installation'
+            print('samefile')
+        else:
+            print('absent')
+        PY
+          )
+          if [[ "$destination_state" == absent ]]; then
+            sudo -n /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import os,sys
+        # os.symlink fails atomically if any file, directory or symlink already exists.
+        os.symlink(sys.argv[1],sys.argv[2])
+        PY
+            echo "Created the missing Xcode path alias."
+          else
+            echo "Reused the equivalent preinstalled Xcode path."
+          fi
+          /usr/bin/python3 -I -S - "$hosted_bundle" "$native_bundle" <<'PY'
+        import os,sys
+        assert os.path.samefile(sys.argv[1],sys.argv[2]), 'Xcode paths no longer identify the same installation'
+        PY
+        fi
+        bridged_version=$(DEVELOPER_DIR="$build_developer_dir" /usr/bin/xcodebuild -version)
+        if [[ "$bridged_version" != "$expected_version" ]]; then
+          echo "::error::The bridged Xcode does not match 27.2 build 27B52."
+          exit 1
+        fi
+        printf 'DEVELOPER_DIR=%s\n' "$build_developer_dir" >> "$GITHUB_ENV"
+        printf 'Verified Xcode 27.2 (27B52): %s -> %s\n' "$actual_developer_dir" "$build_developer_dir"
+    - name: Record hosted OS, hardware, Xcode and audio framework
+      run: |
+        sw_vers
+        uname -m
+        sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+        xcodebuild -version
+        swift -e 'import Foundation; import AVFoundation
+        let bundle = Bundle(for: AVAssetReader.self)
+        guard let version = bundle.object(forInfoDictionaryKey: "CFBundleVersion") else {
+            fatalError("AVFoundation version is unavailable")
+        }
+        print("AVFoundation.bundle=\(bundle.bundlePath)")
+        print("AVFoundation.version=\(version)")'
+    - name: Download the test products
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: test-products
+        path: ${{ runner.temp }}/test-products
+    - name: Restore products at the unchanged build workspace path
+      env:
+        BUILD_WORKSPACE: ${{ needs.build.outputs.workspace }}
+        BUILD_DEVELOPER_DIR: ${{ needs.build.outputs.developer-dir }}
+      run: |
+        native_workspace=/Users/runner/actions-runner/_work/mlx-swift-lm/mlx-swift-lm
+        case "$BUILD_DEVELOPER_DIR" in
+          /Applications/Xcode_27.2.app/Contents/Developer|/Applications/Xcode_27.2.0.app/Contents/Developer) ;;
+          *) echo "::error::Refusing an unexpected build developer directory."; exit 1 ;;
+        esac
+        if [[ "$DEVELOPER_DIR" != "$BUILD_DEVELOPER_DIR" ]]; then
+          echo "::error::The hosted audio job must use the shared build's Xcode path."
+          exit 1
+        fi
+        if [[ "$BUILD_WORKSPACE" == "$GITHUB_WORKSPACE" ]]; then
+          : # The shared build also used the hosted runner workspace.
+        elif [[ "$BUILD_WORKSPACE" == "$native_workspace" ]]; then
+          if [[ -e "$native_workspace" || -L "$native_workspace" ]]; then
+            echo "::error::Refusing an existing canonical build workspace."
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          mkdir -p "$(dirname "$native_workspace")"
+          mkdir "$native_workspace"
+          [[ -O "$native_workspace" ]]
+          cp -a "$GITHUB_WORKSPACE/." "$native_workspace/"
+          [[ $(git -C "$native_workspace" rev-parse HEAD) == "$source_sha" ]]
+        else
+          echo "::error::Refusing an unexpected build workspace."
+          exit 1
+        fi
+        export GITHUB_WORKSPACE="$BUILD_WORKSPACE"
+        printf 'AUDIO_WORKSPACE=%s\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+        cd "$GITHUB_WORKSPACE"
+        .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
+    - name: Use the package versions of the build
+      run: |
+        cp "$AUDIO_WORKSPACE/.build/fork-tests-Package.resolved" "$AUDIO_WORKSPACE/Package.resolved"
+    - name: Download the Metal library
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: metallib
+        path: ${{ runner.temp }}/metallib
+    - name: Run the shard
+      run: |
+        export GITHUB_WORKSPACE="$AUDIO_WORKSPACE"
+        cd "$GITHUB_WORKSPACE"
+        python3 -u .github/scripts/test_shards.py run --shard ${{ needs.plan.outputs.audio-shard }} --results "$RUNNER_TEMP/results/shard-${{ needs.plan.outputs.audio-shard }}" --metallib "$RUNNER_TEMP/metallib/mlx.metallib" --list .build/fork-tests-list.txt
+    - name: Upload the test results
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: shard-${{ needs.plan.outputs.audio-shard }}-results
+        path: ${{ runner.temp }}/results
+        retention-days: 7
+    - name: Upload the crash reports
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: crash-reports-shard-${{ needs.plan.outputs.audio-shard }}
+        path: ~/Library/Logs/DiagnosticReports/*
+        if-no-files-found: warn
+        retention-days: 7
+
   verify:
     name: Each test ran once
-    needs: [list, test]
+    needs: [list, test, audio, route]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-verify'] }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -471,11 +655,11 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [route, build, test]
+    needs: [route, build, test, audio]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: ${{ github.event_name == 'pull_request' && fromJSON(needs.route.outputs.routes)['fork-tests'] || 'xcode-27' }}
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
     permissions:
       contents: read
     timeout-minutes: 30

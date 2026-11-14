@@ -26,6 +26,11 @@ A run with "rest": true selects every test that no other main run selects.
 So a new test always runs, also when nobody adds it to the map. The shard
 lists the tests, finds those tests and runs only them, by their full IDs.
 
+"hosted_tests" records exact temporary runner exceptions. They have their
+own shard with "runner": "hosted"; a new plan preserves those identities
+and balances only the native shards. The workflow selects each matrix
+with `matrix --runner native` or `matrix --runner hosted`.
+
 Commands:
   check   Read the output of `swift test list` and fail when a test is in no
           main run or in more than one, or when an extra run selects no test.
@@ -118,6 +123,23 @@ def load_map(path: Path) -> dict:
     names = [group["name"] for group in data["groups"]]
     if len(names) != len(set(names)):
         raise SystemExit("error: two groups in the map have the same name.")
+    hosted = data.get("hosted_tests", [])
+    if not isinstance(hosted, list) or any(not isinstance(test, str) for test in hosted):
+        raise SystemExit("error: hosted_tests must be a list of test IDs.")
+    if len(hosted) != len(set(hosted)):
+        raise SystemExit("error: hosted_tests repeats a test ID.")
+    assigned = []
+    for shard in data["shards"]:
+        runner = shard.get("runner", "native")
+        if runner not in ("native", "hosted"):
+            raise SystemExit(f"error: unknown shard runner {runner}.")
+        if runner == "hosted":
+            for run in shard["runs"]:
+                if set(run) != {"tests"}:
+                    raise SystemExit("error: hosted runs must name their exact test IDs.")
+                assigned.extend(run["tests"])
+    if sorted(assigned) != sorted(hosted):
+        raise SystemExit("error: hosted runs must match hosted_tests exactly.")
     return data
 
 
@@ -625,6 +647,10 @@ def command_verify(args: argparse.Namespace) -> int:
 def command_plan(args: argparse.Namespace) -> int:
     data = load_map(args.map)
     tests = read_list(args.list)
+    hosted = set(data.get("hosted_tests", []))
+    if hosted - set(tests):
+        raise SystemExit("error: a configured hosted test is absent from the test list.")
+    tests = [test for test in tests if test not in hosted]
     durations = json.loads(args.durations.read_text()) if args.durations else {}
     containers = containers_of(tests)
     overhead = data.get("overhead_seconds", 25)
@@ -634,6 +660,8 @@ def command_plan(args: argparse.Namespace) -> int:
     claimed: set[str] = set()
     for group in data["groups"]:
         part = {"filters": group.get("filters", []), "skips": group.get("skips", [])}
+        if any(part_selects(part, test) for test in hosted):
+            raise SystemExit(f"error: group {group['name']} overlaps a hosted test.")
         chosen = [test for test in tests if part_selects(part, test)]
         if not group.get("extra"):
             claimed.update(chosen)
@@ -690,6 +718,10 @@ def command_plan(args: argparse.Namespace) -> int:
         if index == rest_shard:
             runs.append({"rest": True})
         data["shards"].append({"estimated_seconds": round(loads[index]), "runs": runs})
+    if hosted:
+        data["shards"].append({"runner": "hosted", "estimated_seconds": round(
+            overhead + sum(durations.get(test, 1.0) for test in hosted)),
+            "runs": [{"tests": sorted(hosted)}]})
     args.output.write_text(json.dumps(data, indent=2) + "\n")
     for index, load in enumerate(loads, start=1):
         print(f"shard {index}: about {load:.0f} s")
@@ -699,7 +731,8 @@ def command_plan(args: argparse.Namespace) -> int:
 def command_matrix(args: argparse.Namespace) -> int:
     data = load_map(args.map)
     resolve_runs(data)
-    print(json.dumps(list(range(1, len(data["shards"]) + 1))))
+    print(json.dumps([index for index, shard in enumerate(data["shards"], start=1)
+                      if args.runner == "all" or shard.get("runner", "native") == args.runner]))
     return 0
 
 
@@ -721,9 +754,11 @@ def main() -> int:
     plan = commands.add_parser("plan")
     plan.add_argument("--list", type=Path, required=True)
     plan.add_argument("--durations", type=Path)
-    plan.add_argument("--shards", type=int, required=True)
+    plan.add_argument("--shards", type=int, required=True,
+                      help="Number of native shards; exact hosted exceptions are appended.")
     plan.add_argument("--output", type=Path, default=DEFAULT_MAP)
-    commands.add_parser("matrix")
+    matrix = commands.add_parser("matrix")
+    matrix.add_argument("--runner", choices=("all", "native", "hosted"), default="all")
     args = parser.parse_args()
     return {"check": command_check, "run": command_run, "verify": command_verify,
             "plan": command_plan, "matrix": command_matrix}[args.command](args)
