@@ -49,6 +49,30 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
 
     var isCompiled: Bool { lock.withLock { entry != nil } }
 
+    /// Whether the compiled feed-forward takes `input`'s shape for `owner`:
+    /// the same rule `callAsFunction` applies.
+    static func applies(
+        _ owner: Gemma4DecoderLayer, _ input: MLXArray, isExpertPrefill: Bool
+    ) -> Bool {
+        guard enabled, MLXHardwareInfo.isCompiledDecodeSupported,
+            let state = owner.feedforwardCompilationState()
+        else { return false }
+        return canCompile(owner, input, state: state, isExpertPrefill: isExpertPrefill)
+    }
+
+    private static func canCompile(
+        _ owner: Gemma4DecoderLayer, _ input: MLXArray,
+        state: Gemma4FeedforwardCompilationState, isExpertPrefill: Bool
+    ) -> Bool {
+        Device.defaultDevice().deviceType == .gpu
+            && !isExpertPrefill && input.ndim == 3 && (1 ... 2).contains(input.dim(1))
+            && (1 ... 7).contains(input.dim(0)) && input.dtype == .bfloat16
+            && input.dim(2) == owner.config.hiddenSize
+            && state.topK > 0 && input.dim(0) * input.dim(1) * state.topK < 64
+            // Preserve existing per-invocation component receipts.
+            && !CBv2ForwardShapeObservation.isActive
+    }
+
     func invalidate() {
         let retired = lock.withLock {
             let retired = entry
@@ -70,14 +94,8 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
             invalidate()
             return nil
         }
-        let canCompile =
-            Device.defaultDevice().deviceType == .gpu
-            && !isExpertPrefill && input.ndim == 3 && (1 ... 2).contains(input.dim(1))
-            && (1 ... 7).contains(input.dim(0)) && input.dtype == .bfloat16
-            && input.dim(2) == owner.config.hiddenSize
-            && state.topK > 0 && input.dim(0) * input.dim(1) * state.topK < 64
-            // Preserve existing per-invocation component receipts.
-            && !CBv2ForwardShapeObservation.isActive
+        let canCompile = Self.canCompile(
+            owner, input, state: state, isExpertPrefill: isExpertPrefill)
 
         let result: (forward: ((MLXArray) -> MLXArray)?, retired: Entry?) = lock.withLock {
             var retired: Entry?
