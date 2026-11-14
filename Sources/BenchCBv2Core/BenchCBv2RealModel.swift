@@ -1599,6 +1599,35 @@ func loadAverage1m() -> Double {
     return loads[0]
 }
 
+/// MLX's memory ceiling and buffer-cache limit as serving sets them (the
+/// provider's `MLXMemoryGuard`): ceiling = physical memory - 6 GiB, cache =
+/// min(0.75 x ceiling, 8 GiB), floored at 2 GiB and 1 GiB. Without a cache
+/// limit MLX keeps freed buffers up to its default ceiling, so the bench's
+/// memory use was far above serving's. `DARKBLOOM_MLX_MEMORY_RESERVE_GB` and
+/// `DARKBLOOM_MLX_CACHE_LIMIT_GB` override, as in serving; `BENCH_MLX_LIMITS=0`
+/// keeps MLX's defaults.
+func benchApplyServingMemoryLimits(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    physicalBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+) -> (memoryBytes: Int, cacheBytes: Int)? {
+    if environment["BENCH_MLX_LIMITS"] == "0" { return nil }
+    func gigabytes(_ key: String, _ fallback: Double) -> Double {
+        guard let raw = environment[key], let value = Double(raw), value.isFinite, value >= 0
+        else { return fallback }
+        return value
+    }
+    let gib = 1_073_741_824.0
+    let physical = Double(physicalBytes)
+    let reserve = gigabytes("DARKBLOOM_MLX_MEMORY_RESERVE_GB", 6) * gib
+    let memory = physical > reserve + 2 * gib ? physical - reserve : 2 * gib
+    let cap = gigabytes("DARKBLOOM_MLX_CACHE_LIMIT_GB", 8) * gib
+    let cache = min(max(gib, min(memory * 0.75, cap)), memory)
+    let limits = (memoryBytes: Int(memory), cacheBytes: Int(cache))
+    MLX.Memory.memoryLimit = limits.memoryBytes
+    MLX.Memory.cacheLimit = limits.cacheBytes
+    return limits
+}
+
 /// Contention sentinel for the report header: 1m load average plus whether
 /// any darkbloom provider process is alive (the usual GPU/CPU competitor on
 /// dev machines).
@@ -2098,6 +2127,15 @@ public enum BenchCBv2Driver {
                     ? "default mix" : options.promptLengths.description)
                 + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
         print("host: \(contention.line)")
+        if let limits = benchApplyServingMemoryLimits() {
+            print(
+                String(
+                    format: "mlx limits: memory %.1f GiB, cache %.1f GiB (as serving)",
+                    Double(limits.memoryBytes) / 1_073_741_824,
+                    Double(limits.cacheBytes) / 1_073_741_824))
+        } else {
+            print("mlx limits: MLX defaults (BENCH_MLX_LIMITS=0)")
+        }
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
         }
