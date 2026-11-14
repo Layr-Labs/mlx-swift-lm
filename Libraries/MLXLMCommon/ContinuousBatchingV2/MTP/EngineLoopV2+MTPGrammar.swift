@@ -17,15 +17,6 @@ struct CBv2MTPGrammarPrefix {
     var finished = false
 }
 
-/// One grammar column on a native-tracked engine.
-enum CBv2MTPNativeGrammarColumn {
-    case tokens([Int])
-    /// The column's work completed but was refused; its rows end with this error.
-    case failed(String)
-    /// The engine faulted: nothing more may run or commit.
-    case halted
-}
-
 extension EngineLoopV2 {
     /// The same opt-in governs verification and ordinary seed/fallback state.
     /// A native-tracked engine joins only when its contract qualifies it.
@@ -47,7 +38,7 @@ extension EngineLoopV2 {
         var rows = rows
         var prefixes = rows.map { _ in CBv2MTPGrammarPrefix() }
         let limit = independentWidths ? depth + 1 : commonLimit
-        columns: for column in 0 ..< limit {
+        for column in 0 ..< limit {
             var active: [Int] = []
             var failedAtColumn = false
             for index in rows.indices where !prefixes[index].finished {
@@ -77,20 +68,11 @@ extension EngineLoopV2 {
                 stepIndex: stepCount, pendingSampledTokens: nil, rowContext: { contexts })
             let tokens: [Int]
             if nativeShutdownState != nil {
-                switch mtpNativeGrammarColumn(
-                    sampled, column: column, step: step, commitHeld: &nativeCommitHeld)
-                {
-                case .tokens(let values):
-                    tokens = values
-                case .failed(let reason):
-                    for index in active {
-                        prefixes[index].failure = reason
-                        prefixes[index].finished = true
-                    }
-                    break columns
-                case .halted:
-                    return nil
-                }
+                guard
+                    let values = mtpNativeGrammarColumn(
+                        sampled, column: column, step: step, commitHeld: &nativeCommitHeld)
+                else { return nil }
+                tokens = values
             } else {
                 tokens = sampled.asArray(Int32.self).map(Int.init)
             }
@@ -120,10 +102,11 @@ extension EngineLoopV2 {
     }
 
     /// Submit and read back one column under the native work protocol, never
-    /// under finalize's commit lock, which is held again on return unless halted.
+    /// under finalize's commit lock, which is held again on return. nil: native
+    /// completion is sealed (any failure here seals it), so nothing may commit.
     func mtpNativeGrammarColumn(
         _ sampled: MLXArray, column: Int, step: CBv2InFlightStep, commitHeld: inout Bool
-    ) -> CBv2MTPNativeGrammarColumn {
+    ) -> [Int]? {
         guard let tracking = nativeShutdownState else {
             preconditionFailure("CBv2 MTP: native grammar column without native tracking")
         }
@@ -138,26 +121,18 @@ extension EngineLoopV2 {
                 eval(sampled)
                 try error.check()
             }
-        } catch {
-            // Completion is unknown, so the engine cannot vouch for this work.
-            if tracking.mayExecute { failNativeCompletion(.nativeWorkFailed) }
-            return .halted
-        }
-        var refusal: Error?
-        do {
             try nativeWorkSubmitted()
             try mtpGrammarColumnSubmittedForTesting?(column)
         } catch {
-            refusal = error
+            // First fault wins; an already sealed engine keeps its own reason.
+            failNativeCompletion(.nativeWorkFailed)
+            return nil
         }
         var tokens: [Int] = []
-        if refusal == nil {
-            guard completedNativeReadback({ tokens = sampled.asArray(Int32.self).map(Int.init) })
-            else { return .halted }
-        }
-        guard tracking.beginCommit() else { return .halted }
+        guard completedNativeReadback({ tokens = sampled.asArray(Int32.self).map(Int.init) }),
+            tracking.beginCommit()
+        else { return nil }
         commitHeld = true
-        if let refusal { return .failed("grammar verification: \(refusal)") }
-        return .tokens(tokens)
+        return tokens
     }
 }

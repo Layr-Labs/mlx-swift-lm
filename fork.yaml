@@ -179,10 +179,10 @@ def:
             Unset/off retains target-only constrained rows. Native-completion engines remain
             target-only for constrained requests unless their issued contract qualifies the
             verification (GLM page-bank profiles): each committed position is then sampled under
-            the native work protocol, outside finalize's commit lock. A column refused after its
-            work completed fails its rows and keeps their confirmed prefix; an engine fault stops
-            the walk and commits nothing more. Each committed grammar position adds a bounded
-            host readback; this is not a performance qualification.
+            the native work protocol, outside finalize's commit lock. Any failure there seals
+            native completion, so finalize commits nothing more and the fault path ends the
+            requests. Each committed grammar position adds a bounded host readback; this is not
+            a performance qualification.
             A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the

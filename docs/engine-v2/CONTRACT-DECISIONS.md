@@ -46,9 +46,9 @@ All changes are additive; implementations were updated consistently.
   engines keep constrained rows target-only unless the issued contract sets
   `supportsConstrainedMTPVerification` (GLM page-bank profiles). Then each
   committed position is submitted and read back under the native work protocol,
-  with finalize's commit lock released around it. A column refused after its work
-  completed fails its rows and keeps their confirmed prefix; an engine fault stops
-  the walk and commits nothing more.
+  with finalize's commit lock released around it. Any failure there seals native
+  completion (the first fault wins), so finalize commits nothing more and the fault
+  path ends the requests; output committed before the fault stays delivered.
   On opted-in ordinary seed/fallback steps, raw non-finite samples terminate
   without advancing grammar state. Flag-off ordinary confirmation is unchanged.
   Each grammar position adds a host readback; full-model acceptance and throughput

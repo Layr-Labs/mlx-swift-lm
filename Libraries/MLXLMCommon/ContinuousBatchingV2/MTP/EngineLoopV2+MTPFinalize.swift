@@ -382,14 +382,6 @@ extension EngineLoopV2 {
                     }
                     outcomes[index].nonFiniteAfterPrefix = true
                 }
-                // A native column refused before this row confirmed anything.
-                if prefix.tokens.isEmpty, let failure = prefix.failure {
-                    let outcome = outcomes.remove(at: index)
-                    step.discard.insert(outcome.metadata.id)
-                    releaseDiscarded(outcome.metadata)
-                    finishRequest(outcome.metadata.id, reason: .error(failure))
-                    continue
-                }
                 outcomes[index].committed = prefix.tokens
                 outcomes[index].targets = prefix.tokens
                 outcomes[index].accepted = prefix.accepted

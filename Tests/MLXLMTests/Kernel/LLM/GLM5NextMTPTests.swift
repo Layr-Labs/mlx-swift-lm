@@ -1444,9 +1444,9 @@ extension KernelTests {
             #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
         }
 
-        /// Grammar-aware verification leaves plain rows alone: they keep their
-        /// exact greedy streams and keep speculating, alone and beside a
-        /// grammar-verified row.
+        /// Grammar-aware verification leaves plain rows alone: a plain row keeps
+        /// its exact greedy stream and keeps speculating, and beside a
+        /// grammar-verified row (one speculative row here) both keep theirs.
         @Test(arguments: [GLM5NextMTPVerification.serialTarget, .rectangular(depth: 2)])
         func protectedPagedEngineKeepsPlainRowsWithGrammarVerificationOn(
             verification: GLM5NextMTPVerification
@@ -1502,65 +1502,15 @@ extension KernelTests {
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
-        /// A grammar column that fails after its work completed ends only that
-        /// row: the tokens confirmed before the column are kept, the row fails,
-        /// and the engine stays healthy for the next request.
-        @Test func protectedPagedEngineKeepsConfirmedTokensWhenAGrammarColumnFails() async throws {
-            let h = try NativeHarness(projectionSign: 1, sampled: true, constrainedSpeculation: true)
-            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
-            let prompt = [1, 2, 3, 4]
-            let forced = try greedy(h.fixture.target, prompt: prompt, count: 8)
-            var injected = false
-            h.engine.loopForTesting.onEngineQueueSync {
-                h.engine.loopForTesting.mtpGrammarColumnSubmittedForTesting = { column in
-                    guard column == 1, !injected else { return }
-                    injected = true
-                    throw GrammarColumnFailure()
-                }
-            }
-            let stream = try h.engine.submit(
-                .init(
-                    id: .init(2001), promptTokens: prompt,
-                    sampling: .init(temperature: 0), maxTokens: forced.count,
-                    tokenConstraint: SequenceConstraint(forced)))
-            var tokens: [Int] = []
-            var failed = false
-            for await event in stream {
-                if case .delta(_, let values, _) = event { tokens += values }
-                if case .finished(let reason, _) = event, case .error = reason { failed = true }
-            }
-            h.engine.loopForTesting.onEngineQueueSync {
-                h.engine.loopForTesting.mtpGrammarColumnSubmittedForTesting = nil
-            }
-            #expect(injected && failed)
-            #expect(tokens.count >= 2 && tokens.count < forced.count)
-            #expect(tokens == Array(forced.prefix(tokens.count)))
-            #expect(tracking.outcome == nil && h.engine.nativeCompletionFault == nil)
-
-            let plain = try h.engine.submit(
-                .init(
-                    id: .init(2002), promptTokens: prompt,
-                    sampling: .init(temperature: 0), maxTokens: 6))
-            var plainTokens: [Int] = []
-            for await event in plain {
-                if case .delta(_, let values, _) = event { plainTokens += values }
-            }
-            #expect(plainTokens == Array(forced.prefix(6)))
-            let outcome = await h.engine.shutdownReportingNativeCompletion()
-            guard case .quiescent = outcome else {
-                Issue.record("a failed grammar column left native work unresolved: \(outcome)")
-                return
-            }
-            #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
-            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
-        }
-
-        /// An engine fault while finalize samples a constrained row's committed
-        /// prefix stops the walk without trapping: nothing is committed after
-        /// the fault, earlier output follows the constraint, and the engine
-        /// reports the fault instead of a quiescent shutdown.
-        @Test func protectedPagedEngineStopsGrammarVerificationOnAnEngineFault() async throws {
-            let h = try NativeHarness(projectionSign: 1, sampled: true, constrainedSpeculation: true)
+        /// A fault while finalize samples a constrained row's committed prefix
+        /// stops the walk without trapping: nothing is committed after it,
+        /// earlier output follows the constraint, and the engine reports the
+        /// first fault (`sealedFirst`: a watchdog won before the column failed;
+        /// otherwise the failed column seals native completion itself).
+        @Test(arguments: [false, true])
+        func protectedPagedEngineStopsGrammarVerificationOnAFault(sealedFirst: Bool) async throws {
+            let h = try NativeHarness(
+                projectionSign: 1, sampled: true, constrainedSpeculation: true)
             // A faulted engine is retained for restart only; keep its owners too.
             defer { _ = Unmanaged.passRetained(h) }
             let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
@@ -1572,7 +1522,7 @@ extension KernelTests {
                     [weak loop = h.engine.loopForTesting] column in
                     guard column == 1, !injected else { return }
                     injected = true
-                    loop?.failNativeCompletion(.stepWatchdog)
+                    if sealedFirst { loop?.failNativeCompletion(.stepWatchdog) }
                     throw GrammarColumnFailure()
                 }
             }
@@ -1588,11 +1538,98 @@ extension KernelTests {
             #expect(injected)
             #expect(tokens.count < forced.count && tokens == Array(forced.prefix(tokens.count)))
             guard case .incomplete(let fault)? = tracking.outcome else {
-                Issue.record("an engine fault mid-walk was not reported")
+                Issue.record("a fault mid-walk was not reported")
                 return
             }
-            #expect(fault.reason == .stepWatchdog)
+            #expect(fault.reason == (sealedFirst ? .stepWatchdog : .nativeWorkFailed))
             #expect(tracking.debugRetainedRootCount > 0)
+        }
+
+        /// One rectangular round verifies a grammar-verified row and a plain row
+        /// together: the sampled constrained row follows its constraint, the
+        /// plain row keeps its exact greedy stream, and both draft.
+        @Test func protectedRectangularEngineBatchesAGrammarVerifiedRowWithAPlainRow()
+            async throws
+        {
+            let fixture = try Fixture(layers: 4, targetNoise: true, binaryHead: true)
+            let process = ProcessBudget()
+            let factory = try GLM5NextMTPExecution(
+                target: fixture.target, predictor: fixture.mtp, maximumInputs: 16,
+                storage: .contiguous, verification: .rectangular(depth: 2),
+                maximumSpeculativeBatch: 2)
+            let assistant = try GLM5NextMTPAdapter(
+                target: fixture.target, predictor: fixture.mtp, factory: factory)
+            let resources = try factory.makeNativeResources(
+                assistant: assistant, config: nativeConfiguration(fixture.target),
+                processMemoryOwner: process, construction: NativeConstructionScope())
+            let engine = EngineV2(
+                model: resources.model, layerKinds: fixture.target.cbv2LayerKinds,
+                backend: resources.backend, cacheProvider: resources.cacheProvider,
+                sampler: CBv2DefaultSampler(),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: 8,
+                    prefillChunkSize: 2, maxWaiting: 4, enablePrefixCache: false),
+                admissionConfig: fixture.target.cbv2NativeAdmissionConfig,
+                mtpDrafter: assistant,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 2,
+                    fixedDraftTokens: 2, verificationMode: .rectangular,
+                    constrainedSpeculation: true),
+                processMemoryOwner: process, nativeCompletionTracking: true,
+                nativeExecutionContract: resources.contract)
+            #expect(engine.mtpInactiveReason == nil)
+            let prompts = [[1, 2, 3], [5, 6, 7, 8]]
+            let forced = try greedy(fixture.target, prompt: prompts[0], count: 8)
+            let expectedPlain = try greedy(fixture.target, prompt: prompts[1], count: 8)
+            let constrained = try engine.submit(
+                .init(
+                    id: .init(2021), promptTokens: prompts[0],
+                    sampling: .init(temperature: 1, seed: 5), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            async let plain = generate(engine, id: 2022, prompt: prompts[1], count: 8)
+            var tokens: [Int] = []
+            for await event in constrained {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            let plainTokens = try await plain
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            let outcome = await engine.shutdownReportingNativeCompletion()
+            #expect(tokens == forced && plainTokens == expectedPlain)
+            #expect(metrics.rectangularVerificationRounds > 0 && metrics.proposedTokens > 0)
+            guard case .quiescent = outcome else {
+                Issue.record(
+                    "a mixed grammar-verified rectangular batch left native work: \(outcome)")
+                return
+            }
+            #expect(resources.backend.bytesReserved == 0 && process.bytes == 0)
+        }
+
+        /// With grammar verification on, a constrained logprob row still never
+        /// drafts: it follows its constraint on the target-only path.
+        @Test func protectedPagedEngineKeepsConstrainedLogprobRowsOffSpeculation() async throws {
+            let h = try NativeHarness(
+                projectionSign: 1, sampled: true, constrainedSpeculation: true)
+            let prompt = [1, 2, 3, 4]
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 6).map {
+                ($0 + 1) % 16
+            }
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(2031), promptTokens: prompt,
+                    sampling: .init(temperature: 0, topLogprobs: 2), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            var tokens: [Int] = []
+            for await event in stream {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            #expect(tokens == forced)
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens == 0)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("a constrained logprob row left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
         private struct GrammarColumnFailure: Error {}
