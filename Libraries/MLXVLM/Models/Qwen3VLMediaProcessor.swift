@@ -100,6 +100,13 @@ public struct Qwen3VLMediaProcessor {
         return min(ceiling, budget)
     }
 
+    /// The most pixels a still image keeps without an explicit `processing.maxPixels`.
+    var defaultImageMaxPixels: Int {
+        checkpointImageBounds?.max
+            ?? Self.defaultVisionTokenBudgetPixels(
+                factor: config.patchSize * config.mergeSize, ceiling: config.size.maxPixels)
+    }
+
     /// Exact pre-raster image patch geometry for the default processor policy.
     /// `height` and `width` are after any caller-requested resize. A still image
     /// pads to one temporal group; the language token count is h*w/merge².
@@ -118,10 +125,7 @@ public struct Qwen3VLMediaProcessor {
         // tokens = pixels / factor²), matching the video path's philosophy and
         // the sibling Qwen2.5-VL. An explicit `processing.maxPixels` overrides it.
         let factor = config.patchSize * config.mergeSize
-        let maxPixels =
-            processing?.maxPixels
-            ?? checkpointImageBounds?.max
-            ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.size.maxPixels)
+        let maxPixels = processing?.maxPixels ?? defaultImageMaxPixels
         let resizedHeight: Int
         let resizedWidth: Int
         if let bounds = checkpointImageBounds {

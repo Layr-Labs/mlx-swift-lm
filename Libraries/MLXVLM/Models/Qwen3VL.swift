@@ -49,10 +49,10 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     /// The video sampling the Qwen3.5/3.6/3.8 checkpoints declare in
     /// `video_preprocessor_config.json` (Transformers' `Qwen3VLVideoProcessor`
     /// defaults). Serving caps (`maxVideoFrames`, `defaultVideoPixels`) apply on top.
-    static let referenceVideoFPS = 2.0
-    static let referenceMinVideoFrames = 4
-    static let referenceMaxVideoFrames = 768
-    static let referenceMinVideoPixels = 4096
+    private static let referenceVideoFPS = 2.0
+    private static let referenceMinVideoFrames = 4
+    private static let referenceMaxVideoFrames = 768
+    private static let referenceMinVideoPixels = 4096
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -100,15 +100,16 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         imagesOnly.videos = []
         let imageInput = try await prepareSingleBlock(input: imagesOnly)
         let video = try timestampedVideoConfiguration(input.processing.video)
+        // No frame keeps more pixels than one still image gets by default.
         return try await Qwen4ExpVideoPreparation.prepare(
             input: input, imageInput: imageInput, tokenizer: tokenizer, config: video,
             minPixels: video.size.shortestEdge, maxPixels: video.size.longestEdge,
-            maxFramePixels: stillImagePixels)
+            maxFramePixels: mediaProcessor.defaultImageMaxPixels)
     }
 
     /// Reference sampling under this request's frame and pixel caps. A frame
     /// count request samples exactly that many frames (at most the clip's).
-    func timestampedVideoConfiguration(_ video: UserInput.VideoProcessing) throws
+    private func timestampedVideoConfiguration(_ video: UserInput.VideoProcessing) throws
         -> Qwen4ExpVideoConfiguration
     {
         var maxFrames = min(video.maxFrames ?? Self.maxVideoFrames, Self.referenceMaxVideoFrames)
@@ -131,13 +132,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             fps: fps, minFrames: min(minFrames, maxFrames), maxFrames: maxFrames)
     }
 
-    /// No frame keeps more pixels than one still image gets by default.
-    private var stillImagePixels: Int {
-        checkpointImageBounds?.max
-            ?? Self.defaultVisionTokenBudgetPixels(
-                factor: config.patchSize * config.mergeSize, ceiling: config.size.maxPixels)
-    }
-
+    /// Text and images, and in the single-block layout each clip as one vision block.
     private func prepareSingleBlock(input: UserInput) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(
             from: input.removingSpecialTokenLabels(using: tokenizer))
@@ -2090,10 +2085,9 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         guard tokens.dim(0) == 1 else { return }
         let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
         let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
-        let visibleTokens =
-            maskValues.map { mask in zip(values, mask).map { $1 == 1 ? $0 : -1 } } ?? values
         let videoGrids = QwenVL.positionVideoGrids(
-            videoGrids, tokens: visibleTokens, videoToken: config.videoTokenIndex, merge: merge)
+            videoGrids, tokens: values, mask: maskValues, videoToken: config.videoTokenIndex,
+            merge: merge)
         var imageIndex = 0
         var videoIndex = 0
         var cursor = 0

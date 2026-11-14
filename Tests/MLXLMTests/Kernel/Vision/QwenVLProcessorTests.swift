@@ -68,7 +68,8 @@ extension KernelTests {
                 for id in tokenIds {
                     if let special = Self.special.first(where: { $0.1 == id }) {
                         text += special.0
-                    } else if (1 ... 40).contains(id), let scalar = Unicode.Scalar(UInt32(79 + id)) {
+                    } else if (1 ... 40).contains(id), let scalar = Unicode.Scalar(UInt32(79 + id))
+                    {
                         text.unicodeScalars.append(scalar)
                     }
                 }
@@ -559,7 +560,8 @@ extension KernelTests {
         /// The pair media contract keeps one block of all the clip's tokens.
         @Test func qwen3VLSingleBlockLayoutKeepsOneVideoBlock() async throws {
             let processor = Qwen3VLMediaProcessor(
-                try SyntheticModel.configuration(Qwen3VLProcessorConfiguration.self, Self.processorBase)
+                try SyntheticModel.configuration(
+                    Qwen3VLProcessorConfiguration.self, Self.processorBase)
             ).makeUserInputProcessor(tokenizer: Self.tokenizer)
             let input = UserInput(chat: [
                 .user(

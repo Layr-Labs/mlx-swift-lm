@@ -15,9 +15,13 @@ struct Qwen4ExpVideoConfiguration: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case size, fps
-        case patchSize = "patch_size", mergeSize = "merge_size", temporalPatchSize = "temporal_patch_size"
-        case imageMean = "image_mean", imageStd = "image_std"
-        case minFrames = "min_frames", maxFrames = "max_frames"
+        case patchSize = "patch_size"
+        case mergeSize = "merge_size"
+        case temporalPatchSize = "temporal_patch_size"
+        case imageMean = "image_mean"
+        case imageStd = "image_std"
+        case minFrames = "min_frames"
+        case maxFrames = "max_frames"
         case processorType = "video_processor_type"
     }
 
@@ -39,7 +43,8 @@ struct Qwen4ExpVideoConfiguration: Codable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        size = try c.decodeIfPresent(Qwen4ExpProcessorConfiguration.Size.self, forKey: .size)
+        size =
+            try c.decodeIfPresent(Qwen4ExpProcessorConfiguration.Size.self, forKey: .size)
             ?? .init(shortestEdge: 128 * 32 * 32, longestEdge: 32 * 32 * 768)
         patchSize = try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? 16
         mergeSize = try c.decodeIfPresent(Int.self, forKey: .mergeSize) ?? 2
@@ -51,14 +56,17 @@ struct Qwen4ExpVideoConfiguration: Codable, Sendable {
         maxFrames = try c.decodeIfPresent(Int.self, forKey: .maxFrames) ?? 768
         let type = try c.decodeIfPresent(String.self, forKey: .processorType)
         guard type == nil || type == "Qwen3VLVideoProcessor",
-              size.shortestEdge > 0, size.longestEdge >= size.shortestEdge,
-              patchSize > 0, mergeSize > 0, temporalPatchSize > 0,
-              imageMean.count == 3, imageStd.count == 3,
-              imageMean.allSatisfy({ $0.isFinite }),
-              imageStd.allSatisfy({ $0.isFinite && $0 > 0 }),
-              fps.isFinite, fps > 0, minFrames > 0, maxFrames >= minFrames else {
-            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
-                debugDescription: "Invalid Qwen4 video preprocessing configuration"))
+            size.shortestEdge > 0, size.longestEdge >= size.shortestEdge,
+            patchSize > 0, mergeSize > 0, temporalPatchSize > 0,
+            imageMean.count == 3, imageStd.count == 3,
+            imageMean.allSatisfy({ $0.isFinite }),
+            imageStd.allSatisfy({ $0.isFinite && $0 > 0 }),
+            fps.isFinite, fps > 0, minFrames > 0, maxFrames >= minFrames
+        else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Invalid Qwen4 video preprocessing configuration"))
         }
         _ = try Qwen4ExpMediaGeometry.product(patchSize, mergeSize)
     }
@@ -90,23 +98,29 @@ enum Qwen4ExpProcessorFiles {
             return value
         }
         let processorURL = directory.appendingPathComponent("processor_config.json")
-        let root = fm.fileExists(atPath: processorURL.path)
+        let root =
+            fm.fileExists(atPath: processorURL.path)
             ? try object(Data(contentsOf: processorURL)) : [:]
         var image = try object(fallbackImage)
         if let nested = root["image_processor"] {
-            guard let value = nested as? [String: Any] else { throw Qwen4ExpMediaGeometry.Failure.invalidGeometry }
+            guard let value = nested as? [String: Any] else {
+                throw Qwen4ExpMediaGeometry.Failure.invalidGeometry
+            }
             image = value
         }
         let videoURL = directory.appendingPathComponent("video_preprocessor_config.json")
         let video: [String: Any]?
         if let nested = root["video_processor"] {
-            guard let value = nested as? [String: Any] else { throw Qwen4ExpMediaGeometry.Failure.invalidGeometry }
+            guard let value = nested as? [String: Any] else {
+                throw Qwen4ExpMediaGeometry.Failure.invalidGeometry
+            }
             video = value
         } else if fm.fileExists(atPath: videoURL.path) {
             video = try object(Data(contentsOf: videoURL))
         } else {
             let imageURL = directory.appendingPathComponent("preprocessor_config.json")
-            video = fm.fileExists(atPath: imageURL.path) ? try object(Data(contentsOf: imageURL)) : nil
+            video =
+                fm.fileExists(atPath: imageURL.path) ? try object(Data(contentsOf: imageURL)) : nil
         }
         image["video_processor"] = video ?? NSNull()
         return try JSONSerialization.data(withJSONObject: image, options: [.sortedKeys])

@@ -1912,10 +1912,9 @@ public class Qwen35: Module, VLMModel {
         guard tokens.dim(0) == 1 else { return }
         let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
         let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
-        let visibleTokens =
-            maskValues.map { mask in zip(values, mask).map { $1 == 1 ? $0 : -1 } } ?? values
         let videoGrids = QwenVL.positionVideoGrids(
-            videoGrids, tokens: visibleTokens, videoToken: config.videoTokenId, merge: merge)
+            videoGrids, tokens: values, mask: maskValues, videoToken: config.videoTokenId,
+            merge: merge)
         var imageIndex = 0
         var videoIndex = 0
         var cursor = 0

@@ -82,7 +82,8 @@ extension UnitTests {
         /// a half and 0.35 just below.
         @Test
         func timestampsRoundLikePython() throws {
-            let result = try expand(pad, grids: [THW(4, 2, 2)], timestamps: [[0.05, 0.35, 2.45, 0.15]])
+            let result = try expand(
+                pad, grids: [THW(4, 2, 2)], timestamps: [[0.05, 0.35, 2.45, 0.15]])
             let block = start + pad + end
             #expect(
                 result

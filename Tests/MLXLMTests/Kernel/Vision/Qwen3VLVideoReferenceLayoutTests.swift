@@ -38,9 +38,12 @@ extension KernelTests {
 
                 enum CodingKeys: String, CodingKey {
                     case name, frames, fps, height, width, grid, delta
-                    case maxFrames = "max_frames", maxPixels = "max_pixels"
-                    case sampledIndices = "sampled_indices", tokenCount = "token_count"
-                    case idsRle = "ids_rle", positionsSha256 = "positions_sha256"
+                    case maxFrames = "max_frames"
+                    case maxPixels = "max_pixels"
+                    case sampledIndices = "sampled_indices"
+                    case tokenCount = "token_count"
+                    case idsRle = "ids_rle"
+                    case positionsSha256 = "positions_sha256"
                 }
 
                 var ids: [Int] { idsRle.flatMap { Array(repeating: $0[0], count: $0[1]) } }
@@ -71,7 +74,9 @@ extension KernelTests {
             let golden: Golden
 
             private var specials: [(String, Int)] {
-                golden.specialTokens.sorted { $0.key.count > $1.key.count }.map { ($0.key, $0.value) }
+                golden.specialTokens.sorted { $0.key.count > $1.key.count }.map {
+                    ($0.key, $0.value)
+                }
             }
 
             func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -131,17 +136,20 @@ extension KernelTests {
         }
 
         /// The Qwen3.8 checkpoint's `preprocessor_config.json`.
-        static func processor() throws -> Qwen3VLProcessor {
+        static func configuration() throws -> Qwen3VLProcessorConfiguration {
             let object: [String: Any] = [
                 "size": ["longest_edge": 16_777_216, "shortest_edge": 65_536],
                 "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
                 "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
                 "image_processor_type": "Qwen2VLImageProcessorFast",
             ]
-            let configuration = try JSONDecoder().decode(
+            return try JSONDecoder().decode(
                 Qwen3VLProcessorConfiguration.self,
                 from: JSONSerialization.data(withJSONObject: object))
-            return Qwen3VLProcessor(configuration, tokenizer: GoldenTokenizer(golden: golden))
+        }
+
+        static func processor() throws -> Qwen3VLProcessor {
+            Qwen3VLProcessor(try configuration(), tokenizer: GoldenTokenizer(golden: golden))
         }
 
         /// Solid frames at exact multiples of 1 / fps.
@@ -163,7 +171,9 @@ extension KernelTests {
 
         @Test(arguments: golden.cases)
         func promptGridAndPositionsMatchTransformers(_ c: Golden.Case) async throws {
-            var input = UserInput(chat: [.user("What happens in the video?", videos: [Self.clip(c)])])
+            var input = UserInput(chat: [
+                .user("What happens in the video?", videos: [Self.clip(c)])
+            ])
             input.processing.video = .init(maxFrames: c.maxFrames, maxPixels: c.maxPixels)
             let result = try await Self.processor().prepare(input: input)
 
@@ -195,7 +205,9 @@ extension KernelTests {
         /// the same positions as `getRopeIndex`.
         @Test func seamPositionsAcceptTimestampedBlocks() async throws {
             let c = try #require(Self.golden.cases.first)
-            var input = UserInput(chat: [.user("What happens in the video?", videos: [Self.clip(c)])])
+            var input = UserInput(chat: [
+                .user("What happens in the video?", videos: [Self.clip(c)])
+            ])
             input.processing.video = .init(maxFrames: c.maxFrames, maxPixels: c.maxPixels)
             let result = try await Self.processor().prepare(input: input)
             let seam = Qwen35VisionSeamConfiguration(
@@ -217,19 +229,12 @@ extension KernelTests {
             let c = try #require(Self.golden.cases.first)
             let base = try Self.processor()
             #expect(base.videoLayout == .timestamped, "the factory layout")
-            let object: [String: Any] = [
-                "size": ["longest_edge": 16_777_216, "shortest_edge": 65_536],
-                "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
-                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
-                "image_processor_type": "Qwen2VLImageProcessorFast",
-            ]
-            let configuration = try JSONDecoder().decode(
-                Qwen3VLProcessorConfiguration.self,
-                from: JSONSerialization.data(withJSONObject: object))
-            let pair = Qwen3VLMediaProcessor(configuration)
+            let pair = Qwen3VLMediaProcessor(try Self.configuration())
                 .makeUserInputProcessor(tokenizer: GoldenTokenizer(golden: Self.golden))
             #expect(pair.videoLayout == .singleBlock, "the pair layout")
-            let input = UserInput(chat: [.user("What happens in the video?", videos: [Self.clip(c)])])
+            let input = UserInput(chat: [
+                .user("What happens in the video?", videos: [Self.clip(c)])
+            ])
             let result = try await pair.prepare(input: input)
             let ids = result.text.tokens.asArray(Int32.self).map(Int.init)
             #expect(ids.filter { $0 == 248_053 }.count == 1, "one vision block")
@@ -253,7 +258,8 @@ extension KernelTests {
             #expect(
                 Self.positionGrids([THW(2, 2, 4)], [1, 9, 9, 9, 9, 2]) == [[2, 2, 4]],
                 "one run of t × 2 tokens keeps its grid")
-            #expect(Self.positionGrids([THW(1, 2, 4)], [9, 9]) == [[1, 2, 4]], "t = 1 is unchanged")
+            #expect(
+                Self.positionGrids([THW(1, 2, 4)], [9, 9]) == [[1, 2, 4]], "t = 1 is unchanged")
         }
 
         @Test func positionGridsFollowEachClip() {

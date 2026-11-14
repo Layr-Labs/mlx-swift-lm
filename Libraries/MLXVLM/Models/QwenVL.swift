@@ -294,26 +294,18 @@ public struct QwenVL {
         return (flattenedPatches, .init(gridT, gridH, gridW))
     }
 
-    /// The video grids M-RoPE positions. Transformers' Qwen3-VL gives each
-    /// temporal group its own timestamped vision block, and `get_rope_index`
-    /// positions each block as a `t = 1` grid. A clip whose `t` groups appear as
-    /// separate token runs is split the same way; a clip in one run of
-    /// `t × h × w / merge²` tokens keeps its grid.
+    /// The grids that position video in M-RoPE, as Transformers' `get_rope_index`
+    /// does: a clip whose `t` groups are separate token runs (one timestamped
+    /// block each) becomes `t` grids of `t = 1`; a clip in one run keeps its grid.
     static func positionVideoGrids(
-        _ grids: [THW], tokens: [Int], videoToken: Int, merge: Int
+        _ grids: [THW], tokens: [Int], mask: [Int32]? = nil, videoToken: Int, merge: Int
     ) -> [THW] {
         guard merge > 0, grids.contains(where: { $0.t > 1 }) else { return grids }
-        var runs: [Int] = []
-        var index = 0
-        while index < tokens.count {
-            guard tokens[index] == videoToken else {
-                index += 1
-                continue
-            }
-            let start = index
-            while index < tokens.count, tokens[index] == videoToken { index += 1 }
-            runs.append(index - start)
-        }
+        // Lengths of the unmasked video-token runs, in prompt order.
+        let isVideo: [Bool] =
+            mask.map { zip(tokens, $0).map { $0 == videoToken && $1 == 1 } }
+            ?? tokens.map { $0 == videoToken }
+        let runs = isVideo.split(separator: false).map(\.count)
         var result: [THW] = []
         var run = 0
         for grid in grids {
