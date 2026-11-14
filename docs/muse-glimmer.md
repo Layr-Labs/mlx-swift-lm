@@ -120,9 +120,20 @@ With `setRowExactWindows(true)`, exactness follows the row's role, not the call'
 - Prompt chunks keep MLX's arithmetic, the same bytes as with the switch off. The two prompt
   entry points, `cbv2Prefill` and `prefillWithMTPHidden`, build their graph as a prompt; the
   drafter on and off therefore prefill alike, and prefill keeps MLX's matrix kernels.
-- A prompt's bytes depend on how it is cut into chunks. The engine cuts it at the solo stripe or
-  the plain chunk size, so a restore from a checkpoint at a chunk edge equals the cold run. Under
-  load the step's token budget can cut a chunk shorter, and those prompt bytes can then differ.
+- A prompt's bytes depend on how it is cut into chunks, so the engine cuts this model's prompts
+  on a fixed grid (`CBv2ModelCapabilities.prefillChunkAlignment`, 1,024 tokens, the solo stripe
+  and the checkpoint stride): only at multiples of 1,024, at the prompt end and at a boundary a
+  prefix restore needs. Each such cell runs whole or not at all. When a step's budget or the
+  mixed-step quota cannot hold the next cell, the row waits and takes the first claim on the
+  next step, exempt from the quota. The cuts, and so the prompt bytes, depend on the prompt
+  alone, not on other requests or the drafter, and a restore at a grid edge equals the cold run.
+- Fairness: decode rows are planned before prompt rows, and a claim step arms no further claim.
+  A decode row therefore waits at most one step for a cell, and a cell that did not fit runs
+  within two steps; other waiting cells take claims in running order. A step always holds one
+  cell, even if the configured step limit is smaller. The KV for the whole sequence is
+  reserved at the first chunk, so the cell size does not change memory admission; a paged pool
+  whose `maxPrefillChunk` is below 1,024 is refused at engine start. The first-token deadline
+  projection plans the same cells and returns unbounded where a cell would wait.
 - The engine never puts prompt chunks and decode or verify rows in one forward: each prompt chunk
   runs alone, and packed prefill is off for this model. A one-token final prompt chunk is
   scheduled as a decode row; it runs in the decode batch, exact.
@@ -136,8 +147,9 @@ How the exact rows are computed:
   bytes differ from the plain tower; BF16 and FP8 decode bytes do not.
 - Block norms: from 32 rows MLX's row reduction takes another kernel, so exact calls of 32 or
   more rows reduce in pieces of 16.
-- `numericsProfile` is `muse-glimmer-exact-windows-v3`. `v1` ran every call of up to 64 rows
-  exact, prompt chunks included, and left larger calls to MLX; `v2` ran every call exact.
+- `numericsProfile` is `muse-glimmer-exact-windows-v4`. `v1` ran every call of up to 64 rows
+  exact, prompt chunks included, and left larger calls to MLX; `v2` ran every call exact; `v3`
+  gave prompt chunks MLX's arithmetic but let load move their cuts. `v4` is `v3` on the grid.
 - Attention, RoPE, the gate and the softcap already compute each row alone. Under
   `withMTPRectangularVerification` the paged cache runs attention once per query column, or,
   when the drafter asks for it (`Settings.verifying` does), once per layer for the whole round:
@@ -168,7 +180,11 @@ prompts across the 2,048-token window and the ring wrap, and rolled-back columns
 `MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
 output equals the target alone, greedy and sampled, cold and restored, one or two requests, and
 a request's decode and verify rows keep their bytes while another request's prompt is prefilled
-beside them.
+beside them. A request's prompt K/V bytes and output are the same alone, beside another
+request's decode, and beside it with the drafter on, and a restore under load equals the cold
+run. `CBv2PrefillChunkGridTests` check the grid in the scheduler alone: the cuts, whole cells
+under a tight budget and quota, the fairness bound, the projection, and that other models keep
+their cuts.
 
 Real checkpoint and oracle (skipped unless the variables are set):
 

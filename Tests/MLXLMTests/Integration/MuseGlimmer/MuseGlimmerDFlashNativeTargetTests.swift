@@ -41,6 +41,7 @@ struct MuseGlimmerDFlashNativeTargetTests {
         verification: CBv2MTPVerificationMode = .serialTarget,
         store: CompleteCheckpointFixtureStore? = nil
     ) throws -> (EngineV2, PagedKVBackend) {
+        m.prefillChunkAlignment = Self.chunk
         let backend = try PagedKVBackend(
             layerKinds: m.cbv2LayerKinds,
             config: .init(

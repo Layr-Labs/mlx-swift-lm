@@ -351,6 +351,13 @@ public final class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvi
         didSet { precondition(Self.validHiddenLayers(mtpHiddenLayerIDs, configuration)) }
     }
 
+    /// A prompt chunk's bytes depend on its rows, so the engine cuts every
+    /// prompt on this grid, whatever the load: the solo stripe and the
+    /// checkpoint capture stride (`CBv2ModelCapabilities.prefillChunkAlignment`).
+    public static let defaultPrefillChunkAlignment = 1024
+    /// The grid the tower reports; tests with small chunks lower it.
+    var prefillChunkAlignment = MuseGlimmerTextModel.defaultPrefillChunkAlignment
+
     public var vocabularySize: Int { configuration.vocabularySize }
     public var kvHeads: [Int] {
         Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)

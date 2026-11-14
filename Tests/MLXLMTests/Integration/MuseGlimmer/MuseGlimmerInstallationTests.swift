@@ -325,6 +325,7 @@ struct MuseGlimmerInstallationTests {
         let prompt = MuseGlimmerFixture.tokens(150, vocabulary: 96)
         let expected = try MuseGlimmerFixture.eagerGreedyWithMargins(
             model, prompt: prompt, chunk: 64, steps: 10)
+        model.prefillChunkAlignment = 64
         let backend = try PagedKVBackend(
             layerKinds: model.cbv2LayerKinds,
             config: .init(

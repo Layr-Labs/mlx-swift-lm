@@ -33,12 +33,13 @@ extension MuseGlimmerTextModel: CBv2ModelCapabilityProviding {
     /// Attention K/V lives only in segmented paged storage with the observed
     /// layer dtypes; a contiguous backend is refused at engine build. Packed
     /// prefill stays off until row independence of the ModelOpt products over
-    /// rectangular prompt cohorts is proven.
+    /// rectangular prompt cohorts is proven. Prompts are cut on the
+    /// `prefillChunkAlignment` grid.
     public var cbv2Capabilities: CBv2ModelCapabilities {
         CBv2ModelCapabilities(
             supportsPrefixReuse: true, supportsPagedKV: true, requiresNativePagedKV: true,
             supportsCompiledDecode: false, supportsPackedPrefill: false, supportsMTP: true,
-            requiresPagedKV: true)
+            requiresPagedKV: true, prefillChunkAlignment: prefillChunkAlignment)
     }
 }
 

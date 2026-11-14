@@ -142,9 +142,10 @@ extension MuseGlimmerTextModel {
     /// decode bytes change when exact windows are on. `v1` ran every call of
     /// up to 64 rows exact, prompt chunks included; `v2` ran every call
     /// exact; `v3` runs decode and verify rows exact and prompt chunks as MLX
-    /// does.
+    /// does; `v4` is `v3` with every prompt cut on the model's grid
+    /// (`prefillChunkAlignment`), so load no longer moves a prompt's bytes.
     public var numericsProfile: String {
-        numerics.exactWindows ? "muse-glimmer-exact-windows-v3" : "mlx"
+        numerics.exactWindows ? "muse-glimmer-exact-windows-v4" : "mlx"
     }
 
     /// The model path and layer of every projection slot.

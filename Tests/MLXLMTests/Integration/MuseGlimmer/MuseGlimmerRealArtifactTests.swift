@@ -388,6 +388,7 @@ struct MuseGlimmerRealArtifactTests {
         func run(_ id: UInt64, prompt: [Int], maxTokens: Int) async throws
             -> (ttft: Double, stamps: [Double], tokens: [Int])
         {
+            model.prefillChunkAlignment = chunk
             let backend = try PagedKVBackend(
                 layerKinds: model.cbv2LayerKinds,
                 config: .init(

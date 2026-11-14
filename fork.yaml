@@ -77,7 +77,8 @@ def:
         the bytes of one-row calls (row-exact weight-only NVFP4, FP8 and BF16 products in pieces
         of 16 rows, block norms below MLX's row-reduction switch), so the engine verifies a round
         in one `rectangularExact` forward; prompt chunks keep MLX's arithmetic. Off by default, so
-        the BF16 tower keeps upstream's arithmetic.
+        the BF16 tower keeps upstream's arithmetic. The tower declares a 1,024-token prompt grid
+        (`CBv2ModelCapabilities.prefillChunkAlignment`), so load never moves a prompt's cuts.
         The drafter's `Settings.verifying` also asks for decode-row attention, one paged decode
         dispatch per layer for the whole round.
         The shared pieces are additive in `MLXLMCommon/Quantization`:

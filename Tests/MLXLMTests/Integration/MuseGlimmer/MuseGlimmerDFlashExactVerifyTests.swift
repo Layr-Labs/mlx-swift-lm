@@ -50,6 +50,7 @@ struct MuseGlimmerDFlashExactVerifyTests {
         _ m: MuseGlimmerTextModel, drafter: (any CBv2MTPDrafter)?,
         store: CompleteCheckpointFixtureStore? = nil
     ) throws -> (EngineV2, PagedKVBackend, [PagedLayerCache]) {
+        m.prefillChunkAlignment = Self.chunk
         let backend = try PagedKVBackend(
             layerKinds: m.cbv2LayerKinds,
             config: .init(
@@ -130,6 +131,20 @@ struct MuseGlimmerDFlashExactVerifyTests {
             }
         }
         return collected
+    }
+
+    /// Target K/V bytes of each saved checkpoint, by position: the prompt's
+    /// bytes below that position.
+    private func promptBytes(_ store: CompleteCheckpointFixtureStore) -> [Int: Data] {
+        var bytes = [Int: Data]()
+        for archive in store.saved {
+            let tensors = archive.manifest.tensors
+            let kv = archive.chunks.filter {
+                [CBv2CheckpointTensorRole.keys, .values].contains(tensors[$0.tensor].role)
+            }.sorted { ($0.tensor, $0.offset) < ($1.tensor, $1.offset) }
+            bytes[archive.manifest.position] = kv.reduce(into: Data()) { $0 += $1.bytes }
+        }
+        return bytes
     }
 
     /// Every verification was one rectangular forward. `rounds` counts
@@ -279,6 +294,114 @@ struct MuseGlimmerDFlashExactVerifyTests {
                 await engine.shutdown()
                 #expect(backend.bytesReserved == 0)
             }
+        }
+    }
+
+    /// A prompt's bytes depend on the prompt alone. Alone, beside another
+    /// request's decode rows, and beside its verify rows with the drafter on,
+    /// the engine cuts it on the model's grid and runs each cell whole, though
+    /// the step budget holds only one cell: its checkpointed K/V, its tokens
+    /// and its logprobs match bit for bit.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func promptBytesDoNotDependOnLoad(dtype: DType) async throws {
+        let m = try target(dtype)
+        let long = prompt(5 * Self.chunk + 17, salt: 12)
+        let short = prompt(21, salt: 13)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let shortTokens = try await plain(m, request(short, Self.greedy, id: 2))
+
+        func run(beside: Bool, drafting: Bool) async throws -> (Collected, [Int: Data]) {
+            let store = CompleteCheckpointFixtureStore(segmentBytes: 4096)
+            let speculator: (any CBv2MTPDrafter)? =
+                try drafting
+                ? Scripted(
+                    drafter(m), mode: .wrong(at: 2), scripts: [short + shortTokens],
+                    vocabulary: 96)
+                : nil
+            let (engine, backend, _) = try engine(m, drafter: speculator, store: store)
+            let company = try beside ? engine.submit(request(short, Self.greedy, id: 2)) : nil
+            let a = try engine.submit(request(long, logged, id: 1, receipt: 1001))
+            async let ra = collect(a)
+            var other: Collected?
+            if let company { other = await collect(company) }
+            let x = await ra
+            let label = "\(dtype) beside \(beside) drafting \(drafting)"
+            if let other {
+                #expect(other.tokens == shortTokens, "\(label)")
+                // The other request decoded while this prompt was prefilling.
+                let (at, bt) = (try #require(x.usage).timing, try #require(other.usage).timing)
+                #expect(bt.firstTokenNanos < at.promptComputedNanos, "\(label)")
+            }
+            if drafting { try expectRectangular(engine) }
+            #expect(try #require(x.usage).timing.prefillChunks == 6, "\(label)")
+            await engine.shutdown()
+            #expect(backend.bytesReserved == 0)
+            return (x, promptBytes(store))
+        }
+
+        let (solo, soloBytes) = try await run(beside: false, drafting: false)
+        #expect(solo.tokens.count == Self.maxTokens && solo.logprobs.count == Self.maxTokens)
+        #expect(soloBytes.count >= 2 && soloBytes.keys.allSatisfy { $0 % Self.chunk == 0 })
+        for drafting in [false, true] {
+            let (x, bytes) = try await run(beside: true, drafting: drafting)
+            #expect(x.tokens == solo.tokens && x.logprobs == solo.logprobs, "\(drafting)")
+            #expect(bytes == soloBytes, "\(drafting)")
+        }
+    }
+
+    /// A request restored from its shallowest checkpoint equals the cold
+    /// request while another request decodes beside it, drafter off and on:
+    /// the restore continues the cold run's grid, so its tokens, logprobs and
+    /// the checkpoints it captures match the cold run's.
+    @Test(.timeLimit(.minutes(6)))
+    func restoredRequestEqualsColdRequestUnderLoad() async throws {
+        let m = try target(.bfloat16)
+        let long = prompt(5 * Self.chunk + 17, salt: 14)
+        let short = prompt(21, salt: 15)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let shortTokens = try await plain(m, request(short, Self.greedy, id: 2))
+        for drafting in [false, true] {
+            func speculator() throws -> (any CBv2MTPDrafter)? {
+                try drafting
+                    ? Scripted(
+                        drafter(m), mode: .wrong(at: 2), scripts: [short + shortTokens],
+                        vocabulary: 96)
+                    : nil
+            }
+            let coldStore = CompleteCheckpointFixtureStore(segmentBytes: 4096)
+            let (cold, _, _) = try engine(m, drafter: try speculator(), store: coldStore)
+            let expected = await collect(try cold.submit(request(long, logged, receipt: 1001)))
+            await cold.shutdown()
+            #expect(expected.tokens.count == Self.maxTokens)
+            let coldBytes = promptBytes(coldStore)
+            let first = try #require(
+                coldStore.saved.min { $0.manifest.position < $1.manifest.position })
+            #expect(first.manifest.position <= 2 * Self.chunk)
+
+            let reopened = CompleteCheckpointFixtureStore(archives: [first])
+            let (warm, backend, _) = try engine(m, drafter: try speculator(), store: reopened)
+            let company = try warm.submit(request(short, Self.greedy, id: 2))
+            let warmRequest = request(long, logged, id: 1, receipt: 2002)
+            #expect(try reopened.stage(engine: warm, request: warmRequest))
+            let a = try warm.submit(warmRequest)
+            async let rb = collect(company)
+            let x = await collect(a)
+            let other = await rb
+            #expect(try #require(x.usage?.prefixCachePrefillTokensSaved) > 0, "\(drafting)")
+            #expect(x.tokens == expected.tokens && x.logprobs == expected.logprobs, "\(drafting)")
+            #expect(other.tokens == shortTokens, "\(drafting)")
+            let (at, bt) = (try #require(x.usage).timing, try #require(other.usage).timing)
+            #expect(bt.firstTokenNanos < at.promptComputedNanos, "\(drafting)")
+            if drafting { try expectRectangular(warm) }
+            await warm.shutdown()
+            #expect(backend.bytesReserved == 0)
+            // Checkpoints the restored run captured hold the cold run's bytes.
+            let restored = promptBytes(reopened).filter { $0.key > first.manifest.position }
+            #expect(!restored.isEmpty, "\(drafting)")
+            for (position, bytes) in restored {
+                #expect(coldBytes[position] == nil || coldBytes[position] == bytes, "\(position)")
+            }
+            #expect(restored.keys.contains { coldBytes[$0] != nil }, "\(drafting)")
         }
     }
 

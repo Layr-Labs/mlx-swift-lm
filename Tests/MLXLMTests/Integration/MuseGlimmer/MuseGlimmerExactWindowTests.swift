@@ -380,7 +380,7 @@ struct MuseGlimmerExactWindowTests {
         #expect(try !Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(true)
         #expect(m.verifiesWindowsExactly && m.dflashVerifiesWindowsExactly)
-        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v3")
+        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v4")
         #expect(try Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(false)
         #expect(!m.verifiesWindowsExactly)

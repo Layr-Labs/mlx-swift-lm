@@ -36,6 +36,7 @@ struct MuseGlimmerCBv2Tests {
         _ m: MuseGlimmerTextModel, adapter: (any CBv2SteppableModel)? = nil,
         store: CompleteCheckpointFixtureStore? = nil, concurrency: Int = 2
     ) throws -> (EngineV2, PagedKVBackend) {
+        m.prefillChunkAlignment = Self.chunk
         let backend = try pagedBackend(m)
         #expect(
             EngineV2.backendCapabilityViolation(capabilities: m.cbv2Capabilities, backend: backend)
@@ -49,6 +50,7 @@ struct MuseGlimmerCBv2Tests {
                 prefillChunkSize: Self.chunk, soloPrefillStripeTokens: Self.chunk, maxWaiting: 4,
                 enablePrefixCache: store != nil),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
+        #expect(engine.loopForTesting.scheduler.prefillChunkAlignment == Self.chunk)
         return (engine, backend)
     }
 
@@ -83,6 +85,8 @@ struct MuseGlimmerCBv2Tests {
         let capabilities = m.cbv2Capabilities
         #expect(capabilities.supportsPagedKV && capabilities.requiresNativePagedKV)
         #expect(capabilities.requiresPagedKV && !capabilities.supportsPackedPrefill)
+        #expect(capabilities.prefillChunkAlignment == 1024)
+        #expect(MuseGlimmerTextModel.defaultPrefillChunkAlignment == 1024)
         #expect(m.cbv2SupportsHistoricalAttentionCheckpoint)
         #expect(m.cbv2CompleteCheckpointKVDTypes == Array(repeating: .bfloat16, count: 6))
         #expect(m.kvStorageDTypes == Array(repeating: .bfloat16, count: 6))
@@ -98,6 +102,11 @@ struct MuseGlimmerCBv2Tests {
 
     @Test func nonPagedAndUnprobedBackendsAreRefused() throws {
         let m = try model()
+        // A pool whose prompt write is shorter than one grid cell is refused.
+        #expect(
+            EngineV2.backendCapabilityViolation(
+                capabilities: m.cbv2Capabilities, backend: try pagedBackend(m)) != nil)
+        m.prefillChunkAlignment = Self.chunk
         let capabilities = m.cbv2Capabilities
         let contiguous = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 8 << 20, kvDType: .bfloat16))
