@@ -17,6 +17,8 @@ not code (`ignore`). Every push to `main` re-renders and redeploys it
 Settings → Pages → Source: **GitHub Actions**. The workflow token cannot do
 this itself. Until it's done the deploy workflow still builds the page (kept
 as a run artifact, `forkdiff-page`) and exits with a notice instead of failing.
+If the first deploy fails before it creates a deployment (the packaged artifact
+is not listed yet), the job waits 20 seconds and tries once more.
 
 ## Native CI
 
