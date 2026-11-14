@@ -235,10 +235,12 @@ struct CBv2PagedBackendTests {
             let allV = concatenated(mirrorV, axis: 1)
             let (gotK, gotV) = row.attendableViews()
             assertEqualArrays(
-                gotK, allK[0..., (written - retained) ..< written, 0...]
+                gotK,
+                allK[0..., (written - retained) ..< written, 0...]
                     .expandedDimensions(axis: 0))
             assertEqualArrays(
-                gotV, allV[0..., (written - retained) ..< written, 0...]
+                gotV,
+                allV[0..., (written - retained) ..< written, 0...]
                     .expandedDimensions(axis: 0))
         }
         // Ring must have wrapped (100 tokens through a 4-page/64-token ring).
@@ -255,14 +257,16 @@ struct CBv2PagedBackendTests {
             layerKinds: kinds, promptLength: 0, maxLength: 512)
         let row = try #require(state[0] as? PagedSequenceKV)
 
-        row.write(keys: randomKV(heads: 2, tokens: 10, dim: 64),
-                  values: randomKV(heads: 2, tokens: 10, dim: 64))
+        row.write(
+            keys: randomKV(heads: 2, tokens: 10, dim: 64),
+            values: randomKV(heads: 2, tokens: 10, dim: 64))
         var range = row.decodeAttendRange
         #expect(range.start == 0 && range.length == 10)
 
         for _ in 0 ..< 6 {
-            row.write(keys: randomKV(heads: 2, tokens: 16, dim: 64),
-                      values: randomKV(heads: 2, tokens: 16, dim: 64))
+            row.write(
+                keys: randomKV(heads: 2, tokens: 16, dim: 64),
+                values: randomKV(heads: 2, tokens: 16, dim: 64))
         }
         // 106 tokens written; query position 105; window 32 => start 74.
         range = row.decodeAttendRange
@@ -364,8 +368,9 @@ struct CBv2PagedBackendTests {
         #expect(row.absoluteOffset == 100)
         #expect(row.retainedCount == 0)
 
-        row.write(keys: randomKV(heads: 2, tokens: 16, dim: 64),
-                  values: randomKV(heads: 2, tokens: 16, dim: 64))
+        row.write(
+            keys: randomKV(heads: 2, tokens: 16, dim: 64),
+            values: randomKV(heads: 2, tokens: 16, dim: 64))
         #expect(row.absoluteOffset == 116)
         // Only replayed tokens are attendable.
         #expect(row.retainedCount == 16)
@@ -380,8 +385,9 @@ struct CBv2PagedBackendTests {
         let state = try backend.makeSequenceState(
             layerKinds: kinds, promptLength: 0, maxLength: 32)
         let row = try #require(state[0] as? PagedSequenceKV)
-        row.write(keys: randomKV(heads: 2, tokens: 32, dim: 64),
-                  values: randomKV(heads: 2, tokens: 32, dim: 64))
+        row.write(
+            keys: randomKV(heads: 2, tokens: 32, dim: 64),
+            values: randomKV(heads: 2, tokens: 32, dim: 64))
         #expect(row.table.count == 2)
         backend.release(state)
     }
@@ -540,7 +546,7 @@ struct CBv2PagedBackendTests {
         )
     }
 
-    @Test func positionOffsetsAdvanceOnDeviceWithoutHostRebuild() throws {
+    @Test func positionOffsetsAdvanceWithoutHostRebuild() throws {
         let kind = fullKind()
         let backend = try PagedKVBackend(layerKinds: [kind], config: config())
         let cache = backend.makeLayerCaches()[0]
@@ -552,20 +558,23 @@ struct CBv2PagedBackendTests {
         cache.setRows([state[0]!])
         #expect(cache.positionOffsetsHostRebuilds == 1, "setRows rebuilds once")
 
-        // Prefill chunk of 4 tokens: offset 0 -> 4 on device, no host rebuild.
-        let pf = decodeQKV(queryHeads: kind.queryHeads, kvHeads: kind.kvHeads, dim: kind.headDim, tokens: 4)
+        // Prefill chunk of 4 tokens: offset 0 -> 4, no host rebuild.
+        let pf = decodeQKV(
+            queryHeads: kind.queryHeads, kvHeads: kind.kvHeads, dim: kind.headDim, tokens: 4)
         _ = cache.updateAndAttend(queries: pf.q, keys: pf.k, values: pf.v, scale: scale, sinks: nil)
         #expect(cache.positionOffsetsHostRebuilds == 1)
         #expect(cache.positionOffsets.item(Int32.self) == 4)
 
-        // 20 decode steps: offsets advance on device, counter stays 1.
+        // 20 decode steps: offsets advance from the host mirror, counter stays 1.
         for _ in 0 ..< 20 {
             let d = decodeQKV(
                 queryHeads: kind.queryHeads, kvHeads: kind.kvHeads, dim: kind.headDim, tokens: 1)
-            _ = cache.updateAndAttend(queries: d.q, keys: d.k, values: d.v, scale: scale, sinks: nil)
+            _ = cache.updateAndAttend(
+                queries: d.q, keys: d.k, values: d.v, scale: scale, sinks: nil)
         }
         #expect(cache.positionOffsetsHostRebuilds == 1, "decode loop must not host-rebuild offsets")
         #expect(cache.positionOffsets.item(Int32.self) == 24, "4 prefill + 20 decode tokens")
+        #expect(cache.positionOffsets.asArray(Int32.self) == cache.hostPositionOffsets)
 
         // A batch membership change rebuilds from host truth.
         let state2 = try backend.makeSequenceState(
@@ -573,6 +582,7 @@ struct CBv2PagedBackendTests {
         defer { backend.release(state2) }
         cache.setRows([state[0]!, state2[0]!])
         #expect(cache.positionOffsetsHostRebuilds == 2, "membership change rebuilds")
+        #expect(cache.positionOffsets.asArray(Int32.self) == cache.hostPositionOffsets)
     }
 
     // MARK: - windowed adoption decode-table length (Codex P2)
@@ -1178,7 +1188,8 @@ struct CBv2PagedBackendTests {
         /// Position-coded so a single overwritten slot is visible, and nowhere
         /// near the zeros an untouched page holds.
         func canary(_ tag: Float) -> (MLXArray, MLXArray) {
-            let base = MLXArray(0 ..< Int32(2 * canaryTokens * 64)).asType(.float16)
+            let base =
+                MLXArray(0 ..< Int32(2 * canaryTokens * 64)).asType(.float16)
                 .reshaped([2, canaryTokens, 64]) * 0.0007
             return (base + tag, base - tag)
         }

@@ -134,9 +134,13 @@ def:
             core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
             them through `PagedKVBackend` as the engine does.
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
+            A layer cache advances its position offsets from their host mirror and the segmented
+            merge's unused sinks input is host-built, so a decode step launches no GPU kernel per
+            layer for either (same values, same output bits).
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
             - "docs/runtime-kv-quantization.md"
+            - "changelog.d/decode-noop-kernels.md"
         - title: "Prefix checkpoints"
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
@@ -400,6 +404,8 @@ def:
             affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
             If Metal rejects one of its kernels, the route logs once and keeps the core path.
             Its report separates exact native-state evidence from two-order cold HTTP timing.
+            Decode expert gathers take host row indices (`SwitchGLU.suppliesHostRowIndices`), and the
+            attention's offset snapshot is the cache's array itself, not a `+ 0` copy.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"

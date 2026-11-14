@@ -1125,10 +1125,11 @@ class Gemma4Attention: Module {
         }
 
         // Snapshot the per-row absolute offsets BEFORE updateAndAttend
-        // advances the rows (`+ 0` = graph-safe copy, same convention as
-        // gemma4CapturePositionOffset). KV-shared consumers of this layer
-        // reuse this exact snapshot via the returned PositionOffset.
-        let capturedOffsets = layerCache.positionOffsets + 0
+        // advances the rows. A CBv2 layer cache advances by assigning a new
+        // array, never by mutating this one, so the reference is the
+        // pre-update snapshot without a copy kernel. KV-shared consumers of
+        // this layer reuse this exact snapshot via the returned PositionOffset.
+        let capturedOffsets = layerCache.positionOffsets
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
         // The frontier query sits `outputStart` positions past the chunk's
@@ -1252,7 +1253,7 @@ class Gemma4Experts: Module {
         let moeIntermediate = config.moeIntermediateSize ?? config.intermediateSize
         self.fuseWeightedUnsort = fuseWeightedUnsort
 
-        self._switchGLU.wrappedValue = SwitchGLU(
+        let switchGLU = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: moeIntermediate,
             numExperts: numExperts,
@@ -1260,6 +1261,11 @@ class Gemma4Experts: Module {
             bias: false,
             weightedReductionProfile: .gemma4ProductionGeGLU
         )
+        // Decode gathers take their row indices from the host instead of one
+        // GPU `Arange` per projection: identical index values, so identical
+        // outputs (`Gemma4CompiledFeedforwardTests`).
+        switchGLU.suppliesHostRowIndices = true
+        self._switchGLU.wrappedValue = switchGLU
         super.init()
     }
 
