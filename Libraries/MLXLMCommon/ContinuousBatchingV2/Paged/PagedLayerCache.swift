@@ -138,6 +138,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     package var mtpSerializesRectangularAttention = false
     package var mtpBatchesRectangularAttention = false
     public private(set) var mtpBatchedAttentionCalls = 0
+    /// Opt-in, default off: a rectangular round writes its columns' K/V, then
+    /// attends every (row, column) pair as one row of a single segmented
+    /// decode dispatch, each over that column's own range. The decode kernel
+    /// gives a row the same arithmetic whatever its batchmates (fixed
+    /// partition length), and a row without a fused write reads from the
+    /// slab the bytes a fused-write step reads from its inputs. Rounds it
+    /// cannot take fall back to the column loop.
+    package var mtpBatchesRectangularColumnsAsRows = false
+    /// Rounds attended as decode rows (test hook).
+    public private(set) var mtpColumnsAsRowsCalls = 0
     /// Diagnosis (`DARKBLOOM_PAGED_ENGINE_TRACE=1`): segment dispatch plan
     /// hits/rebuilds and host nanoseconds, nil when tracing is off.
     public static let engineTrace =
@@ -1172,6 +1182,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
             return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
         }
+        if mtpBatchesRectangularColumnsAsRows, tableProvider == nil, let keys, let values,
+            let output = attendColumnsAsDecodeRows(
+                queries: queries, keys: keys, values: values, rows: rows, scale: scale,
+                sinks: sinks)
+        {
+            return output
+        }
         if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
             let keys, let values
         {
@@ -1211,6 +1228,66 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// `mtpBatchesRectangularColumnsAsRows`: `[B, QH, L, D]` as `B * L`
+    /// decode rows of one segmented dispatch. Nil, before anything is
+    /// written, for a round this path does not take.
+    ///
+    /// Each row first writes its `L` columns as one chunk. Column `t` of a
+    /// row then attends `[max(base, qPos - window + 1), qPos]` with `qPos`
+    /// its own position, the range a one-token step at `qPos` attends. The
+    /// windowed ring holds the window plus a speculative span, so the
+    /// round's writes leave every column's window in place.
+    private func attendColumnsAsDecodeRows(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        let (b, qh, l, d) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+        guard (2 ... CBv2PagedSpeculation.maxSpeculativeSpan).contains(l), !rows.isEmpty,
+            !pool.usesStepOwnedAttention, !pool.writeValidation.isFaulted,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0,
+            boundSpanContext == nil, attentionMetadata == nil, attentionPacket == nil,
+            keys.dim(0) == b, keys.dim(2) == l, values.shape == keys.shape
+        else { return nil }
+        let group = pool.group(rows[0].groupKey)
+        guard group.segmentLayout != nil, !group.key.isAsymmetric, group.key.quantization == nil,
+            keys.dtype == group.dtype, values.dtype == group.dtype,
+            rows.allSatisfy({ row in
+                row.groupKey == rows[0].groupKey && !row.isReleased
+                    && row.absoluteOffset >= row.frozenHighWater
+                    && row.absoluteOffset + l <= row.maxLength
+                    && (row.windowSize == nil
+                        || (l <= pool.config.maxPrefillChunk && row.speculativeHeadroom >= l))
+            })
+        else { return nil }
+        for (index, row) in rows.enumerated() {
+            row.write(keys: keys[index], values: values[index])
+        }
+        guard !pool.writeValidation.isFaulted else { return faultOutput(queries) }
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(b * l)
+        for row in rows {
+            for t in 0 ..< l {
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: attendRange(row: row, qPosFromEnd: l - 1 - t)),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
+        }
+        let result = PagedSegmentAttention.decode(
+            queries: queries.transposed(0, 2, 1, 3).reshaped(b * l, qh, d),
+            newKeys: nil, newValues: nil, group: group, rows: descriptors,
+            sinks: preparedSinks(sinks), params: params(scale: scale),
+            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+            dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+            zeroFilledScratch: true,
+            seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo)
+        mtpColumnsAsRowsCalls += 1
+        let output = result.reshaped(b, l, qh, d).transposed(0, 2, 1, 3)
+        return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }
 
     /// Kernel params `{softcap, scale, 0…}`, cached across steps.

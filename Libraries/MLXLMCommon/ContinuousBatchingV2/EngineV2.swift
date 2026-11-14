@@ -883,6 +883,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         } else if !samplerSupportsMTP {
             mtpInactiveReason =
                 "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+        } else if mtpDrafter?.requiresExactAcceptance == true, mtpConfig.acceptance != .exact {
+            mtpInactiveReason = "drafter requires exact acceptance"
         } else {
             mtpInactiveReason =
                 "model/drafter pair cannot prove matching MTP target identity or capture layers"
@@ -900,6 +902,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
+        scheduler.prefillChunkAlignment = modelCapabilities.prefillChunkAlignment
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
@@ -994,7 +997,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         } else if schedulerConfig.enablePrefixCache,
             (model as? any CBv2HistoricalAttentionCheckpointProviding)?
                 .cbv2SupportsHistoricalAttentionCheckpoint == true,
-            !(mtpDriver?.tracksPersistentHistory ?? false),
+            !(mtpDriver?.checkpointsRequireAssistantHistory ?? false),
             let completePrefixCache, let pagedCheckpointConfig, let segmentedPool,
             (try? CBv2HistoricalAttentionLayout(
                 layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil
@@ -1157,6 +1160,21 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public static func backendCapabilityViolation(
         capabilities: CBv2ModelCapabilities, backend: CBv2KVBackend
     ) -> String? {
+        if capabilities.requiresPagedKV, !(backend is PagedKVBackend) {
+            return "EngineV2: model requires paged KV; \(type(of: backend)) is refused"
+        }
+        // A grid cell is one prompt write, and a paged row refuses a windowed
+        // write longer than the pool's prefill chunk.
+        if let alignment = capabilities.prefillChunkAlignment {
+            guard alignment > 0 else {
+                return "EngineV2: prefill chunk alignment \(alignment) is not positive"
+            }
+            if let paged = backend as? PagedKVBackend, paged.pool.config.maxPrefillChunk < alignment
+            {
+                return
+                    "EngineV2: model cuts prompts into \(alignment)-token cells; the paged pool's maxPrefillChunk \(paged.pool.config.maxPrefillChunk) cannot hold one"
+            }
+        }
         // Packed storage disables legacy prefix reuse, not paged execution.
         guard backend is PagedKVBackend || backend.prefixReuseBackend == .pagedFP16 else {
             return nil

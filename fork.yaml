@@ -58,6 +58,43 @@ def:
         - "ThirdPartyNotices/**"
         - "docs/flint.md"
         - "scripts/generate-flint-oracle.py"
+    - title: "Native Muse Glimmer text decoder"
+      description: |
+        Fork-only text tower for Muse Glimmer 30B under `MLXLLM/Models/MuseGlimmer/`. It runs the
+        arithmetic of upstream's `MLXVLM/Models/MuseGlimmer.swift`, which stays unchanged, with
+        projection slots that hold ModelOpt layers, a ContinuousBatchingV2 attention branch, a
+        prompt-output seam, decode command-buffer limits and complete prefix checkpoints. The
+        model serves only from segmented paged KV: `CBv2ModelCapabilities.requiresPagedKV`
+        (default off, set by no other model) makes the engine refuse a contiguous backend.
+        `MuseGlimmerInstallation` loads NVIDIA's ModelOpt checkpoint from SHA-256-pinned shards:
+        calibrated FP8 projections with saturating activation overflow, weight-only NVFP4
+        projections (`ModelOptWeightOnlyNVFP4Linear` in `MLXLMCommon/Quantization`) and BF16
+        ones, with typed refusals for missing, extra or misshapen tensors. `DFlash/` holds the
+        published block drafter (`MuseGlimmerDFlashDrafter`, a request-stateful advisory-history
+        CBv2 drafter): hash-pinned loading of the BF16 artifact and of its quantized form, a
+        bounded context ring, seven drafts per round from the target's own head, exact
+        acceptance. `setRowExactWindows(true)` gives decode and verify rows, at any row count,
+        the bytes of one-row calls (row-exact weight-only NVFP4, FP8 and BF16 products in pieces
+        of 16 rows, block norms below MLX's row-reduction switch), so the engine verifies a round
+        in one `rectangularExact` forward; prompt chunks keep MLX's arithmetic. Off by default, so
+        the BF16 tower keeps upstream's arithmetic. The tower declares a 1,024-token prompt grid
+        (`CBv2ModelCapabilities.prefillChunkAlignment`), so load never moves a prompt's cuts.
+        The drafter's `Settings.verifying` also asks for decode-row attention, one paged decode
+        dispatch per layer for the whole round.
+        The shared pieces are additive in `MLXLMCommon/Quantization`:
+        `ModelOptWeightOnlyNVFP4RowExact`, `ModelOptRowExact.Schedule` (default `.standard`) and
+        `ModelOptIndexedCheckpoint`, a model-agnostic binding of a sharded safetensors checkpoint
+        to its index: the index matches a pinned SHA-256, every key lives in the one shard the
+        index names (each shard verified against its own pin), no shard holds an unindexed
+        tensor, and no payload is read.
+        Vision is not wired and the type is not registered in a factory. Tests use tiny synthetic
+        models, except the `*Real*` suites, which run against the real checkpoint, the pinned
+        drafter and an independent oracle only when `MUSE_GLIMMER_NVFP4_DIR`,
+        `MUSE_GLIMMER_ORACLE_DIR` and the drafter directories are set.
+      globs:
+        - "Libraries/MLXLLM/Models/MuseGlimmer/**"
+        - "Tests/MLXLMTests/Integration/MuseGlimmer/**"
+        - "docs/muse-glimmer.md"
     - title: "ContinuousBatchingV2 engine"
       description: |
         The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible
@@ -86,7 +123,11 @@ def:
             Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
             run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
             `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks, which
-            the first-token projection charges as decode steps).
+            the first-token projection charges as decode steps). A model-scoped prompt grid
+            (`CBv2ModelCapabilities.prefillChunkAlignment`, default off, set only by Muse Glimmer)
+            cuts a text prompt only at multiples of the alignment, its end and a prefix-restore
+            boundary, runs each cell whole or by first claim on the next step, plans decode rows
+            first, and makes the first-token projection fail closed where a cell would wait.
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time
@@ -118,7 +159,11 @@ def:
             sharing (`PrefixBlocks/`: block index, free queue, page handles, resident-prefix plan
             validation). The page allocator (`PagedKVFreePages`) reuses uncached pages before cached
             ones and keeps each row layer's pages in 16-page runs in few segments, spreading row layers
-            over segments, so the segmented decode keeps one dispatch per layer through busy runs. Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
+            over segments, so the segmented decode keeps one dispatch per layer through busy runs.
+            Opt-in `mtpBatchesRectangularColumnsAsRows` (default off, set only for drafters that ask)
+            attends an exact verify round as rows of one segmented decode dispatch per layer: the
+            round's K/V is written first and each (row, column) pair attends its own one-token
+            range; rounds it cannot take keep the per-column loop. Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
             checkpoint storage. Optional token-local affine K4/V4, K8/V4 and K8/V8 pages use
             signed block Hadamard keys and direct mixed packed/native online attention. Original
             recent128 and pending/speculative rows retain separately charged native owners until
@@ -181,7 +226,18 @@ def:
             host readback; this is not a performance qualification.
             A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
-            row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
+            row commits its own accepted prefix. A drafter that declares
+            `batchesVerifyColumnsAsDecodeRows` (default false) has the paged caches attend the
+            round's columns as decode rows. A drafter that declares `requiresExactAcceptance`
+            (default false) gets no round driver under any other acceptance rule, and the engine
+            names the reason. A request-stateful drafter whose history can change
+            only which tokens are proposed may conform to `CBv2MTPAdvisoryHistoryDrafter`
+            (`requestStateIsAdvisory`, `CBv2MTPAdvisoryHistory.swift`): under exact acceptance
+            the generic paged engine then keeps complete prefix checkpoints with no assistant
+            state (`checkpointsRequireAssistantHistory` is false), and each observation carries
+            its absolute target position (`observeCommittedTarget(_:startingAt:requestState:)`),
+            so a restored request's history starts at the restored boundary. Drafters that do
+            not conform, and typical acceptance, keep the old refusal. A fixed-depth owner may also fix the depth by the
             plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
             request-scoped media fallback
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
@@ -286,6 +342,41 @@ def:
         - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
         - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
+    - title: "Muse Glimmer: Onyx frames and ATEM tool calls"
+      description: |
+        Upstream reads Muse Glimmer output strictly (`OnyxStreamAdapter`, `ATEMToolCallParser`): one invoke
+        for each tool frame, the invoke name equal to the frame's recipient, fail-closed value typing, and
+        nothing from a frame that generation leaves open. Those two files are unchanged and stay the default.
+        `ToolCallPolicy.onyxParsing = .referenceParity` selects the reading that vLLM, SGLang and llama.cpp
+        share. `OnyxReferenceDecoder` reads the frames and `ATEMReferenceScanner` the calls: one call for each
+        complete invoke in order, a doubled tool name `X.X` as the declared tool `X`, values typed by the tool
+        schema (a string keeps its bytes, other values decode as JSON, a value that does not fit goes to the
+        validation policy), no call from an invoke that the token limit cut off, a frame that ends at a bare
+        `to=...<|message|>` header, and output without a frame as content. An undeclared tool is still
+        rejected, and a client schema nested past a fixed depth is read as untyped.
+        `OnyxReferenceStreamAdapter` compares the control tokens as ids, so text that spells a marker cannot
+        open a frame. `OnyxTokenStreamDecoder` and `OnyxTextStreamDecoder` are the public decoders for a host
+        with token ids or with marker-visible text. `ToolCallFormat.infer(from:)` maps `muse_glimmer` to `.atem`.
+        In the server, `ReasoningParserFormat.onyx` splits marker-visible text into reasoning and content, and
+        `MLXModelContainerEngine` reads an `.atem` model's frames from the token ids (`ChannelTokenLoopHandler`)
+        and reports reasoning and content as `.parsed`, because `Generation` has no reasoning event. The
+        engine reads tool frames strictly; its `onyxParsing` option (`--onyx-parsing reference-parity` or
+        `MLX_SERVER_ONYX_PARSING` in the CLI) selects the reference reading. A rejected call or a protocol
+        error has no OpenAI field, so the handler emits nothing for it.
+        The unit tests port the vLLM Muse Glimmer parser cases and its schema value table.
+        `MuseGlimmerOnyxTokenizerLiveTests` (with the Muse Glimmer integration tests) runs the token
+        decoder with the published tokenizer when `MUSE_GLIMMER_NVFP4_DIR` names a snapshot directory;
+        it reads no weights.
+      globs:
+        - "Libraries/MLXLMCommon/Tool/Parsers/ATEMReferenceScanner.swift"
+        - "Libraries/MLXLMCommon/Tool/Parsers/OnyxReference*.swift"
+        - "Libraries/MLXLMCommon/Tool/Parsers/OnyxStreamDecoders.swift"
+        - "Libraries/MLXLMServer/Parsing/StreamingOnyxReasoningParser.swift"
+        - "Libraries/MLXLMServer/Runtime/ChannelTokenLoopHandler.swift"
+        - "Tests/MLXLMTests/Unit/Tool/ATEMReferenceScannerTests.swift"
+        - "Tests/MLXLMTests/Unit/Tool/Onyx*.swift"
+        - "Tests/MLXLMServerTests/Unit/Parsing/OnyxReasoningParserTests.swift"
+        - "Tests/MLXLMServerTests/Kernel/Runtime/OnyxContainerEngineTests.swift"
     - title: "Tool calling and parsers"
       description: |
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
@@ -699,7 +790,9 @@ def:
             (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
             decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
             `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
-            capture. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
+            capture. `rowExactSchedule` defaults to `.standard`, which Super uses; Muse Glimmer's
+            exact windows select `.windows`, which casts each activation once in its own pass and gives
+            each thread two output rows; the order of every row's sums, and so its bytes, stay the same. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
             (`ModelOptNVFP4Weights.calibratedMatmul`) calls `qqmm` on at most 4 rows at a time, so it stays one
             matrix-vector product per row; since 3eb822ca larger bfloat16 calls with global scales take the tiled
             matrix kernel, which sums in another order than the graph's `.rowwise` path.

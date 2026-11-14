@@ -149,11 +149,14 @@ extension EngineLoopV2 {
             return try adopted.moveToActiveRequest { auxiliary in
                 do {
                     if staged.codec.historicalLayout != nil {
-                        guard auxiliary.isEmpty, !(mtp?.tracksPersistentHistory ?? false) else {
+                        guard auxiliary.isEmpty,
+                            !(mtp?.checkpointsRequireAssistantHistory ?? false)
+                        else {
                             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                         }
                         // Gemma's stateless drafter seeds from the next target
-                        // round. No persistent assistant history is fabricated.
+                        // round. No persistent assistant history is fabricated;
+                        // advisory history restarts at its first observation.
                         recurrentCheckpointGeometry[requestID] = .init(
                             position: staged.manifest.position, chunkSize: staged.manifest.chunkSize
                         )

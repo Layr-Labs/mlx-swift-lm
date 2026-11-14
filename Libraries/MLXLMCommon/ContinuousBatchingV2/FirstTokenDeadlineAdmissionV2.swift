@@ -348,6 +348,11 @@ extension SchedulerV2 {
         guard record(for: id) != nil else {
             return .unbounded(reason: .targetMissing)
         }
+        // A grid cell that did not fit holds a first claim on the next step
+        // (`prefillChunkAlignment`); the projection does not model the claim.
+        guard prefillChunkAlignment == nil || deferredBlockRequestID == nil else {
+            return .unbounded(reason: .prefixGeometryBlocked)
+        }
 
         var inFlightByID: [CBv2RequestID: Int] = [:]
         for assignment in inFlightAssignments {
@@ -894,7 +899,7 @@ extension SchedulerV2 {
                 }
             }
 
-            let baseBudget = config.maxBatchedTokensPerStep
+            let baseBudget = max(config.maxBatchedTokensPerStep, prefillChunkAlignment ?? 0)
             let liveRunningIDs = runningIDs.filter { runningID in
                 guard let row = rows[runningID] else { return false }
                 return !row.cancelRequested && row.remainingKnownTokens > 0
@@ -955,8 +960,19 @@ extension SchedulerV2 {
                 return max(0, prefillCap - prefillTokensAssigned)
             }
 
+            /// `plan()`'s grid cell. A row with multimodal blocks reaches
+            /// planning only decode-ready (`multimodalWork` above), where no
+            /// cell exists.
+            func gridCell(for row: CBv2ProjectionRow) -> Int? {
+                Self.prefillGridCell(
+                    alignment: prefillChunkAlignment, start: row.computedTokens,
+                    promptTokens: row.promptTokens, end: row.knownTokens,
+                    plan: row.prefixReusePlan, hasBlocks: false)
+            }
+
             func chunkCap(for rowID: CBv2RequestID) -> Int {
-                rows[rowID]?.prefixReusePlan?.recurrentChunkSize
+                if let row = rows[rowID], let cell = gridCell(for: row) { return cell }
+                return rows[rowID]?.prefixReusePlan?.recurrentChunkSize
                     ?? (soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize)
             }
 
@@ -979,8 +995,14 @@ extension SchedulerV2 {
                 return count
             }
 
-            // RUNNING first, preserving authoritative scheduler order.
-            for runningID in runningIDs where budget > 0 {
+            // RUNNING first, preserving authoritative scheduler order; a
+            // grid plan takes decode rows before prompt rows.
+            let visitOrder =
+                prefillChunkAlignment == nil
+                ? runningIDs
+                : runningIDs.filter { rows[$0]?.remainingKnownTokens == 1 }
+                    + runningIDs.filter { rows[$0]?.remainingKnownTokens != 1 }
+            for runningID in visitOrder where budget > 0 {
                 guard var row = rows[runningID],
                     !row.isPaused,
                     !row.cancelRequested
@@ -995,7 +1017,14 @@ extension SchedulerV2 {
                 }
 
                 var count: Int
-                if isPrefill {
+                if isPrefill, let cell = gridCell(for: row) {
+                    // `plan()` runs the cell whole or defers it to a first
+                    // claim, which this projection does not model.
+                    guard cell <= budget, cell <= prefillHeadroom() else {
+                        return .unbounded(reason: .prefixGeometryBlocked)
+                    }
+                    count = cell
+                } else if isPrefill {
                     count = min(remaining, chunkCap(for: runningID), budget)
                     if prefillCap != nil {
                         let headroom = prefillHeadroom()
@@ -1097,7 +1126,13 @@ extension SchedulerV2 {
                     budget,
                     normalHeadroom,
                     admissionHeadroom)
-                count = prefixClamp(row: &row, proposed: count)
+                if let cell = gridCell(for: row) {
+                    // A cell that does not fit is deferred to a first claim.
+                    guard count >= cell else { return .unbounded(reason: .prefixGeometryBlocked) }
+                    count = cell
+                } else {
+                    count = prefixClamp(row: &row, proposed: count)
+                }
                 if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
                     return .unbounded(reason: .prefixGeometryBlocked)
                 }

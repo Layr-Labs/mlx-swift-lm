@@ -18,6 +18,29 @@ public enum ModelOptRowExact {
     /// in place of MLX's choice; the per-output order is unchanged.
     nonisolated(unsafe) static var geometryOverride: (Int, Int)?
 
+    /// How a product schedules its work. Every schedule gives the same bytes:
+    /// only where the FP8 activation cast runs and how output rows map to
+    /// threads change, never the order of a row's sums.
+    public struct Schedule: Sendable, Equatable {
+        /// The FP8 activation cast runs once per activation as its own pass,
+        /// not inside the product for every weight row a thread reads.
+        public var separateActivationCast: Bool
+        /// Two output rows per thread and one simdgroup per threadgroup,
+        /// which keeps eight accumulator sets in registers.
+        public var twoRowsPerThread: Bool
+
+        public init(separateActivationCast: Bool, twoRowsPerThread: Bool) {
+            self.separateActivationCast = separateActivationCast
+            self.twoRowsPerThread = twoRowsPerThread
+        }
+
+        /// MLX's one-row geometry with the cast inside the product.
+        public static let standard = Schedule(
+            separateActivationCast: false, twoRowsPerThread: false)
+        /// Both switches: the schedule for verify windows of up to 16 rows.
+        public static let windows = Schedule(separateActivationCast: true, twoRowsPerThread: true)
+    }
+
     private static let kernel = MLXFast.metalKernel(
         name: "modelopt_row_exact_gemv",
         inputNames: ["mat", "scale", "in_vec", "act_multipliers", "act_bound"],
@@ -186,17 +209,19 @@ public enum ModelOptRowExact {
     /// `activation` (`multipliers`, `overflowBound` of
     /// `ModelOptActivationKernels.fp8`) applies that exact FP8 activation cast
     /// to `vectors` inside the product instead of in a separate pass.
+    /// `schedule` changes only how the work is laid out.
     static func product(
         _ mat: MLXArray, scale: MLXArray?, vectors: MLXArray, splitsK: Bool,
-        activation: (multipliers: MLXArray, overflowBound: MLXArray)? = nil
+        activation: (multipliers: MLXArray, overflowBound: MLXArray)? = nil,
+        schedule: Schedule = .standard
     ) -> MLXArray {
-        if let activation, !fusedActivation {
+        if let activation, !fusedActivation || schedule.separateActivationCast {
             return product(
                 mat, scale: scale,
                 vectors: ModelOptActivationKernels.fp8(
                     vectors, multipliers: activation.multipliers,
                     overflowBound: activation.overflowBound),
-                splitsK: splitsK)
+                splitsK: splitsK, schedule: schedule)
         }
         // More than 8 accumulator sets per thread spill registers (measured
         // slower than one-row calls at 16); larger batches run in chunks.
@@ -206,7 +231,7 @@ public enum ModelOptRowExact {
                     product(
                         mat, scale: scale,
                         vectors: vectors[$0 ..< min(vectors.dim(0), $0 + rowsPerDispatch)],
-                        splitsK: splitsK, activation: activation)
+                        splitsK: splitsK, activation: activation, schedule: schedule)
                 }, axis: 0)
         }
         let (outputs, inputs) = (mat.dim(0), mat.dim(1))
@@ -217,6 +242,8 @@ public enum ModelOptRowExact {
         // Rows per thread and simdgroups per threadgroup only schedule work.
         if let (rows, simdgroups) = geometryOverride, outputs >= rows {
             (tm, bm) = (rows, splitsK ? 1 : simdgroups)
+        } else if schedule.twoRowsPerThread, outputs >= 2 {
+            (tm, bm) = (2, 1)
         }
         let groups = (outputs + bm * tm - 1) / (bm * tm)
         let unit = MLXArray([Float(1)])
