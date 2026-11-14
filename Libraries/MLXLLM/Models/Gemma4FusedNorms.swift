@@ -185,37 +185,38 @@ enum Gemma4FusedNorms {
               }
 
             """ + squares("hv") + reduce("inv_h") + """
-              for (int i = 0; i < N_READS; i++) {
-                if (full || base + i < axis_size) {
-            \(writes)
-                }
-              }
+                  for (int i = 0; i < N_READS; i++) {
+                    if (full || base + i < axis_size) {
+                \(writes)
+                    }
+                  }
 
-            """
+                """
     }
 
     private static func feedforwardTailSource(experts: Bool, next: Bool) -> String {
         var s = prologue + load("dense", into: "dv")
         if experts {
-            s += squares("dv") + reduce("inv_d") + """
-                  T dn[N_READS];
-                  for (int i = 0; i < N_READS; i++) {
-                    dn[i] = (full || base + i < axis_size) ? wd[base + i] * static_cast<T>(dv[i] * inv_d) : T(0);
-                  }
+            s +=
+                squares("dv") + reduce("inv_d") + """
+                      T dn[N_READS];
+                      for (int i = 0; i < N_READS; i++) {
+                        dn[i] = (full || base + i < axis_size) ? wd[base + i] * static_cast<T>(dv[i] * inv_d) : T(0);
+                      }
 
-                """ + load("experts", into: "ev") + squares("ev") + reduce("inv_e") + """
-                  float sv[N_READS];
-                  for (int i = 0; i < N_READS; i++) {
-                    if (full || base + i < axis_size) {
-                      const T en = we[base + i] * static_cast<T>(ev[i] * inv_e);
-                      const T sum = dn[i] + en;
-                      sv[i] = sum;
-                    } else {
-                      sv[i] = 0;
-                    }
-                  }
+                    """ + load("experts", into: "ev") + squares("ev") + reduce("inv_e") + """
+                      float sv[N_READS];
+                      for (int i = 0; i < N_READS; i++) {
+                        if (full || base + i < axis_size) {
+                          const T en = we[base + i] * static_cast<T>(ev[i] * inv_e);
+                          const T sum = dn[i] + en;
+                          sv[i] = sum;
+                        } else {
+                          sv[i] = 0;
+                        }
+                      }
 
-                """
+                    """
         } else {
             s += """
                   float sv[N_READS];
@@ -223,30 +224,32 @@ enum Gemma4FusedNorms {
 
                 """
         }
-        s += squares("sv") + reduce("inv_s") + """
-              float ov[N_READS];
-              for (int i = 0; i < N_READS; i++) {
-                if (full || base + i < axis_size) {
-                  const T post = wp[base + i] * static_cast<T>(sv[i] * inv_s);
-                  const T sum = res[row + base + i] + post;
-                  const T scaled = sum * ls[0];
-                  out[row + base + i] = scaled;
-                  ov[i] = scaled;
-                } else {
-                  ov[i] = 0;
-                }
-              }
-
-            """
-        if next {
-            s += squares("ov") + reduce("inv_o") + """
+        s +=
+            squares("sv") + reduce("inv_s") + """
+                  float ov[N_READS];
                   for (int i = 0; i < N_READS; i++) {
                     if (full || base + i < axis_size) {
-                      nn[row + base + i] = wn[base + i] * static_cast<T>(ov[i] * inv_o);
+                      const T post = wp[base + i] * static_cast<T>(sv[i] * inv_s);
+                      const T sum = res[row + base + i] + post;
+                      const T scaled = sum * ls[0];
+                      out[row + base + i] = scaled;
+                      ov[i] = scaled;
+                    } else {
+                      ov[i] = 0;
                     }
                   }
 
                 """
+        if next {
+            s +=
+                squares("ov") + reduce("inv_o") + """
+                      for (int i = 0; i < N_READS; i++) {
+                        if (full || base + i < axis_size) {
+                          nn[row + base + i] = wn[base + i] * static_cast<T>(ov[i] * inv_o);
+                        }
+                      }
+
+                    """
         }
         return s
     }

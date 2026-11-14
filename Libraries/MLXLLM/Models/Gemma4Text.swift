@@ -2141,15 +2141,15 @@ public class Gemma4TextModelInner: Module {
             } else {
                 precondition(pendingNormalized == nil, "Gemma4: a fused input norm has no consumer")
                 (out, kvState, positionOffset) = layer.forward(
-                h,
-                mask: mask,
-                cache: fullCache[idx],
-                perLayerInput: perLayerInputs[idx],
-                sharedKV: sharedKV,
-                positionOffset: sharedPositionOffset,
-                v2SharedSource: v2SharedSource,
-                outputTailRows: outputTailRows,
-                useLastQueryPrefill: useLastQueryPrefill,
+                    h,
+                    mask: mask,
+                    cache: fullCache[idx],
+                    perLayerInput: perLayerInputs[idx],
+                    sharedKV: sharedKV,
+                    positionOffset: sharedPositionOffset,
+                    v2SharedSource: v2SharedSource,
+                    outputTailRows: outputTailRows,
+                    useLastQueryPrefill: useLastQueryPrefill,
                     // The retained pair is a CBv2 production-prefill optimization.
                     // Ordinary direct forwards keep the established reduction;
                     // enabling it there regressed the raw-prefill control without
