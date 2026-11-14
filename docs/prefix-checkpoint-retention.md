@@ -89,7 +89,11 @@ next turn of a growing conversation re-prefills that gap. With
 grid). The cut is made only when `latest` falls inside the range and is at least
 the minimum past the range's start, so a short tail stays one ordinary range;
 only for a request that allows a checkpoint, with the prefix cache on, and with
-write demand (no hint, or a hint at or above the minimum). The margin keeps the
+write demand (no hint, or a hint at or above the minimum). Unlike the
+short-prompt partition, it needs no cache scope: an unscoped request (a local
+caller's) is captured and restored under the cache-level salt, so its next turn
+reuses the boundary too. The capture-boundary partition qualifies requests the
+same way. The margin keeps the
 boundary inside the prefix the next turn shares after the template re-renders
 the generation prompt. It composes with the short-prompt partition (computed
 first), and the capture-boundary partition takes precedence. A cut range is

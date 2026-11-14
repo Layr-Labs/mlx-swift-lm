@@ -274,6 +274,7 @@ private struct CBv2ProjectionRow {
     let maxTokens: Int
     let isMultimodal: Bool
     let requestAllowsCheckpoint: Bool
+    let requestAllowsLatestCheckpoint: Bool
     let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
@@ -499,6 +500,7 @@ extension SchedulerV2 {
                 maxTokens: max(0, rec.request.maxTokens),
                 isMultimodal: rec.request.multimodal != nil,
                 requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                requestAllowsLatestCheckpoint: rec.canScheduleDemandedLatestCheckpoint,
                 checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
@@ -970,6 +972,7 @@ extension SchedulerV2 {
                     armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
                     hasPrefixReuse: row.prefixReusePlan != nil,
                     requestAllowsCheckpoint: row.requestAllowsCheckpoint,
+                    requestAllowsLatestCheckpoint: row.requestAllowsLatestCheckpoint,
                     continuation: row.demandedCheckpointContinuation)
                 let count =
                     row.prefixReusePlan?.clampedChunk(

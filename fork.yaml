@@ -149,7 +149,10 @@ def:
             in their identity's scope. Retained demanded fork
             endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
             may opt into one aligned interior range boundary for a scoped, cold short text prompt with
-            repeat demand; scheduling and first-token projection share that bounded geometry.
+            repeat demand; scheduling and first-token projection share that bounded geometry. The
+            end-of-prompt boundary and the capture-boundary partition need no scope: an unscoped
+            (local) request is captured and restored under the cache-level salt, so its ranges end on
+            the same boundaries (`canScheduleDemandedLatestCheckpoint`).
             The retention guide documents actual native frontiers, staged byte ownership and
             tracked retirement; the library README links that checkpoint contract. Packed complete
             layouts persist every coded row and its exact native recent band, including historical
@@ -168,6 +171,7 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
+            - "changelog.d/unscoped-near-end-checkpoint.md"
         - title: "MTP speculative decoding (engine side)"
           description: |
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
