@@ -35,14 +35,18 @@ extension MuseGlimmerTextModel {
 
     /// A prompt chunk that keeps the drafter hidden of every row and projects
     /// vocabulary logits for the last row only: `[B, 1]` for an intermediate
-    /// chunk, `[B, vocab]` at the prompt frontier.
+    /// chunk, `[B, vocab]` at the prompt frontier. Like `cbv2Prefill`, it
+    /// keeps MLX's arithmetic with exact windows on.
     public func prefillWithMTPHidden(
         _ tokens: MLXArray, cache: [KVCache]?, requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, hidden: MLXArray) {
-        let (normed, captured) = hiddenWithMTPCapture(model.inputEmbeddings(tokens), cache: cache)
-        switch requirement {
-        case .evaluationOnly: return (normed[0..., -1, 0 ..< 1], captured)
-        case .lastPositionLogits: return (outputLogits(normed[0..., -1, 0...]), captured)
+        numerics.prompt {
+            let (normed, captured) = hiddenWithMTPCapture(
+                model.inputEmbeddings(tokens), cache: cache)
+            switch requirement {
+            case .evaluationOnly: return (normed[0..., -1, 0 ..< 1], captured)
+            case .lastPositionLogits: return (outputLogits(normed[0..., -1, 0...]), captured)
+            }
         }
     }
 }

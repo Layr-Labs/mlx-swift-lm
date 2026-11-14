@@ -48,9 +48,9 @@ struct MuseGlimmerExactWindowRealTests {
     }
 
     /// An 8-token window (the oracle's own continuation) after each oracle
-    /// prompt equals eight one-row steps in logits and K/V, byte for byte,
-    /// with attention as decode rows (one dispatch per layer) and as the
-    /// column loop.
+    /// prompt, prefilled as the engine prefills, equals eight one-row steps in
+    /// logits and K/V, byte for byte, with attention as decode rows (one
+    /// dispatch per layer) and as the column loop.
     @Test(
         .enabled(if: MuseGlimmerRealArtifact.hasOracle), .timeLimit(.minutes(20)),
         arguments: ["P1", "P2", "P3"])
@@ -64,7 +64,7 @@ struct MuseGlimmerExactWindowRealTests {
                 let paged = try MuseGlimmerExactWindowTests.Paged(
                     model, capacityBytes: 1 << 30, chunk: 1024, segmentBytes: 8 << 20,
                     maximumLength: 8192)
-                try paged.add(prompt.map(Int32.init), extra: width)
+                _ = try paged.addPrompt(prompt.map(Int32.init), extra: width)
                 return paged
             }
             let windowed = try paged()

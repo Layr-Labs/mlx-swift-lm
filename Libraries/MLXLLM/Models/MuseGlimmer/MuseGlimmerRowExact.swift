@@ -4,11 +4,14 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// Exact verify windows for the native tower. With them on, every projection
-// and block norm gives each row the bytes that row gets alone, at any row
-// count, so one forward over a draft window equals the decode steps it
+// Exact verify windows for the native tower. Exactness follows the row's role,
+// not the call's row count. With them on, every projection and block norm of a
+// decode or verify forward gives each row the bytes that row gets alone, at any
+// row count, so one forward over a draft window equals the decode steps it
 // replaces and a decode step's bytes do not depend on how many rows share it.
-// Off by default: the tower then keeps MLX's arithmetic at every row count.
+// Prompt chunks keep MLX's arithmetic: the engine runs each in its own
+// forward, never beside decode rows. Off by default: the tower then keeps
+// MLX's arithmetic everywhere.
 
 /// The tower's numerics switch, shared by every block of one model.
 final class MuseGlimmerNumerics {
@@ -19,10 +22,22 @@ final class MuseGlimmerNumerics {
     static let reductionPieceFrom = 32
 
     var exactWindows = false
+    /// Set while a prompt chunk's graph is built (`prompt(_:)`).
+    private(set) var buildingPrompt = false
 
     static func rows(_ x: MLXArray) -> Int { x.dim(-1) == 0 ? 0 : x.size / x.dim(-1) }
 
-    func isExact(_ x: MLXArray) -> Bool { exactWindows && Self.rows(x) > 0 }
+    /// A decode or verify call of an exact tower, at any row count.
+    func isExact(_ x: MLXArray) -> Bool { exactWindows && !buildingPrompt && Self.rows(x) > 0 }
+
+    /// `body` built as a prompt chunk: its projections and norms keep MLX's
+    /// arithmetic, exact windows on or off.
+    func prompt<T>(_ body: () throws -> T) rethrows -> T {
+        let outer = buildingPrompt
+        buildingPrompt = true
+        defer { buildingPrompt = outer }
+        return try body()
+    }
 
     /// `layer(x)`, through the row-exact product on an exact call.
     func project(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
@@ -118,15 +133,18 @@ public enum MuseGlimmerRowExactError: Error, Equatable {
 }
 
 extension MuseGlimmerTextModel {
-    /// Whether every call is row-exact: each row's projections and norms
-    /// are those of the one-row call, whatever the row count.
+    /// Whether decode and verify rows are row-exact: each row's projections
+    /// and norms are those of the one-row call, whatever the row count.
+    /// Prompt chunks keep MLX's arithmetic either way.
     public var verifiesWindowsExactly: Bool { numerics.exactWindows }
 
     /// A name for the numerics, for the checkpoint numerics fingerprint:
-    /// decode and prefill bytes change when exact windows are on. `v1`
-    /// left calls above 64 rows to MLX's kernels; `v2` runs them in pieces.
+    /// decode bytes change when exact windows are on. `v1` ran every call of
+    /// up to 64 rows exact, prompt chunks included; `v2` ran every call
+    /// exact; `v3` runs decode and verify rows exact and prompt chunks as MLX
+    /// does.
     public var numericsProfile: String {
-        numerics.exactWindows ? "muse-glimmer-exact-windows-v2" : "mlx"
+        numerics.exactWindows ? "muse-glimmer-exact-windows-v3" : "mlx"
     }
 
     /// The model path and layer of every projection slot.

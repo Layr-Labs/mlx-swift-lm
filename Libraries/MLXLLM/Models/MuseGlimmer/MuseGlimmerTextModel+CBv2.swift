@@ -45,16 +45,19 @@ extension MuseGlimmerTextModel: CBv2ModelCapabilityProviding {
 // MARK: - Prompt output
 
 /// A prompt chunk runs the whole trunk and writes every layer's K/V; only the
-/// vocabulary projection of rows nothing reads is left out.
+/// vocabulary projection of rows nothing reads is left out. It keeps MLX's
+/// arithmetic with exact windows on too.
 extension MuseGlimmerTextModel: CBv2LanguageModelPrefillForwardable {
     public func cbv2Prefill(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
-        let hidden = model(inputEmbedding ?? model.inputEmbeddings(inputs), cache: cache)
-        switch requirement {
-        case .evaluationOnly: return hidden[0..., -1, 0 ..< 1]
-        case .lastPositionLogits: return outputLogits(hidden[0..., -1, 0...])
+        numerics.prompt {
+            let hidden = model(inputEmbedding ?? model.inputEmbeddings(inputs), cache: cache)
+            switch requirement {
+            case .evaluationOnly: return hidden[0..., -1, 0 ..< 1]
+            case .lastPositionLogits: return outputLogits(hidden[0..., -1, 0...])
+            }
         }
     }
     // Packed prefill keeps the protocol's fail-closed default.

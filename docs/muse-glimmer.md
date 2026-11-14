@@ -111,10 +111,24 @@ tower without exact windows throws `MuseGlimmerDFlashError.target`.
 
 ## Exact verify windows
 
-`setRowExactWindows(true)` makes the projections and block norms of every call, at any row
-count, give each row the bytes it gets alone. One forward over a draft window (up to 8 requests
-of 1 + 7 tokens) then equals the decode steps it replaces, in logits and in the K/V written, and
-a decode step's bytes do not depend on how many requests share it.
+With `setRowExactWindows(true)`, exactness follows the row's role, not the call's row count:
+
+- Decode and verify rows are exact at any row count and any number of requests. The projections
+  and block norms give each row the bytes it gets alone. One forward over a draft window (up to
+  8 requests of 1 + 7 tokens) then equals the decode steps it replaces, in logits and in the K/V
+  written, and a decode step's bytes do not depend on how many requests share it.
+- Prompt chunks keep MLX's arithmetic, the same bytes as with the switch off. The two prompt
+  entry points, `cbv2Prefill` and `prefillWithMTPHidden`, build their graph as a prompt; the
+  drafter on and off therefore prefill alike, and prefill keeps MLX's matrix kernels.
+- A prompt's bytes depend on how it is cut into chunks. The engine cuts it at the solo stripe or
+  the plain chunk size, so a restore from a checkpoint at a chunk edge equals the cold run. Under
+  load the step's token budget can cut a chunk shorter, and those prompt bytes can then differ.
+- The engine never puts prompt chunks and decode or verify rows in one forward: each prompt chunk
+  runs alone, and packed prefill is off for this model. A one-token final prompt chunk is
+  scheduled as a decode row; it runs in the decode batch, exact.
+- The eager iterator has no prompt role: with the switch on, its prompt chunks run exact.
+
+How the exact rows are computed:
 
 - Projections: weight-only NVFP4 through `ModelOptWeightOnlyNVFP4RowExact`, FP8 through
   `rowExactForward` with the window schedule, BF16 through `ModelOptRowExact.matmul`. They run
@@ -122,10 +136,8 @@ a decode step's bytes do not depend on how many requests share it.
   bytes differ from the plain tower; BF16 and FP8 decode bytes do not.
 - Block norms: from 32 rows MLX's row reduction takes another kernel, so exact calls of 32 or
   more rows reduce in pieces of 16.
-- Calls above 64 rows (a decode step of more than 64 requests, a prompt chunk) take the same
-  pieces. Prompt chunks therefore read every projection's weights once per 16 rows, so prefill
-  is slower with exact windows on. `numericsProfile` is `muse-glimmer-exact-windows-v2`; `v1`
-  left calls above 64 rows to MLX's kernels.
+- `numericsProfile` is `muse-glimmer-exact-windows-v3`. `v1` ran every call of up to 64 rows
+  exact, prompt chunks included, and left larger calls to MLX; `v2` ran every call exact.
 - Attention, RoPE, the gate and the softcap already compute each row alone. Under
   `withMTPRectangularVerification` the paged cache runs attention once per query column, or,
   when the drafter asks for it (`Settings.verifying` does), once per layer for the whole round:
@@ -154,7 +166,9 @@ attention per column and as decode rows. `PagedColumnsAsDecodeRowsTests` check t
 attention alone at the production head shape: 1 to 16 requests, rounds of 1 to 8 columns,
 prompts across the 2,048-token window and the ring wrap, and rolled-back columns.
 `MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
-output equals the target alone, greedy and sampled, cold and restored, one or two requests.
+output equals the target alone, greedy and sampled, cold and restored, one or two requests, and
+a request's decode and verify rows keep their bytes while another request's prompt is prefilled
+beside them.
 
 Real checkpoint and oracle (skipped unless the variables are set):
 

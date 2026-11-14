@@ -104,6 +104,34 @@ struct MuseGlimmerDFlashExactVerifyTests {
         return result.tokens
     }
 
+    /// Tokens, the bit patterns of each token's logprob and top logprobs, and usage.
+    private struct Collected {
+        var tokens: [Int] = []
+        var logprobs: [[UInt32]] = []
+        var usage: CBv2Usage?
+    }
+
+    private func collect(_ stream: AsyncStream<CBv2Event>) async -> Collected {
+        var collected = Collected()
+        for await event in stream {
+            switch event {
+            case .delta(_, let tokens, let logprobs):
+                collected.tokens += tokens
+                for entry in logprobs ?? [] {
+                    let top = entry.topLogprobs.flatMap {
+                        [UInt32($0.token), $0.logprob.bitPattern]
+                    }
+                    collected.logprobs.append(
+                        [UInt32(entry.token), entry.logprob.bitPattern] + top)
+                }
+            case .finished(_, let usage):
+                collected.usage = usage
+                return collected
+            }
+        }
+        return collected
+    }
+
     /// Every verification was one rectangular forward. `rounds` counts
     /// request rounds; one forward verifies the rounds of every row it holds.
     @discardableResult
@@ -196,6 +224,58 @@ struct MuseGlimmerDFlashExactVerifyTests {
                 let metrics = try expectRectangular(engine)
                 #expect(metrics.rectangularVerificationRounds < metrics.rounds)
                 #expect(decodeRowCalls(caches) > 0)
+                await engine.shutdown()
+                #expect(backend.bytesReserved == 0)
+            }
+        }
+    }
+
+    /// A request's decode and verify rows keep their bytes while another
+    /// request's prompt is prefilled beside them and then decodes with them:
+    /// the engine runs each prompt chunk in its own forward (packed prefill is
+    /// off), and decode and verify rows are exact at any row count. Drafter
+    /// off, the logprobs match bit for bit; on, the tokens match.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func decodeAndVerifyRowsKeepTheirBytesBesidePromptChunks(dtype: DType) async throws {
+        let m = try target(dtype)
+        let first = prompt(21, salt: 8)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let (soloEngine, _, _) = try engine(m, drafter: nil)
+        let solo = await collect(try soloEngine.submit(request(first, logged)))
+        await soloEngine.shutdown()
+        #expect(solo.tokens.count == Self.maxTokens && solo.logprobs.count == Self.maxTokens)
+        let greedyTokens = try await plain(m, request(first, Self.greedy))
+        let sampledTokens = try await plain(m, request(first, Self.sampled))
+        #expect(solo.tokens == greedyTokens)
+
+        for length in [3 * Self.chunk + 1, 5 * Self.chunk + 17] {
+            let second = prompt(length, salt: 9)
+            for sampling in [logged, Self.greedy, Self.sampled] {
+                let expected = sampling.temperature == 0 ? greedyTokens : sampledTokens
+                let speculator: (any CBv2MTPDrafter)? =
+                    sampling.topLogprobs > 0
+                    ? nil
+                    : Scripted(
+                        try drafter(m), mode: .wrong(at: 2), scripts: [first + expected],
+                        vocabulary: 96)
+                let (engine, backend, _) = try engine(m, drafter: speculator)
+                let a = try engine.submit(request(first, sampling, id: 1))
+                let b = try engine.submit(request(second, Self.greedy, id: 2))
+                async let ra = collect(a)
+                async let rb = collect(b)
+                let (x, y) = await (ra, rb)
+                let label = "\(length) \(sampling.temperature) \(sampling.topLogprobs)"
+                if speculator == nil {
+                    #expect(x.tokens == solo.tokens && x.logprobs == solo.logprobs, "\(label)")
+                } else {
+                    #expect(x.tokens == expected, "\(label)")
+                    try expectRectangular(engine)
+                }
+                // The first request decoded while the second was prefilling.
+                let (at, bt) = (try #require(x.usage).timing, try #require(y.usage).timing)
+                #expect(at.firstTokenNanos < bt.promptComputedNanos, "\(label)")
+                #expect(bt.prefillChunks >= 3 && bt.packedPrefillChunks == 0, "\(label)")
+                #expect(y.tokens.count == Self.maxTokens, "\(label)")
                 await engine.shutdown()
                 #expect(backend.bytesReserved == 0)
             }

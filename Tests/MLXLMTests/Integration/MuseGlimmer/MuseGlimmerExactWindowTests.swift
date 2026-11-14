@@ -10,7 +10,8 @@ import Testing
 
 /// Exact verify windows on tiny towers with the production attention shape:
 /// one `[B, W]` forward on the paged caches gives every row the logits and
-/// K/V bytes of the one-row decode steps it replaces.
+/// K/V bytes of the one-row decode steps it replaces, and prompt chunks keep
+/// MLX's arithmetic.
 @Suite(.serialized, .tags(.integration))
 struct MuseGlimmerExactWindowTests {
     /// Large enough that MLX's kernels give a window other bytes than steps.
@@ -90,6 +91,35 @@ struct MuseGlimmerExactWindowTests {
             for start in stride(from: 0, to: prompt.count, by: chunk) {
                 let piece = Array(prompt[start ..< min(prompt.count, start + chunk)])
                 _ = forward([piece], rectangular: false)
+            }
+        }
+
+        /// A new row prefilled through a prompt entry point, as the engine
+        /// prefills: `cbv2Prefill`, or `prefillWithMTPHidden` with `mtp`.
+        /// Returns each chunk's last-row logits, then its drafter hidden.
+        func addPrompt(_ prompt: [Int32], extra: Int, mtp: Bool = false) throws -> [MLXArray] {
+            let state = try backend.makeSequenceState(
+                layerKinds: model.cbv2LayerKinds, promptLength: prompt.count,
+                maxLength: prompt.count + extra)
+            states.append(state)
+            select([states.count - 1])
+            return stride(from: 0, to: prompt.count, by: chunk).flatMap { start -> [MLXArray] in
+                let piece = Array(prompt[start ..< min(prompt.count, start + chunk)])
+                let input = MLXArray(piece).reshaped(1, -1)
+                let outputs: [MLXArray]
+                if mtp {
+                    let result = model.prefillWithMTPHidden(
+                        input, cache: caches, requirement: .lastPositionLogits)
+                    outputs = [result.logits, result.hidden]
+                } else {
+                    outputs = [
+                        model.cbv2Prefill(
+                            input, inputEmbedding: nil, cache: caches,
+                            requirement: .lastPositionLogits)
+                    ]
+                }
+                eval(outputs + caches.flatMap { $0.innerState() })
+                return outputs
             }
         }
 
@@ -272,10 +302,11 @@ struct MuseGlimmerExactWindowTests {
         }
     }
 
-    /// Prefill-sized calls take the pieces too: every projection of the tower
-    /// gives each of 65, 99 and 200 rows the bytes of its one-row call.
+    /// Decode and verify calls above 64 rows take the pieces too: every
+    /// projection of the tower gives each of 65, 99 and 200 rows the bytes of
+    /// its one-row call.
     @Test(arguments: [DType.bfloat16, .float32])
-    func everyProjectionIsRowExactAtPrefillSizes(dtype: DType) throws {
+    func everyProjectionIsRowExactAbove64Rows(dtype: DType) throws {
         let m = try Self.exact(Self.mixed(dtype: dtype))
         for (index, (path, layer)) in m.projectionSlots.enumerated() {
             let projection = try #require(layer as? any UnaryLayer, "\(path)")
@@ -299,6 +330,43 @@ struct MuseGlimmerExactWindowTests {
         }
     }
 
+    // MARK: Prompt chunks
+
+    /// Prompt chunks keep MLX's arithmetic with exact windows on: through
+    /// either prompt entry point, at every chunk size, the K/V, last-row
+    /// logits and drafter hidden equal the plain tower's. The same chunks as
+    /// decode or verify rows (`callAsFunction`) take the exact pieces, which
+    /// in float32 write other K/V bytes.
+    @Test(arguments: [DType.bfloat16, .float32])
+    func promptChunksKeepMLXArithmetic(dtype: DType) throws {
+        let m = try Self.mixed(dtype: dtype)
+        m.mtpHiddenLayerIDs = [1, 3]
+        let prompt = MuseGlimmerFixture.tokens(200, vocabulary: 96, salt: 12)
+        for chunk in [1, 7, 16, 33, 64, 65, 200] {
+            try m.setRowExactWindows(false)
+            let plain = try Paged(m, chunk: chunk)
+            let expected = try plain.addPrompt(prompt, extra: 1, mtp: true)
+            try m.setRowExactWindows(true)
+            let exact = try Paged(m, chunk: chunk)
+            let logits = try exact.addPrompt(prompt, extra: 1)
+            let withHidden = try exact.addPrompt(prompt, extra: 1, mtp: true)
+            #expect(exact.kv(0) == plain.kv(0) && exact.kv(1) == plain.kv(0), "chunk \(chunk)")
+            let expectedLogits = stride(from: 0, to: expected.count, by: 2).map { expected[$0] }
+            #expect(
+                zip(logits, expectedLogits).allSatisfy { MuseGlimmerFixture.sameBits($0, $1) }
+                    && logits.count == expectedLogits.count, "chunk \(chunk)")
+            #expect(
+                zip(withHidden, expected).allSatisfy { MuseGlimmerFixture.sameBits($0, $1) }
+                    && withHidden.count == expected.count, "chunk \(chunk)")
+            if dtype == .float32 && chunk > 16 {
+                let asRows = try Paged(m, chunk: chunk)
+                try asRows.add(prompt, extra: 1)
+                #expect(asRows.kv(0) != plain.kv(0), "chunk \(chunk)")
+            }
+            #expect(m.verifiesWindowsExactly && !m.numerics.buildingPrompt)
+        }
+    }
+
     // MARK: The switch
 
     /// Off by default; MLX's kernels then give a float32 window other bytes
@@ -312,7 +380,7 @@ struct MuseGlimmerExactWindowTests {
         #expect(try !Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(true)
         #expect(m.verifiesWindowsExactly && m.dflashVerifiesWindowsExactly)
-        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v2")
+        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v3")
         #expect(try Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(false)
         #expect(!m.verifiesWindowsExactly)
@@ -321,31 +389,31 @@ struct MuseGlimmerExactWindowTests {
         }
     }
 
-    /// BF16 and FP8 decode steps keep their bytes with exact windows on:
-    /// from the same cache, a one-row step of the exact tower equals the
-    /// plain tower's. Both towers prefill with the switch off, because an
-    /// exact 99-row prefill takes the row-exact pieces and writes other K/V
-    /// bytes (tested above).
+    /// BF16 and FP8 decode steps keep their bytes with exact windows on: a
+    /// tower prefilled and stepped with the switch on equals the plain tower,
+    /// in the prompt chunk's K/V and logits and in each one-row step.
     @Test(arguments: [false, true])
     func decodeBytesDoNotMoveForBF16AndFP8(fp8: Bool) throws {
-        func run(exactDecode: Bool) throws -> (prefill: MLXArray, steps: [MLXArray]) {
+        func run(exact: Bool) throws -> (prefill: [MLXArray], kv: [Data], steps: [MLXArray]) {
             let m = fp8 ? try Self.mixed(order: [.fp8, .dense], head: .dense) : try Self.dense()
-            let paged = try Paged(m)
-            let prompt = MuseGlimmerFixture.tokens(100, vocabulary: 96, salt: 5)
-            try paged.add(Array(prompt.prefix(1)), extra: 140)
-            let prefill = paged.forward([Array(prompt.dropFirst())], rectangular: false)
-            if exactDecode {
+            if exact {
                 _ = try Self.exact(m)
                 #expect(m.verifiesWindowsExactly)
             }
+            let paged = try Paged(m)
+            let prompt = MuseGlimmerFixture.tokens(100, vocabulary: 96, salt: 5)
+            let prefill = try paged.addPrompt(prompt, extra: 140)
+            let kv = paged.kv(0)
             let steps = MuseGlimmerFixture.tokens(24, vocabulary: 96, salt: 6).map {
                 paged.forward([[$0]], rectangular: false)
             }
-            return (prefill, steps)
+            return (prefill, kv, steps)
         }
-        let plain = try run(exactDecode: false)
-        let exact = try run(exactDecode: true)
-        #expect(MuseGlimmerFixture.sameBits(plain.prefill, exact.prefill))
+        let plain = try run(exact: false)
+        let exact = try run(exact: true)
+        #expect(plain.prefill.count == 1 && exact.prefill.count == 1)
+        #expect(MuseGlimmerFixture.sameBits(plain.prefill[0], exact.prefill[0]))
+        #expect(plain.kv == exact.kv)
         #expect(plain.steps.count == 24 && exact.steps.count == 24)
         #expect(zip(plain.steps, exact.steps).allSatisfy { MuseGlimmerFixture.sameBits($0, $1) })
     }

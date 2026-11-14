@@ -90,6 +90,10 @@ struct MuseGlimmerCBv2Tests {
         let adapter = CBv2SteppableLanguageModelAdapter(m)
         #expect(adapter.cbv2Capabilities == capabilities && !adapter.supportsPackedPrefill)
         #expect(adapter.decodeCommandBufferLimits == MuseGlimmerDecodeCommandBuffers.limits)
+        // No prompt chunk shares a forward with decode or verify rows (exact
+        // windows depend on it): neither adapter packs prompt chunks.
+        let drafting: AnyObject = MuseGlimmerCBv2Adapter(m)
+        #expect(!(drafting is any CBv2PackedPrefillSteppableModel))
     }
 
     @Test func nonPagedAndUnprobedBackendsAreRefused() throws {
