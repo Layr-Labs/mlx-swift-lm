@@ -14,9 +14,8 @@ name: Fork Tests
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
 #
-# The macOS jobs run on a Darkbloom Sandbox when the route job gets one from
-# the Darkbloom plane, else on the GitHub-hosted xcode-27 image. Push and
-# manual runs save caches that later jobs on the same runner service restore.
+# Compute jobs queue directly for a Darkbloom Sandbox, one job at a time.
+# Push and manual runs save caches when the sandbox provides its own cache.
 # Seven audio decoder tests temporarily stay hosted after the unchanged base
 # reproduced strict PCM-bit failures on native macOS. Their assertions remain intact.
 
@@ -68,24 +67,10 @@ jobs:
             "$shards" "$(jq -r '.[0]' <<< "$audio_shards")" \
             "$(jq 'length + 3' <<< "$shards")" >> "$GITHUB_OUTPUT"
 
-  # The native macOS jobs share one lane, granted whole or not at all.
-  # The hosted audio exception reconstructs the build's absolute workspace
-  # and requires the same Xcode path before unpacking its products.
-  route:
-    name: Route Fork Tests
-    needs: plan
-    uses: ./.github/workflows/darkbloom-route.yml
-    permissions: {}
-    with:
-      lanes: |
-        fork-tests macos_arm64 xcode-27 ${{ needs.plan.outputs.macos-jobs }}
-        shard-list linux_arm64 ubuntu-latest
-        shard-verify linux_arm64 ubuntu-latest
-
   build:
     name: Build
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    needs: plan
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
     permissions:
       contents: read
     timeout-minutes: 90
@@ -280,8 +265,8 @@ jobs:
 
   metallib:
     name: Metal library
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    needs: plan
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
     permissions:
       contents: read
     timeout-minutes: 30
@@ -363,8 +348,8 @@ jobs:
 
   list:
     name: Check the shard map
-    needs: [build, route]
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-list'] }}
+    needs: build
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -383,8 +368,8 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, route, build, metallib]
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    needs: [plan, build, metallib]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
     permissions:
       contents: read
     timeout-minutes: 45
@@ -615,9 +600,9 @@ jobs:
 
   verify:
     name: Each test ran once
-    needs: [list, test, audio, route]
+    needs: [list, test, audio]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['shard-verify'] }}
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -655,11 +640,11 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [route, build, test, audio]
+    needs: [build, test, audio]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['fork-tests'] }}
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
     permissions:
       contents: read
     timeout-minutes: 30
