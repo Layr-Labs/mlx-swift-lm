@@ -6,7 +6,8 @@ paged KV. Upstream's `MuseGlimmer` in MLXVLM is unchanged and still loads the ML
 checkpoint through the generic factory. The native tower is not registered in a factory: a host
 stages it with `MuseGlimmerInstallation`.
 
-Status: text only. Vision, the block drafter and row-exact batched decode are not part of it yet.
+Status: text only; vision is not wired. The DFlash block drafter and exact verify windows are
+part of it (sections below).
 
 ## Architecture
 
@@ -97,6 +98,8 @@ against the pin. `MuseGlimmerDFlashDrafter` is a request-stateful CBv2 drafter:
   sampled, so the drafter changes speed and never the output.
 - The ring is advisory: it is not part of a prefix checkpoint, and after a restore it starts at
   the first observed position.
+- A drafter refusal (an observation, draft step or finalize it cannot complete) ends the
+  request with an error instead of continuing target-only: it fails closed.
 
 `Settings.verifying(target, maximumSpeculativeRows:)` picks the verification. On a tower with
 exact windows it is `rectangularExact` with per-row commits, and more than one request may share
