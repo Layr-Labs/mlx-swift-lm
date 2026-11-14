@@ -2088,8 +2088,12 @@ public class Gemma4TextModelInner: Module {
         // Fused norm chains (`Gemma4FusedNorms`): a layer's tail also writes
         // the next layer's input norm (or the final norm) when that consumer
         // takes it, so it is not a launch of its own.
+        // A caller's compiled step (compilable caches) keeps the unfused ops.
+        let compiledStep = fullCache.contains {
+            $0 is CompilableKVCache || $0 is CompilableRotatingKVCache
+        }
         let fusedLayers = layers.indices.map {
-            layers[$0].supportsFusedNorms(h, outputTailRows: outputTailRows($0))
+            !compiledStep && layers[$0].supportsFusedNorms(h, outputTailRows: outputTailRows($0))
         }
         let finalNormFuses =
             type(of: norm) == RMSNorm.self && norm.weight.dtype == h.dtype
