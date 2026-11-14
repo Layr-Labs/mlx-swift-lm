@@ -143,7 +143,7 @@ extension MuseGlimmerTextModel {
     /// Turns exact windows on or off for the whole tower. Every projection must
     /// have a row-exact product for the activation dtype; otherwise this throws
     /// and leaves the tower as it was. On, FP8 products take the window schedule
-    /// (the same bytes, fewer passes). Set before serving; not while a forward
+    /// (the same bytes, scheduled for windows). Set before serving; not while a forward
     /// is being built.
     public func setRowExactWindows(_ enabled: Bool) throws {
         let dtype = activationDType

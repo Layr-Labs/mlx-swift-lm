@@ -69,12 +69,20 @@ def:
         `MuseGlimmerInstallation` loads NVIDIA's ModelOpt checkpoint from SHA-256-pinned shards:
         calibrated FP8 projections with saturating activation overflow, weight-only NVFP4
         projections (`ModelOptWeightOnlyNVFP4Linear` in `MLXLMCommon/Quantization`) and BF16
-        ones, with typed refusals for missing, extra or misshapen tensors. The target side of
-        block drafting (captured residuals, raw embeddings, the head, `MuseGlimmerCBv2Adapter`)
-        is present; the drafter is not. Vision is not wired and the type is not registered in a
-        factory. Tests use tiny synthetic models, except `MuseGlimmerRealArtifactTests`, which
-        run against the real checkpoint and an independent oracle only when
-        `MUSE_GLIMMER_NVFP4_DIR` and `MUSE_GLIMMER_ORACLE_DIR` are set.
+        ones, with typed refusals for missing, extra or misshapen tensors. `DFlash/` holds the
+        published block drafter (`MuseGlimmerDFlashDrafter`, a request-stateful advisory-history
+        CBv2 drafter): hash-pinned loading of the BF16 artifact and of its quantized form, a
+        bounded context ring, seven drafts per round from the target's own head, exact
+        acceptance. `setRowExactWindows(true)` gives every call of 1 to 64 rows the bytes of
+        one-row calls (row-exact weight-only NVFP4, FP8 and BF16 products in pieces of 16 rows,
+        block norms below MLX's row-reduction switch), so the engine verifies a round in one
+        `rectangularExact` forward; off by default, so the BF16 tower keeps upstream's arithmetic.
+        The shared pieces are additive in `MLXLMCommon/Quantization`:
+        `ModelOptWeightOnlyNVFP4RowExact` and `ModelOptRowExact.Schedule` (default `.standard`).
+        Vision is not wired and the type is not registered in a factory. Tests use tiny synthetic
+        models, except the `*Real*` suites, which run against the real checkpoint, the pinned
+        drafter and an independent oracle only when `MUSE_GLIMMER_NVFP4_DIR`,
+        `MUSE_GLIMMER_ORACLE_DIR` and the drafter directories are set.
       globs:
         - "Libraries/MLXLLM/Models/MuseGlimmer/**"
         - "Tests/MLXLMTests/Integration/MuseGlimmer/**"
@@ -732,7 +740,9 @@ def:
             (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
             decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
             `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
-            capture. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
+            capture. `rowExactSchedule` defaults to `.standard`, which Super uses; Muse Glimmer's
+            exact windows select `.windows`, which casts each activation once in its own pass and gives
+            each thread two output rows; the order of every row's sums, and so its bytes, stay the same. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
             (`ModelOptNVFP4Weights.calibratedMatmul`) calls `qqmm` on at most 4 rows at a time, so it stays one
             matrix-vector product per row; since 3eb822ca larger bfloat16 calls with global scales take the tiled
             matrix kernel, which sums in another order than the graph's `.rowwise` path.

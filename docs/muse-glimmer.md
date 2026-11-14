@@ -82,14 +82,62 @@ plain logits and those residuals concatenated on the last axis; the prefill vari
 hidden of every prompt row and project logits for the last row only. `rawTokenEmbeddings` skips
 `embed_norm`; `headProduct` is `lm_head` alone.
 
+## DFlash block drafter
+
+`DFlash/` holds the published drafter for this tower. `MuseGlimmerDFlashDraftModel.load` reads
+the BF16 artifact (`MuseGlimmerDFlashArtifactPin.museGlimmer30BBF16`) or its quantized form
+(`.museGlimmer30BQuantized`: 5-bit MLP, 8-bit elsewhere) and checks the SHA-256 of both files
+against the pin. `MuseGlimmerDFlashDrafter` is a request-stateful CBv2 drafter:
+
+- Each request holds the drafter keys and values of its last `sliding_window` committed target
+  positions in a fixed ring, charged once at admission.
+- One block forward per round proposes up to 7 tokens (decision D6) with the target's own
+  `headProduct` and argmax.
+- The engine keeps a proposal only when it equals the token the target chose, greedy or
+  sampled, so the drafter changes speed and never the output.
+- The ring is advisory: it is not part of a prefix checkpoint, and after a restore it starts at
+  the first observed position.
+
+`Settings.verifying(target, maximumSpeculativeRows:)` picks the verification. On a tower with
+exact windows it is `rectangularExact` with per-row commits, and more than one request may share
+a round. Otherwise it is serial, one request at a time. Asking for `rectangularExact` on a
+tower without exact windows throws `MuseGlimmerDFlashError.target`.
+
+## Exact verify windows
+
+`setRowExactWindows(true)` makes every call of 1 to 64 rows (8 requests of 1 + 7 tokens) give
+each row the bytes it gets alone, so one forward over a draft window equals the decode steps it
+replaces, in logits and in the K/V written.
+
+- Projections: weight-only NVFP4 through `ModelOptWeightOnlyNVFP4RowExact`, FP8 through
+  `rowExactForward` with the window schedule, BF16 through `ModelOptRowExact.matmul`. They run
+  in pieces of 16 rows. A one-row NVFP4 step also takes the row-exact kernel, so NVFP4 decode
+  bytes differ from the plain tower; BF16 and FP8 decode bytes do not.
+- Block norms: from 32 rows MLX's row reduction takes another kernel, so exact calls of 32 or
+  more rows reduce in pieces of 16.
+- Attention, RoPE, the gate and the softcap already compute each row alone. Under
+  `withMTPRectangularVerification` the paged cache runs attention once per query column.
+- Above 64 rows (prefill) MLX's kernels run unchanged.
+
+The switch is off by default, so the BF16 tower keeps upstream's arithmetic. It checks every
+projection first and throws `MuseGlimmerRowExactError.unsupportedProjection` without changing
+anything if one has no row-exact product. The installer does not set it: call it after staging
+and before serving, and add `numericsProfile` to the checkpoint numerics fingerprint, because
+decode bytes change with it.
+
 ## Tests
 
 Tiny synthetic models, no weights:
 
 ```bash
 swift test --build-system native --skip-build \
-  --filter 'MuseGlimmer|ModelOptWeightOnlyNVFP4'
+  --filter 'MuseGlimmer|ModelOptWeightOnlyNVFP4|ModelOptRowExact'
 ```
+
+`MuseGlimmerExactWindowTests` compare windows of 1 to 8 tokens, and 2 to 8 requests at once,
+with one-row steps in BF16 and float32, across the sliding window edge and the ring wrap.
+`MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
+output equals the target alone, greedy and sampled, cold and restored, one or two requests.
 
 Real checkpoint and oracle (skipped unless the variables are set):
 
@@ -98,6 +146,12 @@ MUSE_GLIMMER_NVFP4_DIR=<snapshot directory> \
 MUSE_GLIMMER_ORACLE_DIR=<directory of oracle .npz fixtures> \
 swift test --build-system native --skip-build --filter MuseGlimmerRealArtifactTests
 ```
+
+With `MUSE_GLIMMER_DFLASH_QUANTIZED_DIR` (the quantized drafter) also set,
+`MuseGlimmerExactWindowRealTests` check 8- and 3-token windows against steps on the oracle
+prompts, and greedy and sampled output with the drafter against output without it.
+`MuseGlimmerDFlashRealArtifactTests` check the drafter itself against the oracle and its traces
+(`MUSE_GLIMMER_ASSISTANT_DIR`, `MUSE_GLIMMER_DFLASH_TRACE_DIR`).
 
 The oracle is an independent float32 implementation. The FP8 layers round activations to an
 8-bit grid, so a last-bit difference near a rounding boundary becomes a visible step: the
@@ -111,6 +165,6 @@ require the oracle's greedy tokens wherever its top-1 margin is not a near-tie.
 
 - Vision: upstream's vision classes are private, so loading into them needs a small addition to
   the upstream file.
-- The drafter, and complete checkpoints while a persistent-history drafter is active.
-- Row-exact batched decode for more than one row, and rectangular verify windows.
+- Exact windows set by the installer, and the numerics profile in the checkpoint fingerprint.
+- Attention over a whole verify window in one dispatch: it runs once per query column now.
 - A measured prefill activation bound, load residency accounting and factory registration.
