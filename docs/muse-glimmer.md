@@ -163,6 +163,13 @@ anything if one has no row-exact product. The installer does not set it: call it
 and before serving, and add `numericsProfile` to the checkpoint numerics fingerprint, because
 decode bytes change with it.
 
+Turning the switch on also compiles the verify windows' kernels. MLX compiles a custom kernel
+once for each set of template values, the row count among them, at its first dispatch, so the
+first window of each width would otherwise compile while it is served. `setRowExactWindows(true)`
+runs the row-exact product of each distinct projection shape once at 1 to 8 rows on zero
+activations and drops the results. It changes no weight, cache or numerics state, so no bytes.
+`DARKBLOOM_MUSE_GLIMMER_ROW_EXACT_WARMUP=0` turns it off.
+
 ## Tests
 
 Tiny synthetic models, no weights:
@@ -184,7 +191,9 @@ beside them. A request's prompt K/V bytes and output are the same alone, beside 
 request's decode, and beside it with the drafter on, and a restore under load equals the cold
 run. `CBv2PrefillChunkGridTests` check the grid in the scheduler alone: the cuts, whole cells
 under a tight budget and quota, the fairness bound, the projection, and that other models keep
-their cuts.
+their cuts. `MuseGlimmerRowExactWarmupTests` check that the warm-up compiles every row-exact
+kernel a window of 1 to 8 tokens, a decode step and a batch of 8 rows dispatch, that logits and
+K/V are the same with it on and off, and the environment switch.
 
 Real checkpoint and oracle (skipped unless the variables are set):
 

@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -81,6 +82,15 @@ protocol MuseGlimmerRowExactProjection: UnaryLayer {
     func supportsRowExactWindows(dtype: DType) -> Bool
     /// 1 to 16 rows; each row equals the one-row call.
     func rowExactProduct(_ x: MLXArray) -> MLXArray
+    /// What selects the product's kernels besides the row count and the
+    /// activation dtype: slots with one shape share every kernel.
+    var rowExactShape: MuseGlimmerProjectionShape { get }
+}
+
+struct MuseGlimmerProjectionShape: Hashable {
+    let format: String
+    let inputs: Int
+    let outputs: Int
 }
 
 extension ModelOptWeightOnlyNVFP4Linear: MuseGlimmerRowExactProjection {
@@ -92,6 +102,10 @@ extension ModelOptWeightOnlyNVFP4Linear: MuseGlimmerRowExactProjection {
     func rowExactProduct(_ x: MLXArray) -> MLXArray {
         ModelOptWeightOnlyNVFP4RowExact.product(
             x, weight: weight, blockScales: weightScale, tensorScale: weightScale2)
+    }
+
+    var rowExactShape: MuseGlimmerProjectionShape {
+        .init(format: "nvfp4", inputs: inputDimensions, outputs: outputDimensions)
     }
 }
 
@@ -110,6 +124,10 @@ extension ModelOptCalibratedLinear: MuseGlimmerRowExactProjection {
             preconditionFailure("Invalid calibrated ModelOpt projection: \(error)")
         }
     }
+
+    var rowExactShape: MuseGlimmerProjectionShape {
+        .init(format: "fp8 \(weightDType)", inputs: inputDimensions, outputs: outputDimensions)
+    }
 }
 
 extension Linear: MuseGlimmerRowExactProjection {
@@ -124,6 +142,10 @@ extension Linear: MuseGlimmerRowExactProjection {
         guard rows > 1 else { return self(x) }
         let product = ModelOptRowExact.matmul(x.reshaped(rows, x.dim(-1)), weight)
         return product.reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+    }
+
+    var rowExactShape: MuseGlimmerProjectionShape {
+        .init(format: "dense \(weight.dtype)", inputs: weight.dim(1), outputs: weight.dim(0))
     }
 }
 
@@ -156,12 +178,30 @@ extension MuseGlimmerTextModel {
         }
     }
 
+    /// Set to `0` to turn off the warm-up of `setRowExactWindows(true)`.
+    public static let rowExactWarmupEnvironmentKey = "DARKBLOOM_MUSE_GLIMMER_ROW_EXACT_WARMUP"
+
+    /// The row counts the warm-up compiles: one request's verify window,
+    /// 1 + 7 drafted tokens.
+    static let rowExactWarmupRows = 1 ... 8
+
+    /// On unless the environment sets `rowExactWarmupEnvironmentKey` to `0`.
+    static func rowExactWarmupEnabled(_ environment: [String: String]) -> Bool {
+        environment[rowExactWarmupEnvironmentKey] != "0"
+    }
+
     /// Turns exact windows on or off for the whole tower. Every projection must
     /// have a row-exact product for the activation dtype; otherwise this throws
     /// and leaves the tower as it was. On, FP8 products take the window schedule
-    /// (the same bytes, scheduled for windows). Set before serving; not while a forward
-    /// is being built.
+    /// (the same bytes, scheduled for windows), and the row-exact kernels of
+    /// every projection shape are compiled for 1 to 8 rows
+    /// (`warmRowExactWindows`) unless `DARKBLOOM_MUSE_GLIMMER_ROW_EXACT_WARMUP`
+    /// is `0`. Set before serving; not while a forward is being built.
     public func setRowExactWindows(_ enabled: Bool) throws {
+        try setRowExactWindows(enabled, environment: ProcessInfo.processInfo.environment)
+    }
+
+    func setRowExactWindows(_ enabled: Bool, environment: [String: String]) throws {
         let dtype = activationDType
         let slots = projectionSlots
         if enabled {
@@ -175,5 +215,29 @@ extension MuseGlimmerTextModel {
             layer.rowExactSchedule = enabled ? .windows : .standard
         }
         numerics.exactWindows = enabled
+        if enabled && Self.rowExactWarmupEnabled(environment) { warmRowExactWindows() }
+    }
+
+    /// Runs the row-exact product of each distinct projection shape once at
+    /// every row count in `rows`, on zero activations, and drops the results.
+    /// MLX compiles a custom kernel for each set of template values, the row
+    /// count among them, at its first dispatch; without this, the first verify
+    /// window of each width compiles them while it is served. Changes no
+    /// weight, cache or numerics state, so no bytes.
+    func warmRowExactWindows(rows: ClosedRange<Int> = rowExactWarmupRows) {
+        let dtype = activationDType
+        var shapes = Set<MuseGlimmerProjectionShape>()
+        let projections = projectionSlots.compactMap { _, layer in
+            (layer as? any MuseGlimmerRowExactProjection).flatMap {
+                shapes.insert($0.rowExactShape).inserted ? $0 : nil
+            }
+        }
+        for count in rows {
+            eval(
+                projections.map {
+                    $0.rowExactProduct(
+                        MLXArray.zeros([1, count, $0.rowExactShape.inputs], dtype: dtype))
+                })
+        }
     }
 }
