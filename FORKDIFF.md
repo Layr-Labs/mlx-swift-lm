@@ -17,6 +17,35 @@ not code (`ignore`). Every push to `main` re-renders and redeploys it
 Settings → Pages → Source: **GitHub Actions**. The workflow token cannot do
 this itself. Until it's done the deploy workflow still builds the page (kept
 as a run artifact, `forkdiff-page`) and exits with a notice instead of failing.
+If the first deploy fails before it creates a deployment (the packaged artifact
+is not listed yet), the job waits 20 seconds and tries once more.
+
+## Native CI
+
+Fork Tests, PR lint, the fork-diff check and page rendering use Darkbloom
+macOS or Linux ARM64 runners. Each compute job queues independently with
+the full native runner labels; these jobs have no hosted fallback and do
+not reserve all seven Mac jobs before the build starts. The repository's
+approval still determines its resources, image and network policy.
+
+The shard planner stays hosted. Seven strict audio tests also stay on the
+hosted `xcode-27` image while native decoding is investigated. They share
+the native build products and remain part of the same exactly-once check
+for all 7,718 tests. No assertion, extra test pass or timeout is relaxed.
+
+Queues remain bounded. As reviewed on 2026-11-14 UTC, the initial Linux
+qualification lasts one hour and the Mac qualification lasts 90 minutes,
+each capped by approval expiry. Queue time consumes that initial lifetime.
+The existing watchdog has a default 30-minute wait threshold and at most
+one rescue; a rerun of these native-only jobs still requests native
+runners. Job timeouts also remain in force. These limits are not a promise
+of a 24-hour native queue.
+
+The GitHub-hosted Pages job still packages and publishes the rendered
+artifact through the `github-pages` environment. The disabled native
+CodeQL workflow has separate activation and rollback gates in
+[`docs/ci-codeql-native.md`](docs/ci-codeql-native.md); merging it does not
+switch off GitHub's current default setup.
 
 ## The gate
 

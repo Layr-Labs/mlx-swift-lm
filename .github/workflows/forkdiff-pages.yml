@@ -18,17 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  route:
-    uses: ./.github/workflows/darkbloom-route.yml
-    permissions: {}
-    with:
-      lanes: |
-        forkdiff-render linux_arm64 ubuntu-latest
-
   render:
     name: Render fork diff
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['forkdiff-render'] }}
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -75,7 +67,7 @@ jobs:
     needs: render
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -121,7 +113,22 @@ jobs:
         with:
           path: tmp/pages
 
+      # deploy-pages looks the github-pages artifact up in this run's artifact
+      # list as soon as it starts, and that list can lag the upload above: the
+      # first try then fails with "No artifacts named github-pages were found"
+      # (seen on 2026-11-14). Only when the first try failed before it created a
+      # deployment (no page_url), wait and try once more.
       - name: Deploy to GitHub Pages
         if: steps.pages.outputs.enabled == 'true'
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Wait before the second try
+        if: steps.pages.outputs.enabled == 'true' && steps.deployment.outcome == 'failure' && steps.deployment.outputs.page_url == ''
+        run: sleep 20
+
+      - name: Deploy to GitHub Pages (second try)
+        if: steps.pages.outputs.enabled == 'true' && steps.deployment.outcome == 'failure' && steps.deployment.outputs.page_url == ''
+        id: deployment-retry
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,261 @@
+name: Native CodeQL
+
+# Enable only after the operator switches GitHub default setup to advanced setup.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '15 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  route:
+    if: ${{ vars.CODEQL_NATIVE == 'on' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        codeql linux_arm64 ubuntu-22.04-arm
+
+  scan:
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['codeql'] }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Require Linux ARM64
+        run: |
+          [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the artifact boundary
+        run: python3 .github/scripts/codeql_artifacts_test.py
+      - name: Download the qualified CodeQL 2.27.4 ARM64 bundle
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --proto '=https' --proto-redir '=https'             --connect-timeout 20 --max-time 600 --output codeql.tar.zst             https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.27.4/codeql-bundle-linux-arm64.tar.zst
+          echo '1c015b411c6e1c7f7e767eb8c9408fc6a2012d24d78b177cf22f29edc5772d10  codeql.tar.zst' | sha256sum --check
+          tar --zstd -xf codeql.tar.zst
+          "$RUNNER_TEMP/codeql/codeql" version --format=json
+          "$RUNNER_TEMP/codeql/codeql" resolve languages
+      - name: Run the existing language-default suites without a build
+        run: |
+          set -euo pipefail
+          codeql="$RUNNER_TEMP/codeql/codeql"
+          mkdir "$RUNNER_TEMP/codeql-dbs" "$RUNNER_TEMP/codeql-results"
+          for language in actions cpp python; do
+            "$codeql" database create "$RUNNER_TEMP/codeql-dbs/$language"               --source-root="$GITHUB_WORKSPACE" --language="$language"               --build-mode=none --threads=4 --ram=8192
+            "$codeql" database analyze "$RUNNER_TEMP/codeql-dbs/$language"               --format=sarifv2.1.0 --output="$RUNNER_TEMP/codeql-results/$language.sarif"               --threads=4 --ram=8192
+          done
+      - name: Bind fingerprinted SARIF to the exact workflow run
+        run: |
+          python3 .github/scripts/codeql_artifacts.py             --checkout "$GITHUB_WORKSPACE" --results "$RUNNER_TEMP/codeql-results"             --output "$RUNNER_TEMP/codeql-bundle"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codeql-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codeql-bundle/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: scan
+    if: ${{ vars.CODEQL_NATIVE == 'on' && needs.scan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      # No checkout or repository code; native SARIF already has fingerprints.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codeql-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codeql-publish/
+      - name: Validate the exact run and bounded data-only bundle
+        id: validate
+        env:
+          BUNDLE: ${{ runner.temp }}/codeql-publish
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, re, urllib.parse
+          from pathlib import Path, PurePosixPath
+          LANGUAGES = {
+              "actions": "/language:actions",
+              "cpp": "/language:c-cpp",
+              "python": "/language:python",
+          }
+          CODEQL_VERSION = "2.27.4"
+          MAX_FILE = 16 * 1024 * 1024
+          MAX_BUNDLE = 64 * 1024 * 1024
+
+
+          def context():
+              return {
+                  key: os.environ[env]
+                  for key, env in {
+                      "repository": "GITHUB_REPOSITORY",
+                      "sha": "GITHUB_SHA",
+                      "ref": "GITHUB_REF",
+                      "run_id": "GITHUB_RUN_ID",
+                      "attempt": "GITHUB_RUN_ATTEMPT",
+                  }.items()
+              }
+
+
+          def relative_path(value):
+              if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+                  raise ValueError("invalid bundle path")
+              path = PurePosixPath(value)
+              if path.is_absolute() or any(part in ("..", ".git") for part in path.parts):
+                  raise ValueError("bundle path escapes its data directory")
+              if path.as_posix() != value:
+                  raise ValueError("bundle path is not canonical")
+              return path
+
+
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+          def validate_sarif(sarif):
+              if sarif.get("version") != "2.1.0" or not sarif.get("runs"):
+                  raise ValueError("invalid SARIF")
+              if not any(
+                  run.get("tool", {}).get("driver", {}).get("rules") for run in sarif["runs"]
+              ):
+                  raise ValueError("analysis has no rules")
+              for run in sarif["runs"]:
+                  driver = run.get("tool", {}).get("driver", {})
+                  if (
+                      driver.get("name") != "CodeQL"
+                      or driver.get("semanticVersion") != CODEQL_VERSION
+                  ):
+                      raise ValueError("SARIF was not produced by the qualified CodeQL version")
+                  artifacts = run.get("artifacts", [])
+                  for result in run.get("results", []):
+                      locations = result.get("locations", [])
+                      if not locations:
+                          continue
+                      primary = locations[0].get("physicalLocation", {})
+                      location = primary.get("artifactLocation", {})
+                      if "uri" not in location and "index" in location:
+                          index = location["index"]
+                          if type(index) is not int or not 0 <= index < len(artifacts):
+                              raise ValueError("invalid artifact index")
+                          location = artifacts[index]["location"]
+                      uri = urllib.parse.urlsplit(location.get("uri", ""))
+                      if uri.scheme or uri.netloc:
+                          raise ValueError("source location is not repository relative")
+                      relative_path(urllib.parse.unquote(uri.path))
+                      if primary.get("region", {}).get("startLine") is not None:
+                          fingerprint = result.get("partialFingerprints", {}).get(
+                              "primaryLocationLineHash", ""
+                          )
+                          if not re.fullmatch(r"[0-9a-f]+:[1-9][0-9]*", fingerprint):
+                              raise ValueError("source-line finding lacks a stable fingerprint")
+
+
+          def verify_bundle(root, expected):
+              root = root.resolve(strict=True)
+              manifest_file = root / "manifest.json"
+              if manifest_file.is_symlink() or manifest_file.stat().st_size > 256 * 1024:
+                  raise ValueError("invalid manifest")
+              manifest = json.loads(manifest_file.read_text())
+              if manifest.get("context") != expected or manifest.get("version") != 1:
+                  raise ValueError(
+                      "scan belongs to another run, attempt, repository, ref or commit"
+                  )
+              if (
+                  manifest.get("codeql_version") != CODEQL_VERSION
+                  or manifest.get("categories") != LANGUAGES
+              ):
+                  raise ValueError("unexpected CodeQL recipe")
+              files = manifest.get("files")
+              if not isinstance(files, dict) or len(files) != 3:
+                  raise ValueError("invalid file inventory")
+              required = {f"sarif/{language}.sarif" for language in LANGUAGES}
+              if not required.issubset(files):
+                  raise ValueError("missing language")
+              actual = set()
+              total = 0
+              for path in root.rglob("*"):
+                  if path.is_symlink():
+                      raise ValueError("symlinks are not scan data")
+                  if not path.is_file():
+                      if path.is_dir():
+                          continue
+                      raise ValueError("only regular files are scan data")
+                  rel = path.relative_to(root).as_posix()
+                  if rel == "manifest.json":
+                      continue
+                  relative_path(rel)
+                  if not path.resolve().is_relative_to(root):
+                      raise ValueError("file escapes bundle")
+                  spec = files.get(rel)
+                  size = path.stat().st_size
+                  if not isinstance(spec, dict) or not 0 <= size <= MAX_FILE:
+                      raise ValueError("unexpected or oversized file")
+                  if spec.get("size") != size or spec.get("sha256") != digest(path):
+                      raise ValueError("scan data changed")
+                  if rel not in required:
+                      raise ValueError("only the three SARIF files may be supplied")
+                  actual.add(rel)
+                  total += size
+              if actual != set(files) or total > MAX_BUNDLE:
+                  raise ValueError("file inventory differs or bundle exceeds limit")
+              for language in LANGUAGES:
+                  sarif = json.loads((root / f"sarif/{language}.sarif").read_text())
+                  validate_sarif(sarif)
+              # The official uploader falls back to event SHA/ref without a checkout.
+              # Native CodeQL already supplies every primary-line fingerprint.
+              empty_checkout = root / "empty-checkout"
+              empty_checkout.mkdir(exist_ok=True)
+              return empty_checkout
+
+
+          source = verify_bundle(Path(os.environ['BUNDLE']), context())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'checkout-path={source}\n')
+          PYCODE
+      - name: Upload actions analysis
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/codeql-publish/sarif/actions.sarif
+          checkout_path: ${{ steps.validate.outputs.checkout-path }}
+          category: /language:actions
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+          wait-for-processing: true
+      - name: Upload cpp analysis
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/codeql-publish/sarif/cpp.sarif
+          checkout_path: ${{ steps.validate.outputs.checkout-path }}
+          category: /language:c-cpp
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+          wait-for-processing: true
+      - name: Upload python analysis
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          sarif_file: ${{ runner.temp }}/codeql-publish/sarif/python.sarif
+          checkout_path: ${{ steps.validate.outputs.checkout-path }}
+          category: /language:python
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+          wait-for-processing: true
