@@ -171,6 +171,7 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
+            - "changelog.d/unscoped-near-end-checkpoint.md"
         - title: "MTP speculative decoding (engine side)"
           description: |
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
