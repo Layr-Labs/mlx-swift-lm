@@ -48,8 +48,14 @@ extension MuseGlimmerDFlashTarget {
 /// with `couplesSampledProposals`, a sampled row's race with its verify
 /// noise), and the engine keeps one only when it equals the token the target
 /// itself chose, so they change speed and never the output.
+///
+/// With `batchesRequests`, the requests of one step share their passes
+/// (`CBv2MTPBatchedRequestDrafter`): one context commit for every observed
+/// row, and one block forward and head product for every row of a round.
+/// A round's accepted rows are then committed with the next round's carry,
+/// in that round's pass.
 public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
-    CBv2MTPCoupledProposalDrafter, @unchecked Sendable
+    CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, @unchecked Sendable
 {
     public struct Settings: Sendable, Equatable {
         /// Draft tokens per round, at most the engine's tested window of 7
@@ -74,12 +80,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         /// argmax (`CBv2MTPCoupledProposalDrafter`). Greedy rows keep the
         /// argmax. Output is unchanged either way.
         public var couplesSampledProposals: Bool
+        /// The requests of one step share the drafter's passes: observed
+        /// rows are committed in one projection, and a round's rows draft
+        /// their blocks and head rows in one forward
+        /// (`CBv2MTPBatchedRequestDrafter`). Proposals may move in low bits;
+        /// output is unchanged either way.
+        public var batchesRequests: Bool
 
         public init(
             maximumDraftTokens: Int = CBv2MTPConfig.testedMaxDraftTokens,
             verification: CBv2MTPVerificationMode? = nil, maximumSpeculativeRows: Int = 1,
             commitsAcceptedPrefixPerRow: Bool = false, backendScratchBytes: Int = 0,
-            batchesVerifyColumnsAsDecodeRows: Bool = false, couplesSampledProposals: Bool = false
+            batchesVerifyColumnsAsDecodeRows: Bool = false, couplesSampledProposals: Bool = false,
+            batchesRequests: Bool = false
         ) {
             self.maximumDraftTokens = maximumDraftTokens
             self.verification = verification
@@ -88,6 +101,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             self.backendScratchBytes = backendScratchBytes
             self.batchesVerifyColumnsAsDecodeRows = batchesVerifyColumnsAsDecodeRows
             self.couplesSampledProposals = couplesSampledProposals
+            self.batchesRequests = batchesRequests
         }
 
         /// One-forward exact verification on a target with exact windows,
@@ -96,7 +110,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         public static func verifying(
             _ target: any MuseGlimmerDFlashTarget, maximumSpeculativeRows: Int = 1,
             backendScratchBytes: Int = 0, batchesVerifyColumnsAsDecodeRows: Bool = true,
-            couplesSampledProposals: Bool = false
+            couplesSampledProposals: Bool = false, batchesRequests: Bool = false
         ) -> Settings {
             let exact = target.dflashVerifiesWindowsExactly
             return Settings(
@@ -104,7 +118,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 maximumSpeculativeRows: exact ? maximumSpeculativeRows : 1,
                 commitsAcceptedPrefixPerRow: exact, backendScratchBytes: backendScratchBytes,
                 batchesVerifyColumnsAsDecodeRows: exact && batchesVerifyColumnsAsDecodeRows,
-                couplesSampledProposals: couplesSampledProposals)
+                couplesSampledProposals: couplesSampledProposals, batchesRequests: batchesRequests)
         }
     }
 
@@ -172,6 +186,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     /// sampled rows speculate too.
     public var supportsTargetPrefixAcceptance: Bool { true }
     public var couplesSampledProposals: Bool { settings.couplesSampledProposals }
+    public var batchesRequests: Bool { settings.batchesRequests }
     /// Observation builds lazy writes into the context ring; they must be
     /// evaluated with the step that produced the observed rows.
     public var requiresCommittedObservationFence: Bool { true }
@@ -195,6 +210,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         var memo: (tokens: MLXArray, hidden: MLXArray)?
         /// This round's coupled-proposal rule; nil proposes the argmax.
         var selection: CBv2MTPProposalSelection?
+        /// `startRounds` already drafted this round's block.
+        var prestarted = false
+        /// The last round's accepted target rows `[rows, contextWidth]`,
+        /// not yet in the ring (`batchesRequests` only). They are the next
+        /// positions and are committed before any other row.
+        var pending: MLXArray?
         var committedInputCount = 0
         var stagedInputCount = 0
         /// Why this request cannot continue; reported at the next fence.
@@ -275,10 +296,45 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
             s.refusal = "observation"
             return
         }
-        model.commit(features: rows, at: position, to: s.context)
+        if s.pending == nil {
+            model.commit(features: rows, at: position, to: s.context)
+        } else {
+            model.commit(takePending(s) + [.init(features: rows, at: position, to: s.context)])
+        }
         // Whatever arrived, the context now ends at its newest row.
         s.awaitsCarry = false
         s.committedInputCount += rows.dim(0)
+    }
+
+    /// The state's pending rows as the first commit, at its next position.
+    private func takePending(_ s: State) -> [MuseGlimmerDFlashDraftModel.ContextCommit] {
+        defer { s.pending = nil }
+        return s.pending.map { [.init(features: $0, at: nil, to: s.context)] } ?? []
+    }
+
+    /// Every entry as `observeCommittedTarget` would take it, with one
+    /// context commit for all of them.
+    public func observeCommittedTargets(_ observations: [CBv2MTPRequestObservation]) {
+        var commits: [MuseGlimmerDFlashDraftModel.ContextCommit] = []
+        var observed: [(state: State, rows: Int)] = []
+        for entry in observations {
+            let s = state(entry.requestState)
+            guard s.refusal == nil else { continue }
+            guard s.stagedInputCount == 0, entry.position.map({ $0 >= 0 }) ?? true,
+                let rows = features(entry.observation.hidden)
+            else {
+                s.refusal = "observation"
+                continue
+            }
+            commits += takePending(s)
+            commits.append(.init(features: rows, at: entry.position, to: s.context))
+            observed.append((s, rows.dim(0)))
+        }
+        model.commit(commits)
+        for (s, rows) in observed {
+            s.awaitsCarry = false
+            s.committedInputCount += rows
+        }
     }
 
     /// Draft index 0 commits a carry row that is still missing, runs one
@@ -296,7 +352,11 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         let index = s.stagedInputCount
         s.stagedInputCount += 1
         if s.refusal == nil, index == 0 {
-            s.refusal = startRound(s, tokens: tokens, hidden: hidden)
+            if s.prestarted {
+                s.prestarted = false
+            } else {
+                s.refusal = startRound(s, tokens: tokens, hidden: hidden)
+            }
         }
         guard s.refusal == nil, shortlist == nil, index < settings.maximumDraftTokens,
             let memo = s.memo
@@ -318,7 +378,10 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func startRound(_ s: State, tokens: MLXArray, hidden: MLXArray) -> String? {
         let c = model.configuration
         guard tokens.shape == [1, 1] else { return "seed token" }
-        if s.awaitsCarry {
+        if settings.batchesRequests {
+            guard let carry = commitCarry(s, hidden: hidden) else { return "carry" }
+            if !carry.isEmpty { model.commit(carry) }
+        } else if s.awaitsCarry {
             guard let row = features(hidden), row.dim(0) == 1 else { return "carry" }
             model.commit(features: row, at: s.context.nextPosition, to: s.context)
             s.awaitsCarry = false
@@ -336,6 +399,78 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         s.memo = (proposals(logits, selection: s.selection), rows)
         return nil
+    }
+
+    /// A round's commit before its block: the pending rows and the carry row
+    /// still missing, as one entry at the next position. Nil when the carry
+    /// is not one feature row.
+    private func commitCarry(_ s: State, hidden: MLXArray)
+        -> [MuseGlimmerDFlashDraftModel.ContextCommit]?
+    {
+        var rows = s.pending.map { [$0] } ?? []
+        s.pending = nil
+        if s.awaitsCarry {
+            guard let row = features(hidden), row.dim(0) == 1 else { return nil }
+            rows.append(row)
+            s.awaitsCarry = false
+            s.committedInputCount += 1
+        }
+        guard !rows.isEmpty else { return [] }
+        let features = rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
+        return [.init(features: features, at: s.context.nextPosition, to: s.context)]
+    }
+
+    /// Draft index 0 of every seed's round in one pass: one context commit
+    /// for every carry (and pending rows), one block forward and one head
+    /// product for every block. A seed this cannot serve is left to its own
+    /// index-0 call, which refuses it as before.
+    public func startRounds(_ seeds: [CBv2MTPRoundSeed]) {
+        guard settings.batchesRequests else { return }
+        let c = model.configuration
+        var started: [(state: State, tokens: MLXArray)] = []
+        var commits: [MuseGlimmerDFlashDraftModel.ContextCommit] = []
+        for seed in seeds {
+            let s = state(seed.requestState)
+            guard s.refusal == nil, s.stagedInputCount == 0, !s.prestarted, seed.shortlist == nil,
+                seed.tokens.shape == [1, 1]
+            else { continue }
+            guard let carry = commitCarry(s, hidden: seed.hidden) else {
+                s.refusal = "carry"
+                continue
+            }
+            commits += carry
+            started.append((s, seed.tokens))
+        }
+        guard !started.isEmpty else { return }
+        model.commit(commits)
+        var blocks: [MLXArray] = []
+        for (s, tokens) in started {
+            let anchor = target.dflashTokenEmbeddings(tokens.asType(.int32))
+            guard anchor.size == c.hiddenSize else {
+                s.refusal = "embedding"
+                continue
+            }
+            blocks.append(model.blockEmbeddings(anchor: anchor, mask: maskEmbedding))
+        }
+        let states = started.map(\.state).filter { $0.refusal == nil }
+        guard !states.isEmpty else { return }
+        let k = settings.maximumDraftTokens
+        let rows = model.draftBlocks(embeddings: blocks, states: states.map(\.context)).map {
+            $0[1 ..< (1 + k), 0...]
+        }
+        let logits = target.dflashHeadProduct(
+            rows.count == 1 ? rows[0] : concatenated(rows, axis: 0))
+        guard logits.shape == [states.count * k, target.dflashVocabularySize] else {
+            for s in states { s.refusal = "head" }
+            return
+        }
+        for (index, s) in states.enumerated() {
+            s.memo = (
+                proposals(logits[(index * k) ..< ((index + 1) * k), 0...], selection: s.selection),
+                rows[index]
+            )
+            s.prestarted = true
+        }
     }
 
     /// The argmax of the head products, or a selection's proposals over the
@@ -383,7 +518,12 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
                 s.refusal = "accepted rows"
                 return
             }
-            model.commit(features: accepted, at: s.context.nextPosition, to: s.context)
+            if settings.batchesRequests {
+                // Committed with the next round's carry, in its pass.
+                s.pending = s.pending.map { concatenated([$0, accepted], axis: 0) } ?? accepted
+            } else {
+                model.commit(features: accepted, at: s.context.nextPosition, to: s.context)
+            }
         }
         s.awaitsCarry = true
         s.committedInputCount += rows
@@ -397,6 +537,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private func clearRound(_ s: State) {
         s.memo = nil
         s.selection = nil
+        s.prestarted = false
         s.stagedInputCount = 0
     }
 
@@ -404,6 +545,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released
         else { return }
         clearRound(s)
+        s.pending = nil
         s.context.release()
         s.awaitsCarry = false
         s.committedInputCount = 0
@@ -453,11 +595,21 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             ? 11 * settings.maximumDraftTokens * target.dflashVocabularySize * 4 : 0
     }
 
+    /// A round's accepted rows held for the next round's pass
+    /// (`batchesRequests`): a view of the round's target rows, which can keep
+    /// every row of that round alive, charged at float32.
+    var pendingBytes: Int {
+        settings.batchesRequests
+            ? settings.maximumSpeculativeRows * settings.maximumDraftTokens
+                * model.configuration.contextWidth * 4 : 0
+    }
+
     /// Per request: the ring's two buffers, one copy of each for a write MLX
     /// cannot make in place, and one commit of at most `window` rows (older
-    /// rows of a longer chunk are never projected). Once per engine: one
-    /// block forward for each request a round may hold. The ring does not
-    /// grow with the request, so nothing is charged per token.
+    /// rows of a longer chunk are never projected), plus the pending rows
+    /// when requests are batched. Once per engine: one block forward for
+    /// each request a round may hold. The ring does not grow with the
+    /// request, so nothing is charged per token.
     public func boundedRequestAllocation(limits: CBv2MTPAllocationLimits)
         -> CBv2MTPBoundedAllocationSpec?
     {
@@ -474,8 +626,10 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
         if settings.backendScratchBytes > 0 {
             owner.append(.init(logicalBytes: settings.backendScratchBytes))
         }
+        var resident = [CBv2MTPFixedBufferSpec(logicalBytes: buffer, allocationCount: 2)]
+        if pendingBytes > 0 { resident.append(.init(logicalBytes: pendingBytes)) }
         return CBv2MTPBoundedAllocationSpec(
-            resident: [.init(logicalBytes: buffer, allocationCount: 2)],
+            resident: resident,
             working: [
                 .init(logicalBytes: buffer, allocationCount: 2),
                 .init(logicalBytes: commitBytes(rows: commitRows)),

@@ -511,6 +511,69 @@ public protocol CBv2MTPCoupledProposalDrafter: CBv2MTPRequestStatefulDrafter {
         _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState)
 }
 
+/// One request's committed target observation, handed over with the others
+/// of its step (`CBv2MTPBatchedRequestDrafter`).
+public struct CBv2MTPRequestObservation {
+    public let observation: CBv2MTPCommittedTargetObservation
+    /// Absolute target position of the first hidden row, for an advisory
+    /// drafter (`CBv2MTPAdvisoryHistoryDrafter`); nil otherwise.
+    public let position: Int?
+    public let requestState: any CBv2MTPRequestState
+
+    public init(
+        _ observation: CBv2MTPCommittedTargetObservation, startingAt position: Int?,
+        requestState: any CBv2MTPRequestState
+    ) {
+        self.observation = observation
+        self.position = position
+        self.requestState = requestState
+    }
+}
+
+/// One row's draft index 0 inputs, handed over with the other rows of its
+/// round (`CBv2MTPBatchedRequestDrafter.startRounds`).
+public struct CBv2MTPRoundSeed {
+    /// `[1, 1]`, the row's seed token.
+    public let tokens: MLXArray
+    /// The row's carry hidden row.
+    public let hidden: MLXArray
+    public let shortlist: MLXArray?
+    public let requestState: any CBv2MTPRequestState
+
+    public init(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) {
+        self.tokens = tokens
+        self.hidden = hidden
+        self.shortlist = shortlist
+        self.requestState = requestState
+    }
+}
+
+/// A request-stateful drafter that does several requests' work in one pass,
+/// so its weights are read once per step instead of once per request.
+///
+/// Each request state must end as the per-request calls would leave it, up
+/// to the accumulation order of the shared matmuls. Proposals may therefore
+/// differ in low bits; the target's verify and acceptance are unchanged, so
+/// with exact acceptance the emitted tokens are too. Opt-in and default off;
+/// without it, or with `batchesRequests` false, the engine keeps its
+/// per-request calls.
+public protocol CBv2MTPBatchedRequestDrafter: CBv2MTPRequestStatefulDrafter {
+    /// True to receive the batched calls.
+    var batchesRequests: Bool { get }
+    /// In place of one `observeCommittedTarget` per entry, in order, for a
+    /// step that observes more than one request. Entries of one request
+    /// keep their order.
+    func observeCommittedTargets(_ observations: [CBv2MTPRequestObservation])
+    /// Before draft index 0 of a round of more than one row, after the
+    /// rows' proposal selections: every row's index-0 inputs at once. The
+    /// engine then calls `draftStep` for every row and index as usual; at
+    /// index 0 a drafter returns what this call prepared.
+    func startRounds(_ seeds: [CBv2MTPRoundSeed])
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.

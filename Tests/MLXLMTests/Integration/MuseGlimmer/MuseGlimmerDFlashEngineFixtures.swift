@@ -130,7 +130,7 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
 /// keeps its own state; only the proposed token is replaced, from the known
 /// continuation of the request, so a test decides where the target accepts.
 final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
-    CBv2MTPCoupledProposalDrafter, CBv2MTPBoundedAllocationProviding
+    CBv2MTPCoupledProposalDrafter, CBv2MTPBatchedRequestDrafter, CBv2MTPBoundedAllocationProviding
 {
     enum Mode: Equatable, Sendable {
         /// The drafter's own proposals.
@@ -163,6 +163,10 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private(set) var proposals: [[MLXArray]] = []
     /// Replaces a non-nil selection before the drafter sees it.
     var selectionOverride: ((CBv2MTPProposalSelection) -> CBv2MTPProposalSelection)?
+    /// Entries of every batched observation call, and rows of every batched
+    /// round start, in order.
+    private(set) var observationBatches: [Int] = []
+    private(set) var roundStarts: [Int] = []
 
     init(
         _ native: MuseGlimmerDFlashDrafter, mode: Mode, scripts: [[Int]] = [], vocabulary: Int
@@ -179,6 +183,7 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     var maximumSpeculativeBatch: Int? { native.maximumSpeculativeBatch }
     var supportsTargetPrefixAcceptance: Bool { native.supportsTargetPrefixAcceptance }
     var couplesSampledProposals: Bool { native.couplesSampledProposals }
+    var batchesRequests: Bool { native.batchesRequests }
     func setProposalSelection(
         _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState
     ) {
@@ -247,6 +252,28 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
         }
         native.observeCommittedTarget(
             observation, startingAt: position, requestState: requestState)
+    }
+
+    func observeCommittedTargets(_ observations: [CBv2MTPRequestObservation]) {
+        observationBatches.append(observations.count)
+        // Where each entry lands, as the per-entry calls would place it.
+        var next: [ObjectIdentifier: Int] = [:]
+        for entry in observations {
+            let state = entry.requestState as! MuseGlimmerDFlashDrafter.State
+            let id = ObjectIdentifier(state)
+            let position = entry.position ?? next[id] ?? state.context.nextPosition
+            if let given = entry.position { observedPositions.append(given) }
+            if entry.observation.tokens.dim(1) > 1 || bound[id] == nil {
+                bind(state, tokens: entry.observation.tokens, at: position)
+            }
+            next[id] = position + entry.observation.tokens.dim(1)
+        }
+        native.observeCommittedTargets(observations)
+    }
+
+    func startRounds(_ seeds: [CBv2MTPRoundSeed]) {
+        roundStarts.append(seeds.count)
+        native.startRounds(seeds)
     }
 
     func draftStep(
@@ -329,7 +356,8 @@ enum MuseGlimmerDFlashEngineFixture {
         target: MuseGlimmerDFlashTinyTarget, drafter: (any CBv2MTPDrafter)?, depth: Int = 7,
         verification: CBv2MTPVerificationMode = .serialTarget,
         store: CompleteCheckpointFixtureStore? = nil, acceptance: CBv2MTPAcceptance = .exact,
-        sampler: CBv2StepSampler = CBv2DefaultSampler()
+        sampler: CBv2StepSampler = CBv2DefaultSampler(), concurrentRequests: Int = 2,
+        speculativeRows: Int = 2
     ) throws -> (EngineV2, PagedKVBackend) {
         let kinds = target.layerKinds
         let backend = try PagedKVBackend(
@@ -342,12 +370,15 @@ enum MuseGlimmerDFlashEngineFixture {
             cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
             sampler: sampler,
             schedulerConfig: .init(
-                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 2 * chunk,
-                prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: store != nil),
+                maxConcurrentRequests: concurrentRequests,
+                maxBatchedTokensPerStep: concurrentRequests * chunk,
+                prefillChunkSize: chunk, maxWaiting: 2 * concurrentRequests,
+                enablePrefixCache: store != nil),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
             mtpDrafter: drafter,
             mtpConfig: CBv2MTPConfig(
-                enabled: drafter != nil, maxDraftTokens: depth, maxSpeculativeBatch: 2,
+                enabled: drafter != nil, maxDraftTokens: depth,
+                maxSpeculativeBatch: speculativeRows,
                 fixedDraftTokens: depth, verificationMode: verification,
                 maxAutomaticRectangularTokens: 16, acceptance: acceptance))
         if store != nil {

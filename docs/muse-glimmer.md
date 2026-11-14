@@ -107,6 +107,15 @@ against the pin. `MuseGlimmerDFlashDrafter` is a request-stateful CBv2 drafter:
   Greedy rows, and samplers without the race, keep the argmax. The emitted token is the
   target's draw either way, so only agreement changes. The race's float32 working set is
   charged in `blockBytes`.
+- With `Settings.batchesRequests` (default off), the requests of one step share the drafter's
+  passes (`CBv2MTPBatchedRequestDrafter`). A plain step's observed rows are committed in one
+  context projection (`commit(_:)`: one `fc` and one key / value projection per layer, then
+  norm and RoPE per request at its own positions). A round of two or more rows starts in one
+  `startRounds` call: one commit for every carry, one `blockForwards` pass (projections and MLP
+  over every block; RoPE and attention per block over its own ring) and one head product. A
+  round's accepted rows are held (`pending`, charged per request) and committed with the next
+  round's carry, so one round needs one commit. Each ring ends as the per-request calls leave
+  it; proposals can move only in low bits, and the output is the target's either way.
 - The engine keeps a proposal only when it equals the token the target chose, greedy or
   sampled, so the drafter changes speed and never the output. The drafter requires this exact
   acceptance: under `.typical` the round driver is not built and speculation stays off.
@@ -193,6 +202,11 @@ prompts across the 2,048-token window and the ring wrap, and rolled-back columns
 output equals the target alone (seeded, unseeded on a shared fallback seed, serial and
 rectangular), each round's race uses its verify draw's keys, the drafter proposes what the
 selection gives, and greedy rows and drafters that do not opt in get nothing.
+`MuseGlimmerDFlashBatchedRequestTests` run batched requests: two speculating rows start their
+rounds in one call and three rows over two slots observe in one call, with output equal to the
+target alone; one batched commit and forward match the per-state ones through duplicates, a
+gap and a chunk longer than the window; held accepted rows end in the context of immediate
+commits; and pending rows are charged only when batching is on.
 `MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
 output equals the target alone, greedy and sampled, cold and restored, one or two requests, and
 a request's decode and verify rows keep their bytes while another request's prompt is prefilled
