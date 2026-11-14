@@ -111,8 +111,8 @@ extension KernelTests {
             let kind = CBv2LayerKind(attention: .full, headDim: 256, kvHeads: 2, queryHeads: 12)
             let pageBytes = 2 * 16 * 256 * 2 * dtype.size
             var config = PagedKVPoolConfig(
-                capacityBytes: 16 << 20, dtype: dtype, maxPrefillChunk: 512,
-                nominalMaxSequenceLength: 4096, maxBufferLength: 16 << 20)
+                capacityBytes: 128 << 20, dtype: dtype, maxPrefillChunk: 512,
+                nominalMaxSequenceLength: 2048, maxBufferLength: 16 << 20)
             config.segmentSizeBytes = pageBytes * 5
             let plain = try PagedKVBackend(layerKinds: [kind], config: config)
             let side = try PagedKVBackend(layerKinds: [kind], config: config)
@@ -126,9 +126,9 @@ extension KernelTests {
             var sideRows: [PagedSequenceKV] = []
             for (index, count) in [613, 1100].enumerated() {
                 let a = try plain.makeSequenceState(
-                    layerKinds: [kind], promptLength: 0, maxLength: 4096)
+                    layerKinds: [kind], promptLength: 0, maxLength: 2048)
                 let b = try side.makeSequenceState(
-                    layerKinds: [kind], promptLength: 0, maxLength: 4096)
+                    layerKinds: [kind], promptLength: 0, maxLength: 2048)
                 plainStates.append(a)
                 sideStates.append(b)
                 let rowA = try #require(a[0] as? PagedSequenceKV)
