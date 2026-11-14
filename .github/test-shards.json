@@ -298,6 +298,21 @@
         "DARKBLOOM_GEMMA_SCHEMA_COERCION": "1"
       },
       "timeout_minutes": 5
+    },
+    {
+      "name": "gemma-reopened-thought-enabled",
+      "strict": true,
+      "extra": true,
+      "metallib": false,
+      "filters": [
+        "GemmaReopenedThoughtConformanceTests",
+        "Gemma4NonStreamingTests",
+        "Gemma4StreamingTests"
+      ],
+      "env": {
+        "DARKBLOOM_GEMMA_REOPENED_THOUGHTS": "1"
+      },
+      "timeout_minutes": 5
     }
   ],
   "shards": [
@@ -604,7 +619,7 @@
       ]
     },
     {
-      "estimated_seconds": 1621,
+      "estimated_seconds": 1636,
       "runs": [
         {
           "groups": [
@@ -898,6 +913,11 @@
         {
           "groups": [
             "gemma-quoted-number-enabled"
+          ]
+        },
+        {
+          "groups": [
+            "gemma-reopened-thought-enabled"
           ]
         }
       ]
