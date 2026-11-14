@@ -444,12 +444,15 @@ public enum ModelOptWeightOnlyNVFP4RowExact {
         let kernel = scalar ? scalarKernel : matrixKernel
         let (tile, simdgroups) = scalar ? (16, 2) : (32, 8)
         let tiles = (outputs + tile - 1) / tile
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
+            ("SCALED", tensorScale != nil),
+        ]
+        ModelOptRowExactPipelines.record(
+            "modelopt_weight_only_nvfp4_row_exact_" + (scalar ? "scalar" : "matrix"), template)
         let result = kernel(
             [weight, blockScales, x.reshaped(rows, inputs), tensorScale?.reshaped(1) ?? unit],
-            template: [
-                ("T", x.dtype), ("V", rows), ("K", inputs), ("N", outputs),
-                ("SCALED", tensorScale != nil),
-            ],
+            template: template,
             grid: (32, simdgroups * tiles, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows, outputs]], outputDTypes: [x.dtype])[0]
         return result.reshaped(Array(x.shape.dropLast()) + [outputs])
