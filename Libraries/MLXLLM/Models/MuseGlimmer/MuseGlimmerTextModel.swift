@@ -77,21 +77,27 @@ final class MuseGlimmerCenteredRMSNorm: Module, UnaryLayer {
     @ModuleInfo var weight: MLXArray
     let eps: Float
     private let epsArray: MuseGlimmerConstant
+    private let numerics: MuseGlimmerNumerics
 
-    init(dimensions: Int, eps: Float) {
+    init(dimensions: Int, eps: Float, numerics: MuseGlimmerNumerics) {
         _weight.wrappedValue = MLXArray.zeros([dimensions])
         self.eps = eps
         epsArray = MuseGlimmerConstant(MLXArray(eps))
+        self.numerics = numerics
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MuseGlimmerFusion.centeredRMSNorm([x, weight, epsArray.value])[0]
+        numerics.reduceRows([x]) {
+            MuseGlimmerFusion.centeredRMSNorm([$0[0], weight, epsArray.value])[0]
+        }
     }
 
     /// `residual + self(x)` as one fused region.
     func addedTo(_ residual: MLXArray, _ x: MLXArray) -> MLXArray {
-        MuseGlimmerFusion.addCenteredRMSNorm([residual, x, weight, epsArray.value])[0]
+        numerics.reduceRows([x, residual]) {
+            MuseGlimmerFusion.addCenteredRMSNorm([$0[1], $0[0], weight, epsArray.value])[0]
+        }
     }
 }
 
@@ -101,16 +107,20 @@ final class MuseGlimmerTextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: any UnaryLayer
     @ModuleInfo(key: "up_proj") var upProj: any UnaryLayer
     @ModuleInfo(key: "down_proj") var downProj: any UnaryLayer
+    private let numerics: MuseGlimmerNumerics
 
-    init(_ c: MuseGlimmerTextModelConfiguration) {
+    init(_ c: MuseGlimmerTextModelConfiguration, numerics: MuseGlimmerNumerics) {
         _gateProj.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: false)
         _upProj.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: false)
         _downProj.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: false)
+        self.numerics = numerics
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
+        let n = numerics
+        return n.project(
+            downProj, compiledSiluProduct(n.project(gateProj, x), n.project(upProj, x)))
     }
 }
 
@@ -131,8 +141,12 @@ final class MuseGlimmerTextAttention: Module {
     /// The ordinary softmax scale; `qkScaleFactor` multiplies the queries as well.
     let scale: Float
     let qkScaleFactor: Float
+    private let numerics: MuseGlimmerNumerics
 
-    init(_ c: MuseGlimmerTextModelConfiguration, layerIndex: Int) {
+    init(
+        _ c: MuseGlimmerTextModelConfiguration, layerIndex: Int, numerics: MuseGlimmerNumerics
+    ) {
+        self.numerics = numerics
         heads = c.attentionHeads
         kvHeads = c.kvHeads
         headDimensions = c.headDimensions
@@ -160,9 +174,10 @@ final class MuseGlimmerTextAttention: Module {
         ropeOffsets: MLXArray? = nil
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
-        var queries = queryProj(x).reshaped(batch, length, heads, headDimensions)
-        var keys = keyProj(x).reshaped(batch, length, kvHeads, headDimensions)
-        var values = valueProj(x).reshaped(batch, length, kvHeads, headDimensions)
+        let n = numerics
+        var queries = n.project(queryProj, x).reshaped(batch, length, heads, headDimensions)
+        var keys = n.project(keyProj, x).reshaped(batch, length, kvHeads, headDimensions)
+        var values = n.project(valueProj, x).reshaped(batch, length, kvHeads, headDimensions)
 
         // The query scale is applied in FP32 before RoPE. Folding it into the
         // softmax scale is the same expression but rounds differently in BF16.
@@ -195,8 +210,8 @@ final class MuseGlimmerTextAttention: Module {
         }
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         // The gate comes from the layer input, not from the attention output.
-        output = MuseGlimmerFusion.sigmoidGate([output, gateProj(x)])[0]
-        return outputProj(output)
+        output = MuseGlimmerFusion.sigmoidGate([output, n.project(gateProj, x)])[0]
+        return n.project(outputProj, output)
     }
 }
 
@@ -212,18 +227,21 @@ final class MuseGlimmerDecoderLayer: Module {
         MuseGlimmerCenteredRMSNorm
     let isSliding: Bool
 
-    init(_ c: MuseGlimmerTextModelConfiguration, layerIndex: Int) {
-        _selfAttention.wrappedValue = MuseGlimmerTextAttention(c, layerIndex: layerIndex)
-        _mlp.wrappedValue = MuseGlimmerTextMLP(c)
+    init(
+        _ c: MuseGlimmerTextModelConfiguration, layerIndex: Int, numerics: MuseGlimmerNumerics
+    ) {
+        _selfAttention.wrappedValue = MuseGlimmerTextAttention(
+            c, layerIndex: layerIndex, numerics: numerics)
+        _mlp.wrappedValue = MuseGlimmerTextMLP(c, numerics: numerics)
         // The norms before a sublayer use rms_norm_eps, the ones after it post_norm_eps.
         _inputLayerNorm.wrappedValue = MuseGlimmerCenteredRMSNorm(
-            dimensions: c.hiddenSize, eps: c.rmsNormEps)
+            dimensions: c.hiddenSize, eps: c.rmsNormEps, numerics: numerics)
         _postAttentionLayerNorm.wrappedValue = MuseGlimmerCenteredRMSNorm(
-            dimensions: c.hiddenSize, eps: c.postNormEps)
+            dimensions: c.hiddenSize, eps: c.postNormEps, numerics: numerics)
         _preFeedforwardLayerNorm.wrappedValue = MuseGlimmerCenteredRMSNorm(
-            dimensions: c.hiddenSize, eps: c.rmsNormEps)
+            dimensions: c.hiddenSize, eps: c.rmsNormEps, numerics: numerics)
         _postFeedforwardLayerNorm.wrappedValue = MuseGlimmerCenteredRMSNorm(
-            dimensions: c.hiddenSize, eps: c.postNormEps)
+            dimensions: c.hiddenSize, eps: c.postNormEps, numerics: numerics)
         isSliding = c.isSliding(layerIndex)
         super.init()
     }
@@ -245,16 +263,18 @@ final class MuseGlimmerTextTrunk: Module {
     @ModuleInfo var norm: RMSNorm
     let embedNorm: MuseGlimmerUnitRMSNorm
     let configuration: MuseGlimmerTextModelConfiguration
+    let numerics: MuseGlimmerNumerics
     private let fullAttentionIndex: Int
     private let slidingAttentionIndex: Int?
 
-    init(_ c: MuseGlimmerTextModelConfiguration) {
+    init(_ c: MuseGlimmerTextModelConfiguration, numerics: MuseGlimmerNumerics) {
         configuration = c
+        self.numerics = numerics
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: c.vocabularySize, dimensions: c.hiddenSize)
         embedNorm = MuseGlimmerUnitRMSNorm(eps: c.rmsNormEps)
         _layers.wrappedValue = (0 ..< c.hiddenLayers).map {
-            MuseGlimmerDecoderLayer(c, layerIndex: $0)
+            MuseGlimmerDecoderLayer(c, layerIndex: $0, numerics: numerics)
         }
         _norm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.rmsNormEps)
         fullAttentionIndex =
@@ -345,7 +365,7 @@ public final class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvi
 
     public init(_ configuration: MuseGlimmerTextModelConfiguration) {
         self.configuration = configuration
-        _model.wrappedValue = MuseGlimmerTextTrunk(configuration)
+        _model.wrappedValue = MuseGlimmerTextTrunk(configuration, numerics: MuseGlimmerNumerics())
         _lmHead.wrappedValue = Linear(
             configuration.hiddenSize, configuration.vocabularySize, bias: false)
         mtpHiddenLayerIDs = Self.defaultHiddenLayers(configuration)
@@ -383,13 +403,16 @@ public final class MuseGlimmerTextModel: Module, LLMModel, KVCacheDimensionProvi
 
     // MARK: Readout
 
+    /// The switch shared by every block (`setRowExactWindows`).
+    var numerics: MuseGlimmerNumerics { model.numerics }
+
     /// `lm_head(hidden)` without the output multiplier or the softcap.
-    public func headProduct(_ hidden: MLXArray) -> MLXArray { lmHead(hidden) }
+    public func headProduct(_ hidden: MLXArray) -> MLXArray { numerics.project(lmHead, hidden) }
 
     /// The readout of a final-normed hidden: `lm_head`, then
     /// `output_multiplier`, then the tanh softcap.
     public func outputLogits(_ normedHidden: MLXArray) -> MLXArray {
-        var logits = lmHead(normedHidden) * configuration.outputMultiplier
+        var logits = headProduct(normedHidden) * configuration.outputMultiplier
         let cap = configuration.finalLogitSoftcapping
         if cap > 0 { logits = tanh(logits / cap) * cap }
         return logits

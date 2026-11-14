@@ -42,14 +42,32 @@ struct MuseGlimmerTinyCheckpoint {
         return Tensor(dtype: "BF16", shape: shape, bytes: Array(values.asData(access: .copy).data))
     }
 
-    init(layers: Int = 3) throws {
+    /// The same values as `bf16`, stored as `dtype` (BF16 or F32).
+    static func dense(
+        _ shape: [Int], seed: UInt64, scale: Float, offset: Float = 0, dtype: DType
+    ) -> Tensor {
+        let tensor = bf16(shape, seed: seed, scale: scale, offset: offset)
+        guard dtype == .float32 else { return tensor }
+        let values = MLXArray(Data(tensor.bytes), shape, dtype: .bfloat16).asType(.float32)
+        return Tensor(dtype: "F32", shape: shape, bytes: Array(values.asData(access: .copy).data))
+    }
+
+    /// `order` rotates through the projection slots; `head` is the format of
+    /// `lm_head` (NVFP4 as published).
+    init(
+        layers: Int = 3, hidden: Int = 64, intermediate: Int = 128, window: Int = 64,
+        order: [MuseGlimmerInstallation.ProjectionFormat] = [.fp8, .nvfp4, .dense],
+        head: MuseGlimmerInstallation.ProjectionFormat = .nvfp4, dtype: DType = .bfloat16
+    ) throws {
         configuration = try MuseGlimmerFixture.configuration(
-            MuseGlimmerFixture.pagedText(window: 64, layers: layers))
+            MuseGlimmerFixture.pagedText(
+                window: window, layers: layers, hidden: hidden, intermediate: intermediate))
         let c = configuration
         let trunk = "model.language_model."
-        tensors[trunk + "embed_tokens.weight"] = Self.bf16(
-            [c.vocabularySize, c.hiddenSize], seed: 1, scale: 1)
-        tensors[trunk + "norm.weight"] = Self.bf16([c.hiddenSize], seed: 2, scale: 0.1, offset: 1)
+        tensors[trunk + "embed_tokens.weight"] = Self.dense(
+            [c.vocabularySize, c.hiddenSize], seed: 1, scale: 1, dtype: dtype)
+        tensors[trunk + "norm.weight"] = Self.dense(
+            [c.hiddenSize], seed: 2, scale: 0.1, offset: 1, dtype: dtype)
         var seed: UInt64 = 10
         for layer in 0 ..< c.hiddenLayers {
             for norm in [
@@ -57,22 +75,20 @@ struct MuseGlimmerTinyCheckpoint {
                 "post_feedforward_layernorm",
             ] {
                 seed += 1
-                tensors[trunk + "layers.\(layer).\(norm).weight"] = Self.bf16(
-                    [c.hiddenSize], seed: seed, scale: 0.1)
+                tensors[trunk + "layers.\(layer).\(norm).weight"] = Self.dense(
+                    [c.hiddenSize], seed: seed, scale: 0.1, dtype: dtype)
             }
         }
-        // Rotate the three formats through the slots; the head is NVFP4 as published.
-        let order: [MuseGlimmerInstallation.ProjectionFormat] = [.fp8, .nvfp4, .dense]
         for (index, slot) in MuseGlimmerInstallation.projectionSlots(c).enumerated() {
             seed += 1
-            let format = slot.path == "lm_head" ? .nvfp4 : order[index % 3]
+            let format = slot.path == "lm_head" ? head : order[index % order.count]
             formats[slot.path] = format
             let prefix = MuseGlimmerInstallation.checkpointKey(slot.path)
             let fanIn = Float(slot.input).squareRoot()
             switch format {
             case .dense:
-                tensors[prefix + ".weight"] = Self.bf16(
-                    [slot.output, slot.input], seed: seed, scale: 1.7 / fanIn)
+                tensors[prefix + ".weight"] = Self.dense(
+                    [slot.output, slot.input], seed: seed, scale: 1.7 / fanIn, dtype: dtype)
             case .fp8:
                 // E4M3 magnitudes in [1/8, 8): exponent field 4...9.
                 tensors[prefix + ".weight"] = Tensor(

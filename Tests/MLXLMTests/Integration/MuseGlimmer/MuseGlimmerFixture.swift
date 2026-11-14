@@ -34,10 +34,13 @@ enum MuseGlimmerFixture {
 
     /// The production attention shape (32 query heads over 2 KV heads of 128)
     /// on a small trunk; the native paged kernel needs head dim >= 64.
-    static func pagedText(window: Int, layers: Int = 6) -> [String: Any] {
+    /// `hidden` above 64 gives every projection a row-exact product.
+    static func pagedText(
+        window: Int, layers: Int = 6, hidden: Int = 64, intermediate: Int = 128
+    ) -> [String: Any] {
         [
-            "hidden_size": 64, "num_hidden_layers": layers, "num_attention_heads": 32,
-            "num_key_value_heads": 2, "head_dim": 128, "intermediate_size": 128,
+            "hidden_size": hidden, "num_hidden_layers": layers, "num_attention_heads": 32,
+            "num_key_value_heads": 2, "head_dim": 128, "intermediate_size": intermediate,
             "sliding_window": window, "vocab_size": 96,
             "rope_parameters": ["rope_theta": 500000.0],
         ]
