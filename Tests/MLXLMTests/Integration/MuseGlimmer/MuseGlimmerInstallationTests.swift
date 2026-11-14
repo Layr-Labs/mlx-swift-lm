@@ -450,6 +450,34 @@ struct MuseGlimmerInstallationTests {
         #expect(try Index.readRegularFile(at: config, maximumBytes: configBytes.count) == configBytes)
     }
 
+    /// NVFP4's unscaled product can leave the FP16 range, so a tower with an
+    /// NVFP4 projection refuses FP16 activations; one without plans in FP16.
+    @Test func fp16ActivationsAreRefusedWithNVFP4Projections() throws {
+        func plan(_ checkpoint: MuseGlimmerTinyCheckpoint, _ dtype: DType) throws
+            -> MuseGlimmerInstallation.Plan
+        {
+            var checkpoint = checkpoint
+            if dtype == .float16 {
+                for (key, tensor) in checkpoint.tensors where tensor.dtype == "BF16" {
+                    checkpoint.tensors[key]?.dtype = "F16"
+                }
+            }
+            let written = try checkpoint.write()
+            defer { try? FileManager.default.removeItem(at: written.directory) }
+            return try MuseGlimmerInstallation.plan(
+                configuration: checkpoint.configuration, source: try written.source(),
+                dtype: dtype)
+        }
+        let mixed = try MuseGlimmerTinyCheckpoint()
+        #expect(try plan(mixed, .bfloat16).count(.nvfp4) == 9)
+        #expect(throws: Failure.dtype("F16 activations with NVFP4 projections")) {
+            try plan(mixed, .float16)
+        }
+        let withoutNVFP4 = try MuseGlimmerTinyCheckpoint(order: [.fp8, .dense], head: .dense)
+        let half = try plan(withoutNVFP4, .float16)
+        #expect(half.count(.nvfp4) == 0 && half.count(.fp8) > 0)
+    }
+
     @Test func missingExtraAndMisshapenTensorsRefuseTheLoad() throws {
         let base = try MuseGlimmerTinyCheckpoint()
         func expect(

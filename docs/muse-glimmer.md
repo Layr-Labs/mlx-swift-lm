@@ -54,7 +54,8 @@ Numerics decisions that enter a checkpoint's numerics fingerprint:
   calibrated range clamps instead of becoming NaN.
 - Weight-only NVFP4 products run MLX's `nvfp4` quantized matmul on the producer's bytes; the
   per-tensor `weight_scale_2` multiplies the output in FP32. With BF16 activations the product
-  is rounded to BF16 once by the kernel and once after the scale.
+  is rounded to BF16 once by the kernel and once after the scale. The unscaled product can leave
+  the FP16 range, so the installer refuses FP16 activations when any projection is NVFP4.
 
 The installer reserves no memory. A host holds its own load admission around `stage`.
 

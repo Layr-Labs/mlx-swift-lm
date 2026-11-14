@@ -199,6 +199,11 @@ public enum MuseGlimmerInstallation {
                 textBytes += tensor.layout.byteCount
             }
         }
+        // The unscaled NVFP4 product can leave the FP16 range before
+        // `weight_scale_2` applies, so FP16 activations are refused with it.
+        if dtype == .float16, projections.values.contains(.nvfp4) {
+            throw Failure.dtype("F16 activations with NVFP4 projections")
+        }
         var vision = [String]()
         var visionBytes = 0
         for key in remaining.sorted() {
