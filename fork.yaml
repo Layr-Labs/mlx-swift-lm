@@ -122,7 +122,11 @@ def:
             Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
             run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
             `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks, which
-            the first-token projection charges as decode steps).
+            the first-token projection charges as decode steps). A model-scoped prompt grid
+            (`CBv2ModelCapabilities.prefillChunkAlignment`, default off, set only by Muse Glimmer)
+            cuts a text prompt only at multiples of the alignment, its end and a prefix-restore
+            boundary, runs each cell whole or by first claim on the next step, plans decode rows
+            first, and makes the first-token projection fail closed where a cell would wait.
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time

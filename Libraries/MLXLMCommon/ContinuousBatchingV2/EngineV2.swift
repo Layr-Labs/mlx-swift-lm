@@ -902,6 +902,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
+        scheduler.prefillChunkAlignment = modelCapabilities.prefillChunkAlignment
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
@@ -1161,6 +1162,18 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     ) -> String? {
         if capabilities.requiresPagedKV, !(backend is PagedKVBackend) {
             return "EngineV2: model requires paged KV; \(type(of: backend)) is refused"
+        }
+        // A grid cell is one prompt write, and a paged row refuses a windowed
+        // write longer than the pool's prefill chunk.
+        if let alignment = capabilities.prefillChunkAlignment {
+            guard alignment > 0 else {
+                return "EngineV2: prefill chunk alignment \(alignment) is not positive"
+            }
+            if let paged = backend as? PagedKVBackend, paged.pool.config.maxPrefillChunk < alignment
+            {
+                return
+                    "EngineV2: model cuts prompts into \(alignment)-token cells; the paged pool's maxPrefillChunk \(paged.pool.config.maxPrefillChunk) cannot hold one"
+            }
         }
         // Packed storage disables legacy prefix reuse, not paged execution.
         guard backend is PagedKVBackend || backend.prefixReuseBackend == .pagedFP16 else {

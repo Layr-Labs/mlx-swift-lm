@@ -38,6 +38,13 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     /// The model runs only on paged KV storage: the engine refuses any other
     /// backend instead of serving it from contiguous rows. Default off.
     public var requiresPagedKV: Bool
+    /// The model's prompt bytes depend on where a prompt is cut into chunks.
+    /// When set, the scheduler cuts a text prompt only at multiples of this
+    /// many tokens, at the prompt end and at a boundary a prefix restore
+    /// requires, and runs each such cell whole or not at all, so the cuts
+    /// depend on the prompt alone (`SchedulerV2.prefillChunkAlignment`).
+    /// Default off.
+    public var prefillChunkAlignment: Int?
 
     public init(
         supportsPrefixReuse: Bool = true,
@@ -50,7 +57,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsCompactRecurrentMTPReplay: Bool = false,
         alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
         supportsCausalMediaCheckpointReuse: Bool = false,
-        requiresPagedKV: Bool = false
+        requiresPagedKV: Bool = false,
+        prefillChunkAlignment: Int? = nil
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -63,6 +71,7 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
         self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
         self.requiresPagedKV = requiresPagedKV
+        self.prefillChunkAlignment = prefillChunkAlignment
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()
