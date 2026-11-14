@@ -6,19 +6,8 @@ permissions:
   contents: read
 
 jobs:
-  # Chooses a Darkbloom Sandbox for the lint job when the Darkbloom plane
-  # grants one, else the GitHub-hosted xcode-27 image.
-  route:
-    name: Route Lint
-    uses: ./.github/workflows/darkbloom-route.yml
-    permissions: {}
-    with:
-      lanes: |
-        lint macos_arm64 xcode-27
-
   lint:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['lint'] }}
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
     permissions:
       contents: read
     timeout-minutes: 15

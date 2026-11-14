@@ -18,17 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  route:
-    uses: ./.github/workflows/darkbloom-route.yml
-    permissions: {}
-    with:
-      lanes: |
-        forkdiff-render linux_arm64 ubuntu-latest
-
   render:
     name: Render fork diff
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.routes)['forkdiff-render'] }}
+    runs-on: [self-hosted, linux, ARM64, darkbloom-linux-arm64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -1,4 +1,6 @@
-# Custom macOS runner label available to this repository.
+# Custom runner labels available to this repository.
 self-hosted-runner:
   labels:
     - xcode-27
+    - darkbloom-macos-arm64
+    - darkbloom-linux-arm64

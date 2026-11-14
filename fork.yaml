@@ -943,10 +943,14 @@ def:
         above.
 
         The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a Mac with Xcode 27.2.
-        On a pull request, its macOS jobs and the Lint job run on a Darkbloom Sandbox when the Darkbloom plane
-        grants one (`.github/workflows/darkbloom-route.yml`), else on the GitHub-hosted `xcode-27` image.
-        `.github/workflows/darkbloom-watchdog.yml` re-runs a run whose routed jobs get no runner.
-        Both files are copies from Layr-Labs/d-inference.
+        Its compute jobs, PR lint, fork-diff checking and page rendering queue independently
+        on Darkbloom macOS or Linux ARM64 runners, without a hosted fallback or a seven-Mac
+        reservation before the build. Seven strict audio tests remain hosted on `xcode-27`
+        while native decoding is investigated; they share the native products and exactly-once gate.
+        `.github/workflows/darkbloom-watchdog.yml` keeps its default 30-minute wait threshold
+        and at most one rescue. Native-only reruns still request native runners.
+        `FORKDIFF.md` records the bounded qualification lifetimes and the protected hosted
+        Pages publisher. The reusable route and watchdog files remain available unchanged.
         Parallel jobs then run every test in the package once, in the shards of `.github/test-shards.json`.
         A last job writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
@@ -958,7 +962,19 @@ def:
         asymmetric payload required by the explicit native historical-retention CI selector.
         `AGENTS.md` names the swift-format that CI uses: the one of the Xcode 27.2 that
         `.github/actions/select-xcode` selects.
+
+        The disabled native CodeQL workflow scans Actions, C/C++ and Python with
+        the pinned CodeQL 2.27.4 ARM64 bundle and their existing default suites.
+        It requires `CODEQL_NATIVE=on` after an operator switches default setup
+        to advanced setup. The separate GitHub-hosted publisher validates the
+        same run's bounded, fingerprinted SARIF bundle, then uploads the original
+        category identities without checking out or executing repository code.
+        `docs/ci-codeql-native.md` records activation and rollback gates.
       globs:
+        - ".github/scripts/codeql_artifacts.py"
+        - ".github/scripts/codeql_artifacts_test.py"
+        - ".github/workflows/codeql-native.yml"
+        - "docs/ci-codeql-native.md"
         - "AGENTS.md"
         - ".pre-commit-config.yaml"
         - "scripts/check_forkdiff.py"
