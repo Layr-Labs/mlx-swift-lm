@@ -7,7 +7,7 @@ import Testing
 
 extension UnitTests {
     /// Each case the strict `ATEMToolCallParser` rejects comes back as a call,
-    /// as the reference servers return it.
+    /// as the reference servers return it. An integral float is read alike by both.
     @Suite
     struct ATEMReferenceReaderTests {
         private static let tools: [[String: any Sendable]] = [
@@ -86,7 +86,10 @@ extension UnitTests {
         }
 
         @Test func anIntegralFloatIsAnIntegerAndAWrongTypeKeepsItsText() throws {
-            #expect(Self.strict("get_weather", [("city", "Paris"), ("days", "6.0")]) == nil)
+            // The strict parser also reads an integral float as the integer.
+            #expect(
+                Self.strict("get_weather", [("city", "Paris"), ("days", "6.0")])?.function
+                    .arguments["days"] == .int(6))
             let integral = try #require(
                 Self.read("get_weather", [("city", "Paris"), ("days", "6.0")]).calls.first)
             #expect(integral.toolCall.function.arguments["days"] == .int(6))
