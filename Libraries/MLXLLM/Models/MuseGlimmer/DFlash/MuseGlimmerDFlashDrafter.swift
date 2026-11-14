@@ -21,6 +21,13 @@ public protocol MuseGlimmerDFlashTarget: AnyObject {
     /// `[..., vocabulary]`. Both are increasing maps, so the argmax is the
     /// target's.
     func dflashHeadProduct(_ hidden: MLXArray) -> MLXArray
+    /// True when one forward over a verify window gives every row the bytes
+    /// of the decode step it replaces (`rectangularExact`).
+    var dflashVerifiesWindowsExactly: Bool { get }
+}
+
+extension MuseGlimmerDFlashTarget {
+    public var dflashVerifiesWindowsExactly: Bool { false }
 }
 
 /// The Muse Glimmer DFlash block drafter as a request-stateful CBv2 drafter.
@@ -59,6 +66,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
             self.commitsAcceptedPrefixPerRow = commitsAcceptedPrefixPerRow
             self.backendScratchBytes = backendScratchBytes
         }
+
+        /// One-forward exact verification on a target with exact windows,
+        /// each row committing its own prefix; serial verification otherwise.
+        public static func verifying(
+            _ target: any MuseGlimmerDFlashTarget, maximumSpeculativeRows: Int = 1,
+            backendScratchBytes: Int = 0
+        ) -> Settings {
+            let exact = target.dflashVerifiesWindowsExactly
+            return Settings(
+                verification: exact ? .rectangularExact : .serialTarget,
+                maximumSpeculativeRows: exact ? maximumSpeculativeRows : 1,
+                commitsAcceptedPrefixPerRow: exact, backendScratchBytes: backendScratchBytes)
+        }
     }
 
     public let target: any MuseGlimmerDFlashTarget
@@ -88,6 +108,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
                 settings.maximumSpeculativeRows),
             settings.backendScratchBytes >= 0
         else { throw MuseGlimmerDFlashError.configuration("settings") }
+        guard settings.verification != .rectangularExact || target.dflashVerifiesWindowsExactly
+        else { throw MuseGlimmerDFlashError.target("exact verify windows") }
         self.target = target
         self.model = model
         self.settings = settings

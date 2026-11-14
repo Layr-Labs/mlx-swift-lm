@@ -13,4 +13,5 @@ extension MuseGlimmerTextModel: MuseGlimmerDFlashTarget {
         rawTokenEmbeddings(tokens)
     }
     public func dflashHeadProduct(_ hidden: MLXArray) -> MLXArray { headProduct(hidden) }
+    public var dflashVerifiesWindowsExactly: Bool { verifiesWindowsExactly }
 }
