@@ -24,6 +24,11 @@ public protocol MuseGlimmerDFlashTarget: AnyObject {
     /// `[..., vocabulary]`. Both are increasing maps, so the argmax is the
     /// target's.
     func dflashHeadProduct(_ hidden: MLXArray) -> MLXArray
+    /// The target's readout after its head product (logit multiplier, then
+    /// softcap), so a head product becomes the logits the target samples
+    /// from. Only coupled proposals read it: their race needs the target's
+    /// scale, while an argmax does not.
+    func dflashReadout(_ headProduct: MLXArray) -> MLXArray
     /// True when one forward over a verify window gives every row the bytes
     /// of the decode step it replaces (`rectangularExact`).
     var dflashVerifiesWindowsExactly: Bool { get }
@@ -31,6 +36,7 @@ public protocol MuseGlimmerDFlashTarget: AnyObject {
 
 extension MuseGlimmerDFlashTarget {
     public var dflashVerifiesWindowsExactly: Bool { false }
+    public func dflashReadout(_ headProduct: MLXArray) -> MLXArray { headProduct }
 }
 
 /// The Muse Glimmer DFlash block drafter as a request-stateful CBv2 drafter.
@@ -38,10 +44,13 @@ extension MuseGlimmerDFlashTarget {
 /// Bound to one target instance. Each request owns the keys and values of its
 /// last `sliding_window` committed target positions. The first draft step of
 /// a round runs one block forward and keeps its proposals; later steps of the
-/// round return them. Proposals are the argmax of the target's own head, and
-/// the engine keeps one only when it equals the token the target itself
-/// chose, so they change speed and never the output.
-public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unchecked Sendable {
+/// round return them. Proposals are the argmax of the target's own head (or,
+/// with `couplesSampledProposals`, a sampled row's race with its verify
+/// noise), and the engine keeps one only when it equals the token the target
+/// itself chose, so they change speed and never the output.
+public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter,
+    CBv2MTPCoupledProposalDrafter, @unchecked Sendable
+{
     public struct Settings: Sendable, Equatable {
         /// Draft tokens per round, at most the engine's tested window of 7
         /// and the block's `blockSize - 1`.
@@ -60,12 +69,17 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         /// A rectangular round attends its (row, column) pairs as rows of one
         /// paged decode dispatch per layer instead of one per column.
         public var batchesVerifyColumnsAsDecodeRows: Bool
+        /// Sampled rows propose the race of the draft's row with the noise
+        /// of the target's verify draw at each position, instead of the
+        /// argmax (`CBv2MTPCoupledProposalDrafter`). Greedy rows keep the
+        /// argmax. Output is unchanged either way.
+        public var couplesSampledProposals: Bool
 
         public init(
             maximumDraftTokens: Int = CBv2MTPConfig.testedMaxDraftTokens,
             verification: CBv2MTPVerificationMode? = nil, maximumSpeculativeRows: Int = 1,
             commitsAcceptedPrefixPerRow: Bool = false, backendScratchBytes: Int = 0,
-            batchesVerifyColumnsAsDecodeRows: Bool = false
+            batchesVerifyColumnsAsDecodeRows: Bool = false, couplesSampledProposals: Bool = false
         ) {
             self.maximumDraftTokens = maximumDraftTokens
             self.verification = verification
@@ -73,6 +87,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
             self.commitsAcceptedPrefixPerRow = commitsAcceptedPrefixPerRow
             self.backendScratchBytes = backendScratchBytes
             self.batchesVerifyColumnsAsDecodeRows = batchesVerifyColumnsAsDecodeRows
+            self.couplesSampledProposals = couplesSampledProposals
         }
 
         /// One-forward exact verification on a target with exact windows,
@@ -80,14 +95,16 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         /// decode rows; serial verification otherwise.
         public static func verifying(
             _ target: any MuseGlimmerDFlashTarget, maximumSpeculativeRows: Int = 1,
-            backendScratchBytes: Int = 0, batchesVerifyColumnsAsDecodeRows: Bool = true
+            backendScratchBytes: Int = 0, batchesVerifyColumnsAsDecodeRows: Bool = true,
+            couplesSampledProposals: Bool = false
         ) -> Settings {
             let exact = target.dflashVerifiesWindowsExactly
             return Settings(
                 verification: exact ? .rectangularExact : .serialTarget,
                 maximumSpeculativeRows: exact ? maximumSpeculativeRows : 1,
                 commitsAcceptedPrefixPerRow: exact, backendScratchBytes: backendScratchBytes,
-                batchesVerifyColumnsAsDecodeRows: exact && batchesVerifyColumnsAsDecodeRows)
+                batchesVerifyColumnsAsDecodeRows: exact && batchesVerifyColumnsAsDecodeRows,
+                couplesSampledProposals: couplesSampledProposals)
         }
     }
 
@@ -154,6 +171,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
     /// target's own distribution, and that token is what is emitted, so
     /// sampled rows speculate too.
     public var supportsTargetPrefixAcceptance: Bool { true }
+    public var couplesSampledProposals: Bool { settings.couplesSampledProposals }
     /// Observation builds lazy writes into the context ring; they must be
     /// evaluated with the step that produced the observed rows.
     public var requiresCommittedObservationFence: Bool { true }
@@ -175,6 +193,8 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         /// This round's proposals `[maximumDraftTokens]` and their hidden
         /// rows `[maximumDraftTokens, hiddenSize]`.
         var memo: (tokens: MLXArray, hidden: MLXArray)?
+        /// This round's coupled-proposal rule; nil proposes the argmax.
+        var selection: CBv2MTPProposalSelection?
         var committedInputCount = 0
         var stagedInputCount = 0
         /// Why this request cannot continue; reported at the next fence.
@@ -199,6 +219,15 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
 
     public func makeRequestState() -> any CBv2MTPRequestState {
         State(owner: ObjectIdentifier(self), context: model.makeContextState())
+    }
+
+    /// The engine's rule for this round's proposals. Ignored unless
+    /// `couplesSampledProposals`; cleared with the round.
+    public func setProposalSelection(
+        _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState
+    ) {
+        let s = state(requestState)
+        s.selection = settings.couplesSampledProposals ? selection : nil
     }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
@@ -305,8 +334,19 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         guard logits.shape == [settings.maximumDraftTokens, target.dflashVocabularySize] else {
             return "head"
         }
-        s.memo = (argMax(logits, axis: -1).asType(.int32), rows)
+        s.memo = (proposals(logits, selection: s.selection), rows)
         return nil
+    }
+
+    /// The argmax of the head products, or a selection's proposals over the
+    /// target's readout of them when it gives one per row.
+    private func proposals(_ logits: MLXArray, selection: CBv2MTPProposalSelection?) -> MLXArray {
+        if let selection, let coupled = selection.propose(target.dflashReadout(logits)),
+            coupled.shape == [logits.dim(0)]
+        {
+            return coupled.asType(.int32)
+        }
+        return argMax(logits, axis: -1).asType(.int32)
     }
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
@@ -356,6 +396,7 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
 
     private func clearRound(_ s: State) {
         s.memo = nil
+        s.selection = nil
         s.stagedInputCount = 0
     }
 
@@ -386,7 +427,8 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
     /// Explicit arrays of one block forward and its head rows. Per layer: the
     /// keys and values handed to attention (held rows and the block), float32
     /// scores, queries, the attention output and the MLP's three products.
-    /// Then float32 head rows and their argmax.
+    /// Then float32 head rows and their argmax, and the coupled race when
+    /// it is on.
     var blockBytes: Int {
         let c = model.configuration
         let size = model.activationDType.size
@@ -398,7 +440,17 @@ extension MuseGlimmerDFlashDrafter: CBv2MTPBoundedAllocationProviding {
             * (3 * c.attentionHeads * c.headDimensions + 6 * c.hiddenSize + 3 * c.intermediateSize)
         let head =
             settings.maximumDraftTokens * (target.dflashVocabularySize * 4 + c.hiddenSize * 4)
-        return c.hiddenLayers * layer + head + c.blockSize * (keys + c.hiddenSize * size)
+        return c.hiddenLayers * layer + head + coupledProposalBytes
+            + c.blockSize * (keys + c.hiddenSize * size)
+    }
+
+    /// The coupled race over the head rows (`couplesSampledProposals`), all
+    /// float32 at worst: the readout's four steps (multiplier, scale, tanh,
+    /// scale back) and the race's seven arrays (cast, temperature, softmax,
+    /// noise, their ratio, the above-winner mask and its masked mass).
+    var coupledProposalBytes: Int {
+        settings.couplesSampledProposals
+            ? 11 * settings.maximumDraftTokens * target.dflashVocabularySize * 4 : 0
     }
 
     /// Per request: the ring's two buffers, one copy of each for a write MLX

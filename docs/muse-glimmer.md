@@ -95,6 +95,18 @@ against the pin. `MuseGlimmerDFlashDrafter` is a request-stateful CBv2 drafter:
   positions in a fixed ring, charged once at admission.
 - One block forward per round proposes up to 7 tokens (decision D6) with the target's own
   `headProduct` and argmax.
+- With `Settings.couplesSampledProposals` (default off), a sampled row proposes with coupled
+  proposals instead (`CBv2MTPCoupledProposalDrafter`). Each round the engine hands the row a
+  `CBv2MTPProposalSelection`: draft index j races the drafter's logits, put on the target's
+  readout scale (`dflashReadout`: output multiplier, then softcap), with the noise of the
+  target's verify draw at output index `generatedTokenCount + j`
+  (`CBv2StepSampler.mtpCoupledDraftProposal`, the default sampler's `mtpCoupledProposal`).
+  The engine hands a selection only for exact target-prefix acceptance without a free span.
+  A real-weight replay measured lower sampled acceptance with it than with the argmax, so it
+  stays off.
+  Greedy rows, and samplers without the race, keep the argmax. The emitted token is the
+  target's draw either way, so only agreement changes. The race's float32 working set is
+  charged in `blockBytes`.
 - The engine keeps a proposal only when it equals the token the target chose, greedy or
   sampled, so the drafter changes speed and never the output. The drafter requires this exact
   acceptance: under `.typical` the round driver is not built and speculation stays off.
@@ -177,6 +189,10 @@ with one-row steps in BF16 and float32, across the sliding window edge and the r
 attention per column and as decode rows. `PagedColumnsAsDecodeRowsTests` check the decode-row
 attention alone at the production head shape: 1 to 16 requests, rounds of 1 to 8 columns,
 prompts across the 2,048-token window and the ring wrap, and rolled-back columns.
+`MuseGlimmerDFlashCoupledProposalTests` run coupled proposals through the engine: sampled
+output equals the target alone (seeded, unseeded on a shared fallback seed, serial and
+rectangular), each round's race uses its verify draw's keys, the drafter proposes what the
+selection gives, and greedy rows and drafters that do not opt in get nothing.
 `MuseGlimmerDFlashExactVerifyTests` run the engine with the drafter on exact windows: the
 output equals the target alone, greedy and sampled, cold and restored, one or two requests, and
 a request's decode and verify rows keep their bytes while another request's prompt is prefilled

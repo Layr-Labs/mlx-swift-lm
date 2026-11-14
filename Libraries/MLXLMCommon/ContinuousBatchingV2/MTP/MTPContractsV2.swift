@@ -475,6 +475,42 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
 }
 
+/// One sampled row's coupled proposals for one round: draft logits
+/// `[n, vocab]`, row j for the round's draft index j, raced with the noise
+/// the target's verify draw uses at that row's output index
+/// (`CBv2StepSampler.mtpCoupledDraftProposal`). The engine builds it; a
+/// drafter only applies it.
+public struct CBv2MTPProposalSelection {
+    private let race: (MLXArray) -> MLXArray?
+
+    public init(_ race: @escaping (MLXArray) -> MLXArray?) {
+        self.race = race
+    }
+
+    /// Lazy `[n]` int32 proposals, or nil when the sampler has no coupled
+    /// race (the drafter then keeps its own rule).
+    public func propose(_ logits: MLXArray) -> MLXArray? {
+        race(logits)
+    }
+}
+
+/// A request-stateful drafter that can propose with its row's verify noise.
+///
+/// Exact acceptance keeps a draft only when it equals the target's own
+/// draw, and that draw is what is emitted, so which proposal is made never
+/// changes the output; a proposal raced with the same noise as the draw
+/// only agrees with it more often. Opt-in and default off.
+public protocol CBv2MTPCoupledProposalDrafter: CBv2MTPRequestStatefulDrafter {
+    /// True to receive a selection for sampled rows.
+    var couplesSampledProposals: Bool { get }
+    /// Before draft index 0 of every round, for every row of the round: the
+    /// row's selection, or nil when it has none (greedy, a free span,
+    /// typical acceptance, or no target-prefix verify). A drafter uses it
+    /// for that round only.
+    func setProposalSelection(
+        _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState)
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.

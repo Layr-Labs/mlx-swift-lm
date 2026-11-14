@@ -130,7 +130,7 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
 /// keeps its own state; only the proposed token is replaced, from the known
 /// continuation of the request, so a test decides where the target accepts.
 final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
-    CBv2MTPBoundedAllocationProviding
+    CBv2MTPCoupledProposalDrafter, CBv2MTPBoundedAllocationProviding
 {
     enum Mode: Equatable, Sendable {
         /// The drafter's own proposals.
@@ -157,6 +157,12 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     private(set) var observedPositions: [Int] = []
     /// Called on the engine thread when a block is drafted, with the count so far.
     var onBlock: ((Int) -> Void)?
+    /// Every proposal selection the engine installed, in order.
+    private(set) var selections: [CBv2MTPProposalSelection?] = []
+    /// Every proposal returned, per drafted block (lazy until read).
+    private(set) var proposals: [[MLXArray]] = []
+    /// Replaces a non-nil selection before the drafter sees it.
+    var selectionOverride: ((CBv2MTPProposalSelection) -> CBv2MTPProposalSelection)?
 
     init(
         _ native: MuseGlimmerDFlashDrafter, mode: Mode, scripts: [[Int]] = [], vocabulary: Int
@@ -172,6 +178,14 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     var maximumDraftTokens: Int? { native.maximumDraftTokens }
     var maximumSpeculativeBatch: Int? { native.maximumSpeculativeBatch }
     var supportsTargetPrefixAcceptance: Bool { native.supportsTargetPrefixAcceptance }
+    var couplesSampledProposals: Bool { native.couplesSampledProposals }
+    func setProposalSelection(
+        _ selection: CBv2MTPProposalSelection?, requestState: any CBv2MTPRequestState
+    ) {
+        selections.append(selection)
+        native.setProposalSelection(
+            selection.map { selectionOverride?($0) ?? $0 }, requestState: requestState)
+    }
     var commitsAcceptedPrefixPerRow: Bool { native.commitsAcceptedPrefixPerRow }
     var batchesVerifyColumnsAsDecodeRows: Bool { native.batchesVerifyColumnsAsDecodeRows }
     /// Lets a test drive the driver's switches under typical acceptance.
@@ -248,8 +262,10 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
             anchors[id] = state.context.nextPosition
             blockAnchors.append(state.context.nextPosition)
             blockContextRows.append(state.context.count)
+            proposals.append([])
             onBlock?(blockAnchors.count)
         }
+        if !proposals.isEmpty { proposals[proposals.count - 1].append(result.tokens) }
         guard mode != .native, let script = bound[id], let anchor = anchors[id] else {
             return result
         }
@@ -312,7 +328,8 @@ enum MuseGlimmerDFlashEngineFixture {
     static func engine(
         target: MuseGlimmerDFlashTinyTarget, drafter: (any CBv2MTPDrafter)?, depth: Int = 7,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        store: CompleteCheckpointFixtureStore? = nil, acceptance: CBv2MTPAcceptance = .exact
+        store: CompleteCheckpointFixtureStore? = nil, acceptance: CBv2MTPAcceptance = .exact,
+        sampler: CBv2StepSampler = CBv2DefaultSampler()
     ) throws -> (EngineV2, PagedKVBackend) {
         let kinds = target.layerKinds
         let backend = try PagedKVBackend(
@@ -323,6 +340,7 @@ enum MuseGlimmerDFlashEngineFixture {
         let engine = EngineV2(
             model: target, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+            sampler: sampler,
             schedulerConfig: .init(
                 maxConcurrentRequests: 2, maxBatchedTokensPerStep: 2 * chunk,
                 prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: store != nil),

@@ -668,6 +668,35 @@ extension EngineLoopV2 {
                 ? rec.request.promptTokens : nil)
     }
 
+    /// A sampled row's coupled proposals for this round; nil keeps the
+    /// drafter's own rule. Draft index j is verified against the target's
+    /// draw at output index `generatedTokenCount + j`, the verify path's own
+    /// step base, so the race uses exactly that draw's noise. Only for exact
+    /// target-prefix acceptance, where the emitted token is the target's draw
+    /// whatever is proposed.
+    func mtpCoupledProposalSelection(
+        _ rec: CBv2ScheduledRequest, freeSpan: CBv2MTPFreeSpan?, driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPProposalSelection? {
+        let params = rec.request.sampling
+        guard params.temperature >= LogitsPipelineV2.greedyEpsilon, freeSpan == nil,
+            mtp.targetPrefixAcceptance, sampler.supportsMTPTargetPrefix,
+            mtp.config.acceptance == .exact
+        else { return nil }
+        let sampler = self.sampler
+        let id = rec.id
+        let base = rec.generatedTokenCount
+        return CBv2MTPProposalSelection { logits in
+            guard logits.ndim == 2, logits.dim(0) > 0 else { return nil }
+            let n = logits.dim(0)
+            return sampler.mtpCoupledDraftProposal(
+                logits: logits.reshaped([n, 1, logits.dim(1)]),
+                params: Array(repeating: params, count: n),
+                requestIDs: Array(repeating: id, count: n),
+                stepBases: (0 ..< n).map { base + $0 }
+            )?.reshaped([n])
+        }
+    }
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
@@ -762,6 +791,18 @@ extension EngineLoopV2 {
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+            // Opted-in drafters only; every other drafter's round is unchanged.
+            if let coupled = stateful as? any CBv2MTPCoupledProposalDrafter,
+                coupled.couplesSampledProposals
+            {
+                for (index, row) in verifyRows.enumerated() {
+                    guard let requestState = rowMetadata[index].assistantState else { continue }
+                    coupled.setProposalSelection(
+                        mtpCoupledProposalSelection(
+                            row.rec, freeSpan: rowMetadata[index].freeSpan, driver: mtp),
+                        requestState: requestState)
+                }
+            }
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }
