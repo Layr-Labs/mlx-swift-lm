@@ -363,16 +363,22 @@ def:
         engine reads tool frames strictly; its `onyxParsing` option (`--onyx-parsing reference-parity` or
         `MLX_SERVER_ONYX_PARSING` in the CLI) selects the reference reading. A rejected call or a protocol
         error has no OpenAI field, so the handler emits nothing for it.
+        `ATEMReferenceReader` is for a host that splits the frames and validates calls itself: it reads one
+        frame's invokes with the same scanner and value typing, but returns an undeclared name as generated,
+        as vLLM does, and `Call.isDeclared` says which. It checks nothing against the schema.
         The unit tests port the vLLM Muse Glimmer parser cases and its schema value table.
         `MuseGlimmerOnyxTokenizerLiveTests` (with the Muse Glimmer integration tests) runs the token
         decoder with the published tokenizer when `MUSE_GLIMMER_NVFP4_DIR` names a snapshot directory;
         it reads no weights.
       globs:
+        - "changelog.d/atem-reference-reader.md"
+        - "Libraries/MLXLMCommon/Tool/Parsers/ATEMReferenceReader.swift"
         - "Libraries/MLXLMCommon/Tool/Parsers/ATEMReferenceScanner.swift"
         - "Libraries/MLXLMCommon/Tool/Parsers/OnyxReference*.swift"
         - "Libraries/MLXLMCommon/Tool/Parsers/OnyxStreamDecoders.swift"
         - "Libraries/MLXLMServer/Parsing/StreamingOnyxReasoningParser.swift"
         - "Libraries/MLXLMServer/Runtime/ChannelTokenLoopHandler.swift"
+        - "Tests/MLXLMTests/Unit/Tool/ATEMReferenceReaderTests.swift"
         - "Tests/MLXLMTests/Unit/Tool/ATEMReferenceScannerTests.swift"
         - "Tests/MLXLMTests/Unit/Tool/Onyx*.swift"
         - "Tests/MLXLMServerTests/Unit/Parsing/OnyxReasoningParserTests.swift"
