@@ -17,9 +17,9 @@
 // (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
 // (prefill completion into a different set, finish, cancel, join, pause).
 // Token-constrained rows chain only when their constraint and the sampler
-// opt in: N+1 is masked speculatively and, if N's confirmed token changed
-// the mask, redrawn from its retained logits before anything consumes it
-// (`redrawInvalidatedConstrainedSuccessor`).
+// opt in, and never on a native-tracked engine: N+1 is masked speculatively
+// and, if N's confirmed token changed the mask, redrawn from its retained
+// logits before anything consumes it (`redrawInvalidatedConstrainedSuccessor`).
 
 import Cmlx
 import Foundation
@@ -3060,11 +3060,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Constraint state advances from the host-confirmed token. A
             // constrained row chains only when both its constraint and the
             // sampler opt in: N+1 is then masked speculatively and redrawn
-            // after N's finalization if N's token changed the mask.
+            // after N's finalization if N's token changed the mask. Never on
+            // a native-tracked engine, whose launches go through the native
+            // work protocol that the redraw does not.
             ids.allSatisfy({ id in
                 guard let constraint = scheduler.record(for: id)?.request.tokenConstraint
                 else { return true }
                 return constraint.allowsChainedDecode && sampler.supportsConstrainedChainedDecode
+                    && nativeShutdownState == nil
             }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(

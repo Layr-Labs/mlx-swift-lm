@@ -1,0 +1,4 @@
+# Custom macOS runner label available to this repository.
+self-hosted-runner:
+  labels:
+    - xcode-27
