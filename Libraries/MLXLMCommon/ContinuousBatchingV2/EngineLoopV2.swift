@@ -885,6 +885,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Root must retain/charge every attached copy before its execution.
     var nativeHistoricalMTPCaptureBeforeCommit: ((CBv2InFlightStep) throws -> Void)?
     var nativeSubmittedWorkFailureForTesting: (() throws -> Void)?
+    var mtpGrammarColumnSubmittedForTesting: ((Int) throws -> Void)?
     var nativeRequiredAssistantFenceForTesting: ((any CBv2MTPRequestState) throws -> Void)?
     var nativePendingRetirementCountForTesting: Int { nativePendingRetirements.count }
     /// Engine-queue-confined fact only. Call within the existing test boundary;

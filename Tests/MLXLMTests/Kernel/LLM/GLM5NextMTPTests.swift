@@ -1406,6 +1406,197 @@ extension KernelTests {
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
+        /// With grammar-aware verification on, a constrained row drafts on the
+        /// protected engine and still follows its constraint: drafts that match
+        /// it are accepted (`shift` 0), others are corrected by the mask (1).
+        @Test(arguments: [GLM5NextMTPVerification.serialTarget, .rectangular(depth: 2)], [0, 1])
+        func protectedPagedEngineVerifiesConstrainedDraftsWithTheGrammar(
+            verification: GLM5NextMTPVerification, shift: Int
+        ) async throws {
+            let h = try NativeHarness(
+                projectionSign: 1, verification: verification, sampled: true,
+                constrainedSpeculation: true)
+            #expect(h.resources.contract.supportsConstrainedMTPVerification)
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            let prompt = [1, 2, 3, 4]
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 8).map {
+                ($0 + shift) % 16
+            }
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(1981), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            var tokens: [Int] = []
+            for await event in stream {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            #expect(tokens == forced)
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            #expect(metrics.proposedTokens > 0)
+            if shift == 0 { #expect(metrics.acceptedTokens > 0) }
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("grammar-verified GLM row left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
+            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// Grammar-aware verification leaves plain rows alone: they keep their
+        /// exact greedy streams and keep speculating, alone and beside a
+        /// grammar-verified row.
+        @Test(arguments: [GLM5NextMTPVerification.serialTarget, .rectangular(depth: 2)])
+        func protectedPagedEngineKeepsPlainRowsWithGrammarVerificationOn(
+            verification: GLM5NextMTPVerification
+        ) async throws {
+            let h = try NativeHarness(
+                projectionSign: 1, verification: verification, sampled: true,
+                constrainedSpeculation: true)
+            let prompt = [1, 2, 3, 4]
+            let other = [5, 6, 7]
+            let plainExpected = try greedy(h.fixture.target, prompt: prompt, count: 6)
+            let otherExpected = try greedy(h.fixture.target, prompt: other, count: 5)
+            let alone = try h.engine.submit(
+                .init(
+                    id: .init(1991), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: 6))
+            var aloneTokens: [Int] = []
+            for await event in alone {
+                if case .delta(_, let values, _) = event { aloneTokens += values }
+            }
+            #expect(aloneTokens == plainExpected)
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens > 0)
+
+            let forced = plainExpected.map { ($0 + 1) % 16 }
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+            }
+            let constrainedRow = try h.engine.submit(
+                .init(
+                    id: .init(1992), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            let plainRow = try h.engine.submit(
+                .init(
+                    id: .init(1993), promptTokens: other,
+                    sampling: .init(temperature: 0), maxTokens: 5))
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+            }
+            var tokens: [Int] = []
+            for await event in constrainedRow {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            var plainTokens: [Int] = []
+            for await event in plainRow {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(tokens == forced && plainTokens == otherExpected)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("plain rows beside grammar verification left native work: \(outcome)")
+                return
+            }
+            #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// A grammar column that fails after its work completed ends only that
+        /// row: the tokens confirmed before the column are kept, the row fails,
+        /// and the engine stays healthy for the next request.
+        @Test func protectedPagedEngineKeepsConfirmedTokensWhenAGrammarColumnFails() async throws {
+            let h = try NativeHarness(projectionSign: 1, sampled: true, constrainedSpeculation: true)
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            let prompt = [1, 2, 3, 4]
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 8)
+            var injected = false
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.mtpGrammarColumnSubmittedForTesting = { column in
+                    guard column == 1, !injected else { return }
+                    injected = true
+                    throw GrammarColumnFailure()
+                }
+            }
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(2001), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            var tokens: [Int] = []
+            var failed = false
+            for await event in stream {
+                if case .delta(_, let values, _) = event { tokens += values }
+                if case .finished(let reason, _) = event, case .error = reason { failed = true }
+            }
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.mtpGrammarColumnSubmittedForTesting = nil
+            }
+            #expect(injected && failed)
+            #expect(tokens.count >= 2 && tokens.count < forced.count)
+            #expect(tokens == Array(forced.prefix(tokens.count)))
+            #expect(tracking.outcome == nil && h.engine.nativeCompletionFault == nil)
+
+            let plain = try h.engine.submit(
+                .init(
+                    id: .init(2002), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: 6))
+            var plainTokens: [Int] = []
+            for await event in plain {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(plainTokens == Array(forced.prefix(6)))
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("a failed grammar column left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
+            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// An engine fault while finalize samples a constrained row's committed
+        /// prefix stops the walk without trapping: nothing is committed after
+        /// the fault, earlier output follows the constraint, and the engine
+        /// reports the fault instead of a quiescent shutdown.
+        @Test func protectedPagedEngineStopsGrammarVerificationOnAnEngineFault() async throws {
+            let h = try NativeHarness(projectionSign: 1, sampled: true, constrainedSpeculation: true)
+            // A faulted engine is retained for restart only; keep its owners too.
+            defer { _ = Unmanaged.passRetained(h) }
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            let prompt = [1, 2, 3, 4]
+            let forced = try greedy(h.fixture.target, prompt: prompt, count: 8)
+            var injected = false
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.mtpGrammarColumnSubmittedForTesting = {
+                    [weak loop = h.engine.loopForTesting] column in
+                    guard column == 1, !injected else { return }
+                    injected = true
+                    loop?.failNativeCompletion(.stepWatchdog)
+                    throw GrammarColumnFailure()
+                }
+            }
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(2011), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: forced.count,
+                    tokenConstraint: SequenceConstraint(forced)))
+            var tokens: [Int] = []
+            for await event in stream {
+                if case .delta(_, let values, _) = event { tokens += values }
+            }
+            #expect(injected)
+            #expect(tokens.count < forced.count && tokens == Array(forced.prefix(tokens.count)))
+            guard case .incomplete(let fault)? = tracking.outcome else {
+                Issue.record("an engine fault mid-walk was not reported")
+                return
+            }
+            #expect(fault.reason == .stepWatchdog)
+            #expect(tracking.debugRetainedRootCount > 0)
+        }
+
+        private struct GrammarColumnFailure: Error {}
+
         /// Allows exactly `tokens[state]` at each step.
         private final class SequenceConstraint: CBv2TokenConstraint, @unchecked Sendable {
             let mode: CBv2TokenConstraintMode = .auto
@@ -2502,7 +2693,8 @@ extension KernelTests {
                 pageSize: Int = CBv2PagedDefaults.pageSize, targetNoise: Bool = false,
                 binaryHead: Bool = false, executionPolicy: GLM5NextExecutionPolicy = .reference,
                 sampled: Bool = false, noiseAmplitude: Double = 0.35,
-                capacityBytes: Int = 128 << 20, submitsEveryDraftStepEarly: Bool = true
+                capacityBytes: Int = 128 << 20, submitsEveryDraftStepEarly: Bool = true,
+                constrainedSpeculation: Bool = false
             ) throws {
                 fixture = try Fixture(
                     layers: 4, mtpProjectionSign: projectionSign, targetNoise: targetNoise,
@@ -2545,7 +2737,8 @@ extension KernelTests {
                     mtpConfig: .init(
                         enabled: true, maxDraftTokens: verification.depth,
                         maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
-                        verificationMode: verification.engineMode),
+                        verificationMode: verification.engineMode,
+                        constrainedSpeculation: constrainedSpeculation),
                     processMemoryOwner: process, nativeCompletionTracking: true,
                     nativeExecutionContract: resources.contract)
                 #expect(engine.mtpInactiveReason == nil)

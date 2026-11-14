@@ -100,6 +100,8 @@ public struct CBv2NativeExecutionContract: Sendable {
     /// GLM page-bank profiles mask a constrained row with the ordinary sampler,
     /// as they capture logprob rows; the row never drafts or chains. Not MiMo.
     public var supportsTokenConstraints: Bool { supportsLogprobCapture }
+    /// Not qualified yet: constrained rows stay target-only on every native profile.
+    public var supportsConstrainedMTPVerification: Bool { false }
     /// Separate permission of the same ticket: the GLM page bank verifies one
     /// captured rectangular window per round, optionally with its complete
     /// prefix store (a distinct profile, so checkpoint identities differ).
