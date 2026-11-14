@@ -80,7 +80,11 @@ def:
         The drafter's `Settings.verifying` also asks for decode-row attention, one paged decode
         dispatch per layer for the whole round.
         The shared pieces are additive in `MLXLMCommon/Quantization`:
-        `ModelOptWeightOnlyNVFP4RowExact` and `ModelOptRowExact.Schedule` (default `.standard`).
+        `ModelOptWeightOnlyNVFP4RowExact`, `ModelOptRowExact.Schedule` (default `.standard`) and
+        `ModelOptIndexedCheckpoint`, a model-agnostic binding of a sharded safetensors checkpoint
+        to its index: the index matches a pinned SHA-256, every key lives in the one shard the
+        index names (each shard verified against its own pin), no shard holds an unindexed
+        tensor, and no payload is read.
         Vision is not wired and the type is not registered in a factory. Tests use tiny synthetic
         models, except the `*Real*` suites, which run against the real checkpoint, the pinned
         drafter and an independent oracle only when `MUSE_GLIMMER_NVFP4_DIR`,
@@ -218,7 +222,14 @@ def:
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A drafter that declares
             `batchesVerifyColumnsAsDecodeRows` (default false) has the paged caches attend the
-            round's columns as decode rows. A fixed-depth owner may also fix the depth by the
+            round's columns as decode rows. A request-stateful drafter whose history can change
+            only which tokens are proposed may conform to `CBv2MTPAdvisoryHistoryDrafter`
+            (`requestStateIsAdvisory`, `CBv2MTPAdvisoryHistory.swift`): under exact acceptance
+            the generic paged engine then keeps complete prefix checkpoints with no assistant
+            state (`checkpointsRequireAssistantHistory` is false), and each observation carries
+            its absolute target position (`observeCommittedTarget(_:startingAt:requestState:)`),
+            so a restored request's history starts at the restored boundary. Drafters that do
+            not conform, and typical acceptance, keep the old refusal. A fixed-depth owner may also fix the depth by the
             plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
             request-scoped media fallback
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
