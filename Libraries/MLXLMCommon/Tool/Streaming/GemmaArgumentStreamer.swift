@@ -98,6 +98,22 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
                 phase = .finished
                 return ""
             }
+            // Numeric marker strings can change type at frame close. Keep
+            // their bytes private until the schema-guided parse is complete.
+            if GemmaFunctionParser.schemaCoercionEnabled,
+                let name, let tools,
+                let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: name, in: tools)
+            {
+                let schema = GemmaFunctionParser.quotedMemberSchema(key, in: parameters)
+                // Normalization uses only declared types to decide whether a
+                // numeric string can convert; a valid numeric probe checks it.
+                if GemmaFunctionParser.numericReading("0", schema: schema) != nil {
+                    lexer = GemmaValueLexer()
+                    token = []
+                    phase = .heldValue
+                    return consume(scalar)
+                }
+            }
             if scalar == "<" {
                 token = [scalar]
                 phase = .markerProbe(key)

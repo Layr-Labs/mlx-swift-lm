@@ -238,14 +238,16 @@ extension EngineLoopV2 {
             let metadata: CBv2MTPRoundInFlight.VerifyRow
             let rec: CBv2ScheduledRequest
             /// The target's own token at every window position.
-            let targets: [Int]
+            var targets: [Int]
             /// What the row commits: the accepted drafts as proposed, then
             /// the target token at the first rejection or bonus position.
             /// Equals `targets` position-for-position under exact acceptance.
-            let committed: [Int]
-            let accepted: Int
+            var committed: [Int]
+            var accepted: Int
             /// Accepted drafts plus one, cut at the length bound and a stop token.
-            let naturalEmitted: Int
+            var naturalEmitted: Int
+            var constraintFailure: String? = nil
+            var nonFiniteAfterPrefix = false
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
@@ -279,13 +281,37 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
+            if metadata.freeSpan != nil, let failure = sampler.tokenConstraintFailure(for: id) {
+                step.discard.insert(id)
+                releaseDiscarded(metadata)
+                finishRequest(id, reason: .error(failure))
+                continue
+            }
             let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
             let targets = (0 ..< targetWidth).map {
                 Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
+            // Grammar verification owns constrained rows outside an opted-in
+            // free span; free-span rows keep their pure same-state previews.
+            if rec.request.tokenConstraint != nil, metadata.freeSpan == nil {
+                let limit = min(targetWidth, rec.request.maxTokens - rec.generatedTokenCount)
+                commonEmitted = min(commonEmitted, limit)
+                outcomes.append(
+                    RowOutcome(
+                        batchIndex: batchIndex, metadata: metadata, rec: rec,
+                        targets: targets, committed: [], accepted: 0, naturalEmitted: limit))
+                continue
+            }
+
             var accepted = 0
-            if let acceptBase {
+            if let span = metadata.freeSpan {
+                while accepted < k, targets[accepted] == drafts[accepted],
+                    span.continues(with: drafts[accepted])
+                {
+                    accepted += 1
+                }
+            } else if let acceptBase {
                 while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
                     accepted += 1
                 }
@@ -322,6 +348,42 @@ extension EngineLoopV2 {
                     committed: committed,
                     accepted: accepted,
                     naturalEmitted: naturalEmitted))
+        }
+
+        if let logits = verify.constraintLogits {
+            let grammarRows = outcomes.filter {
+                $0.rec.request.tokenConstraint != nil && $0.metadata.freeSpan == nil
+            }
+            let prefixes = mtpSampleAndConfirmConstrainedPrefixes(
+                logits: logits,
+                rows: grammarRows.map {
+                    CBv2MTPGrammarRow(
+                        batchIndex: $0.batchIndex, context: Self.samplerRow($0.rec),
+                        stopTokens: $0.rec.request.stopTokens,
+                        nonFinite: $0.targets.map { $0 == Int(CBv2NonFiniteLogits.invalidTarget) })
+                },
+                draftPacket: Array(host.prefix(draftCount)), depth: k,
+                commonLimit: commonEmitted, independentWidths: perRowWidth)
+            for index in outcomes.indices.reversed() {
+                guard let prefix = prefixes[outcomes[index].metadata.id] else { continue }
+                if prefix.nonFinite {
+                    nonFiniteVerifyFailures += 1
+                    if prefix.tokens.isEmpty {
+                        let outcome = outcomes.remove(at: index)
+                        step.discard.insert(outcome.metadata.id)
+                        releaseDiscarded(outcome.metadata)
+                        finishRequest(outcome.metadata.id, reason: CBv2NonFiniteLogits.finishReason)
+                        continue
+                    }
+                    outcomes[index].nonFiniteAfterPrefix = true
+                }
+                outcomes[index].committed = prefix.tokens
+                outcomes[index].targets = prefix.tokens
+                outcomes[index].accepted = prefix.accepted
+                outcomes[index].naturalEmitted = prefix.tokens.count
+                outcomes[index].constraintFailure = prefix.failure
+            }
+            commonEmitted = outcomes.map(\.naturalEmitted).min() ?? 0
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -371,9 +433,20 @@ extension EngineLoopV2 {
             var kept: [Int] = []
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
-            for token in emitted {
+            for (index, token) in emitted.enumerated() {
+                if metadata.freeSpan != nil {
+                    sampler.confirmSampledTokens([token], requestIDs: [id])
+                    if let failure = sampler.tokenConstraintFailure(for: id) {
+                        finishReason = .error(failure)
+                        break
+                    }
+                }
                 scheduler.recordSampled(id: id, token: token)
                 kept.append(token)
+                if index == emitted.count - 1, let failure = outcome.constraintFailure {
+                    finishReason = .error(failure)
+                    break
+                }
                 if rec.request.stopTokens.contains(token) {
                     finishReason = .stop
                     break
@@ -407,6 +480,9 @@ extension EngineLoopV2 {
                     finishReason = .length
                     break
                 }
+            }
+            if finishReason == nil && outcome.nonFiniteAfterPrefix {
+                finishReason = CBv2NonFiniteLogits.finishReason
             }
 
             // Correct KV and scheduler state before any terminal release.
@@ -461,7 +537,7 @@ extension EngineLoopV2 {
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 // Target KV/recurrent truth is committed first. The assistant
@@ -497,8 +573,9 @@ extension EngineLoopV2 {
                 let stream = stream(for: id)
                 stream?.reserveEmission()
                 let endsWithStopToken = finishReason == .stop
-                let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
-                let allTokens = kept
+                let visibleTokens = outcome.constraintFailure == nil ? kept : Array(kept.dropLast())
+                let pushTokens = endsWithStopToken ? Array(visibleTokens.dropLast()) : visibleTokens
+                let allTokens = visibleTokens
                 let trackedLoop = nativeShutdownState == nil ? nil : self
                 enqueueDetokenization(owner: detokenizer) {
                     let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")

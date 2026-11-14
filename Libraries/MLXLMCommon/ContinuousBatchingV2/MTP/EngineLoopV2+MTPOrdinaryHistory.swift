@@ -39,7 +39,7 @@ extension EngineLoopV2 {
     ) -> [(id: CBv2RequestID, index: Int, preemptions: Int)] {
         guard mtpFeedsHistoryFromOrdinaryDecode else { return [] }
         return ids.enumerated().compactMap { index, id in
-            guard let rec = scheduler.record(for: id), mtpBasicEligible(rec),
+            guard let rec = scheduler.record(for: id), mtpHistoryEligible(rec),
                 let state = kvStates[id], Self.mtpStorageEligible(state)
             else { return nil }
             return (id, index, rec.preemptionCount)

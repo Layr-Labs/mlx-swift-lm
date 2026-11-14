@@ -272,11 +272,37 @@
       ],
       "strict": true,
       "own_process": true
+    },
+    {
+      "name": "native-reasoning-budget",
+      "strict": true,
+      "filters": [
+        "^MLXLMTests\\.CBv2ReasoningBudgetTests/",
+        "^MLXLMTests\\.CBv2ReasoningBudgetNativeMiMoTests/"
+      ]
+    },
+    {
+      "name": "gemma-quoted-number-enabled",
+      "strict": true,
+      "extra": true,
+      "metallib": false,
+      "filters": [
+        "GemmaQuotedNumberConformanceTests",
+        "GemmaFunctionConstraintParserTests",
+        "ToolCallStreamingTests",
+        "ToolCallStreamingDifferentialTests",
+        "ToolArgumentNormalizationTests",
+        "testGemmaBareScalarsFollowTheSchema"
+      ],
+      "env": {
+        "DARKBLOOM_GEMMA_SCHEMA_COERCION": "1"
+      },
+      "timeout_minutes": 5
     }
   ],
   "shards": [
     {
-      "estimated_seconds": 1606,
+      "estimated_seconds": 1626,
       "runs": [
         {
           "groups": [
@@ -569,11 +595,16 @@
           "groups": [
             "native-complete-prefix-ownership"
           ]
+        },
+        {
+          "groups": [
+            "native-reasoning-budget"
+          ]
         }
       ]
     },
     {
-      "estimated_seconds": 1606,
+      "estimated_seconds": 1621,
       "runs": [
         {
           "groups": [
@@ -863,11 +894,16 @@
           "groups": [
             "contiguous-historical-checkpoint"
           ]
+        },
+        {
+          "groups": [
+            "gemma-quoted-number-enabled"
+          ]
         }
       ]
     },
     {
-      "estimated_seconds": 1606,
+      "estimated_seconds": 1666,
       "runs": [
         {
           "groups": [
@@ -1221,6 +1257,14 @@
         {
           "groups": [
             "paged-kernel-exclusive"
+          ]
+        },
+        {
+          "units": [
+            "MLXLMTests.CBv2FreeSpanTests",
+            "MLXLMTests.QwenFreeSpanHistoryTests",
+            "MLXLMTests.CBv2GrammarNonFiniteTests",
+            "MLXLMTests.CBv2GrammarQwen4Tests"
           ]
         }
       ]
