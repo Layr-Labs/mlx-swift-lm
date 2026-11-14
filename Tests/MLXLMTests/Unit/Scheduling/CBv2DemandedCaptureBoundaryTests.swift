@@ -18,12 +18,14 @@ extension UnitTests {
 
         private func range(
             _ config: CBv2SchedulerConfig, prompt: Int = 8_233, hint: Int? = 8_192,
-            computed: Int = 0, proposed: Int = 2_048, reused: Bool = false, scoped: Bool = true
+            computed: Int = 0, proposed: Int = 2_048, reused: Bool = false,
+            allowed: Bool = true
         ) -> Int {
             config.demandedCheckpointRange(
                 promptTokens: prompt, hintTokens: hint, computedTokens: computed,
                 proposed: proposed, armedSoloStripeTokens: nil, hasPrefixReuse: reused,
-                requestAllowsCheckpoint: scoped, continuation: nil
+                requestAllowsCheckpoint: allowed, requestAllowsLatestCheckpoint: allowed,
+                continuation: nil
             ).count
         }
 
@@ -128,8 +130,8 @@ extension UnitTests {
             #expect(tail(1_024) == 1_792)
         }
 
-        @Test func unscopedDisabledAndShortPromptsKeepTheirRange() {
-            #expect(range(config(), computed: 6_144, proposed: 2_089, scoped: false) == 2_089)
+        @Test func unqualifiedDisabledAndShortPromptsKeepTheirRange() {
+            #expect(range(config(), computed: 6_144, proposed: 2_089, allowed: false) == 2_089)
             #expect(range(config(enabled: false), computed: 6_144, proposed: 2_089) == 2_089)
             var off = config()
             off.enablePrefixCache = false
@@ -158,6 +160,22 @@ extension UnitTests {
             #expect(cut(12_032, 68) == 68)
         }
 
+        /// A local caller's request has no cache scope; it is captured under the
+        /// cache-level salt, so its ranges end on the same boundaries as a
+        /// scoped donor's.
+        @Test func unscopedDonorEndsOnTheSameBoundaries() throws {
+            for company in [false, true] {
+                let scoped = try prefillRanges(
+                    config(), donor(9, prompt: 8_233, hint: nil), company: company)
+                let unscoped = try prefillRanges(
+                    config(), donor(10, prompt: 8_233, hint: nil, salt: nil), company: company)
+                #expect(unscoped == scoped)
+            }
+            let unscoped = try prefillRanges(
+                config(), donor(11, prompt: 8_233, hint: nil, salt: nil), company: true)
+            #expect(unscoped == [2_047, 2_047, 2_047, 1_923, 128, 41])
+        }
+
         /// A shape-bound adopter (a forced `recurrentChunkSize`) never qualifies,
         /// so no boundary can shorten the chunk it must run whole.
         @Test func shapeBoundAdopterIsNeverCut() throws {
@@ -172,9 +190,11 @@ extension UnitTests {
             plan.recurrentPromptLength = 8_233
             record.prefixReusePlan = plan
             #expect(!record.canScheduleDemandedShortCheckpoint)
+            #expect(!record.canScheduleDemandedLatestCheckpoint)
             plan.recurrentChunkSize = nil
             record.prefixReusePlan = plan
             #expect(record.canScheduleDemandedShortCheckpoint)
+            #expect(record.canScheduleDemandedLatestCheckpoint)
         }
 
         /// The first-token projection charges the same extra ranges.

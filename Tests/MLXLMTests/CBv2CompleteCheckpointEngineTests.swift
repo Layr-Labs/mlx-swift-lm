@@ -602,6 +602,67 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         }
     }
 
+    /// A local caller's request has no cache scope. Beside a decoding request
+    /// its ranges end on its deepest aligned boundary as a scoped donor's do,
+    /// the store keeps that boundary under the cache-level salt, and a fresh
+    /// engine restores it for an unscoped follow-up, which then decodes the
+    /// donor's own tokens.
+    func testUnscopedDonorBesideADecodingRequestCapturesItsLatestBoundary() async throws {
+        let prompt = (0 ..< 6 * chunk + 1).map { ($0 * 3) % 7 }
+        let boundaryAlignment = try XCTUnwrap(CBv2SchedulerConfig.demandedBoundaryAlignment)
+        let latest = (prompt.count - 1) / boundaryAlignment * boundaryAlignment
+        func unscopedPositions(_ store: CompleteCheckpointFixtureStore) -> [Int] {
+            store.saved.filter { $0.manifest.cacheSalt == nil }.map(\.manifest.position)
+        }
+        let store = CompleteCheckpointFixtureStore()
+        let (engine, backend) = engine(
+            store, maxConcurrentRequests: 2, captureBoundaryMinimumTokens: boundaryAlignment)
+        let neighbourStream = try engine.submit(
+            CBv2Request(
+                id: .init(71), promptTokens: [3], maxTokens: 6 * chunk, cacheSalt: "other",
+                prefixCacheEnabled: false))
+        let decoding = CheckpointPublicationGate()
+        let neighbour = Task { () -> Int in
+            var tokens = 0
+            for await event in neighbourStream {
+                if case .delta(_, let emitted, _) = event {
+                    if tokens == 0 { decoding.entered.signal() }
+                    tokens += emitted.count
+                }
+                if case .finished = event { break }
+            }
+            return tokens
+        }
+        let started = await Task.detached { decoding.waitUntilEntered() }.value
+        XCTAssertTrue(started, "the neighbour decodes before the donor arrives")
+        let donor = await cbv2SchedCollect(
+            try engine.submit(
+                CBv2Request(
+                    id: .init(72), promptTokens: prompt, maxTokens: 3,
+                    prefixCacheReceiptID: .init(1072))))
+        XCTAssertEqual(donor.finishReason, .length)
+        engine.cancel(.init(71))
+        _ = await neighbour.value
+        XCTAssertEqual(unscopedPositions(store), [latest])
+        XCTAssertEqual(backend.bytesReserved, 0)
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        await engine.shutdown()
+
+        let reopened = CompleteCheckpointFixtureStore(
+            archives: store.saved.filter { $0.manifest.position == latest })
+        let (second, secondBackend) = self.engine(reopened)
+        let warmRequest = CBv2Request(
+            id: .init(73), promptTokens: prompt, maxTokens: 3, prefixCacheReceiptID: .init(1073))
+        XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
+        let warm = await cbv2SchedCollect(try second.submit(warmRequest))
+        XCTAssertEqual(warm.tokens, donor.tokens)
+        XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, latest)
+        XCTAssertEqual(secondBackend.bytesReserved, 0)
+        reopened.finishPublicationCallbacks(engine: second)
+        await second.shutdown()
+    }
+
     /// The donor's first range is the solo `2c` stripe; company with three
     /// full chunks of its own arrives while that boundary is being captured,
     /// so a later donor chunk runs in a packed cohort beside a company chunk

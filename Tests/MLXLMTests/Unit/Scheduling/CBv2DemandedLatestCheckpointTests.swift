@@ -131,25 +131,58 @@ extension UnitTests {
             #expect(ends(shortOnly) == [2_048, 3_500])
         }
 
-        /// A fleet-novel prompt (a hint below the floor) is not written, and an
-        /// unscoped or cache-disabled request takes no checkpoint, so none of
-        /// them pays an extra range.
-        @Test func writeDemandAndScopeDecideWhetherARangeIsCut() {
-            func tail(_ config: CBv2SchedulerConfig, hint: Int?, scoped: Bool = true) -> Int {
+        /// A fleet-novel prompt (a hint below the floor) is not written, and a
+        /// request that allows no end-of-prompt checkpoint (cache disabled,
+        /// media) takes none, so none of them pays an extra range. The short
+        /// partition's scope requirement does not apply to this boundary.
+        @Test func writeDemandAndQualificationDecideWhetherARangeIsCut() {
+            func tail(
+                _ config: CBv2SchedulerConfig, hint: Int?, scoped: Bool = true,
+                allowed: Bool = true
+            ) -> Int {
                 config.demandedCheckpointRange(
                     promptTokens: 30_164, hintTokens: hint, computedTokens: 28_672, proposed: 1_492,
                     armedSoloStripeTokens: 4_096, hasPrefixReuse: false,
-                    requestAllowsCheckpoint: scoped, continuation: nil
+                    requestAllowsCheckpoint: scoped && allowed,
+                    requestAllowsLatestCheckpoint: allowed, continuation: nil
                 ).count
             }
             #expect(tail(config(), hint: nil) == 1_280)
             #expect(tail(config(), hint: 1_024) == 1_280)
             for hint in [0, 512, 1_023] { #expect(tail(config(), hint: hint) == 1_492) }
-            #expect(tail(config(), hint: nil, scoped: false) == 1_492)
+            #expect(tail(config(), hint: nil, scoped: false) == 1_280)
+            #expect(tail(config(), hint: nil, allowed: false) == 1_492)
             var off = config()
             off.enablePrefixCache = false
             #expect(tail(off, hint: nil) == 1_492)
             #expect(tail(config(latest: false), hint: nil) == 1_492)
+        }
+
+        /// A local caller's request has no cache scope; its checkpoints are
+        /// captured and restored under the cache-level salt, so its first turn
+        /// is cut just below the prompt end like a scoped donor's. The short
+        /// partition still requires a scope, and a cache-disabled or media
+        /// request still qualifies for neither.
+        @Test func unscopedDonorEndsARangeJustBelowItsPromptEnd() throws {
+            let scheduler = SchedulerV2(config: config())
+            let unscoped = try scheduler.enqueue(donor(13, prompt: 30_164, hint: nil, salt: nil))
+            #expect(unscoped.canScheduleDemandedLatestCheckpoint)
+            #expect(!unscoped.canScheduleDemandedShortCheckpoint)
+            let empty = try scheduler.enqueue(donor(14, prompt: 30_164, hint: nil, salt: ""))
+            #expect(empty.canScheduleDemandedLatestCheckpoint)
+            #expect(!empty.canScheduleDemandedShortCheckpoint)
+            var disabled = donor(15, prompt: 30_164, hint: nil, salt: nil)
+            disabled.prefixCacheEnabled = false
+            #expect(!disabled.canScheduleDemandedLatestCheckpoint)
+
+            let ranges = try prefillRanges(
+                config(), donor(16, prompt: 30_164, hint: nil, salt: nil))
+            #expect(ranges == Array(repeating: 4_096, count: 7) + [1_280, 212])
+            // A short-partition hint is ignored without a scope; the
+            // end-of-prompt boundary is still cut.
+            let hinted = try prefillRanges(
+                config(), donor(17, prompt: 3_500, hint: 2_048, salt: nil))
+            #expect(ends(hinted) == [3_328, 3_500])
         }
 
         /// An adopter restored at 29,952 is cut above its restore like a donor.
@@ -158,7 +191,8 @@ extension UnitTests {
                 config().demandedCheckpointRange(
                     promptTokens: 35_279, hintTokens: 30_155, computedTokens: computed,
                     proposed: proposed, armedSoloStripeTokens: 4_096, hasPrefixReuse: true,
-                    requestAllowsCheckpoint: true, continuation: nil
+                    requestAllowsCheckpoint: true, requestAllowsLatestCheckpoint: true,
+                    continuation: nil
                 ).count
             }
             #expect(cut(29_952, 4_096) == 4_096)
@@ -179,18 +213,21 @@ extension UnitTests {
                     config.demandedCheckpointRange(
                         promptTokens: 30_164, hintTokens: 20_000, computedTokens: computed,
                         proposed: proposed, armedSoloStripeTokens: 4_096, hasPrefixReuse: false,
-                        requestAllowsCheckpoint: true, continuation: nil
+                        requestAllowsCheckpoint: true, requestAllowsLatestCheckpoint: true,
+                        continuation: nil
                     ).count
                 }
                 #expect(count(both) == count(captureOnly))
             }
         }
 
-        /// The first-token projection charges the same extra range.
-        @Test func deadlineProjectionCountsTheCutRange() throws {
+        /// The first-token projection charges the same extra range, for a
+        /// scoped and an unscoped donor.
+        @Test(arguments: ["tenant-fixture", nil] as [String?])
+        func deadlineProjectionCountsTheCutRange(salt: String?) throws {
             for latest in [false, true] {
                 let scheduler = SchedulerV2(config: config(latest: latest))
-                let request = donor(11, prompt: 30_164, hint: nil)
+                let request = donor(11, prompt: 30_164, hint: nil, salt: salt)
                 try scheduler.enqueue(request)
                 guard
                     case .bounded(let work, _) = scheduler.firstTokenWorkProjection(for: request.id)
