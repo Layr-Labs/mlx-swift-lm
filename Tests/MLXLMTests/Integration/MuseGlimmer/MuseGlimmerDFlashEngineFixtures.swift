@@ -174,6 +174,11 @@ final class MuseGlimmerDFlashScriptedDrafter: CBv2MTPAdvisoryHistoryDrafter,
     var supportsTargetPrefixAcceptance: Bool { native.supportsTargetPrefixAcceptance }
     var commitsAcceptedPrefixPerRow: Bool { native.commitsAcceptedPrefixPerRow }
     var batchesVerifyColumnsAsDecodeRows: Bool { native.batchesVerifyColumnsAsDecodeRows }
+    /// Lets a test drive the driver's switches under typical acceptance.
+    var waivesExactAcceptance = false
+    var requiresExactAcceptance: Bool {
+        native.requiresExactAcceptance && !waivesExactAcceptance
+    }
     var requiresCommittedObservationFence: Bool { native.requiresCommittedObservationFence }
     var requestStateBytesPerToken: Int { native.requestStateBytesPerToken }
     /// False makes the engine treat this drafter like any other
@@ -307,7 +312,7 @@ enum MuseGlimmerDFlashEngineFixture {
     static func engine(
         target: MuseGlimmerDFlashTinyTarget, drafter: (any CBv2MTPDrafter)?, depth: Int = 7,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        store: CompleteCheckpointFixtureStore? = nil
+        store: CompleteCheckpointFixtureStore? = nil, acceptance: CBv2MTPAcceptance = .exact
     ) throws -> (EngineV2, PagedKVBackend) {
         let kinds = target.layerKinds
         let backend = try PagedKVBackend(
@@ -326,7 +331,7 @@ enum MuseGlimmerDFlashEngineFixture {
             mtpConfig: CBv2MTPConfig(
                 enabled: drafter != nil, maxDraftTokens: depth, maxSpeculativeBatch: 2,
                 fixedDraftTokens: depth, verificationMode: verification,
-                maxAutomaticRectangularTokens: 16))
+                maxAutomaticRectangularTokens: 16, acceptance: acceptance))
         if store != nil {
             engine.loopForTesting.onEngineQueueSync {
                 engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = chunk

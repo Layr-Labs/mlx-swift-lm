@@ -147,6 +147,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
     public var batchesVerifyColumnsAsDecodeRows: Bool {
         settings.verification == .rectangularExact && settings.batchesVerifyColumnsAsDecodeRows
     }
+    /// Exact acceptance only (decision D6): typical acceptance can emit a
+    /// draft, and the advisory history then loses its observation positions.
+    public var requiresExactAcceptance: Bool { true }
     /// A proposal is kept only when it equals the token pre-sampled from the
     /// target's own distribution, and that token is what is emitted, so
     /// sampled rows speculate too.

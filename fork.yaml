@@ -222,7 +222,9 @@ def:
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A drafter that declares
             `batchesVerifyColumnsAsDecodeRows` (default false) has the paged caches attend the
-            round's columns as decode rows. A request-stateful drafter whose history can change
+            round's columns as decode rows. A drafter that declares `requiresExactAcceptance`
+            (default false) gets no round driver under any other acceptance rule, and the engine
+            names the reason. A request-stateful drafter whose history can change
             only which tokens are proposed may conform to `CBv2MTPAdvisoryHistoryDrafter`
             (`requestStateIsAdvisory`, `CBv2MTPAdvisoryHistory.swift`): under exact acceptance
             the generic paged engine then keeps complete prefix checkpoints with no assistant

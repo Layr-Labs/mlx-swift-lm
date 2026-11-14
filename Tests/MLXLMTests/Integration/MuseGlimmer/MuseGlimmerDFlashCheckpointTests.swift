@@ -246,7 +246,7 @@ struct MuseGlimmerDFlashCheckpointTests {
     }
 
     /// The seam's three switches, on the driver alone.
-    @Test func advisoryHistoryNeedsTheDeclarationAndExactAcceptance() throws {
+    @Test func advisoryHistoryNeedsTheDeclarationAndExactAcceptance() async throws {
         let target = MuseGlimmerDFlashTinyTarget()
         func driver(
             _ drafter: any CBv2MTPDrafter, fixed: Int? = 7, acceptance: CBv2MTPAcceptance = .exact
@@ -263,8 +263,24 @@ struct MuseGlimmerDFlashCheckpointTests {
         var d = try driver(advisory)
         #expect(d.tracksPersistentHistory && d.historyIsAdvisory)
         #expect(!d.checkpointsRequireAssistantHistory)
-        // Typical acceptance can keep a draft the target did not choose.
-        d = try driver(advisory, acceptance: .typical(delta: 0.2))
+        // Typical acceptance can keep a draft the target did not choose, so the
+        // DFlash drafter refuses it (decision D6): no driver, and the engine
+        // says why.
+        #expect(advisory.requiresExactAcceptance)
+        #expect(
+            CBv2MTPRoundDriver.build(
+                model: target, drafter: advisory,
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 7, fixedDraftTokens: 7,
+                    verificationMode: .serialTarget, acceptance: .typical(delta: 0.2))) == nil)
+        let (typical, _) = try Fixture.engine(
+            target: target, drafter: advisory, acceptance: .typical(delta: 0.2))
+        #expect(typical.mtpInactiveReason == "drafter requires exact acceptance")
+        await typical.shutdown()
+        // The switch itself, on an advisory drafter that waives the refusal.
+        let tolerant = MuseGlimmerDFlashScriptedDrafter(advisory, mode: .native, vocabulary: 128)
+        tolerant.waivesExactAcceptance = true
+        d = try driver(tolerant, acceptance: .typical(delta: 0.2))
         #expect(d.tracksPersistentHistory && !d.historyIsAdvisory)
         #expect(d.checkpointsRequireAssistantHistory)
         // Target-only: no history at all, as before.

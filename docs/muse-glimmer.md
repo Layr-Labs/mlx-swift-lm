@@ -95,7 +95,8 @@ against the pin. `MuseGlimmerDFlashDrafter` is a request-stateful CBv2 drafter:
 - One block forward per round proposes up to 7 tokens (decision D6) with the target's own
   `headProduct` and argmax.
 - The engine keeps a proposal only when it equals the token the target chose, greedy or
-  sampled, so the drafter changes speed and never the output.
+  sampled, so the drafter changes speed and never the output. The drafter requires this exact
+  acceptance: under `.typical` the round driver is not built and speculation stays off.
 - The target's tapped layers must be the drafter's `target_layer_ids`; another target is refused.
 - The ring is advisory: it is not part of a prefix checkpoint, and after a restore it starts at
   the first observed position.

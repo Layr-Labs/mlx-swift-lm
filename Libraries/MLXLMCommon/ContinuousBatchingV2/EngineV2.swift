@@ -883,6 +883,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         } else if !samplerSupportsMTP {
             mtpInactiveReason =
                 "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+        } else if mtpDrafter?.requiresExactAcceptance == true, mtpConfig.acceptance != .exact {
+            mtpInactiveReason = "drafter requires exact acceptance"
         } else {
             mtpInactiveReason =
                 "model/drafter pair cannot prove matching MTP target identity or capture layers"

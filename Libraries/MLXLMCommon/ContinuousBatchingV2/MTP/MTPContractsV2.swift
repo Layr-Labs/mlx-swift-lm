@@ -289,6 +289,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// (row, column) pairs as rows of one decode dispatch
     /// (`mtpBatchesRectangularColumnsAsRows`). Default false.
     var batchesVerifyColumnsAsDecodeRows: Bool { get }
+    /// True when this drafter may run only under `.exact` acceptance; the
+    /// engine then does not activate MTP with any other rule. Default false.
+    var requiresExactAcceptance: Bool { get }
     /// True only when the bound target's arithmetic for one verify row never
     /// depends on the other rows or on the next step's batch shape (row-exact
     /// products). Each row then commits its own accepted prefix. False keeps
@@ -341,6 +344,7 @@ extension CBv2MTPDrafter {
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
     public var batchesVerifyColumnsAsDecodeRows: Bool { false }
+    public var requiresExactAcceptance: Bool { false }
     public var commitsAcceptedPrefixPerRow: Bool { false }
 }
 

@@ -439,6 +439,7 @@ final class CBv2MTPRoundDriver {
         supportsOrdinaryDecodeChaining: Bool = true
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
+        guard !drafter.requiresExactAcceptance || config.acceptance == .exact else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
         let recurrentTarget = model as? any CBv2RecurrentMTPSteppableModel
