@@ -29,21 +29,42 @@ import MLX
 /// and reads each weight once for up to 16 rows. The scalar kernel runs the
 /// fused multiply-adds one by one for a single row, where the weight read is
 /// the cost. The two agree only where a multiply-accumulate is that ascending
-/// chain of fused multiply-adds (measured on Apple GPU family 15); elsewhere
-/// the matrix kernel serves every row count.
+/// chain of fused multiply-adds (measured on Apple GPU families 15 and 17);
+/// elsewhere the matrix kernel serves every row count.
 public enum ModelOptWeightOnlyNVFP4RowExact {
     public static let maximumRows = 16
 
-    /// The GPU family whose simdgroup multiply-accumulate was measured equal
-    /// to the scalar kernel's chain, bit for bit.
-    public static let scalarKernelMeasured: Bool = {
-        let forced = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"] ?? ""
-        let code = Array((forced.isEmpty ? GPU.deviceInfo().architecture : forced).utf8)
-        guard code.count >= 3 else { return false }
-        let tens = Int(code[code.count - 3]) - 48
-        let ones = Int(code[code.count - 2]) - 48
-        return tens == 1 && ones == 5
-    }()
+    /// The generation `NN` and variant letters of an Apple GPU architecture
+    /// name such as `applegpu_g15d`, or nil for any other name.
+    static func gpuFamily(architecture: String) -> (generation: Int, variant: String)? {
+        let prefix = "applegpu_g"
+        guard architecture.hasPrefix(prefix) else { return nil }
+        let rest = architecture.dropFirst(prefix.count)
+        let digits = rest.prefix { ("0" ... "9").contains($0) }
+        let variant = rest.dropFirst(digits.count)
+        guard (1 ... 3).contains(digits.count), !variant.isEmpty,
+            variant.allSatisfy({ ("a" ... "z").contains($0) }), let generation = Int(digits)
+        else { return nil }
+        return (generation, String(variant))
+    }
+
+    static func gpuGeneration(architecture: String) -> Int? {
+        gpuFamily(architecture: architecture)?.generation
+    }
+
+    /// The GPU generations whose simdgroup multiply-accumulate was measured
+    /// equal to the scalar kernel's chain, bit for bit (M3 Ultra, M5 Ultra).
+    static let scalarKernelGenerations: Set<Int> = [15, 17]
+
+    /// The family of the Metal device itself. No environment variable
+    /// changes it, so none can select a kernel that was not measured.
+    static let deviceFamily = gpuFamily(architecture: GPU.deviceInfo().architecture)
+    static let deviceGeneration = deviceFamily?.generation
+
+    /// True on a GPU generation where the scalar kernel was measured equal to
+    /// the matrix kernel.
+    public static let scalarKernelMeasured =
+        deviceGeneration.map { scalarKernelGenerations.contains($0) } ?? false
 
     /// Rows the scalar kernel takes (0: none). Tests and benchmarks set it.
     nonisolated(unsafe) static var scalarRows = scalarKernelMeasured ? 1 : 0
