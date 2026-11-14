@@ -49,12 +49,14 @@ public struct CBv2SamplerRow {
     /// Request output ceiling, used by the constraint runtime to reserve
     /// enough tokens to close the grammar before the engine length stop.
     public var maxTokens: Int
+    public var reasoningBudget: CBv2ReasoningBudget?
 
     public init(
         id: CBv2RequestID, params: CBv2SamplingParams,
         promptTokens: [Int], outputTokens: [Int] = [],
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
-        maxTokens: Int = .max
+        maxTokens: Int = .max,
+        reasoningBudget: CBv2ReasoningBudget? = nil
     ) {
         self.id = id
         self.params = params
@@ -62,6 +64,7 @@ public struct CBv2SamplerRow {
         self.outputTokens = outputTokens
         self.tokenConstraint = tokenConstraint
         self.maxTokens = maxTokens
+        self.reasoningBudget = reasoningBudget
     }
 }
 

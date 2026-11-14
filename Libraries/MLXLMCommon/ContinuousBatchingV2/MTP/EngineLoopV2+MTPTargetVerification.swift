@@ -39,7 +39,7 @@ extension EngineLoopV2 {
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
-        scores: MLXArray, accept: MLXArray?, hidden: MLXArray,
+        scores: MLXArray, accept: MLXArray?, hidden: MLXArray, constraintLogits: MLXArray?,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
@@ -48,6 +48,13 @@ extension EngineLoopV2 {
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+        // Raw logits are retained only for grammar-verified rows; rows in an
+        // opted-in free span are scored on the masked window below.
+        let hasConstraints = rows.contains {
+            $0.rec.request.tokenConstraint != nil && mtpFreeSpan($0.rec) == nil
+        }
+        var constraintColumns: [MLXArray] = []
+        var constraintLogits: MLXArray?
         var scores: MLXArray
         var accept: MLXArray?
         let nonFinite: MLXArray
@@ -79,6 +86,9 @@ extension EngineLoopV2 {
             }
         let verifyParams = rows.map(\.rec.request.sampling)
         let verifyIDs = rows.map(\.rec.id)
+        let spanSampler =
+            rows.contains { mtpFreeSpan($0.rec) != nil }
+            ? sampler as? any CBv2FreeSpanSampler : nil
         // Per-request output-step index of window position 0: the seed token
         // (already confirmed output) was drawn at index base-1, so position j
         // of the window is output index base + j.
@@ -98,8 +108,11 @@ extension EngineLoopV2 {
         /// columns of `logits`) when typical acceptance needs a decision for
         /// this call; nil otherwise.
         func scoreColumns(
-            _ logits: MLXArray, columnOffset: Int, drafts: MLXArray?
+            _ rawLogits: MLXArray, columnOffset: Int, drafts: MLXArray?
         ) -> (scores: MLXArray, accept: MLXArray?) {
+            let logits =
+                spanSampler?.maskFreeSpanVerification(rawLogits, requestIDs: verifyIDs)
+                ?? rawLogits
             guard useTargetPrefix else {
                 return (argMax(logits, axis: -1).asType(.int32), nil)
             }
@@ -256,6 +269,7 @@ extension EngineLoopV2 {
                         mtp.model.forwardWithHidden(tokens: column, caches: caches)
                     }
                 }
+                if hasConstraints { constraintColumns.append(output.logits) }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
                 // Flag the model's logits before a host sampler sees them.
@@ -300,6 +314,7 @@ extension EngineLoopV2 {
                 accept = concatenated(acceptColumnsAccum, axis: 1)
             }
             hidden = concatenated(hiddenColumns, axis: 1)
+            if hasConstraints { constraintLogits = concatenated(constraintColumns, axis: 1) }
 
         } else {
             for cache in serializingCaches {
@@ -368,6 +383,7 @@ extension EngineLoopV2 {
             if let nativePagedWork, let windowWork {
                 try nativePagedWork.closeWindow(windowWork)
             }
+            if hasConstraints { constraintLogits = output.logits }
             // Flag the model's logits before a host sampler sees them.
             nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             if mtp.usesRequestStatefulDrafter {
@@ -385,7 +401,7 @@ extension EngineLoopV2 {
                     topTwo.values.reshaped([batch, width, 2]).asType(.float32)
                 )
             }
-            if useTargetPrefix {
+            if useTargetPrefix || spanSampler != nil {
                 let drafts: MLXArray? =
                     typicalDelta != nil
                     ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
@@ -418,7 +434,7 @@ extension EngineLoopV2 {
 
         scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
         return (
-            scores, accept, hidden, shortlist, policyTopTwo,
+            scores, accept, hidden, constraintLogits, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
         )
     }

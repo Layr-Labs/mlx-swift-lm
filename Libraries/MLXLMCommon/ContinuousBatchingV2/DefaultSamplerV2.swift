@@ -25,11 +25,12 @@
 import Foundation
 import MLX
 
-public final class CBv2DefaultSampler: CBv2StepSampler {
+public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
 
     private var pipeline: LogitsPipelineV2?
     private let sampler: SamplerV2
     private let constraintSampler = CBv2TokenConstraintSampler()
+    private let budgetSampler = CBv2ReasoningBudgetSampler()
     private var configuredIDs: [CBv2RequestID] = []
     /// The lazy logprob gather built by the most recent `sample` call, until
     /// the loop consumes it via `takeStepLogprobs` (take semantics).
@@ -44,6 +45,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// sample on the engine queue. No callback result changes sampling.
     var sampleObserverForTesting: (([CBv2RequestID], Int) -> Void)?
     public var supportsTokenConstraints: Bool { true }
+    public var supportsReasoningBudgets: Bool { true }
     public var supportsConstrainedChainedDecode: Bool { true }
 
     /// Sampler state from just before the most recent speculative sample (a
@@ -86,6 +88,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             pipeline.setRows(rows)
             sampler.setRows(rows)
             constraintSampler.configure(rows)
+            budgetSampler.configure(rows)
             configuredIDs = requestIDs
             if let pendingSampledTokens {
                 // Fold the chained in-flight tokens into the fresh state so
@@ -129,10 +132,12 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let output = pipeline.process(
             logits,
             rawLogprobsFrom: logits,
-            hardMask: constraintSampler.hasRows
-                ? { [constraintSampler] transformed in
-                    constraintSampler.mask(
-                        transformed, requestIDs: requestIDs, speculative: speculative)
+            hardMask: constraintSampler.hasRows || budgetSampler.hasRows
+                ? { [constraintSampler, budgetSampler] transformed in
+                    budgetSampler.mask(
+                        constraintSampler.mask(
+                            transformed, requestIDs: requestIDs, speculative: speculative),
+                        requestIDs: requestIDs)
                 } : nil)
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
@@ -194,6 +199,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// exact — reconfiguration is a pure function of `rowContext()`.
     public func requestDidFinish(_ id: CBv2RequestID) {
         constraintSampler.requestDidFinish(id)
+        budgetSampler.requestDidFinish(id)
         if configuredIDs.contains(id) {
             configuredIDs = []
         }
@@ -443,9 +449,22 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         _ tokens: [Int], requestIDs: [CBv2RequestID]
     ) {
         constraintSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+        budgetSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+    }
+
+    public func reasoningBudgetFailure(for id: CBv2RequestID) -> String? {
+        budgetSampler.failure(for: id)
     }
 
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
         constraintSampler.failure(for: id)
+    }
+
+    func confirmedConstraintState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        constraintSampler.confirmedState(for: id, outputTokenCount: outputTokenCount)
+    }
+
+    func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
+        constraintSampler.mask(logits, requestIDs: requestIDs)
     }
 }

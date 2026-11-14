@@ -2221,11 +2221,13 @@ struct ToolTests {
         #expect(call.function.arguments["optional"] == .null)
         #expect(call.function.arguments["maybe"] == .null)
 
-        // A marker-quoted value is a string, whatever its parameter's type.
+        // Marker strings keep their text unless numeric schema coercion is enabled.
         let quoted = try #require(
             parser.parse(
                 content: #"<|tool_call>call:lookup{count:<|"|>3<|"|>}<tool_call|>"#, tools: tools))
-        #expect(quoted.function.arguments["count"] == .string("3"))
+        let schemaCoercion =
+            ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA_SCHEMA_COERCION"] == "1"
+        #expect(quoted.function.arguments["count"] == (schemaCoercion ? .int(3) : .string("3")))
 
         // Without a schema a bare scalar stays its JSON reading.
         let untyped = try #require(

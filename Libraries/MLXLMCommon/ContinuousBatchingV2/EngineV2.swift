@@ -127,6 +127,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public var acceptsLogprobRows: Bool {
         nativeShutdownState == nil || issuedNativeExecutionContract?.supportsLogprobCapture == true
     }
+    /// Whether `submit` accepts a request with a `tokenConstraint` (the
+    /// sampler must support constraints too): an untracked engine always does,
+    /// a native-tracked engine only when its issued contract qualifies them.
+    public var acceptsTokenConstraints: Bool {
+        nativeShutdownState == nil
+            || issuedNativeExecutionContract?.supportsTokenConstraints == true
+    }
     /// A sealed failure only, never a positive drain/refund assertion. Allows
     /// the existing host fault registry to refuse other native admissions
     /// immediately after a failed warm preparation, without another fence.
@@ -160,6 +167,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     private let requiredPositionAxisCount: Int?
     private let supportsPositionedForwarding: Bool
     private let samplerSupportsTokenConstraints: Bool
+    public let supportsReasoningBudgets: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
     /// the submit thread (hashing is host work — never on the engine step
@@ -292,7 +300,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         nativeCompletionTracking: Bool = false,
         nativeExecutionContract: CBv2NativeExecutionContract? = nil,
         automaticMiMoPrefill: Bool = false,
-        miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil
+        miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil,
+        reasoningBudgetsEnabled: Bool = CBv2ReasoningBudget.enabled()
     ) {
         // Explicit SDK scheduler choices stay unchanged unless the native
         // factory requests this optional default profile. Commit a wider copy
@@ -308,6 +317,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.supportsPositionedForwarding = Self.modelSupportsPositionedForwarding(model)
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
+        self.supportsReasoningBudgets = reasoningBudgetsEnabled && sampler.supportsReasoningBudgets
         let modelCapabilities =
             (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
         self.modelCapabilities = modelCapabilities
@@ -1213,6 +1223,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     }
 
     private func validateRequest(_ request: CBv2Request) throws {
+        if request.reasoningBudget != nil {
+            guard supportsReasoningBudgets, request.tokenConstraint == nil else {
+                throw CBv2ReasoningBudgetError.unsupported
+            }
+        }
         guard
             request.mimoClusterImages == nil && request.clusterStillImages == nil
                 && request.clusterGLMMedia == nil && request.clusterQwenMedia == nil
@@ -1221,7 +1236,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 "encoded cluster media requires the native cluster worker")
         }
         if nativeShutdownState != nil,
-            request.positionState != nil || request.tokenConstraint != nil
+            request.positionState != nil
+                || (request.tokenConstraint != nil && !acceptsTokenConstraints)
                 || (request.sampling.topLogprobs != 0 && !acceptsLogprobRows)
         {
             throw CBv2NativeShutdownError.unsupportedConsumer

@@ -147,8 +147,8 @@ enum MiMoV26TinyCheckpoint {
     // MARK: - Tensor inventories
 
     /// Native converted inventory. The order is the order in the shard files.
-    static func nativeSpecs() throws -> [Spec] {
-        let c = try configuration(nativeFields())
+    static func nativeSpecs(fields: [String: Any] = nativeFields()) throws -> [Spec] {
+        let c = try configuration(fields)
         var specs: [Spec] = []
         func add(
             _ name: String, _ shape: [Int], _ dtype: MiMoV26ConvertedScalarType, _ file: String
@@ -477,9 +477,11 @@ enum MiMoV26TinyCheckpoint {
     /// Writes the complete native bundle: config, index, four shards and the
     /// tokenizer sidecars that the factory reads. Returns the root folder.
     @discardableResult
-    static func writeNativeBundle(to root: URL, tokenizerSidecars: Bool = true) throws -> URL {
-        let specs = try nativeSpecs()
-        let inputs = try nativeInputs()
+    static func writeNativeBundle(
+        to root: URL, tokenizerSidecars: Bool = true, fields: [String: Any] = nativeFields()
+    ) throws -> URL {
+        let specs = try nativeSpecs(fields: fields)
+        let inputs = try inputs(fields: fields, specs: specs, provenance: provenance)
         try inputs.config.write(to: root.appendingPathComponent("config.json"))
         try inputs.index.write(to: root.appendingPathComponent("model.safetensors.index.json"))
         for file in nativeFiles {
