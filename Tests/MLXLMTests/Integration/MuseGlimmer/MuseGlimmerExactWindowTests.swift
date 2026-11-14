@@ -228,9 +228,9 @@ struct MuseGlimmerExactWindowTests {
         #expect(try Self.windowEqualsSteps(m, prompts: prompts, width: width))
     }
 
-    /// The block norms at the production width: 32 to 64 rows reduce like
+    /// The block norms at the production width: 32 rows and more reduce like
     /// one row (MLX takes another row reduction from 32 rows on).
-    @Test(arguments: [DType.bfloat16, .float32], [32, 47, 64])
+    @Test(arguments: [DType.bfloat16, .float32], [32, 47, 64, 65, 99, 200])
     func blockNormsAtTheProductionWidthAreRowExact(dtype: DType, rows: Int) throws {
         let numerics = MuseGlimmerNumerics()
         numerics.exactWindows = true
@@ -251,6 +251,54 @@ struct MuseGlimmerExactWindowTests {
         }
     }
 
+    // MARK: Above 64 rows
+
+    /// More rows than a verify window: 65 decode rows, and windows of 9 and 16
+    /// sequences (72 and 128 rows), each equal to its sequence's steps.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func callsAbove64RowsEqualSteps(dtype: DType) throws {
+        let m = try Self.exact(Self.mixed(dtype: dtype))
+        func prompts(_ count: Int) -> [[Int32]] {
+            (0 ..< count).map {
+                MuseGlimmerFixture.tokens(3 + $0 % 29, vocabulary: 96, salt: 200 + $0)
+            }
+        }
+        #expect(try Self.windowEqualsSteps(m, prompts: prompts(65), width: 1), "65 x 1")
+        for (sequences, width) in [(9, 8), (16, 8)] {
+            #expect(
+                try Self.windowEqualsSteps(
+                    m, prompts: prompts(sequences), width: width, columnsAsRows: true),
+                "\(sequences) x \(width)")
+        }
+    }
+
+    /// Prefill-sized calls take the pieces too: every projection of the tower
+    /// gives each of 65, 99 and 200 rows the bytes of its one-row call.
+    @Test(arguments: [DType.bfloat16, .float32])
+    func everyProjectionIsRowExactAtPrefillSizes(dtype: DType) throws {
+        let m = try Self.exact(Self.mixed(dtype: dtype))
+        for (index, (path, layer)) in m.projectionSlots.enumerated() {
+            let projection = try #require(layer as? any UnaryLayer, "\(path)")
+            let inputs: Int
+            switch layer {
+            case let nvfp4 as ModelOptWeightOnlyNVFP4Linear: inputs = nvfp4.inputDimensions
+            case let fp8 as ModelOptCalibratedLinear: inputs = fp8.inputDimensions
+            case let dense as Linear: inputs = dense.weight.dim(1)
+            default: Issue.record("\(path)"); continue
+            }
+            for rows in [65, 99, 200] {
+                let x = MuseGlimmerFixture.hostTensor(
+                    [1, rows, inputs], seed: UInt64(index * 1000 + rows)
+                ).asType(dtype)
+                let all = m.numerics.project(projection, x)
+                let one = (0 ..< rows).map { m.numerics.project(projection, x[0..., $0 ..< $0 + 1]) }
+                #expect(
+                    MuseGlimmerFixture.sameBits(all, concatenated(one, axis: 1)),
+                    "\(path) rows \(rows)")
+            }
+        }
+    }
+
     // MARK: The switch
 
     /// Off by default; MLX's kernels then give a float32 window other bytes
@@ -264,7 +312,7 @@ struct MuseGlimmerExactWindowTests {
         #expect(try !Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(true)
         #expect(m.verifiesWindowsExactly && m.dflashVerifiesWindowsExactly)
-        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v1")
+        #expect(m.numericsProfile == "muse-glimmer-exact-windows-v2")
         #expect(try Self.windowEqualsSteps(m, prompts: [prompt], width: 8))
         try m.setRowExactWindows(false)
         #expect(!m.verifiesWindowsExactly)
@@ -273,27 +321,32 @@ struct MuseGlimmerExactWindowTests {
         }
     }
 
-    /// BF16 and FP8 decode steps keep their bytes with exact windows on, and so
-    /// does every call above 64 rows (prefill).
+    /// BF16 and FP8 decode steps keep their bytes with exact windows on:
+    /// from the same cache, a one-row step of the exact tower equals the
+    /// plain tower's. Both towers prefill with the switch off, because an
+    /// exact 99-row prefill takes the row-exact pieces and writes other K/V
+    /// bytes (tested above).
     @Test(arguments: [false, true])
-    func decodeAndPrefillBytesDoNotMoveForBF16AndFP8(fp8: Bool) throws {
-        func model() throws -> MuseGlimmerTextModel {
-            fp8 ? try Self.mixed(order: [.fp8, .dense], head: .dense) : try Self.dense()
-        }
-        func run(_ m: MuseGlimmerTextModel) throws -> (prefill: MLXArray, steps: [MLXArray]) {
+    func decodeBytesDoNotMoveForBF16AndFP8(fp8: Bool) throws {
+        func run(exactDecode: Bool) throws -> (prefill: MLXArray, steps: [MLXArray]) {
+            let m = fp8 ? try Self.mixed(order: [.fp8, .dense], head: .dense) : try Self.dense()
             let paged = try Paged(m)
             let prompt = MuseGlimmerFixture.tokens(100, vocabulary: 96, salt: 5)
             try paged.add(Array(prompt.prefix(1)), extra: 140)
-            // 99 rows: above the exact range, MLX's kernels in both towers.
             let prefill = paged.forward([Array(prompt.dropFirst())], rectangular: false)
+            if exactDecode {
+                _ = try Self.exact(m)
+                #expect(m.verifiesWindowsExactly)
+            }
             let steps = MuseGlimmerFixture.tokens(24, vocabulary: 96, salt: 6).map {
                 paged.forward([[$0]], rectangular: false)
             }
             return (prefill, steps)
         }
-        let plain = try run(try model())
-        let exact = try run(try Self.exact(try model()))
+        let plain = try run(exactDecode: false)
+        let exact = try run(exactDecode: true)
         #expect(MuseGlimmerFixture.sameBits(plain.prefill, exact.prefill))
+        #expect(plain.steps.count == 24 && exact.steps.count == 24)
         #expect(zip(plain.steps, exact.steps).allSatisfy { MuseGlimmerFixture.sameBits($0, $1) })
     }
 

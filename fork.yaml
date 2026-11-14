@@ -73,7 +73,7 @@ def:
         published block drafter (`MuseGlimmerDFlashDrafter`, a request-stateful advisory-history
         CBv2 drafter): hash-pinned loading of the BF16 artifact and of its quantized form, a
         bounded context ring, seven drafts per round from the target's own head, exact
-        acceptance. `setRowExactWindows(true)` gives every call of 1 to 64 rows the bytes of
+        acceptance. `setRowExactWindows(true)` gives every call, at any row count, the bytes of
         one-row calls (row-exact weight-only NVFP4, FP8 and BF16 products in pieces of 16 rows,
         block norms below MLX's row-reduction switch), so the engine verifies a round in one
         `rectangularExact` forward; off by default, so the BF16 tower keeps upstream's arithmetic.

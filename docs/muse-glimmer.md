@@ -108,9 +108,10 @@ tower without exact windows throws `MuseGlimmerDFlashError.target`.
 
 ## Exact verify windows
 
-`setRowExactWindows(true)` makes every call of 1 to 64 rows (8 requests of 1 + 7 tokens) give
-each row the bytes it gets alone, so one forward over a draft window equals the decode steps it
-replaces, in logits and in the K/V written.
+`setRowExactWindows(true)` makes the projections and block norms of every call, at any row
+count, give each row the bytes it gets alone. One forward over a draft window (up to 8 requests
+of 1 + 7 tokens) then equals the decode steps it replaces, in logits and in the K/V written, and
+a decode step's bytes do not depend on how many requests share it.
 
 - Projections: weight-only NVFP4 through `ModelOptWeightOnlyNVFP4RowExact`, FP8 through
   `rowExactForward` with the window schedule, BF16 through `ModelOptRowExact.matmul`. They run
@@ -118,13 +119,16 @@ replaces, in logits and in the K/V written.
   bytes differ from the plain tower; BF16 and FP8 decode bytes do not.
 - Block norms: from 32 rows MLX's row reduction takes another kernel, so exact calls of 32 or
   more rows reduce in pieces of 16.
+- Calls above 64 rows (a decode step of more than 64 requests, a prompt chunk) take the same
+  pieces. Prompt chunks therefore read every projection's weights once per 16 rows, so prefill
+  is slower with exact windows on. `numericsProfile` is `muse-glimmer-exact-windows-v2`; `v1`
+  left calls above 64 rows to MLX's kernels.
 - Attention, RoPE, the gate and the softcap already compute each row alone. Under
   `withMTPRectangularVerification` the paged cache runs attention once per query column, or,
   when the drafter asks for it (`Settings.verifying` does), once per layer for the whole round:
   each row first writes its columns' K/V, then every (row, column) pair is one row of a single
   paged decode dispatch over that column's own range. The decode kernels give a row the same
   bytes whatever its batchmates, so this equals the column loop.
-- Above 64 rows (prefill) MLX's kernels run unchanged.
 
 The switch is off by default, so the BF16 tower keeps upstream's arithmetic. It checks every
 projection first and throws `MuseGlimmerRowExactError.unsupportedProjection` without changing

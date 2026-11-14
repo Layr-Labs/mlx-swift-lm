@@ -4,16 +4,16 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// Exact verify windows for the native tower. With them on, every call of 1 to
-// `exactWindowRows` rows gives each row the bytes that row gets alone, so one
-// forward over a draft window equals the decode steps it replaces. Off by
-// default: the tower then keeps MLX's arithmetic at every row count.
+// Exact verify windows for the native tower. With them on, every projection
+// and block norm gives each row the bytes that row gets alone, at any row
+// count, so one forward over a draft window equals the decode steps it
+// replaces and a decode step's bytes do not depend on how many rows share it.
+// Off by default: the tower then keeps MLX's arithmetic at every row count.
 
 /// The tower's numerics switch, shared by every block of one model.
 final class MuseGlimmerNumerics {
-    /// Largest exact call: 8 speculated sequences of 1 + 7 tokens.
-    static let exactWindowRows = 64
-    /// The row-exact products take 1 to 16 rows per call.
+    /// The row-exact products take 1 to 16 rows per call; larger calls run
+    /// in pieces of this many rows.
     static let pieceRows = 16
     /// MLX's row reduction switches kernels at 32 rows (`row_reduce_simple`).
     static let reductionPieceFrom = 32
@@ -22,9 +22,7 @@ final class MuseGlimmerNumerics {
 
     static func rows(_ x: MLXArray) -> Int { x.dim(-1) == 0 ? 0 : x.size / x.dim(-1) }
 
-    func isExact(_ x: MLXArray) -> Bool {
-        exactWindows && (1 ... Self.exactWindowRows).contains(Self.rows(x))
-    }
+    func isExact(_ x: MLXArray) -> Bool { exactWindows && Self.rows(x) > 0 }
 
     /// `layer(x)`, through the row-exact product on an exact call.
     func project(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
@@ -120,16 +118,15 @@ public enum MuseGlimmerRowExactError: Error, Equatable {
 }
 
 extension MuseGlimmerTextModel {
-    /// Rows of the largest call that `verifiesWindowsExactly` covers.
-    public static let exactWindowRows = MuseGlimmerNumerics.exactWindowRows
-
-    /// Whether calls of up to `exactWindowRows` rows are row-exact.
+    /// Whether every call is row-exact: each row's projections and norms
+    /// are those of the one-row call, whatever the row count.
     public var verifiesWindowsExactly: Bool { numerics.exactWindows }
 
     /// A name for the numerics, for the checkpoint numerics fingerprint:
-    /// decode steps change bytes when exact windows are on.
+    /// decode and prefill bytes change when exact windows are on. `v1`
+    /// left calls above 64 rows to MLX's kernels; `v2` runs them in pieces.
     public var numericsProfile: String {
-        numerics.exactWindows ? "muse-glimmer-exact-windows-v1" : "mlx"
+        numerics.exactWindows ? "muse-glimmer-exact-windows-v2" : "mlx"
     }
 
     /// The model path and layer of every projection slot.
