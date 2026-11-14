@@ -131,7 +131,8 @@ extension UnitTests {
             }
             #expect(try mode([]) == .strict)
             #expect(try mode(["--onyx-parsing", "reference-parity"]) == .referenceParity)
-            #expect(try mode([], ["MLX_SERVER_ONYX_PARSING": "reference-parity"]) == .referenceParity)
+            #expect(
+                try mode([], ["MLX_SERVER_ONYX_PARSING": "reference-parity"]) == .referenceParity)
             #expect(
                 try mode(
                     ["--onyx-parsing", "strict"], ["MLX_SERVER_ONYX_PARSING": "reference-parity"])

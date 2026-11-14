@@ -448,7 +448,8 @@ struct MuseGlimmerInstallationTests {
         #expect(throws: Index.Failure.unsafeFile("config.json")) {
             try Index.readRegularFile(at: config, maximumBytes: configBytes.count - 1)
         }
-        #expect(try Index.readRegularFile(at: config, maximumBytes: configBytes.count) == configBytes)
+        #expect(
+            try Index.readRegularFile(at: config, maximumBytes: configBytes.count) == configBytes)
     }
 
     /// NVFP4's unscaled product can leave the FP16 range, so a tower with an

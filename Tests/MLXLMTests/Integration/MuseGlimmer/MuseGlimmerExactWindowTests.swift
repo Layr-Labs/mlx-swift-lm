@@ -315,14 +315,18 @@ struct MuseGlimmerExactWindowTests {
             case let nvfp4 as ModelOptWeightOnlyNVFP4Linear: inputs = nvfp4.inputDimensions
             case let fp8 as ModelOptCalibratedLinear: inputs = fp8.inputDimensions
             case let dense as Linear: inputs = dense.weight.dim(1)
-            default: Issue.record("\(path)"); continue
+            default:
+                Issue.record("\(path)")
+                continue
             }
             for rows in [65, 99, 200] {
                 let x = MuseGlimmerFixture.hostTensor(
                     [1, rows, inputs], seed: UInt64(index * 1000 + rows)
                 ).asType(dtype)
                 let all = m.numerics.project(projection, x)
-                let one = (0 ..< rows).map { m.numerics.project(projection, x[0..., $0 ..< $0 + 1]) }
+                let one = (0 ..< rows).map {
+                    m.numerics.project(projection, x[0..., $0 ..< $0 + 1])
+                }
                 #expect(
                     MuseGlimmerFixture.sameBits(all, concatenated(one, axis: 1)),
                     "\(path) rows \(rows)")

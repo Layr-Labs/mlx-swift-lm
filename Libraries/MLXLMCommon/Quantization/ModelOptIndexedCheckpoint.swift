@@ -4,9 +4,9 @@ import CryptoKit
 import Foundation
 
 #if canImport(Darwin)
-    import Darwin
+import Darwin
 #else
-    import Glibc
+import Glibc
 #endif
 
 /// A sharded safetensors checkpoint bound to its index: the index bytes match

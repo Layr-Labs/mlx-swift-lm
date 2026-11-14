@@ -206,7 +206,9 @@ extension KernelTests {
                     parameters: .object([
                         "type": .string("object"),
                         "properties": .object([
-                            "q": .object(["type": .string("string"), "enum": .array([.string("z")])])
+                            "q": .object([
+                                "type": .string("string"), "enum": .array([.string("z")]),
+                            ])
                         ]),
                     ])))
             struct Read {

@@ -27,8 +27,10 @@ extension KernelTests {
             let projection = try layer(outputs: 64, inputs: 128, seed: 1)
             #expect(projection.rowExactSchedule == .standard)
             #expect(!projection.rowExactBatches)
-            #expect(ModelOptRowExact.Schedule.standard == .init(
-                separateActivationCast: false, twoRowsPerThread: false))
+            #expect(
+                ModelOptRowExact.Schedule.standard
+                    == .init(
+                        separateActivationCast: false, twoRowsPerThread: false))
         }
 
         /// Muse Glimmer's FP8 shapes (K/V, query and output projections).
