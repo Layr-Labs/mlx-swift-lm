@@ -139,10 +139,12 @@ final class Qwen35PositionStateTests: XCTestCase {
                 ]),
                 imageGrids: [THW(1, 4, 4)],
                 videoGrids: [THW(2, 2, 2)])) { error in
+            // A run of one frame pair's tokens reads as the timestamped
+            // layout (one block per pair), whose second pair has no run.
             XCTAssertEqual(
                 error as? Qwen35PositionSeamError,
                 .visualTokenRunMismatch(
-                    kind: "video", gridIndex: 0, expected: 2, actual: 1))
+                    kind: "video", gridIndex: 1, expected: 1, actual: 0))
         }
     }
 

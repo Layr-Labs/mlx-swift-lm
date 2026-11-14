@@ -65,6 +65,8 @@ public struct Qwen4ExpProcessor: UserInputProcessor {
         let imageInput = try await imageProcessor.prepare(input: imagesOnly)
         return try await Qwen4ExpVideoPreparation.prepare(
             input: input, imageInput: imageInput,
-            tokenizer: tokenizer, config: videoConfig)
+            tokenizer: tokenizer, config: videoConfig,
+            minPixels: input.processing.minPixels ?? videoConfig.size.shortestEdge,
+            maxPixels: input.processing.maxPixels ?? videoConfig.size.longestEdge)
     }
 }

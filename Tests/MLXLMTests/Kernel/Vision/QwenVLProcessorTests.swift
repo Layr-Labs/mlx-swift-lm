@@ -61,8 +61,18 @@ extension KernelTests {
                 return ids
             }
 
+            /// Inverts `encode`: a special id gives its markup, and id `n` in
+            /// 1...40 gives a character that encodes to `n` again.
             func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-                tokenIds.map(String.init).joined(separator: " ")
+                var text = ""
+                for id in tokenIds {
+                    if let special = Self.special.first(where: { $0.1 == id }) {
+                        text += special.0
+                    } else if (1 ... 40).contains(id), let scalar = Unicode.Scalar(UInt32(79 + id)) {
+                        text.unicodeScalars.append(scalar)
+                    }
+                }
+                return text
             }
 
             func convertTokenToId(_ token: String) -> Int? {
@@ -532,14 +542,37 @@ extension KernelTests {
             let image = try #require(result.image, "Qwen3VL: image pixels")
             #expect(image.pixels.shape == [48, 96], "Qwen3VL: image patch shape")
             #expect(image.frames?.map(Self.grid) == [[1, 6, 8]], "Qwen3VL: image grid")
+            // Frames 0-3 at 2 fps make two frame pairs at 0.25 s and 1.25 s.
+            // The clip's 4 x 24 x 32 px is below the reference minimum of
+            // 4,096, so the frames grow to 32 x 40 px: 20 tokens a pair.
             let video = try #require(result.video, "Qwen3VL: video pixels")
-            #expect(video.pixels.shape == [96, 96], "Qwen3VL: video patch shape")
-            #expect(video.frames?.map(Self.grid) == [[2, 6, 8]], "Qwen3VL: video grid")
+            #expect(video.pixels.shape == [160, 96], "Qwen3VL: video patch shape")
+            #expect(video.frames?.map(Self.grid) == [[2, 8, 10]], "Qwen3VL: video grid")
+            #expect(
+                Self.ids(result.text.tokens)
+                    == Self.tokenizer.encode(
+                        text: "user:" + Self.imageBlock(12) + "<0.2 seconds>" + Self.videoBlock(20)
+                            + "<1.2 seconds>" + Self.videoBlock(20) + "Look."),
+                "Qwen3VL: image tokens, then a timestamped block per frame pair")
+        }
+
+        /// The pair media contract keeps one block of all the clip's tokens.
+        @Test func qwen3VLSingleBlockLayoutKeepsOneVideoBlock() async throws {
+            let processor = Qwen3VLMediaProcessor(
+                try SyntheticModel.configuration(Qwen3VLProcessorConfiguration.self, Self.processorBase)
+            ).makeUserInputProcessor(tokenizer: Self.tokenizer)
+            let input = UserInput(chat: [
+                .user(
+                    "Look.", images: [.ciImage(Self.image(width: 32, height: 24))],
+                    videos: [Self.fourFrames])
+            ])
+            let result = try await processor.prepare(input: input)
+            #expect(result.video?.frames?.map(Self.grid) == [[2, 6, 8]], "single block: grid")
             #expect(
                 Self.ids(result.text.tokens)
                     == Self.tokenizer.encode(
                         text: "user:" + Self.imageBlock(12) + Self.videoBlock(24) + "Look."),
-                "Qwen3VL: image and video tokens")
+                "single block: image and video tokens")
         }
 
         /// Qwen3-VL gives text-only prompts a batch axis and no mask: one unpadded
@@ -564,8 +597,9 @@ extension KernelTests {
             }
         }
 
-        /// Ten frames, 1 second apart: 2 frames per second asks for 18,
-        /// the cap keeps `maxVideoFrames` = 8, which make 4 temporal pairs.
+        /// Ten frames, 1 second apart: 2 frames per second asks for 20,
+        /// the default cap keeps `maxVideoFrames` = 8, which make 4 temporal
+        /// pairs; `processing.video.maxFrames` raises it to all 10.
         @Test func qwen3VLVideoKeepsAtMostEightFrames() async throws {
             #expect(Qwen3VLProcessor.maxVideoFrames == 8, "frame cap")
             let input = UserInput(chat: [
@@ -578,20 +612,35 @@ extension KernelTests {
             #expect(
                 Self.ids(result.text.tokens).filter { $0 == 61 }.count == 48,
                 "4 * 6 * 8 / 4 = 48 video pad tokens")
+            #expect(
+                Self.ids(result.text.tokens).filter { $0 == 57 }.count == 4,
+                "a vision block per pair")
+
+            var raised = input
+            raised.processing.video = .init(maxFrames: 10)
+            let all = try await Self.qwen3().prepare(input: raised)
+            #expect(all.video?.frames?.map(Self.grid) == [[5, 6, 8]], "10 frames make 5 pairs")
         }
 
-        /// An explicit `maxPixels` of 1024 resizes 64x48 images and video
-        /// frames: beta = sqrt(3072 / 1024), so 48 and 64 become 24 and 32.
+        /// An explicit `maxPixels` of 1024 resizes 64x48 images: beta =
+        /// sqrt(3072 / 1024), so 48 and 64 become 24 and 32. It leaves video
+        /// alone; `video.maxPixels` of 4096 bounds the 4-frame clip the same
+        /// way (beta = sqrt(4 x 3072 / 4096)).
         @Test func qwen3VLExplicitMaxPixelsNarrowsImagesAndVideo() async throws {
-            let input = UserInput(
-                chat: [
-                    .user(
-                        "Look.", images: [.ciImage(Self.image(width: 64, height: 48))],
-                        videos: [Self.video(count: 4, step: 0.5, width: 64, height: 48)])
-                ], processing: .init(maxPixels: 1024))
-            let result = try await Self.qwen3().prepare(input: input)
-            #expect(result.image?.frames?.map(Self.grid) == [[1, 6, 8]], "image to 24x32")
-            #expect(result.video?.frames?.map(Self.grid) == [[2, 6, 8]], "video frames to 24x32")
+            func prepared(_ processing: UserInput.Processing) async throws -> LMInput {
+                try await Self.qwen3().prepare(
+                    input: UserInput(
+                        chat: [
+                            .user(
+                                "Look.", images: [.ciImage(Self.image(width: 64, height: 48))],
+                                videos: [Self.video(count: 4, step: 0.5, width: 64, height: 48)])
+                        ], processing: processing))
+            }
+            let images = try await prepared(.init(maxPixels: 1024))
+            #expect(images.image?.frames?.map(Self.grid) == [[1, 6, 8]], "image to 24x32")
+            #expect(images.video?.frames?.map(Self.grid) == [[2, 12, 16]], "video unchanged")
+            let video = try await prepared(.init(video: .init(maxPixels: 4096)))
+            #expect(video.video?.frames?.map(Self.grid) == [[2, 6, 8]], "video frames to 24x32")
         }
 
         @Test func qwen3VLPreprocessUsesTheTokenBudget() throws {

@@ -125,6 +125,10 @@ public enum QwenVisionSeamSupport {
         guard tokens.dim(0) == 1 else { return }
         let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
         let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
+        let visibleTokens =
+            maskValues.map { mask in zip(values, mask).map { $1 == 1 ? $0 : -1 } } ?? values
+        let videoGrids = QwenVL.positionVideoGrids(
+            videoGrids, tokens: visibleTokens, videoToken: seam.videoPositionTokenId, merge: merge)
         let imageToken = seam.imagePositionTokenId
         let videoToken = seam.videoPositionTokenId
         var imageIndex = 0

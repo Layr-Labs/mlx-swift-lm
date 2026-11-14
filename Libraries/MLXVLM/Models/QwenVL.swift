@@ -294,10 +294,39 @@ public struct QwenVL {
         return (flattenedPatches, .init(gridT, gridH, gridW))
     }
 
+    /// The video grids M-RoPE positions. Transformers' Qwen3-VL gives each
+    /// temporal group its own timestamped vision block, and `get_rope_index`
+    /// positions each block as a `t = 1` grid. A clip whose `t` groups appear as
+    /// separate token runs is split the same way; a clip in one run of
+    /// `t × h × w / merge²` tokens keeps its grid.
     static func positionVideoGrids(
         _ grids: [THW], tokens: [Int], videoToken: Int, merge: Int
     ) -> [THW] {
-        grids
+        guard merge > 0, grids.contains(where: { $0.t > 1 }) else { return grids }
+        var runs: [Int] = []
+        var index = 0
+        while index < tokens.count {
+            guard tokens[index] == videoToken else {
+                index += 1
+                continue
+            }
+            let start = index
+            while index < tokens.count, tokens[index] == videoToken { index += 1 }
+            runs.append(index - start)
+        }
+        var result: [THW] = []
+        var run = 0
+        for grid in grids {
+            let groupTokens = (grid.h / merge) * (grid.w / merge)
+            if grid.t > 1, run < runs.count, runs[run] == groupTokens {
+                result.append(contentsOf: repeatElement(THW(1, grid.h, grid.w), count: grid.t))
+                run += grid.t
+            } else {
+                result.append(grid)
+                run += 1
+            }
+        }
+        return result
     }
 
     // MARK: - Prepared input splitting

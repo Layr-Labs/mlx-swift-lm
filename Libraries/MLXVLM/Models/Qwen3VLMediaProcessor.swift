@@ -60,14 +60,12 @@ public struct Qwen3VLMediaProcessor {
     }
 
     /// Build the ordinary prompt processor with exactly the same checkpoint
-    /// image policy used by media-only native preparation.
+    /// image policy used by media-only native preparation, and this policy's
+    /// one vision block per video (`videoFrames`).
     public func makeUserInputProcessor(tokenizer: any Tokenizer) -> Qwen3VLProcessor {
-        if let checkpointImageBounds {
-            return Qwen3VLProcessor(
-                configuration, tokenizer: tokenizer,
-                checkpointImageBounds: checkpointImageBounds)
-        }
-        return Qwen3VLProcessor(configuration, tokenizer: tokenizer)
+        Qwen3VLProcessor(
+            configuration, tokenizer: tokenizer,
+            checkpointImageBounds: checkpointImageBounds, videoLayout: .singleBlock)
     }
 
     /// Exact standalone top-level merge: preprocessor values win, including
@@ -275,9 +273,9 @@ public struct Qwen3VLMediaProcessor {
             temporalPatchSize: config.temporalPatchSize)
     }
 
-    /// Exact full-clip sampling/preprocessing used by `Qwen3VLProcessor`.
-    /// One complete T×H×W grid is retained; temporal attention must not become
-    /// unrelated still-image invocations.
+    /// Exact full-clip sampling/preprocessing of the single-block layout
+    /// (`Qwen3VLProcessor.VideoLayout.singleBlock`). One complete T×H×W grid is
+    /// retained; temporal attention must not become unrelated still-image invocations.
     func videoFrames(_ video: UserInput.Video, processing: UserInput.Processing) async throws
         -> [MLXArray]
     {

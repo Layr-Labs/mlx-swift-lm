@@ -78,6 +78,19 @@ extension UnitTests {
             #expect(result == tokens(expected), "a bare slot gets a full block")
         }
 
+        /// Python's `f"{t:.1f}"` rounds the binary value: 0.05 is just above
+        /// a half and 0.35 just below.
+        @Test
+        func timestampsRoundLikePython() throws {
+            let result = try expand(pad, grids: [THW(4, 2, 2)], timestamps: [[0.05, 0.35, 2.45, 0.15]])
+            let block = start + pad + end
+            #expect(
+                result
+                    == tokens(
+                        "<0.1 seconds>\(block)<0.3 seconds>\(block)<2.5 seconds>\(block)"
+                            + "<0.1 seconds>\(block)"))
+        }
+
         @Test
         func twoClipsExpandInPromptOrder() throws {
             let result = try expand(
@@ -95,7 +108,7 @@ extension UnitTests {
             let input = [0xD800] + tokens(pad)
             #expect(
                 throws: VLMError.processing(
-                    "Qwen4 video prompt could not preserve its rendered template")
+                    "Qwen video prompt could not preserve its rendered template")
             ) {
                 try Qwen4ExpVideoPrompt.expandedTokens(
                     input, tokenizer: tokenizer, grids: [THW(1, 2, 2)], timestamps: [[0]],
@@ -105,7 +118,7 @@ extension UnitTests {
 
         @Test
         func mismatchedGridAndTimestampListsAreRejected() {
-            let message = "Qwen4 video prompt could not preserve its rendered template"
+            let message = "Qwen video prompt could not preserve its rendered template"
             #expect(throws: VLMError.processing(message), "two grids, one timestamp list") {
                 try expand(pad, grids: [THW(1, 2, 2), THW(1, 2, 2)], timestamps: [[0]])
             }
@@ -118,7 +131,7 @@ extension UnitTests {
         func placeholderCountMustMatchClips() {
             #expect(
                 throws: VLMError.processing(
-                    "Qwen4 video placeholder count does not match supplied clips")
+                    "Qwen video placeholder count does not match supplied clips")
             ) {
                 try expand(
                     "one \(pad)", grids: [THW(1, 2, 2), THW(1, 2, 2)], timestamps: [[0], [1]])
@@ -127,7 +140,7 @@ extension UnitTests {
 
         @Test
         func gridMustAgreeWithMergeAndTimestamps() {
-            let message = "Qwen4 video grid and timestamps disagree"
+            let message = "Qwen video grid and timestamps disagree"
             #expect(throws: VLMError.processing(message), "height 3 is not a multiple of 2") {
                 try expand(pad, grids: [THW(1, 3, 4)], timestamps: [[0]])
             }
@@ -141,7 +154,7 @@ extension UnitTests {
 
         @Test
         func startTokenWithoutEndTokenIsMalformed() {
-            #expect(throws: VLMError.processing("Qwen4 video placeholder is malformed")) {
+            #expect(throws: VLMError.processing("Qwen video placeholder is malformed")) {
                 try expand("\(start)\(pad)z", grids: [THW(1, 2, 2)], timestamps: [[0]])
             }
         }

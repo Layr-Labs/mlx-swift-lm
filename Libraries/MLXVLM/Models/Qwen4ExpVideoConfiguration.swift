@@ -21,6 +21,22 @@ struct Qwen4ExpVideoConfiguration: Codable, Sendable {
         case processorType = "video_processor_type"
     }
 
+    init(
+        size: Qwen4ExpProcessorConfiguration.Size, patchSize: Int, mergeSize: Int,
+        temporalPatchSize: Int, imageMean: [CGFloat], imageStd: [CGFloat],
+        fps: Double, minFrames: Int, maxFrames: Int
+    ) {
+        self.size = size
+        self.patchSize = patchSize
+        self.mergeSize = mergeSize
+        self.temporalPatchSize = temporalPatchSize
+        self.imageMean = imageMean
+        self.imageStd = imageStd
+        self.fps = fps
+        self.minFrames = minFrames
+        self.maxFrames = maxFrames
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         size = try c.decodeIfPresent(Qwen4ExpProcessorConfiguration.Size.self, forKey: .size)
