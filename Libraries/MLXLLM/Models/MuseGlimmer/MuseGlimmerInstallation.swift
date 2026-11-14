@@ -5,6 +5,12 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
+
 /// Strict loading of NVIDIA's ModelOpt checkpoint into the native text tower.
 ///
 /// Each projection's format comes from the dtype of its `weight` and the
@@ -251,8 +257,9 @@ public enum MuseGlimmerInstallation {
     /// Opens the pinned artifact in `directory`: the index and every shard
     /// must match `MuseGlimmerCheckpointPin`. Hashing reads each shard once.
     public static func openPinnedSource(directory: URL) throws -> ModelOptIndexedCheckpoint {
-        let indexData = try Data(
-            contentsOf: directory.appendingPathComponent("model.safetensors.index.json"))
+        let indexData = try ModelOptIndexedCheckpoint.readRegularFile(
+            at: directory.appendingPathComponent("model.safetensors.index.json"),
+            maximumBytes: ModelOptIndexedCheckpoint.maximumIndexBytes)
         let names: [String]
         do {
             names = try ModelOptIndexedCheckpoint.shardNames(
@@ -315,18 +322,36 @@ public enum MuseGlimmerInstallation {
             activationOverflow: .museGlimmer)
     }
 
+    /// Bound of `config.json` and `hf_quant_config.json`, checked before
+    /// either is read.
+    static let maximumRecordBytes = 4 << 20
+
     /// The pinned artifact from a local directory in the Hugging Face layout.
     /// `config.json` must describe the published decoder; `hf_quant_config.json`
-    /// is cross-checked when present.
+    /// is cross-checked when present. Both, and the index, are read as the
+    /// shards are opened: regular files, no symlinks, sizes bounded first. A
+    /// record that is present but cannot be read refuses the load.
     public static func stage(directory: URL) throws -> Installed {
         let configuration = try MuseGlimmerTextModelConfiguration.textConfiguration(
-            checkpointConfiguration: Data(
-                contentsOf: directory.appendingPathComponent("config.json")))
+            checkpointConfiguration: ModelOptIndexedCheckpoint.readRegularFile(
+                at: directory.appendingPathComponent("config.json"),
+                maximumBytes: maximumRecordBytes))
+        let recordURL = directory.appendingPathComponent("hf_quant_config.json")
+        // Present means any directory entry, a dangling symlink included.
+        var entry = stat()
+        let record: Data?
+        if lstat(recordURL.path, &entry) == 0 {
+            record = try ModelOptIndexedCheckpoint.readRegularFile(
+                at: recordURL, maximumBytes: maximumRecordBytes)
+        } else if errno == ENOENT {
+            record = nil
+        } else {
+            throw ModelOptIndexedCheckpoint.Failure.unsafeFile(recordURL.lastPathComponent)
+        }
         let source = try openPinnedSource(directory: directory)
-        let record = directory.appendingPathComponent("hf_quant_config.json")
-        if let data = try? Data(contentsOf: record) {
+        if let record {
             try crossCheck(
-                quantizationRecord: data,
+                quantizationRecord: record,
                 plan: plan(configuration: configuration, source: source))
         }
         return try stage(source: source, configuration: configuration)

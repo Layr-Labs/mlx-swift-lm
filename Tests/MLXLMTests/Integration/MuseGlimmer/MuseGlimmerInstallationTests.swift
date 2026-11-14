@@ -387,6 +387,69 @@ struct MuseGlimmerInstallationTests {
         }
     }
 
+    /// The index, `config.json` and `hf_quant_config.json` are read as shards
+    /// are opened: a symlink, a file that is not regular or one over its bound
+    /// refuses the load before it is read, and a quantization record that is
+    /// present but unreadable refuses it too.
+    @Test func smallCheckpointFilesAreReadLikeShards() throws {
+        typealias Index = ModelOptIndexedCheckpoint
+        let files = FileManager.default
+        let written = try MuseGlimmerTinyCheckpoint().write()
+        let directory = written.directory
+        defer { try? files.removeItem(at: directory) }
+        func stage() throws { _ = try MuseGlimmerInstallation.stage(directory: directory) }
+        func swapForSymlink(_ url: URL) throws -> URL {
+            let target = directory.appendingPathComponent("target-" + url.lastPathComponent)
+            try files.moveItem(at: url, to: target)
+            try files.createSymbolicLink(at: url, withDestinationURL: target)
+            return target
+        }
+        func restore(_ url: URL, from target: URL) throws {
+            try files.removeItem(at: url)
+            try files.moveItem(at: target, to: url)
+        }
+        let config = directory.appendingPathComponent("config.json")
+        let configBytes = Data(#"{"text_config": {}}"#.utf8)
+        try configBytes.write(to: config)
+        // Readable files: the tiny index then fails the pin.
+        #expect(throws: Failure.identity("model.safetensors.index.json")) { try stage() }
+
+        let index = directory.appendingPathComponent("model.safetensors.index.json")
+        var target = try swapForSymlink(index)
+        #expect(throws: Index.Failure.unsafeFile(index.lastPathComponent)) { try stage() }
+        #expect(throws: Index.Failure.unsafeFile(index.lastPathComponent)) {
+            try MuseGlimmerInstallation.openPinnedSource(directory: directory)
+        }
+        try restore(index, from: target)
+
+        target = try swapForSymlink(config)
+        #expect(throws: Index.Failure.unsafeFile("config.json")) { try stage() }
+        try restore(config, from: target)
+        try Data(count: MuseGlimmerInstallation.maximumRecordBytes + 1).write(to: config)
+        #expect(throws: Index.Failure.unsafeFile("config.json")) { try stage() }
+        try configBytes.write(to: config)
+
+        let record = directory.appendingPathComponent("hf_quant_config.json")
+        try files.createDirectory(at: record, withIntermediateDirectories: false)
+        #expect(throws: Index.Failure.unsafeFile(record.lastPathComponent)) { try stage() }
+        try files.removeItem(at: record)
+        try files.createSymbolicLink(
+            at: record, withDestinationURL: directory.appendingPathComponent("absent.json"))
+        #expect(throws: Index.Failure.unsafeFile(record.lastPathComponent)) { try stage() }
+        try files.removeItem(at: record)
+        try Data("{}".utf8).write(to: record)
+        try files.setAttributes([.posixPermissions: 0], ofItemAtPath: record.path)
+        #expect(throws: Index.Failure.unsafeFile(record.lastPathComponent)) { try stage() }
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: record.path)
+        // A readable record: the load goes on to the pin.
+        #expect(throws: Failure.identity("model.safetensors.index.json")) { try stage() }
+
+        #expect(throws: Index.Failure.unsafeFile("config.json")) {
+            try Index.readRegularFile(at: config, maximumBytes: configBytes.count - 1)
+        }
+        #expect(try Index.readRegularFile(at: config, maximumBytes: configBytes.count) == configBytes)
+    }
+
     @Test func missingExtraAndMisshapenTensorsRefuseTheLoad() throws {
         let base = try MuseGlimmerTinyCheckpoint()
         func expect(
