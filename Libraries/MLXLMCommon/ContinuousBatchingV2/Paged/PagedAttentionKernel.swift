@@ -538,17 +538,18 @@ public enum PagedAttentionKernel {
         }
     }
 
-    /// Attended length from which decode takes the side-by-side pass A. Both
-    /// forms give the same bits; the side-by-side form reads a partition's
-    /// keys and values once per kv head instead of once per head group, which
-    /// pays at long context (measured on an M5 Ultra: per layer 1.08x for
-    /// the 27B shape and 1.22x for Gemma 4 global layers at 65,536 tokens,
-    /// slower for Gemma below 32,768). `DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS`
-    /// sets the length; 0 turns the form off.
+    /// Attended length from which decode takes the side-by-side pass A; 0 is
+    /// off, the default. Both forms give the same bits; the side-by-side form
+    /// reads a partition's keys and values once per kv head instead of once
+    /// per head group. Per attention layer it was faster at long context on an
+    /// M5 Ultra (1.08x for the 27B shape and 1.22x for Gemma 4 global layers at
+    /// 65,536 tokens, slower for Gemma below 32,768), but whole decode steps on
+    /// an M5 Max were not faster, so it stays opt-in until the engine is timed:
+    /// `DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS=49152` takes it from that length.
     public static let sideBySideMinimumTokens = sideBySideMinimum(
         environment: ProcessInfo.processInfo.environment)
     static let sideBySideEnvironmentKey = "DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS"
-    static let sideBySideDefaultTokens = 49_152
+    static let sideBySideDefaultTokens = 0
 
     static func sideBySideMinimum(environment: [String: String]) -> Int {
         guard let raw = environment[sideBySideEnvironmentKey],

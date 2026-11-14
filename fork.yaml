@@ -135,10 +135,10 @@ def:
             them through `PagedKVBackend` as the engine does.
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
             When a kv head's query heads split over several pass-A threadgroups (large head dims),
-            decode from 49,152 attended tokens runs them side by side in one threadgroup
-            (`paged_attention_part_side_impl`; `DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS`, 0 off):
-            same partitions and per-head order, so the same bits, and the partition's keys and
-            values are read once per kv head. Packed pages and verify windows keep the plain form.
+            decode can run them side by side in one threadgroup (`paged_attention_part_side_impl`,
+            opt-in: `DARKBLOOM_CBV2_PAGED_SIDE_BY_SIDE_TOKENS=<n>` from n attended tokens): same
+            partitions and per-head order, so the same bits, and the partition's keys and values
+            are read once per kv head. Packed pages and verify windows keep the plain form.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
             - "docs/runtime-kv-quantization.md"
