@@ -273,6 +273,22 @@ public final class MuseGlimmerImageEncoder: @unchecked Sendable {
             sourceHeight: Int(image.extent.height.rounded()),
             sourceWidth: Int(image.extent.width.rounded()),
             maximumImageTokens: maximumImageTokens)
+        let pixels = museGlimmerPatchify(
+            normalizedPixels(image, grid: grid), gridH: grid.patchRows,
+            gridW: grid.patchColumns, patchSize: MuseGlimmerImageGeometry.patchSize,
+            temporalPatchSize: MuseGlimmerImageGeometry.temporalPatchSize)
+        try MLX.withError { errors in
+            eval(pixels)
+            try errors.check()
+        }
+        return (pixels, grid)
+    }
+
+    /// One image's `[1, 3, H, W]` pixels at `grid`'s size, not yet evaluated:
+    /// sRGB tone curve, LANCZOS resize, mean and std 0.5.
+    static func normalizedPixels(_ image: CIImage, grid: MuseGlimmerImageGeometry.Grid)
+        -> MLXArray
+    {
         let targetSize = CGSize(width: grid.pixelWidth, height: grid.pixelHeight)
         var processing = UserInput.Processing()
         processing.resize = targetSize
@@ -281,15 +297,7 @@ public final class MuseGlimmerImageEncoder: @unchecked Sendable {
         let resized = MediaProcessing.resampleLanczos(srgb, to: targetSize)
         let normalized = MediaProcessing.normalize(
             resized, mean: (0.5, 0.5, 0.5), std: (0.5, 0.5, 0.5))
-        let pixels = museGlimmerPatchify(
-            MediaProcessing.asMLXArray(normalized), gridH: grid.patchRows,
-            gridW: grid.patchColumns, patchSize: MuseGlimmerImageGeometry.patchSize,
-            temporalPatchSize: MuseGlimmerImageGeometry.temporalPatchSize)
-        try MLX.withError { errors in
-            eval(pixels)
-            try errors.check()
-        }
-        return (pixels, grid)
+        return MediaProcessing.asMLXArray(normalized)
     }
 
     /// The evaluated `[grid.featureRows, featureWidth]` rows to splice at the
