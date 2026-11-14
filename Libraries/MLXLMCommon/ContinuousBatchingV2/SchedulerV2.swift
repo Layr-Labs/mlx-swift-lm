@@ -87,6 +87,9 @@ public final class CBv2ScheduledRequest {
     internal let fullSequenceCapacityTokens: Int?
     internal var prefixReplayBoundarySplits = 0
     internal var plannedPrefillChunkSize = 0
+    /// The prompt's canonical partition (grid multiples and message
+    /// boundaries), set at enqueue; nil while the canonical grid is off.
+    internal var canonicalPartition: CBv2CanonicalPartition?
     internal var recurrentChunkWaits = 0
     /// Monotonic capture veto from an actually packed/disarmed range. This
     /// prevents scheduling a later short boundary that capture cannot use.
@@ -341,6 +344,9 @@ public final class SchedulerV2 {
             request: request, arrivalSeq: nextArrivalSeq, submittedAt: now,
             enqueuedNanos: DispatchTime.now().uptimeNanoseconds,
             reserveFullSequenceTokens: reserveFullSequenceTokens)
+        // Message boundaries for text prompts; media prompts keep the grid alone.
+        record.canonicalPartition = config.canonicalPartition(
+            for: request.multimodal == nil ? request.promptTokens : [])
         nextArrivalSeq += 1
         byID[request.id] = record
         insertWaiting(record, preemptedRequeue: false)
@@ -415,6 +421,16 @@ public final class SchedulerV2 {
         // chunk delays the striped row's own sample — defeating the very
         // TTFT the stripe exists for.
         func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
+            // Canonical grid: exactly the rest of the current cell, whatever
+            // the stripe, the company or an adoption. The cap recorded for
+            // checkpoint capture is the grid itself.
+            if let cell = config.canonicalCellTokens(
+                start: rec.numComputedTokens, hasMultimodalBlocks: !rec.multimodalBlocks.isEmpty,
+                boundaries: rec.canonicalPartition?.boundaries ?? [])
+            {
+                rec.plannedPrefillChunkSize = config.canonicalPrefillGridTokens!
+                return cell
+            }
             let cap =
                 rec.prefixReusePlan?.recurrentChunkSize
                 ?? (soloStripe?.id == rec.id
@@ -427,6 +443,8 @@ public final class SchedulerV2 {
         var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
         var demandedCheckpointRanges: [CBv2RequestID: CBv2DemandedCheckpointRange] = [:]
         func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            // The canonical grid already ends a range at every boundary.
+            if config.canonicalPrefillGridTokens != nil { return proposed }
             let range = config.demandedCheckpointRange(
                 promptTokens: rec.request.promptTokens.count,
                 hintTokens: rec.request.prefixCheckpointTargetTokens,
@@ -646,6 +664,18 @@ public final class SchedulerV2 {
                 idx += 1
                 continue
             }
+            // Canonical grid: never split a cell. A row the budget or quota
+            // would cut short waits for a step that holds its whole cell.
+            if isPrefillRow,
+                let cell = config.canonicalCellTokens(
+                    start: rec.numComputedTokens,
+                    hasMultimodalBlocks: !rec.multimodalBlocks.isEmpty,
+                    boundaries: rec.canonicalPartition?.boundaries ?? []),
+                n < min(rec.remainingTokens, cell)
+            {
+                idx += 1
+                continue
+            }
 
             // Reserve KV headroom; preemption is the backstop.
             // A striped solo chunk holds capacity it only wants
@@ -811,6 +841,15 @@ public final class SchedulerV2 {
                     // queue block that fits a full budget but not what the
                     // running rows left over gets first claim next step.
                     if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
+                    break
+                }
+                // Canonical grid: admit only with a whole first cell (FCFS).
+                if let cell = config.canonicalCellTokens(
+                    start: rec.numComputedTokens,
+                    hasMultimodalBlocks: !rec.multimodalBlocks.isEmpty,
+                    boundaries: rec.canonicalPartition?.boundaries ?? []),
+                    chunk < min(rec.remainingTokens, cell)
+                {
                     break
                 }
                 if let capacity {

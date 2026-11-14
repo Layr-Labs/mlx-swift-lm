@@ -98,10 +98,15 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         assistant: (any CBv2MTPPrefixCheckpoint)? = nil,
         qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
-        mediaSideStateRequired: Bool = true
+        mediaSideStateRequired: Bool = true,
+        canonical: Bool = false
     ) -> [MLXArray] {
+        // `canonical`: the engine's canonical partition already proved this
+        // position a cold-run chunk end (a grid multiple or a message boundary).
         guard position > 0, chunkSize > 1,
-            CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize)
+            canonical
+                || CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(
+                    position, chunkSize: chunkSize)
         else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
         // Bound, target-only media; QSA side state unless the model's only
@@ -279,6 +284,45 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return staged[requestID]?.isEmpty == false
+    }
+
+    /// The deepest boundary a live request has staged, if any.
+    func highestStagedPosition(requestID: CBv2RequestID) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return staged[requestID]?.map(\.position).max()
+    }
+
+    /// Benchmark seam: the arrays of the published checkpoint at exactly
+    /// `tokens.count` whose entry starts with `tokens`, named per tensor:
+    /// full-attention rows `[0, p)` and recurrent conv/SSM state. Slices are
+    /// lazy; the engine evaluates them on its queue.
+    func checkpointArrays(cacheSalt: String?, tokens: [Int]) -> [(String, MLXArray)]? {
+        lock.lock()
+        defer { lock.unlock() }
+        let position = tokens.count
+        let scope = Scope(salt: cacheSalt)
+        let candidates = entries.values
+            .filter { $0.scope == scope && $0.tokens.count >= position }
+            .sorted { $0.lastUse > $1.lastUse }
+        for entry in candidates {
+            guard let checkpoint = entry.checkpoints.first(where: { $0.position == position }),
+                entry.tokens.prefix(position).elementsEqual(tokens)
+            else { continue }
+            var arrays: [(String, MLXArray)] = []
+            for (layer, row) in entry.kv.enumerated() {
+                guard let row else { continue }
+                arrays.append(("kv.\(layer).keys", row.keys[.ellipsis, 0 ..< position, 0...]))
+                arrays.append(("kv.\(layer).values", row.values[.ellipsis, 0 ..< position, 0...]))
+            }
+            for layer in checkpoint.layers.keys.sorted() {
+                let state = checkpoint.layers[layer]!
+                if let conv = state.conv { arrays.append(("rec.\(layer).conv", conv)) }
+                if let ssm = state.ssm { arrays.append(("rec.\(layer).ssm", ssm)) }
+            }
+            return arrays
+        }
+        return nil
     }
 
     /// `publish` with rows that already exist, such as views of contiguous

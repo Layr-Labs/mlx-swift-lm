@@ -8,6 +8,10 @@ extension EngineV2 {
         _ manifest: CBv2CompleteCheckpointManifest, codec: CBv2CompleteCheckpointCodec
     ) throws {
         guard codec.contiguousLayout != nil || codec.isNativePagedHistorical else { return }
+        // Canonical grid: checkpoints sit on the grid and adopters resume on it.
+        if let grid = schedulerConfig.canonicalPrefillGridTokens, manifest.chunkSize == grid {
+            return
+        }
         guard manifest.chunkSize >= schedulerConfig.prefillChunkSize,
             manifest.chunkSize
                 <= max(

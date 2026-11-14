@@ -1749,6 +1749,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         registerWithGeneration(stream: stream) != nil
     }
 
+    /// Canonical grid: a resident page hit adopts only through a canonical
+    /// position (a grid multiple or a message boundary) on a page boundary,
+    /// so its replay and the rest of its prefill run the cold run's cells.
+    /// Off the grid the match is unchanged; with no such position, none.
+    func canonicalResidentMatch(
+        _ match: CBv2PagedPrefixMatch?, partition: CBv2CanonicalPartition?
+    ) -> CBv2PagedPrefixMatch? {
+        guard let match, let partition, match.blockSize > 0 else { return match }
+        guard
+            let tokens = partition.deepestCanonical(
+                atOrBelow: match.matchedTokens, multipleOf: match.blockSize)
+        else { return nil }
+        guard tokens != match.matchedTokens else { return match }
+        return CBv2PagedPrefixMatch(
+            chainHashes: Array(match.chainHashes.prefix(tokens / match.blockSize)),
+            matchedTokens: tokens, blockSize: match.blockSize)
+    }
+
+    /// Requests from registration until ownership retirement, the engine's
+    /// idle test for an Exact Turn Continuation.
+    func registeredStreamCount() -> Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return streams.count
+    }
+
     func registerWithGeneration(stream: CBv2OutputStream) -> UInt64? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -2262,9 +2288,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                         chainHashes: residentPrefixProbe.chainHashes,
                         publishedBlockCount: 0)
                 }
-                let residentMatch = residentPrefixProbe.flatMap {
-                    residentPrefixBackend?.longestResidentPrefix(for: $0)
-                }
+                let residentMatch = canonicalResidentMatch(
+                    residentPrefixProbe.flatMap {
+                        residentPrefixBackend?.longestResidentPrefix(for: $0)
+                    }, partition: record.canonicalPartition)
                 let snapshotMatched = prefixLookup.adoption?.matched ?? 0
                 if let residentMatch, residentMatch.matchedTokens >= snapshotMatched {
                     switch applyResidentAdoption(residentMatch, requestID: request.id) {
@@ -2462,9 +2489,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     do {
                         let record = try scheduler.enqueue(request)
                         record.timing.prefixLookupNanos = prefixLookup.lookupNanos
-                        let residentMatch = residentPrefixProbe.flatMap {
-                            residentPrefixBackend?.longestResidentPrefix(for: $0)
-                        }
+                        let residentMatch = canonicalResidentMatch(
+                            residentPrefixProbe.flatMap {
+                                residentPrefixBackend?.longestResidentPrefix(for: $0)
+                            }, partition: record.canonicalPartition)
                         let residentPlan = residentMatch.flatMap {
                             residentReusePlan(for: $0, request: request)
                         }
