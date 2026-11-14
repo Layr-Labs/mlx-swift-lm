@@ -14,3 +14,11 @@
   layout its pair media contract carries.
 - Video timestamps round like Python's `:.1f` (0.35 s is `<0.3 seconds>`); this
   also changes Qwen4's labels at such ties.
+- The timestamped layout reads the selected frames at their presentation times
+  (the frame count and rate from the track's shown range and nominal rate), so a
+  clip trimmed without re-encoding and a long clip need no full decode. Qwen4
+  keeps its frame-ordinal reader.
+- A template the tokenizer does not decode and re-encode unchanged expands in
+  token space instead of failing. Video geometry and track failures of
+  `Qwen3VLProcessor` are `VLMError.imageProcessingFailure` / `videoNotDecodable`,
+  as in the single-block layout.

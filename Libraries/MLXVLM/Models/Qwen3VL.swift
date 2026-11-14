@@ -101,10 +101,19 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let imageInput = try await prepareSingleBlock(input: imagesOnly)
         let video = try timestampedVideoConfiguration(input.processing.video)
         // No frame keeps more pixels than one still image gets by default.
-        return try await Qwen4ExpVideoPreparation.prepare(
-            input: input, imageInput: imageInput, tokenizer: tokenizer, config: video,
-            minPixels: video.size.shortestEdge, maxPixels: video.size.longestEdge,
-            maxFramePixels: mediaProcessor.defaultImageMaxPixels)
+        do {
+            return try await Qwen4ExpVideoPreparation.prepare(
+                input: input, imageInput: imageInput, tokenizer: tokenizer, config: video,
+                minPixels: video.size.shortestEdge, maxPixels: video.size.longestEdge,
+                maxFramePixels: mediaProcessor.defaultImageMaxPixels, byPresentationTime: true)
+        } catch Qwen4ExpMediaGeometry.Failure.invalidFrameMetadata {
+            throw VLMError.videoNotDecodable
+        } catch is Qwen4ExpMediaGeometry.Failure {
+            // A side below 32 px or an aspect ratio above 200, as the single-block resize.
+            throw VLMError.imageProcessingFailure("Qwen video frames cannot be resized")
+        } catch let failure as Qwen4ExpVideoSampler.Failure where failure != .missingFrame {
+            throw VLMError.videoNotDecodable
+        }
     }
 
     /// Reference sampling under this request's frame and pixel caps. A frame

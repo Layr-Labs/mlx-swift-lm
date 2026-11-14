@@ -128,6 +128,67 @@ extension UnitTests {
             }
         }
 
+        /// Specials are single ids; every other scalar is its own id, and
+        /// `decode` drops `~`, so a template with `~` does not round-trip.
+        private struct LossyTokenizer: Tokenizer {
+            static let specials = [
+                "<|vision_start|>": 1_000_001, "<|video_pad|>": 1_000_002,
+                "<|vision_end|>": 1_000_003,
+            ]
+            let bosToken: String? = nil
+            let eosToken: String? = nil
+            let unknownToken: String? = nil
+
+            func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+                var ids: [Int] = []
+                var rest = Substring(text)
+                while let scalar = rest.unicodeScalars.first {
+                    if let special = Self.specials.first(where: { rest.hasPrefix($0.key) }) {
+                        ids.append(special.value)
+                        rest = rest.dropFirst(special.key.count)
+                    } else {
+                        ids.append(Int(scalar.value))
+                        rest = rest.dropFirst()
+                    }
+                }
+                return ids
+            }
+
+            func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+                var text = ""
+                for id in tokenIds where id != 0x7E {
+                    if let name = Self.specials.first(where: { $0.value == id })?.key {
+                        text += name
+                    } else if let scalar = Unicode.Scalar(UInt32(id)) {
+                        text.unicodeScalars.append(scalar)
+                    }
+                }
+                return text
+            }
+
+            func convertTokenToId(_ token: String) -> Int? { Self.specials[token] }
+            func convertIdToToken(_ id: Int) -> String? { nil }
+
+            func applyChatTemplate(
+                messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                additionalContext: [String: any Sendable]?
+            ) throws -> [Int] { [] }
+        }
+
+        @Test
+        func templateThatDoesNotRoundTripExpandsInTokenSpace() throws {
+            let lossy = LossyTokenizer()
+            let template = lossy.encode(text: "~a\(start)\(pad)\(end)b", addSpecialTokens: false)
+            let result = try Qwen4ExpVideoPrompt.expandedTokens(
+                template, tokenizer: lossy, grids: [THW(2, 4, 4)], timestamps: [[0.5, 1.5]],
+                merge: 2)
+            let block = [1_000_001] + Array(repeating: 1_000_002, count: 4) + [1_000_003]
+            let text = { (value: String) in lossy.encode(text: value, addSpecialTokens: false) }
+            #expect(
+                result == text("~a") + text("<0.5 seconds>") + block + text("<1.5 seconds>") + block
+                    + text("b"), "each label is encoded on its own")
+        }
+
         @Test
         func placeholderCountMustMatchClips() {
             #expect(

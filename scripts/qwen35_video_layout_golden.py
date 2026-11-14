@@ -15,7 +15,10 @@ Usage (Python 3.10+, transformers==5.8.0, torch, numpy; offline):
   python qwen35_video_layout_golden.py <checkpoint dir> <full.json> \
       Tests/MLXLMTests/Resources/qwen35-video-layout-golden.json
 The checkpoint dir needs only the tokenizer, chat template, config.json and
-preprocessor_config.json / video_preprocessor_config.json.
+preprocessor_config.json / video_preprocessor_config.json. Leave out the
+EigenLabs processor_config.json: Transformers 5.8.0 refuses its image
+processor type ("Unrecognized image processor"); the fixture was made from a
+copy without it.
 """
 
 import hashlib

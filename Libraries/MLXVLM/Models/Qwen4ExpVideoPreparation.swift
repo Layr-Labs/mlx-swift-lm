@@ -10,10 +10,12 @@ import MLXLMCommon
 enum Qwen4ExpVideoPreparation {
     /// `minPixels` and `maxPixels` bound each clip's frames × height × width.
     /// `maxFramePixels`, when set, also bounds one frame's height × width.
+    /// `byPresentationTime` reads the selected frames by time instead of
+    /// decoding the clip in order (`Qwen4ExpVideoSampler.sampleByPresentationTime`).
     static func prepare(
         input: UserInput, imageInput: LMInput, tokenizer: any Tokenizer,
         config: Qwen4ExpVideoConfiguration, minPixels: Int, maxPixels: Int,
-        maxFramePixels: Int? = nil
+        maxFramePixels: Int? = nil, byPresentationTime: Bool = false
     ) async throws -> LMInput {
         var pixels: [MLXArray] = []
         var grids: [THW] = []
@@ -24,8 +26,7 @@ enum Qwen4ExpVideoPreparation {
         for video in input.videos {
             try Task.checkCancellation()
             var selectedSize: Qwen4ExpMediaGeometry.Size?
-            let sampled = try await Qwen4ExpVideoSampler.sample(video, config: config) {
-                frame, count in
+            func resized(_ frame: CIImage, _ count: Int) throws -> CIImage {
                 let source = MediaProcessing.apply(frame, processing: input.processing)
                 let extent = source.extent.size
                 guard extent.width.isFinite, extent.height.isFinite, extent.width > 0,
@@ -53,6 +54,11 @@ enum Qwen4ExpVideoPreparation {
                     .resampled(to: CGSize(width: size.width, height: size.height), method: .bicubic)
                     .normalized(mean: mean, std: std)
             }
+            let sampled =
+                byPresentationTime
+                ? try await Qwen4ExpVideoSampler.sampleByPresentationTime(
+                    video, config: config, process: resized)
+                : try await Qwen4ExpVideoSampler.sample(video, config: config, process: resized)
             let (array, grid) = try QwenVL.patchify(
                 images: sampled.frames,
                 mergeSize: config.mergeSize, patchSize: config.patchSize,

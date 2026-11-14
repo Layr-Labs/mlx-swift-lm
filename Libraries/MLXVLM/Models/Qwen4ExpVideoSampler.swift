@@ -1,5 +1,5 @@
 // Copyright © 2026 Eigen Labs.
-// Native frame extraction for the reference Qwen4 sampling policy.
+// Native frame extraction for the reference Qwen3-VL / Qwen4 sampling policy.
 @preconcurrency import AVFoundation
 import CoreImage
 import Foundation
@@ -162,5 +162,97 @@ enum Qwen4ExpVideoSampler {
             throw Failure.missingFrame
         }
         return frames
+    }
+
+    /// The same reference indices, read at presentation times: the frame count
+    /// and rate come from the track's shown time range and nominal rate, and an
+    /// image generator takes each selected frame at the middle of its interval.
+    /// A clip trimmed without re-encoding (an edit list that starts between
+    /// keyframes) and a long clip then need no full decode.
+    static func sampleByPresentationTime(
+        _ video: UserInput.Video, config: Qwen4ExpVideoConfiguration,
+        process: (CIImage, Int) throws -> CIImage
+    ) async throws -> Sample {
+        switch video.source {
+        case .memoryBacked(let owner):
+            return try await owner.withAsset { asset in
+                try await sampleByTime(asset: asset, config: config, process: process)
+            }
+        case .avAsset(let asset):
+            return try await sampleByTime(asset: asset, config: config, process: process)
+        case .url(let url):
+            let asset = AVURLAsset(
+                url: url,
+                options: [
+                    AVURLAssetReferenceRestrictionsKey: AVAssetReferenceRestrictions.forbidAll
+                        .rawValue
+                ])
+            return try await sampleByTime(asset: asset, config: config, process: process)
+        case .frames:
+            return try await sample(video, config: config, process: process)
+        }
+    }
+
+    private static func sampleByTime(
+        asset: AVAsset, config: Qwen4ExpVideoConfiguration,
+        process: (CIImage, Int) throws -> CIImage
+    ) async throws -> Sample {
+        try Task.checkCancellation()
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw Failure.invalidMetadata
+        }
+        let (range, rate) = try await track.load(.timeRange, .nominalFrameRate)
+        let duration = range.duration.seconds
+        let fps = Double(rate)
+        guard duration.isFinite, duration > 0, fps.isFinite, fps > 0 else {
+            throw Failure.invalidMetadata
+        }
+        let frameCount = (duration * fps).rounded()
+        guard frameCount >= 1 else { throw Failure.invalidMetadata }
+        guard frameCount <= Double(maxIndexedFrames) else { throw Failure.excessiveMetadata }
+        let indices = try Qwen4ExpMediaGeometry.sampleIndices(
+            totalFrames: Int(frameCount), sourceFPS: fps,
+            targetFPS: config.fps, minFrames: config.minFrames, maxFrames: config.maxFrames)
+        let latest = max(0, duration - 0.001 / fps)
+        let times = indices.map { index in
+            CMTimeAdd(
+                range.start,
+                CMTime(
+                    seconds: min((Double(index) + 0.5) / fps, latest),
+                    preferredTimescale: 1_000_000))
+        }
+        // One more pass when the generator drops a frame, as the readers retry.
+        for attempt in 0 ..< 2 {
+            if let frames = try await generatedFrames(
+                asset, times: times, process: { try process($0, indices.count) })
+            {
+                return .init(frames: frames, indices: indices, sourceFPS: fps)
+            }
+            if attempt == 0 { try Task.checkCancellation() }
+        }
+        throw Failure.missingFrame
+    }
+
+    /// Every requested frame in order, or nil when the generator fails one.
+    private static func generatedFrames(
+        _ asset: AVAsset, times: [CMTime], process: (CIImage) throws -> CIImage
+    ) async throws -> [MLXArray]? {
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        var frames: [MLXArray] = []
+        frames.reserveCapacity(times.count)
+        for await result in generator.images(for: times) {
+            try Task.checkCancellation()
+            guard case .success(requestedTime: _, let image, actualTime: _) = result else {
+                return nil
+            }
+            // Decoded bytes as sRGB, as the frame-ordinal reader tags them.
+            let frame = CIImage(
+                cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
+            frames.append(MediaProcessing.asMLXArray(try process(frame)))
+        }
+        return frames.count == times.count ? frames : nil
     }
 }
