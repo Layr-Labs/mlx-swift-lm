@@ -184,7 +184,7 @@ enum PagedSegmentAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let mergeSinks = sinks ?? MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let mergeSinks = sinks ?? MLXArray([Float](repeating: 0, count: max(8, qh)))
         return mergeKernel(key: mergeKey, source: source)(
             [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
