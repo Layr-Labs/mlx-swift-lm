@@ -34,23 +34,32 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     /// spatial detail while bounding tower memory and first-content latency.
     public static let maxVideoFramePixels = 512 * 512
 
+    /// How a clip enters the prompt.
+    enum VideoLayout: Sendable {
+        case timestamped
+        case singleBlock
+    }
+
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
     private let checkpointImageBounds: (min: Int, max: Int)?
+    let videoLayout: VideoLayout
 
     public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
         self.checkpointImageBounds = nil
+        self.videoLayout = .singleBlock
     }
 
     init(
         _ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer,
-        checkpointImageBounds: (min: Int, max: Int)
+        checkpointImageBounds: (min: Int, max: Int)?, videoLayout: VideoLayout = .singleBlock
     ) {
         self.config = config
         self.tokenizer = tokenizer
         self.checkpointImageBounds = checkpointImageBounds
+        self.videoLayout = videoLayout
     }
 
     private var mediaProcessor: Qwen3VLMediaProcessor {

@@ -294,6 +294,12 @@ public struct QwenVL {
         return (flattenedPatches, .init(gridT, gridH, gridW))
     }
 
+    static func positionVideoGrids(
+        _ grids: [THW], tokens: [Int], videoToken: Int, merge: Int
+    ) -> [THW] {
+        grids
+    }
+
     // MARK: - Prepared input splitting
 
     /// Split a Qwen VL prepared input at `prefixTokenCount`, keeping only the media
