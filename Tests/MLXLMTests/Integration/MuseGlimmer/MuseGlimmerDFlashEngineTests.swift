@@ -406,6 +406,13 @@ struct MuseGlimmerDFlashEngineTests {
             try MuseGlimmerDFlashDrafter(
                 target: target, model: try MuseGlimmerDFlashFixture.model(narrow))
         }
+        // The same width from other layers: the drafter was trained on its own taps.
+        var otherTaps = try Fixture.drafterConfiguration()
+        otherTaps.targetLayerIDs = [1, 3]
+        #expect(throws: MuseGlimmerDFlashError.target("tapped layers")) {
+            try MuseGlimmerDFlashDrafter(
+                target: target, model: try MuseGlimmerDFlashFixture.model(otherTaps))
+        }
         var mask = try Fixture.drafterConfiguration()
         mask.maskTokenID = 128
         #expect(throws: MuseGlimmerDFlashError.target("mask token")) {

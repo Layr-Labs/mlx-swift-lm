@@ -9,6 +9,7 @@ extension MuseGlimmerTextModel: MuseGlimmerDFlashTarget {
     public var dflashHiddenSize: Int { configuration.hiddenSize }
     public var dflashVocabularySize: Int { configuration.vocabularySize }
     public var dflashContextWidth: Int { mtpHiddenWidth }
+    public var dflashTappedLayerIDs: [Int] { mtpHiddenLayerIDs }
     public func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray {
         rawTokenEmbeddings(tokens)
     }

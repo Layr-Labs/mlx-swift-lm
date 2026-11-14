@@ -14,6 +14,9 @@ public protocol MuseGlimmerDFlashTarget: AnyObject {
     /// Width of the hidden rows the target hands to the MTP seam: the
     /// residual stream after each tapped layer, concatenated.
     var dflashContextWidth: Int { get }
+    /// The layers whose residual streams make those rows, in order. The
+    /// drafter was trained on one set and refuses any other.
+    var dflashTappedLayerIDs: [Int] { get }
     /// Rows of the token embedding table WITHOUT the target's embedding
     /// norm: `[..., hiddenSize]`.
     func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray
@@ -104,6 +107,9 @@ public final class MuseGlimmerDFlashDrafter: CBv2MTPAdvisoryHistoryDrafter, @unc
         }
         guard target.dflashContextWidth == c.contextWidth else {
             throw MuseGlimmerDFlashError.target("context width")
+        }
+        guard target.dflashTappedLayerIDs == c.targetLayerIDs else {
+            throw MuseGlimmerDFlashError.target("tapped layers")
         }
         guard c.maskTokenID < target.dflashVocabularySize else {
             throw MuseGlimmerDFlashError.target("mask token")

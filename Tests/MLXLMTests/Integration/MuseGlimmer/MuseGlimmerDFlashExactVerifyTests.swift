@@ -132,6 +132,10 @@ struct MuseGlimmerDFlashExactVerifyTests {
         #expect(exact.maximumSpeculativeRows == 2)
         let d = try drafter(exactTower)
         #expect(d.requiredVerificationMode == .rectangularExact && d.commitsAcceptedPrefixPerRow)
+        // The tower taps other layers of the same count: refused.
+        exactTower.mtpHiddenLayerIDs = [0, 2, 4]
+        #expect(throws: MuseGlimmerDFlashError.target("tapped layers")) { try drafter(exactTower) }
+        exactTower.mtpHiddenLayerIDs = Self.taps
         // Decode-row attention: on for exact verification unless declined,
         // never for serial verification, off in a bare `Settings`.
         #expect(exact.batchesVerifyColumnsAsDecodeRows && d.batchesVerifyColumnsAsDecodeRows)

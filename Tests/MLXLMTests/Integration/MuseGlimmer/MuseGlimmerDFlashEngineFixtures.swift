@@ -121,6 +121,7 @@ final class MuseGlimmerDFlashTinyTarget: Module, CBv2MTPPrefillSteppableModel,
     var dflashHiddenSize: Int { config.hiddenSize }
     var dflashVocabularySize: Int { config.vocabSize }
     var dflashContextWidth: Int { Self.tapLayers.count * config.hiddenSize }
+    var dflashTappedLayerIDs: [Int] { Self.tapLayers }
     func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray { embed(tokens) }
     func dflashHeadProduct(_ hidden: MLXArray) -> MLXArray { lmHead(hidden) }
 }
