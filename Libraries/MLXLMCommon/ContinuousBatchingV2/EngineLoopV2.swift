@@ -702,6 +702,9 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 /// registration, and the watchdog — all lock-protected.
 public final class EngineLoopV2: @unchecked Sendable {
     let nativeShutdownState: CBv2NativeShutdownState?
+    /// Set before `start()` when the issued native contract qualifies
+    /// grammar-aware MTP verification (`grammarMTPEnabled`).
+    var nativeConstrainedMTPVerification = false
     private let blockBatchBudget: MiMoV26BlockBatchBudget?
     private let rectangularDenseBudget: MiMoV26RectangularDenseBudget?
     // Build-to-step handoff only; real ownership remains the existing native

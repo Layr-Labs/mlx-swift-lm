@@ -1115,6 +1115,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             rectangularDenseBudget: rectangularDenseBudget,
             nativeQuiescentCleanup: nativeCleanup)
         nativeState?.installEngine(self)
+        loop.nativeConstrainedMTPVerification =
+            nativeState?.supported == true
+            && nativeExecutionContract?.supportsConstrainedMTPVerification == true
         if nativePagedTarget, let binding = (backend as? PagedKVBackend)?.nativeModelBinding {
             loop.configureNativePaged(binding: binding, retaining: self)
         }

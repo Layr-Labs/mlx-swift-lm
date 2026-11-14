@@ -177,7 +177,11 @@ def:
             row-local grammar verification: retain raw target logits and mask/sample only the
             committed prefix at finalization, never advance grammar over rejected drafts.
             Unset/off retains target-only constrained rows. Native-completion engines remain
-            target-only for constrained requests. Each committed grammar position adds a bounded
+            target-only for constrained requests unless their issued contract qualifies the
+            verification (GLM page-bank profiles): each committed position is then sampled under
+            the native work protocol, outside finalize's commit lock. A column refused after its
+            work completed fails its rows and keeps their confirmed prefix; an engine fault stops
+            the walk and commits nothing more. Each committed grammar position adds a bounded
             host readback; this is not a performance qualification.
             A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
@@ -362,6 +366,8 @@ def:
             allocator slack remain separate consumer admission obligations.
             The issued GLM pool returns its free segments once the engine idles and before a
             lone row whose step scratch was refused is retried (`DARKBLOOM_NATIVE_SEGMENT_RELEASE`).
+            GLM page-bank contracts accept token-constrained rows, which never chain; with
+            `DARKBLOOM_CBV2_MTP_GRAMMAR` they draft under grammar-aware verification.
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"

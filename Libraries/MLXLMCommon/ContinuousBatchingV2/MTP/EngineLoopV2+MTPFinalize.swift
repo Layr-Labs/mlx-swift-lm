@@ -354,16 +354,21 @@ extension EngineLoopV2 {
             let grammarRows = outcomes.filter {
                 $0.rec.request.tokenConstraint != nil && $0.metadata.freeSpan == nil
             }
-            let prefixes = mtpSampleAndConfirmConstrainedPrefixes(
-                logits: logits,
-                rows: grammarRows.map {
-                    CBv2MTPGrammarRow(
-                        batchIndex: $0.batchIndex, context: Self.samplerRow($0.rec),
-                        stopTokens: $0.rec.request.stopTokens,
-                        nonFinite: $0.targets.map { $0 == Int(CBv2NonFiniteLogits.invalidTarget) })
-                },
-                draftPacket: Array(host.prefix(draftCount)), depth: k,
-                commonLimit: commonEmitted, independentWidths: perRowWidth)
+            guard
+                let prefixes = mtpSampleAndConfirmConstrainedPrefixes(
+                    logits: logits,
+                    rows: grammarRows.map {
+                        CBv2MTPGrammarRow(
+                            batchIndex: $0.batchIndex, context: Self.samplerRow($0.rec),
+                            stopTokens: $0.rec.request.stopTokens,
+                            nonFinite: $0.targets.map {
+                                $0 == Int(CBv2NonFiniteLogits.invalidTarget)
+                            })
+                    },
+                    draftPacket: Array(host.prefix(draftCount)), depth: k,
+                    commonLimit: commonEmitted, independentWidths: perRowWidth, step: step,
+                    nativeCommitHeld: &nativeCommitHeld)
+            else { return }
             for index in outcomes.indices.reversed() {
                 guard let prefix = prefixes[outcomes[index].metadata.id] else { continue }
                 if prefix.nonFinite {
@@ -376,6 +381,14 @@ extension EngineLoopV2 {
                         continue
                     }
                     outcomes[index].nonFiniteAfterPrefix = true
+                }
+                // A native column refused before this row confirmed anything.
+                if prefix.tokens.isEmpty, let failure = prefix.failure {
+                    let outcome = outcomes.remove(at: index)
+                    step.discard.insert(outcome.metadata.id)
+                    releaseDiscarded(outcome.metadata)
+                    finishRequest(outcome.metadata.id, reason: .error(failure))
+                    continue
                 }
                 outcomes[index].committed = prefix.tokens
                 outcomes[index].targets = prefix.tokens

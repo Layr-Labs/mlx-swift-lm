@@ -98,10 +98,15 @@ public struct CBv2NativeExecutionContract: Sendable {
             || profile == "glm5_next_native_paged_full_state_rectangular_mtp_v1"
     }
     /// GLM page-bank profiles mask a constrained row with the ordinary sampler,
-    /// as they capture logprob rows; the row never drafts or chains. Not MiMo.
+    /// as they capture logprob rows. The row never chains, and it drafts only
+    /// with grammar-aware verification (`supportsConstrainedMTPVerification`).
+    /// Not MiMo.
     public var supportsTokenConstraints: Bool { supportsLogprobCapture }
-    /// Not qualified yet: constrained rows stay target-only on every native profile.
-    public var supportsConstrainedMTPVerification: Bool { false }
+    /// GLM page-bank profiles also verify a constrained row's drafts when
+    /// `CBv2MTPConfig.constrainedSpeculation` is on: finalize samples each
+    /// committed position with the ordinary sampler under the native work
+    /// protocol (`EngineLoopV2.mtpNativeGrammarColumn`). Not MiMo.
+    public var supportsConstrainedMTPVerification: Bool { supportsTokenConstraints }
     /// Separate permission of the same ticket: the GLM page bank verifies one
     /// captured rectangular window per round, optionally with its complete
     /// prefix store (a distinct profile, so checkpoint identities differ).
