@@ -9,7 +9,7 @@ import Tokenizers
 /// The Onyx token decoder with the published Muse Glimmer tokenizer. It
 /// reads only the tokenizer files of the checkpoint: no weights, no GPU.
 /// Set `MUSE_GLIMMER_NVFP4_DIR` to a snapshot directory to run it.
-@Suite("Muse Glimmer Onyx decoder with the published tokenizer", .serialized)
+@Suite("Muse Glimmer Onyx decoder with the published tokenizer", .serialized, .tags(.integration))
 struct MuseGlimmerOnyxTokenizerLiveTests {
     typealias Fixtures = UnitTests.OnyxATEMConformanceTests
     typealias Decoders = UnitTests.OnyxStreamDecoderTests
