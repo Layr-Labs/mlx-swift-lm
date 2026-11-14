@@ -95,8 +95,9 @@ def:
         and shape set (config.json is cross-checked, never used to load), runs upstream's
         preprocessing and expands each image's `<|patch|>` placeholder. `MuseGlimmerCBv2Adapter` conforms to
         `CBv2MultimodalSteppableModel` for causal spans only: features replace placeholder rows,
-        image requests run on the target alone and never use the prefix cache. Video is refused.
-        Media is not advertised and the type is not registered in a factory. Tests use tiny synthetic
+        image requests run on the target alone and never use the prefix cache. Images have no
+        switch: they are served whenever the encoder has loaded from the verified stack. Video is
+        refused. The type is not registered in a factory. Tests use tiny synthetic
         models, except the `*Real*` suites, which run against the real checkpoint, the pinned
         drafter and an independent oracle only when `MUSE_GLIMMER_NVFP4_DIR`,
         `MUSE_GLIMMER_ORACLE_DIR` and the drafter directories are set.
