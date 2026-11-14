@@ -213,18 +213,20 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// A bank that cannot serialise runs `body` unchanged (the contract's
     /// degrade, never a trap).
     public func withMTPRectangularVerification<R>(
-        batched: Bool = false, _ body: () throws -> R
+        batched: Bool = false, columnsAsRows: Bool = false, _ body: () throws -> R
     ) rethrows -> R {
         let serializing = caches.compactMap { $0 as? any CBv2MTPRectangularSerializing }
         guard serializing.count == caches.count else { return try body() }
         for cache in serializing {
             cache.mtpSerializesRectangularAttention = true
             cache.mtpBatchesRectangularAttention = batched
+            cache.mtpBatchesRectangularColumnsAsRows = columnsAsRows
         }
         defer {
             for cache in serializing {
                 cache.mtpSerializesRectangularAttention = false
                 cache.mtpBatchesRectangularAttention = false
+                cache.mtpBatchesRectangularColumnsAsRows = false
             }
         }
         return try body()

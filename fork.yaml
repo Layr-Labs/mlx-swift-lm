@@ -147,7 +147,11 @@ def:
             sharing (`PrefixBlocks/`: block index, free queue, page handles, resident-prefix plan
             validation). The page allocator (`PagedKVFreePages`) reuses uncached pages before cached
             ones and keeps each row layer's pages in 16-page runs in few segments, spreading row layers
-            over segments, so the segmented decode keeps one dispatch per layer through busy runs. Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
+            over segments, so the segmented decode keeps one dispatch per layer through busy runs.
+            Opt-in `mtpBatchesRectangularColumnsAsRows` (default off, set only for drafters that ask)
+            attends an exact verify round as rows of one segmented decode dispatch per layer: the
+            round's K/V is written first and each (row, column) pair attends its own one-token
+            range; rounds it cannot take keep the per-column loop. Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
             checkpoint storage. Optional token-local affine K4/V4, K8/V4 and K8/V8 pages use
             signed block Hadamard keys and direct mixed packed/native online attention. Original
             recent128 and pending/speculative rows retain separately charged native owners until
@@ -210,7 +214,9 @@ def:
             host readback; this is not a performance qualification.
             A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
-            row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
+            row commits its own accepted prefix. A drafter that declares
+            `batchesVerifyColumnsAsDecodeRows` (default false) has the paged caches attend the
+            round's columns as decode rows. A fixed-depth owner may also fix the depth by the
             plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
             request-scoped media fallback
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent

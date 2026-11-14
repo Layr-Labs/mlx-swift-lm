@@ -285,6 +285,10 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this model's paged full-attention layers may represent an
     /// exact rectangular window as independent native decode rows.
     var prefersBatchedRectangularAttention: Bool { get }
+    /// True when the target's paged layers may attend a rectangular round's
+    /// (row, column) pairs as rows of one decode dispatch
+    /// (`mtpBatchesRectangularColumnsAsRows`). Default false.
+    var batchesVerifyColumnsAsDecodeRows: Bool { get }
     /// True only when the bound target's arithmetic for one verify row never
     /// depends on the other rows or on the next step's batch shape (row-exact
     /// products). Each row then commits its own accepted prefix. False keeps
@@ -336,6 +340,7 @@ extension CBv2MTPDrafter {
     public var supportsTargetPrefixAcceptance: Bool { false }
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
+    public var batchesVerifyColumnsAsDecodeRows: Bool { false }
     public var commitsAcceptedPrefixPerRow: Bool { false }
 }
 

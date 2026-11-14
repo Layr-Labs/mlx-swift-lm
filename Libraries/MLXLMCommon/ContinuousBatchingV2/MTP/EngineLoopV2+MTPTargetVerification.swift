@@ -321,11 +321,14 @@ extension EngineLoopV2 {
                 cache.mtpSerializesRectangularAttention = true
                 cache.mtpBatchesRectangularAttention =
                     mtp.drafter.prefersBatchedRectangularAttention
+                cache.mtpBatchesRectangularColumnsAsRows =
+                    mtp.drafter.batchesVerifyColumnsAsDecodeRows
             }
             defer {
                 for cache in serializingCaches {
                     cache.mtpSerializesRectangularAttention = false
                     cache.mtpBatchesRectangularAttention = false
+                    cache.mtpBatchesRectangularColumnsAsRows = false
                 }
             }
             let tokens = concatenated(columns, axis: 1)
