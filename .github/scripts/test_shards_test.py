@@ -256,5 +256,65 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(test_shards.read_list(path), ["M.A/testOne", "M.free()"])
 
 
+class HostedShardTests(unittest.TestCase):
+    def data(self):
+        data = make_map(json.loads(json.dumps(GOOD)))
+        data["hosted_tests"] = ["M.free()"]
+        data["shards"].append({"runner": "hosted", "runs": [{"tests": ["M.free()"]}]})
+        return data
+
+    def command(self, data, *arguments, tests=TESTS):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "map.json").write_text(json.dumps(data))
+            (root / "tests.txt").write_text("\n".join(tests) + "\n")
+            args = [arg.replace("{list}", str(root / "tests.txt")) for arg in arguments]
+            if args[0] == "plan":
+                args += ["--output", str(root / "map.json")]
+            result = subprocess.run(
+                [sys.executable, test_shards.__file__, "--map", str(root / "map.json"), *args],
+                capture_output=True, text=True)
+            return result, json.loads((root / "map.json").read_text())
+
+    def test_matrix_separates_native_and_hosted_shards(self):
+        for runner, expected in [("all", [1, 2, 3]), ("native", [1, 2]), ("hosted", [3])]:
+            result, _ = self.command(self.data(), "matrix", "--runner", runner)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_plan_preserves_the_exact_hosted_exception(self):
+        data = self.data()
+        result, planned = self.command(data, "plan", "--list", "{list}", "--shards", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(planned["groups"], data["groups"])
+        self.assertEqual(planned["hosted_tests"], ["M.free()"])
+        self.assertEqual(planned["shards"][-1]["runs"], [{"tests": ["M.free()"]}])
+        self.assertEqual(planned["shards"][-1]["runner"], "hosted")
+        self.assertEqual(len(planned["shards"]), 3)
+        owners, problems = problems_of(planned)
+        self.assertEqual(problems, [])
+        self.assertEqual(owners["M.free()"], ["shard3-run1"])
+
+    def test_hosted_runs_must_match_the_configured_identities(self):
+        data = self.data()
+        data["hosted_tests"] = ["M.A/testOne"]
+        result, _ = self.command(data, "matrix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must match hosted_tests exactly", result.stderr)
+
+    def test_hosted_runs_cannot_silently_expand_a_suite(self):
+        data = self.data()
+        data["shards"][-1]["runs"] = [{"units": ["M.A"]}]
+        result, _ = self.command(data, "matrix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must name their exact test IDs", result.stderr)
+
+    def test_plan_rejects_a_stale_hosted_identity(self):
+        result, _ = self.command(self.data(), "plan", "--list", "{list}", "--shards", "2",
+                                 tests=[test for test in TESTS if test != "M.free()"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("configured hosted test is absent", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,6 +104,9 @@ def:
             template and checked on rendered two-turn prompts), so prompts that start with the same
             tokens are prefilled in the same chunks. `EngineV2.submitContinuation` prefills a known
             next-turn prefix while the engine is idle; any other submission cancels it.
+            Opt-in native reasoning budgets count confirmed thought payload tokens, force the
+            validated close marker at N, and continue the same request within its total output
+            limit. Budget rows use target decoding without MTP or chaining.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -176,7 +179,13 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. A rectangular round commits one common width for all rows unless the
+            target-authoritative. `DARKBLOOM_CBV2_MTP_GRAMMAR=1` opts ordinary engines into
+            row-local grammar verification: retain raw target logits and mask/sample only the
+            committed prefix at finalization, never advance grammar over rejected drafts.
+            Unset/off retains target-only constrained rows. Native-completion engines remain
+            target-only for constrained requests. Each committed grammar position adds a bounded
+            host readback; this is not a performance qualification.
+            A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
             plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
@@ -184,6 +193,12 @@ def:
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
             `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
             lifetime beside speculating text rows. Model-specific drafters live under "Models".
+            Opt-in `CBv2FreeSpanTokenConstraint` consumers may draft through pure same-state
+            spans while retaining structural masks, then use ordinary constrained decoding
+            through protected spans. Persistent assistant history crosses those spans without
+            drafting. `DARKBLOOM_CONSTRAINT_SPANS` defaults off; custom samplers stay target-only.
+            With both opt-ins, a row inside a free span keeps the pure same-state preview and
+            its masked window; grammar verification owns constrained rows outside free spans.
             The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
             falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
             so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
@@ -208,6 +223,8 @@ def:
           globs:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/Integration/Engine/**"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2ReasoningBudgetTests.swift"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2ReasoningBudgetNativeMiMoTests.swift"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/Native*Checkpoint*"
@@ -295,6 +312,9 @@ def:
         Gemma 4's strict reader keeps each unmarked scalar's text, so a parameter whose schema admits a
         string but not the scalar's JSON type reads `zip:01000` as "01000", as vLLM does
         (`ToolArgumentNormalization.bareLiteral`).
+        `DARKBLOOM_GEMMA_SCHEMA_COERCION=1` additionally types quoted numeric arguments at frame close;
+        the Gemma streamer withholds those values until the complete parse. Default-off keeps existing
+        string exposure. `GemmaQuotedNumberConformanceTests` runs with the flag off and on.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
@@ -854,6 +874,10 @@ def:
         `response_format` (`json_object` / `json_schema`); streaming reasoning parsers (think tags,
         Gemma 4, Harmony); streamed tool-call handling; a batched engine adapter over CBv2 and a
         runtime `setMaxNumSeqs` for adaptive concurrency.
+        `DARKBLOOM_GEMMA_REOPENED_THOUGHTS=1` routes reopened Gemma thought spans into reasoning,
+        absorbs stray channel-close markers, and preserves opaque tool payloads in streamed and
+        collected output. Default-off retains the existing parsing behavior; the Gemma conformance
+        unit suite runs in separate enabled and disabled processes.
         Responses input replay retains reasoning and adjacent function calls in one assistant turn,
         preserving tool arguments and explicit message/result boundaries.
         Collected think-tag parsing keeps unclosed generated or prompt-seeded blocks in reasoning;
@@ -876,6 +900,7 @@ def:
         - "Executables/mlx-server/**"
         - "Tests/MLXLMServerTests/**"
         - "docs/server-request-validation.md"
+        - "skills/mlx-swift-lm/references/generation.md"
     - title: "Benchmarks and measurement"
       description: |
         Nothing here ships to users; it is how the fork proves its numbers. `BenchCBv2` (real-weights

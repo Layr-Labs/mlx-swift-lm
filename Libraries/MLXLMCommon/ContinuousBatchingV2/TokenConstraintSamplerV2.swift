@@ -122,8 +122,8 @@ final class CBv2TokenConstraintSampler {
         invalidated.removeAll(keepingCapacity: true)
     }
 
-    /// Apply a per-row boolean mask to `[B, vocab]` logits. The common path
-    /// returns the original array without allocating a mask.
+    /// Apply a per-row mask to `[B, vocab]` or `[B, width, vocab]` logits.
+    /// The unconstrained path returns the original array without a mask.
     ///
     /// `speculative`: every row has exactly one launched-but-unconfirmed
     /// sample (chained decode). Masks use the confirmed state with the
@@ -177,7 +177,8 @@ final class CBv2TokenConstraintSampler {
             rows[id] = row
         }
         let mask = rowMasks.count == 1 ? rowMasks[0] : concatenated(rowMasks, axis: 0)
-        return which(mask, logits, MLXArray(-Float.infinity).asType(logits.dtype))
+        let broadcastMask = logits.ndim == 3 ? mask.expandedDimensions(axis: 1) : mask
+        return which(broadcastMask, logits, MLXArray(-Float.infinity).asType(logits.dtype))
     }
 
     /// `[1, vocab]` bool, true exactly at `allowed`. An out-of-range id
@@ -242,6 +243,13 @@ final class CBv2TokenConstraintSampler {
 
     func failure(for id: CBv2RequestID) -> String? {
         rows[id]?.failure
+    }
+
+    func confirmedState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        guard let row = rows[id], row.failure == nil, row.consumed == outputTokenCount else {
+            return nil
+        }
+        return row.state
     }
 
     func requestDidFinish(_ id: CBv2RequestID) {

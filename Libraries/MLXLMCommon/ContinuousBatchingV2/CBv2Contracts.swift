@@ -132,6 +132,8 @@ public struct CBv2Request: Sendable {
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
     public var tokenConstraint: (any CBv2TokenConstraint)?
+    /// Optional reasoning-only output budget; nil preserves ordinary decoding.
+    public var reasoningBudget: CBv2ReasoningBudget? = nil
     /// Coordinator-observed length, in tokens, of the prefix other prompts
     /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
     /// Historical checkpoint retention keeps the stride-aligned boundary at
@@ -1607,6 +1609,8 @@ public struct CBv2ResidentPrefixCandidate: Sendable, Equatable {
 /// internally (EngineV2 is engine-queue + lock confined) rather than being
 /// value-isolated, hence `@unchecked Sendable` conformances downstream.
 public protocol CBv2Engine: AnyObject, Sendable {
+    /// Whether this engine enforces request-owned thought-token budgets.
+    var supportsReasoningBudgets: Bool { get }
     /// Submit a request; events stream until `.finished`.
     /// Throws CBv2KVError.capacityExhausted when admission fails (the
     /// provider maps this to 429/503 exactly as today).
@@ -1692,6 +1696,7 @@ public protocol CBv2Engine: AnyObject, Sendable {
 }
 
 extension CBv2Engine {
+    public var supportsReasoningBudgets: Bool { false }
     public func updateKVBytesCapacity(_ bytes: Int) {}
     public func residentPrefixCandidate(
         for request: CBv2Request

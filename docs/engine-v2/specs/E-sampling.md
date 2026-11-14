@@ -49,3 +49,42 @@
 Report 08 §6 (vLLM sampler order, Gumbel trick, BatchUpdate churn safety),
 critique items on seed/batch-invariance and detok (report 12 items 5, 6).
 Corpus: `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+
+## Opt-in constrained spans in MTP
+
+`CBv2MTPConfig.freeSpanSpeculation` defaults off. Set
+`DARKBLOOM_CONSTRAINT_SPANS=1` before process startup or pass the configuration
+value explicitly. The environment also accepts `true`, `yes`, and `on`, ignoring
+case and surrounding whitespace. Unset or any other value keeps the existing
+whole-request constrained fallback. Restart without the flag to roll back.
+
+A `CBv2FreeSpanTokenConstraint` declares committed states whose vocabulary mask
+is independent of a positive remaining-token budget. Its pure continuation check
+may return true only for a valid token that stays in exactly that state and
+touches no protected boundary, including intermediate bytes within a token. The
+check must not intern states or change caches, exhaustion, or subsequent results.
+
+Only built-in samplers attest span verification. Custom samplers and constraints
+that do not opt in stay target-only. Existing sampling, media, logprob, penalty,
+stop-string, storage and native-lifecycle exclusions still apply. The SDK does
+not interpret tool or JSON markers; the consumer's constraint owns that policy.
+
+Every target verification position uses the current grammar mask, including
+correction and bonus positions. The engine accepts only the exact verified
+draft prefix whose tokens pass the pure continuation check. The first boundary
+token commits as a target correction; the speculative suffix rolls back.
+Grammar confirmation runs once per emitted token, before publication. Protected
+spans use ordinary masked decoding, and drafting can resume after the request
+returns to a free state. Raw nonfinite logits retain their existing failure path.
+
+Persistent assistants retain trusted target history through protected spans but
+never draft there. This covers requests that start protected as well as those
+that enter a protected span later. Both ordinary hidden-returning decode and the
+existing seed path feed the intervening transitions. A constraint that remains
+protected for its entire request may retain history while the flag is enabled.
+
+`CBv2FreeSpanTests` checks literal outputs, masked greedy verification in all four
+modes, boundary rollback and explicit-off behavior. `QwenFreeSpanHistoryTests`
+uses a tiny real hybrid target and inline assistant through public request/event
+and assistant interfaces to check contiguous history across a protected span.
+These fixtures do not qualify production artifacts or establish throughput gains.

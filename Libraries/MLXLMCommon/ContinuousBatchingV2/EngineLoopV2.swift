@@ -17,9 +17,9 @@
 // (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
 // (prefill completion into a different set, finish, cancel, join, pause).
 // Token-constrained rows chain only when their constraint and the sampler
-// opt in: N+1 is masked speculatively and, if N's confirmed token changed
-// the mask, redrawn from its retained logits before anything consumes it
-// (`redrawInvalidatedConstrainedSuccessor`).
+// opt in, and never on a native-tracked engine: N+1 is masked speculatively
+// and, if N's confirmed token changed the mask, redrawn from its retained
+// logits before anything consumes it (`redrawInvalidatedConstrainedSuccessor`).
 
 import Cmlx
 import Foundation
@@ -94,6 +94,9 @@ public protocol CBv2StepSampler: AnyObject {
     /// request-id retirement. EngineV2 rejects constrained requests unless
     /// the installed sampler opts in.
     var supportsTokenConstraints: Bool { get }
+    /// Implements confirmed-token thought budgets, including retirement and failure reporting.
+    var supportsReasoningBudgets: Bool { get }
+    func reasoningBudgetFailure(for id: CBv2RequestID) -> String?
 
     func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
@@ -196,6 +199,8 @@ public protocol CBv2StepSampler: AnyObject {
 
 extension CBv2StepSampler {
     public var supportsTokenConstraints: Bool { false }
+    public var supportsReasoningBudgets: Bool { false }
+    public func reasoningBudgetFailure(for id: CBv2RequestID) -> String? { nil }
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
@@ -221,7 +226,7 @@ extension CBv2StepSampler {
 /// construction (per-row reduction, no cross-row ops). Kept as the
 /// deterministic fallback for scheduler/loop tests; production uses
 /// `CBv2DefaultSampler`.
-public final class CBv2GreedySampler: CBv2StepSampler {
+public final class CBv2GreedySampler: CBv2StepSampler, CBv2FreeSpanSampler {
     private let constraintSampler = CBv2TokenConstraintSampler()
     private var configuredIDs: [CBv2RequestID] = []
 
@@ -258,6 +263,14 @@ public final class CBv2GreedySampler: CBv2StepSampler {
 
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
         constraintSampler.failure(for: id)
+    }
+
+    func confirmedConstraintState(for id: CBv2RequestID, outputTokenCount: Int) -> Int? {
+        constraintSampler.confirmedState(for: id, outputTokenCount: outputTokenCount)
+    }
+
+    func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
+        constraintSampler.mask(logits, requestIDs: requestIDs)
     }
 }
 
@@ -3070,14 +3083,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
+            // Thought counts require the preceding token to be confirmed first.
+            ids.allSatisfy({ scheduler.record(for: $0)?.request.reasoningBudget == nil }),
             // Constraint state advances from the host-confirmed token. A
             // constrained row chains only when both its constraint and the
             // sampler opt in: N+1 is then masked speculatively and redrawn
-            // after N's finalization if N's token changed the mask.
+            // after N's finalization if N's token changed the mask. Never on
+            // a native-tracked engine, whose launches go through the native
+            // work protocol that the redraw does not.
             ids.allSatisfy({ id in
                 guard let constraint = scheduler.record(for: id)?.request.tokenConstraint
                 else { return true }
                 return constraint.allowsChainedDecode && sampler.supportsConstrainedChainedDecode
+                    && nativeShutdownState == nil
             }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(
@@ -5278,8 +5296,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         let tokenProducingRows = step.tokenProducingRows
         step.nonFiniteFailures = Set(nonFiniteIndices.map { step.sampledRows[$0] })
         if !step.sampledRows.isEmpty {
-            sampler.confirmSampledTokens(
-                host.map(Int.init), requestIDs: step.sampledRows)
+            var tokens = host.map(Int.init)
+            var ids = step.sampledRows
+            if grammarMTPEnabled, !nonFiniteIndices.isEmpty {
+                // Opted-in rows can seed or fall back to ordinary decoding.
+                // A failed raw-logit sample must not advance their grammar.
+                let kept = ids.indices.filter { index in
+                    !nonFiniteIndices.contains(index)
+                        || scheduler.record(for: ids[index])?.request.tokenConstraint == nil
+                }
+                tokens = kept.map { tokens[$0] }
+                ids = kept.map { ids[$0] }
+            }
+            sampler.confirmSampledTokens(tokens, requestIDs: ids)
         }
 
         // Recurrent state follows the same one-step-late transaction as KV.
@@ -5370,6 +5399,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             if nonFiniteIndices.contains(i) {
                 nonFiniteSampledFailures += 1
                 finishPlainRow(id, reason: CBv2NonFiniteLogits.finishReason)
+                continue
+            }
+            if let failure = sampler.reasoningBudgetFailure(for: id) {
+                finishPlainRow(id, reason: .error(failure))
                 continue
             }
             finalizedPlainWork = true
@@ -6331,7 +6364,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             promptTokens: rec.request.promptTokens,
             outputTokens: Array(rec.tokens.dropFirst(rec.request.promptTokens.count)),
             tokenConstraint: rec.request.tokenConstraint,
-            maxTokens: rec.request.maxTokens)
+            maxTokens: rec.request.maxTokens,
+            reasoningBudget: rec.request.reasoningBudget)
     }
 
     // MARK: Boundary housekeeping
