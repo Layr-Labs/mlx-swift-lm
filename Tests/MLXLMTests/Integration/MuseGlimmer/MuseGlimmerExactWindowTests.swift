@@ -57,15 +57,21 @@ struct MuseGlimmerExactWindowTests {
         let caches: [PagedLayerCache]
         private(set) var states: [[CBv2SequenceKV?]] = []
 
-        init(_ m: MuseGlimmerTextModel) throws {
+        let chunk: Int
+
+        init(
+            _ m: MuseGlimmerTextModel, capacityBytes: Int = 192 << 20,
+            chunk: Int = MuseGlimmerExactWindowTests.chunk, segmentBytes: Int = 1 << 20,
+            maximumLength: Int = 2048
+        ) throws {
             model = m
+            self.chunk = chunk
             backend = try PagedKVBackend(
                 layerKinds: m.cbv2LayerKinds,
                 config: .init(
-                    capacityBytes: 192 << 20, dtype: m.activationDType,
-                    maxPrefillChunk: MuseGlimmerExactWindowTests.chunk,
-                    nominalMaxSequenceLength: 2048, segmentSizeBytes: 1 << 20,
-                    layerDTypes: m.kvStorageDTypes))
+                    capacityBytes: capacityBytes, dtype: m.activationDType,
+                    maxPrefillChunk: chunk, nominalMaxSequenceLength: maximumLength,
+                    segmentSizeBytes: segmentBytes, layerDTypes: m.kvStorageDTypes))
             caches = backend.makeLayerCaches()
         }
 
@@ -81,9 +87,8 @@ struct MuseGlimmerExactWindowTests {
                 maxLength: prompt.count + extra)
             states.append(state)
             select([states.count - 1])
-            let step = MuseGlimmerExactWindowTests.chunk
-            for start in stride(from: 0, to: prompt.count, by: step) {
-                let piece = Array(prompt[start ..< min(prompt.count, start + step)])
+            for start in stride(from: 0, to: prompt.count, by: chunk) {
+                let piece = Array(prompt[start ..< min(prompt.count, start + chunk)])
                 _ = forward([piece], rectangular: false)
             }
         }
