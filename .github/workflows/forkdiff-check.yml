@@ -28,9 +28,17 @@ permissions:
   contents: read
 
 jobs:
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        forkdiff linux_arm64 ubuntu-latest
+
   analysis-up-to-date:
     name: fork.yaml describes the fork
-    runs-on: ubuntu-latest
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['forkdiff'] }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -50,8 +58,9 @@ jobs:
 
       - name: Verify fork.yaml against the real diff
         run: |
-          python3 -m pip install --quiet pyyaml
-          python3 scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
+          python3 -m venv "$RUNNER_TEMP/forkdiff-venv"
+          "$RUNNER_TEMP/forkdiff-venv/bin/python" -m pip install --quiet pyyaml
+          "$RUNNER_TEMP/forkdiff-venv/bin/python" scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
