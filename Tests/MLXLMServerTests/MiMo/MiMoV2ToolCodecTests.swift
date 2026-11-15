@@ -82,11 +82,18 @@ final class MiMoV2ToolCodecTests: XCTestCase {
         XCTAssertEqual(
             parser.parse(content: frame(#"{"x":"\n","n":1}"#), tools: tools("object"))?.function
                 .arguments["text"], .object(["x": .string("\n"), "n": .int(1)]))
-        for (value, type) in [
-            ("yes", "boolean"), ("garbage", "boolean"), ("01", "integer"),
-            ("1.5", "integer"), ("nan", "number"), ("{'x':1}", "object"),
+        // A value of another type is returned as generated: JSON when it
+        // parses, else its raw text. The switch restores the refusal.
+        let checked = MiMoV2ToolCallParser(grammarOnly: false)
+        for (value, type, generated) in [
+            ("yes", "boolean", JSONValue.string("yes")), ("garbage", "boolean", .string("garbage")),
+            ("01", "integer", .string("01")), ("1.5", "integer", .double(1.5)),
+            ("nan", "number", .string("nan")), ("{'x':1}", "object", .string("{'x':1}")),
         ] {
-            XCTAssertNil(parser.parse(content: frame(value), tools: tools(type)), value)
+            XCTAssertEqual(
+                parser.parse(content: frame(value), tools: tools(type))?.function.arguments["text"],
+                generated, value)
+            XCTAssertNil(checked.parse(content: frame(value), tools: tools(type)), value)
         }
         XCTAssertEqual(try text(parser.parse(content: frame("null"), tools: tools())), "null")
     }
@@ -135,13 +142,14 @@ final class MiMoV2ToolCodecTests: XCTestCase {
         XCTAssertNotNil(parser.parse(content: frame("x"), tools: nil))
     }
 
-    func testMissingTypeRetainsRawAndAmbiguousTypesRefuse() throws {
+    func testMissingTypeRetainsRawAndAmbiguousTypesTakeTheirOtherType() throws {
         let parser = MiMoV2ToolCallParser()
+        let checked = MiMoV2ToolCallParser(grammarOnly: false)
         XCTAssertEqual(try text(parser.parse(content: frame("123"), tools: nil)), "123")
-        for schema: [String: any Sendable] in [
-            ["type": ["string", "integer"]],
-            ["anyOf": [["type": "string"], ["type": "integer"]]],
-            ["type": "unsupported"],
+        for (schema, generated): ([String: any Sendable], JSONValue) in [
+            (["type": ["string", "integer"]], .int(123)),
+            (["anyOf": [["type": "string"], ["type": "integer"]]], .int(123)),
+            (["type": "unsupported"], .string("123")),
         ] {
             let properties: [String: any Sendable] = ["text": schema]
             let parameters: [String: any Sendable] = ["properties": properties]
@@ -149,7 +157,10 @@ final class MiMoV2ToolCodecTests: XCTestCase {
                 "name": "record_text", "parameters": parameters,
             ]
             let declared: [[String: any Sendable]] = [["function": function]]
-            XCTAssertNil(parser.parse(content: frame("123"), tools: declared))
+            XCTAssertEqual(
+                parser.parse(content: frame("123"), tools: declared)?.function.arguments["text"],
+                generated)
+            XCTAssertNil(checked.parse(content: frame("123"), tools: declared))
         }
     }
 

@@ -137,6 +137,37 @@ extension UnitTests {
                 "\(format) \(shape): \(result.text)")
         }
 
+        /// `DARKBLOOM_GRAMMAR_ONLY_TOOL_PARSING=0` restores each parser's
+        /// schema refusals, and only those.
+        @Test(arguments: Shape.allCases)
+        func theSwitchRestoresTheSchemaRefusals(shape: Shape) {
+            let refused: [(any ToolCallParser, ToolCallFormat, Set<Shape>)] = [
+                (GLM5ToolCallParser(grammarOnly: false), .glm5, Set(Shape.allCases)),
+                (
+                    GemmaFunctionParser(grammarOnly: false), .gemma,
+                    [.undeclaredWithAdditionalPropertiesFalse]
+                ),
+                (
+                    MiMoV2ToolCallParser(grammarOnly: false), .mimoV2,
+                    [.nullableUnionParameter, .mismatchedType]
+                ),
+            ]
+            for (parser, format, shapes) in refused {
+                let frame = Self.frame(format, Self.arguments(shape))
+                let call = parser.parse(content: frame, tools: Self.tools(shape))
+                #expect((call == nil) == shapes.contains(shape), "\(format) \(shape)")
+            }
+            #expect(GrammarOnlyToolParsing.enabled(environment: [:]))
+            for value in ["0", "off", " FALSE ", "no"] {
+                #expect(
+                    !GrammarOnlyToolParsing.enabled(
+                        environment: [GrammarOnlyToolParsing.environmentKey: value]))
+            }
+            #expect(
+                GrammarOnlyToolParsing.enabled(
+                    environment: [GrammarOnlyToolParsing.environmentKey: "1"]))
+        }
+
         @Test(arguments: formats, Shape.allCases)
         func aParallelBatchKeepsEveryCall(format: ToolCallFormat, shape: Shape) {
             let valid = Self.frame(

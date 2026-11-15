@@ -12,10 +12,21 @@ import Foundation
 /// parser rejects malformed/duplicate structure, never guesses a repair, and
 /// cannot infer the caller's intended value from an otherwise valid collision.
 /// Declaration/schema/cardinality validation remains mandatory at the caller.
+///
+/// A value whose parameter declares a type other than `string` is JSON when
+/// it parses as one of those types (for a union with `string`, only as one of
+/// the others; with only other types, as any JSON); any other value is its
+/// raw text, so a union or a value of another type is returned as generated.
+/// `grammarOnly` false (`GrammarOnlyToolParsing`) restores refusing a union
+/// and a value of another type.
 public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<tool_call>"
     public let endTag: String? = "</tool_call>"
-    public init() {}
+    private let grammarOnly: Bool
+
+    public init(grammarOnly: Bool = GrammarOnlyToolParsing.isEnabled) {
+        self.grammarOnly = grammarOnly
+    }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         let frame = Self.trimFramingWhitespace(content)
@@ -51,7 +62,9 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
             else { return nil }
             let raw = String(body[..<closing.lowerBound])
             guard
-                let value = Self.value(raw, function: function, parameter: parameter, tools: tools)
+                let value = Self.value(
+                    raw, function: function, parameter: parameter, tools: tools,
+                    grammarOnly: grammarOnly)
             else { return nil }
             arguments[parameter] = value
             body = body[closing.upperBound...]
@@ -80,12 +93,13 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
 
     private static func value(
         _ raw: String, function: String, parameter: String,
-        tools: [[String: any Sendable]]?
+        tools: [[String: any Sendable]]?, grammarOnly: Bool
     ) -> JSONValue? {
         let properties = getParameterConfig(funcName: function, tools: tools)
         guard let schema = properties[parameter] as? [String: any Sendable] else {
             return .string(raw)  // No type evidence: retain bytes; caller validates schema.
         }
+        if grammarOnly { return asGenerated(raw, schema: schema) }
         // Do not infer a type from a string-looking JSON literal or ambiguous
         // union. The native template has no discriminator for string "1" vs1.
         if schema["anyOf"] != nil || schema["oneOf"] != nil || schema["allOf"] != nil { return nil }
@@ -101,6 +115,38 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
             ("boolean", .bool), ("object", .object), ("array", .array), ("null", .null):
             return decoded
         default: return nil
+        }
+    }
+
+    private static func asGenerated(_ raw: String, schema: [String: any Sendable]) -> JSONValue {
+        var types: Set<String> = []
+        let branches = (schema["anyOf"] ?? schema["oneOf"]) as? [[String: any Sendable]] ?? []
+        for node in [schema] + branches {
+            if let type = node["type"] as? String {
+                types.insert(type)
+            } else if let values = node["type"] as? [String] {
+                types.formUnion(values)
+            }
+        }
+        if let nullable = schema["nullable"], JSONValue.from(nullable) == .bool(true) {
+            types.insert("null")
+        }
+        types.formIntersection([
+            "string", "integer", "number", "boolean", "null", "object", "array",
+        ])
+        let others = types.subtracting(["string"])
+        guard !others.isEmpty,
+            let decoded = try? JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
+        else { return .string(raw) }
+        guard types.contains("string") else { return decoded }
+        switch decoded {
+        case .int where others.contains("integer") || others.contains("number"),
+            .double where others.contains("number"), .bool where others.contains("boolean"),
+            .object where others.contains("object"), .array where others.contains("array"),
+            .null where others.contains("null"):
+            return decoded
+        default:
+            return .string(raw)
         }
     }
 

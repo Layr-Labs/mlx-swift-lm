@@ -16,7 +16,8 @@ import Foundation
 ///
 /// Only the frame grammar and the declared function name are checked: a frame
 /// missing a required argument, with an undeclared argument or with a value of
-/// another type is returned as generated. Output frames contain no call IDs;
+/// another type is returned as generated (`grammarOnly`, on unless
+/// `GrammarOnlyToolParsing` is switched off). Output frames contain no call IDs;
 /// the response owner assigns them. Parsing is not constrained decoding or
 /// JSON-Schema validation. The caller must still validate schema assertions,
 /// selection and call cardinality. Raw strings have no delimiter-escaping
@@ -27,12 +28,18 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
     public let endTag: String? = "</tool_call>"
     /// UTF-8 bound of one parsed response tool suffix.
     static let maximumBytes = 1 << 20
+    /// False restores the schema refusals: a call that misses a required
+    /// argument, or has an argument without a declared type, of an ambiguous
+    /// type or of another type, does not parse.
+    public let grammarOnly: Bool
 
-    public init() {}
+    public init(grammarOnly: Bool = GrammarOnlyToolParsing.isEnabled) {
+        self.grammarOnly = grammarOnly
+    }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         guard content.utf8.count <= Self.maximumBytes else { return nil }
-        var reader = GLM5ToolOutputReader(content)
+        var reader = GLM5ToolOutputReader(content, grammarOnly: grammarOnly)
         guard let call = reader.call(tools: tools), reader.isAtEnd else { return nil }
         return call
     }
@@ -41,7 +48,7 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
     /// return an earlier successful prefix or manufacture a missing end tag.
     public func parseEOS(_ buffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         guard buffer.utf8.count <= Self.maximumBytes else { return [] }
-        var reader = GLM5ToolOutputReader(buffer)
+        var reader = GLM5ToolOutputReader(buffer, grammarOnly: grammarOnly)
         var calls: [ToolCall] = []
         while !reader.isAtEnd {
             guard let call = reader.call(tools: tools) else { return [] }
@@ -84,9 +91,13 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
 
 private struct GLM5ToolOutputReader {
     private let bytes: [UInt8]
+    private let grammarOnly: Bool
     private var index = 0
 
-    init(_ text: String) { bytes = Array(text.utf8) }
+    init(_ text: String, grammarOnly: Bool = true) {
+        bytes = Array(text.utf8)
+        self.grammarOnly = grammarOnly
+    }
 
     var isAtEnd: Bool {
         mutating get {
@@ -101,13 +112,17 @@ private struct GLM5ToolOutputReader {
             return nil
         }
         let name = rawName.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n"))
-        guard Self.validFunctionName(name), let parameters = Self.parameters(name, tools: tools)
+        guard Self.validFunctionName(name),
+            let parameters = Self.parameters(name, tools: tools, grammarOnly: grammarOnly)
         else { return nil }
 
         var arguments: [String: JSONValue] = [:]
         while true {
             skipWhitespace()
             if consume("</tool_call>") {
+                if !grammarOnly, Self.schemaRefuses(arguments, parameters: parameters) {
+                    return nil
+                }
                 return ToolCall(function: .init(name: name, arguments: arguments))
             }
             guard consume("<arg_key>"), let key = take(until: "</arg_key>"),
@@ -123,7 +138,7 @@ private struct GLM5ToolOutputReader {
     /// The parameter schema of the one function declared as `name`, used only
     /// as type evidence; empty when it is omitted or not an object.
     private static func parameters(
-        _ name: String, tools: [[String: any Sendable]]?
+        _ name: String, tools: [[String: any Sendable]]?, grammarOnly: Bool
     ) -> [String: any Sendable]? {
         guard let tools else { return nil }
         var matches: [[String: any Sendable]] = []
@@ -138,7 +153,67 @@ private struct GLM5ToolOutputReader {
             if function["name"] as? String == name { matches.append(function) }
         }
         guard matches.count == 1 else { return nil }
-        return matches[0]["parameters"] as? [String: any Sendable] ?? [:]
+        guard let rawParameters = matches[0]["parameters"] else { return [:] }
+        guard let parameters = rawParameters as? [String: any Sendable] else {
+            return grammarOnly ? [:] : nil
+        }
+        return parameters
+    }
+
+    /// The refusals of schema-checked parsing (`grammarOnly` false), on a
+    /// call the grammar accepts: a parameter object that is not a plain
+    /// object schema, a missing required argument, an argument without a
+    /// declared type (none, unknown, indirect, or a key that only canonically
+    /// equals a declared one), a union with `string`, or a value of another type.
+    private static func schemaRefuses(
+        _ arguments: [String: JSONValue], parameters: [String: any Sendable]
+    ) -> Bool {
+        let indirect = [
+            "$ref", "$dynamicRef", "anyOf", "oneOf", "allOf", "not", "if", "then", "else",
+        ]
+        guard parameters["type"] == nil || parameters["type"] as? String == "object",
+            !indirect.contains(where: { parameters[$0] != nil }),
+            parameters["properties"].map({ $0 is [String: any Sendable] }) ?? true
+        else { return true }
+        if let rawRequired = parameters["required"] {
+            guard let required = rawRequired as? [String],
+                required.allSatisfy({ name in
+                    arguments.keys.contains { $0.utf8.elementsEqual(name.utf8) }
+                })
+            else { return true }
+        }
+        let properties = parameters["properties"] as? [String: any Sendable] ?? [:]
+        for (key, value) in arguments {
+            var schema = parameters["additionalProperties"]
+            if let declared = properties.index(forKey: key) {
+                guard properties[declared].key.utf8.elementsEqual(key.utf8) else { return true }
+                schema = properties[declared].value
+            }
+            guard let schema = schema as? [String: any Sendable],
+                !indirect.contains(where: { schema[$0] != nil })
+            else { return true }
+            var types: Set<String>
+            if let type = schema["type"] as? String {
+                types = [type]
+            } else if let values = schema["type"] as? [String], !values.isEmpty {
+                types = Set(values)
+            } else {
+                return true
+            }
+            if let nullable = schema["nullable"] {
+                guard case .bool(let enabled) = JSONValue.from(nullable) else { return true }
+                if enabled { types.insert("null") }
+            }
+            guard
+                types.isSubset(of: [
+                    "string", "integer", "number", "boolean", "null", "object", "array",
+                ])
+            else { return true }
+            if types.contains("string") ? types.count != 1 : !matches(value, types: types) {
+                return true
+            }
+        }
+        return false
     }
 
     private mutating func argument(types: Set<String>) -> JSONValue? {
