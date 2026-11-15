@@ -32,8 +32,13 @@ extension KernelTests {
         }
 
         /// An H.264 clip of `frames` frames at `fps`, a keyframe every 10
-        /// frames; frame `i` is gray at level `12 * i`.
-        private static func writeClip(to url: URL, frames: Int, fps: Int32) async throws {
+        /// frames; frame `i` is gray at level `12 * i % 256`. `first` is the
+        /// first frame's time (a later one leaves an empty edit before it);
+        /// with `timescale`, a frame lasts `step` ticks of it.
+        private static func writeClip(
+            to url: URL, frames: Int, fps: Int32, first: CMTime = .zero, step: Int64 = 1,
+            timescale: Int32? = nil
+        ) async throws {
             let size = 64
             let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
             let input = AVAssetWriterInput(
@@ -69,7 +74,7 @@ extension KernelTests {
                 else { throw ClipError.setup }
                 CVPixelBufferLockBaseAddress(buffer, [])
                 let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
-                let level = UInt8(12 * index)
+                let level = UInt8(12 * index % 256)
                 for row in 0 ..< size {
                     let line = base + row * CVPixelBufferGetBytesPerRow(buffer)
                     for x in 0 ..< size {
@@ -78,14 +83,16 @@ extension KernelTests {
                     }
                 }
                 CVPixelBufferUnlockBaseAddress(buffer, [])
-                guard
-                    adaptor.append(
-                        buffer,
-                        withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps))
-                else { throw writer.error ?? ClipError.append }
+                let time = CMTimeAdd(
+                    first, CMTime(value: CMTimeValue(index) * step, timescale: timescale ?? fps))
+                guard adaptor.append(buffer, withPresentationTime: time) else {
+                    throw writer.error ?? ClipError.append
+                }
             }
             input.markAsFinished()
-            writer.endSession(atSourceTime: CMTime(value: CMTimeValue(frames), timescale: fps))
+            writer.endSession(
+                atSourceTime: CMTimeAdd(
+                    first, CMTime(value: CMTimeValue(frames) * step, timescale: timescale ?? fps)))
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
                 writer.finishWriting { done.resume() }
             }
@@ -101,12 +108,16 @@ extension KernelTests {
             }
         }
 
-        private static func temporaryClip(frames: Int, fps: Int32) async throws -> (URL, URL) {
+        private static func temporaryClip(
+            frames: Int, fps: Int32, first: CMTime = .zero, step: Int64 = 1,
+            timescale: Int32? = nil
+        ) async throws -> (URL, URL) {
             let folder = FileManager.default.temporaryDirectory
                 .appendingPathComponent("qwen3vl-video-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let url = folder.appendingPathComponent("clip.mp4")
-            try await writeClip(to: url, frames: frames, fps: fps)
+            try await writeClip(
+                to: url, frames: frames, fps: fps, first: first, step: step, timescale: timescale)
             return (folder, url)
         }
 
@@ -197,6 +208,37 @@ extension KernelTests {
                         .user("Watch.", videos: [.avAsset(AVMutableComposition())])
                     ]))
             }
+        }
+
+        /// The first frame at 0.5 s leaves an empty edit before it; times count
+        /// from the first shown frame (the generator has no image in the gap).
+        @Test
+        func leadingEmptyEditIsSkipped() async throws {
+            let (folder, url) = try await Self.temporaryClip(
+                frames: 20, fps: 10, first: CMTime(value: 1, timescale: 2))
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let sample = try await Qwen4ExpVideoSampler.sampleByPresentationTime(
+                .avAsset(AVURLAsset(url: url)), config: Self.configuration(maxFrames: 64)
+            ) { image, _ in image.toSRGB() }
+            #expect(sample.indices == [0, 6, 13, 19], "20 shown frames")
+            let levels = Self.levels(sample.frames)
+            for (got, index) in zip(levels, sample.indices) {
+                #expect(abs(got - Float(12 * index) / 255) < 0.06, "frame \(index): \(levels)")
+            }
+        }
+
+        /// 360 frames at 29.97 fps (1,001 ticks of 1/30,000 s): the count, not
+        /// the Float nominal rate, sets the rate, so 2 fps asks for 24 frames.
+        @Test
+        func ntscRateGivesTheReferenceCount() async throws {
+            let (folder, url) = try await Self.temporaryClip(
+                frames: 360, fps: 30, step: 1_001, timescale: 30_000)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let sample = try await Qwen4ExpVideoSampler.sampleByPresentationTime(
+                .avAsset(AVURLAsset(url: url)), config: Self.configuration(maxFrames: 64)
+            ) { image, _ in image }
+            #expect(sample.indices.count == 24)
+            #expect(sample.indices.last == 359)
         }
     }
 }

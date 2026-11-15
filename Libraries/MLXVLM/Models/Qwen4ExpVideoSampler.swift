@@ -165,10 +165,11 @@ enum Qwen4ExpVideoSampler {
     }
 
     /// The same reference indices, read at presentation times: the frame count
-    /// and rate come from the track's shown time range and nominal rate, and an
-    /// image generator takes each selected frame at the middle of its interval.
-    /// A clip trimmed without re-encoding (an edit list that starts between
-    /// keyframes) and a long clip then need no full decode.
+    /// comes from the track's shown span (its first to its last non-empty edit)
+    /// and nominal rate, and an image generator takes each selected frame at the
+    /// middle of its interval. A clip trimmed without re-encoding and a long clip
+    /// then need no full decode. A variable-rate clip is sampled evenly in time,
+    /// where the reference samples it evenly in frame number.
     static func sampleByPresentationTime(
         _ video: UserInput.Video, config: Qwen4ExpVideoConfiguration,
         process: (CIImage, Int) throws -> CIImage
@@ -201,58 +202,70 @@ enum Qwen4ExpVideoSampler {
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw Failure.invalidMetadata
         }
-        let (range, rate) = try await track.load(.timeRange, .nominalFrameRate)
-        let duration = range.duration.seconds
-        let fps = Double(rate)
-        guard duration.isFinite, duration > 0, fps.isFinite, fps > 0 else {
+        let (range, rate, segments) = try await track.load(
+            .timeRange, .nominalFrameRate, .segments)
+        let shown = segments.filter { !$0.isEmpty }.map(\.timeMapping.target)
+        let start = shown.first?.start ?? range.start
+        let duration = CMTimeSubtract(shown.last?.end ?? range.end, start).seconds
+        guard duration.isFinite, duration > 0, rate.isFinite, rate > 0 else {
             throw Failure.invalidMetadata
         }
-        let frameCount = (duration * fps).rounded()
+        let frameCount = (duration * Double(rate)).rounded()
         guard frameCount >= 1 else { throw Failure.invalidMetadata }
         guard frameCount <= Double(maxIndexedFrames) else { throw Failure.excessiveMetadata }
+        // The rate of the rounded count: a Float rate of 30.000002 would sample
+        // one frame fewer than the reference's 30.
+        let fps = frameCount / duration
         let indices = try Qwen4ExpMediaGeometry.sampleIndices(
             totalFrames: Int(frameCount), sourceFPS: fps,
             targetFPS: config.fps, minFrames: config.minFrames, maxFrames: config.maxFrames)
         let latest = max(0, duration - 0.001 / fps)
         let times = indices.map { index in
             CMTimeAdd(
-                range.start,
+                start,
                 CMTime(
                     seconds: min((Double(index) + 0.5) / fps, latest),
                     preferredTimescale: 1_000_000))
         }
-        // One more pass when the generator drops a frame, as the readers retry.
-        for attempt in 0 ..< 2 {
-            if let frames = try await generatedFrames(
-                asset, times: times, process: { try process($0, indices.count) })
-            {
-                return .init(frames: frames, indices: indices, sourceFPS: fps)
-            }
-            if attempt == 0 { try Task.checkCancellation() }
+        let resize = { (image: CIImage) in try process(image, indices.count) }
+        var frames = try await generatedFrames(asset, times: times, tolerance: .zero, resize)
+        // A time in a gap of the track has no image; read it again within one
+        // sampling step, which also retries a dropped frame.
+        let missing = frames.indices.filter { frames[$0] == nil }
+        if !missing.isEmpty {
+            let step = CMTime(
+                seconds: duration / Double(indices.count), preferredTimescale: 1_000_000)
+            let retried = try await generatedFrames(
+                asset, times: missing.map { times[$0] }, tolerance: step, resize)
+            for (slot, frame) in zip(missing, retried) { frames[slot] = frame }
         }
-        throw Failure.missingFrame
+        let complete = frames.compactMap { $0 }
+        guard complete.count == indices.count else { throw Failure.missingFrame }
+        return .init(frames: complete, indices: indices, sourceFPS: fps)
     }
 
-    /// Every requested frame in order, or nil when the generator fails one.
+    /// The processed frame at each time, nil where the generator has no image.
     private static func generatedFrames(
-        _ asset: AVAsset, times: [CMTime], process: (CIImage) throws -> CIImage
-    ) async throws -> [MLXArray]? {
+        _ asset: AVAsset, times: [CMTime], tolerance: CMTime,
+        _ process: (CIImage) throws -> CIImage
+    ) async throws -> [MLXArray?] {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        var frames: [MLXArray] = []
-        frames.reserveCapacity(times.count)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        var frames = [MLXArray?](repeating: nil, count: times.count)
         for await result in generator.images(for: times) {
             try Task.checkCancellation()
-            guard case .success(requestedTime: _, let image, actualTime: _) = result else {
-                return nil
-            }
+            guard case .success(let requested, let image, actualTime: _) = result,
+                let slot = times.indices.first(where: {
+                    times[$0] == requested && frames[$0] == nil
+                })
+            else { continue }
             // Decoded bytes as sRGB, as the frame-ordinal reader tags them.
             let frame = CIImage(
                 cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-            frames.append(MediaProcessing.asMLXArray(try process(frame)))
+            frames[slot] = MediaProcessing.asMLXArray(try process(frame))
         }
-        return frames.count == times.count ? frames : nil
+        return frames
     }
 }

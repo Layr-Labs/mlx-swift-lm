@@ -53,7 +53,8 @@ enum Qwen4ExpVideoPrompt {
     }
 
     /// The same expansion in token space, for a template the tokenizer does not
-    /// decode and re-encode unchanged. Each label is encoded on its own.
+    /// decode and re-encode unchanged. Each label is encoded on its own, so a
+    /// label after a space or punctuation may split where the text path merges.
     private static func expandedTokenIDs(
         _ tokens: [Int], tokenizer: any Tokenizer,
         grids: [THW], timestamps: [[Double]], merge: Int

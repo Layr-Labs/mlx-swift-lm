@@ -103,8 +103,10 @@ extension UnitTests {
             #expect(result == tokens(expected), "each clip fills its own slot")
         }
 
+        /// Without single-token marker ids a template that does not round-trip
+        /// cannot expand in token space either.
         @Test
-        func templateThatDoesNotRoundTripIsRejected() {
+        func templateWithoutMarkerIdsIsRejected() {
             // 0xD800 is not a valid scalar, so decode drops it.
             let input = [0xD800] + tokens(pad)
             #expect(
