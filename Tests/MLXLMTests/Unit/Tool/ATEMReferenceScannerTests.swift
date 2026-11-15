@@ -281,6 +281,56 @@ extension UnitTests {
             Self.expect("12", nested, .int(12))
         }
 
+        private static func nested(_ depth: Int, object: Bool) -> String {
+            object
+                ? String(repeating: "{\"a\":", count: depth) + "1"
+                    + String(repeating: "}", count: depth)
+                : String(repeating: "[", count: depth) + "1" + String(repeating: "]", count: depth)
+        }
+
+        private static func depth(of value: JSONValue) -> Int {
+            switch value {
+            case .array(let items): 1 + (items.first.map(depth) ?? 0)
+            case .object(let fields): 1 + (fields.values.first.map(depth) ?? 0)
+            default: 0
+            }
+        }
+
+        /// The value is the model's, so it is bounded as a client's body is.
+        /// A call's arguments object adds one level, so 63 levels here are
+        /// arguments 64 deep: the most a replayed call may nest.
+        @Test func aValueNestedPastTheBoundStaysText() {
+            for object in [false, true] {
+                let atBound = Self.nested(63, object: object)
+                #expect(Self.convert(atBound, [:]).map(Self.depth) == [63, 63])
+                for depth in [64, 100] {
+                    let past = Self.nested(depth, object: object)
+                    Self.expect(past, [:], .string(past))
+                    Self.expect(past, ["type": "array"], .string(past))
+                }
+            }
+            // Brackets inside a string are text, not nesting.
+            let brackets = String(repeating: "[{", count: 300)
+            Self.expect(
+                "[\"\(brackets)\", \"\\\"[\"]", [:], .array([.string(brackets), .string("\"[")]))
+        }
+
+        /// `JSONSerialization` reads 512 levels. Decoding, encoding, comparing,
+        /// hashing and releasing a value each recurse once per level, here on
+        /// the test's cooperative thread, whose stack is 512 KiB.
+        @Test func aValueAtTheParsersLimitNeverExhaustsTheStack() throws {
+            for object in [false, true] {
+                let raw = Self.nested(512, object: object)
+                var values: [JSONValue]? = Self.convert(raw, [:])
+                let arguments: [String: JSONValue] = ["v": values?.first ?? .null]
+                _ = try JSONEncoder().encode(arguments)
+                #expect(arguments == arguments)
+                #expect(Set(values ?? []).count == 1)
+                #expect(values == [.string(raw), .string(raw)])
+                values = nil
+            }
+        }
+
         @Test func undeclaredParametersDecodeWhenTheyParse() {
             let tools = ATEMDeclaredTools([["function": ["name": "f"] as [String: any Sendable]]])
             #expect(tools.value("12", parameter: "n", ofTool: "f") == .int(12))

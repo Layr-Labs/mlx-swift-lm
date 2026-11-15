@@ -237,6 +237,10 @@ struct ATEMDeclaredTools: Sendable {
 /// JSON types a parameter schema admits.
 enum ATEMReferenceValue {
     static let maximumDepth = 32
+    /// The most arrays and objects a decoded value opens at once. A call's
+    /// arguments object adds one, so its arguments nest at most 64 deep: the
+    /// limit d-inference holds a client's body and a replayed call to.
+    static let maximumValueDepth = 63
 
     /// Keeps the text when the schema admits only a string. Otherwise decodes
     /// JSON; when the schema also admits a string, the decoded value is used
@@ -337,12 +341,52 @@ enum ATEMReferenceValue {
 
     /// Decodes any JSON value, a bare scalar included. A number written with
     /// a fraction or an exponent stays a floating-point number.
+    ///
+    /// The text is the model's, so it is bounded as a client's body is.
+    /// `JSONSerialization` reads 512 levels, and decoding, encoding,
+    /// comparing, hashing and releasing a value each recurse once per level,
+    /// on a cooperative thread's 512 KiB stack. A value nested deeper than
+    /// `maximumValueDepth` is not decoded: it stays text, as one that does not
+    /// parse does.
     static func decode(_ raw: String) -> JSONValue? {
-        guard let data = raw.data(using: .utf8),
+        guard !nestsPastTheBound(raw), let data = raw.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(
                 with: data, options: [.fragmentsAllowed])
         else { return nil }
         return value(object)
+    }
+
+    /// Whether `text` opens more than `maximumValueDepth` arrays and objects
+    /// at once, counted without recursion. Brackets inside strings do not
+    /// count; malformed text is left to the parser.
+    static func nestsPastTheBound(_ text: String) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for byte in text.utf8 {
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if byte == UInt8(ascii: "\\") {
+                    escaped = true
+                } else if byte == UInt8(ascii: "\"") {
+                    inString = false
+                }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""):
+                inString = true
+            case UInt8(ascii: "["), UInt8(ascii: "{"):
+                depth += 1
+                if depth > maximumValueDepth { return true }
+            case UInt8(ascii: "]"), UInt8(ascii: "}"):
+                depth -= 1
+            default:
+                break
+            }
+        }
+        return false
     }
 
     private static func value(_ object: Any) -> JSONValue {
