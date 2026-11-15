@@ -49,6 +49,37 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
         }
         return calls
     }
+
+    /// The JSON types `parameters` declares for the argument `key`: its
+    /// property schema's, else those of `additionalProperties`. Empty when
+    /// nothing declares a type. They choose between a value's raw and JSON
+    /// readings, never whether a call parses.
+    public static func argumentTypes(
+        _ key: String, parameters: [String: any Sendable]
+    ) -> Set<String> {
+        var schema = parameters["additionalProperties"]
+        if let properties = parameters["properties"] as? [String: any Sendable],
+            let declared = properties.index(forKey: key),
+            // Swift dictionary lookup equates canonically equivalent Unicode
+            // keys; JSON property names do not.
+            properties[declared].key.utf8.elementsEqual(key.utf8)
+        {
+            schema = properties[declared].value
+        }
+        guard let schema = schema as? [String: any Sendable] else { return [] }
+        var types: Set<String> = []
+        if let type = schema["type"] as? String {
+            types = [type]
+        } else if let values = schema["type"] as? [String] {
+            types = Set(values)
+        }
+        if let nullable = schema["nullable"], JSONValue.from(nullable) == .bool(true) {
+            types.insert("null")
+        }
+        return types.intersection([
+            "string", "integer", "number", "boolean", "null", "object", "array",
+        ])
+    }
 }
 
 private struct GLM5ToolOutputReader {
@@ -82,7 +113,8 @@ private struct GLM5ToolOutputReader {
             guard consume("<arg_key>"), let key = take(until: "</arg_key>"),
                 !key.isEmpty, !key.utf8.contains(60), arguments[key] == nil,
                 consume("<arg_value>"),
-                let value = argument(types: Self.declaredTypes(key, parameters: parameters))
+                let value = argument(
+                    types: GLM5ToolCallParser.argumentTypes(key, parameters: parameters))
             else { return nil }
             arguments[key] = value
         }
@@ -107,35 +139,6 @@ private struct GLM5ToolOutputReader {
         }
         guard matches.count == 1 else { return nil }
         return matches[0]["parameters"] as? [String: any Sendable] ?? [:]
-    }
-
-    /// The JSON types declared for `key`: its property schema's, else those of
-    /// `additionalProperties`. Empty when nothing declares a type.
-    private static func declaredTypes(
-        _ key: String, parameters: [String: any Sendable]
-    ) -> Set<String> {
-        var schema = parameters["additionalProperties"]
-        if let properties = parameters["properties"] as? [String: any Sendable],
-            let declared = properties.index(forKey: key),
-            // Swift dictionary lookup equates canonically equivalent Unicode
-            // keys; JSON property names do not.
-            properties[declared].key.utf8.elementsEqual(key.utf8)
-        {
-            schema = properties[declared].value
-        }
-        guard let schema = schema as? [String: any Sendable] else { return [] }
-        var types: Set<String> = []
-        if let type = schema["type"] as? String {
-            types = [type]
-        } else if let values = schema["type"] as? [String] {
-            types = Set(values)
-        }
-        if let nullable = schema["nullable"], JSONValue.from(nullable) == .bool(true) {
-            types.insert("null")
-        }
-        return types.intersection([
-            "string", "integer", "number", "boolean", "null", "object", "array",
-        ])
     }
 
     private mutating func argument(types: Set<String>) -> JSONValue? {

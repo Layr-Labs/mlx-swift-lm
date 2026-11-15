@@ -417,6 +417,26 @@ extension UnitTests {
             }
         }
 
+        @Test("Argument types come from the exact declared key, else additionalProperties")
+        func argumentTypes() {
+            let parameters: [String: any Sendable] = [
+                "properties": [
+                    "\u{e9}": ["type": "integer"],
+                    "n": ["type": ["string", "future"], "nullable": true] as [String: any Sendable],
+                    "u": ["description": "no type"],
+                ] as [String: any Sendable],
+                "additionalProperties": ["type": "object"],
+            ]
+            #expect(
+                GLM5ToolCallParser.argumentTypes("\u{e9}", parameters: parameters) == ["integer"])
+            #expect(
+                GLM5ToolCallParser.argumentTypes("e\u{301}", parameters: parameters) == ["object"])
+            #expect(
+                GLM5ToolCallParser.argumentTypes("n", parameters: parameters) == ["string", "null"])
+            #expect(GLM5ToolCallParser.argumentTypes("u", parameters: parameters).isEmpty)
+            #expect(GLM5ToolCallParser.argumentTypes("x", parameters: [:]).isEmpty)
+        }
+
         @Test("Frames that break the grammar still fail closed")
         func grammarFailuresStayClosed() {
             let tools = [tool(properties: ["x": ["type": "integer"]])]
