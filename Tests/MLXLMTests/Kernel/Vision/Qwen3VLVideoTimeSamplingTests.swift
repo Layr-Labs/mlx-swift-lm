@@ -298,5 +298,56 @@ extension KernelTests {
             #expect(sample.frames.count == sample.indices.count)
             #expect(sample.indices.count == 6, "3 s at 10 fps, 2 fps")
         }
+
+        /// 2 s, a 5 s empty edit, then 3 s: five sampled times fall in the gap
+        /// and move onto the frames at its edges, which several slots share.
+        @Test
+        func longInteriorEmptyEditSharesTheEdgeFrames() async throws {
+            let (folder, url) = try await Self.temporaryClip(frames: 50, fps: 10)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let source = AVURLAsset(url: url)
+            let track = try #require(try await source.loadTracks(withMediaType: .video).first)
+            let composition = AVMutableComposition()
+            let target = try #require(
+                composition.addMutableTrack(
+                    withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+            let two = CMTime(value: 2, timescale: 1)
+            try target.insertTimeRange(
+                CMTimeRange(start: .zero, duration: two), of: track, at: .zero)
+            try target.insertTimeRange(
+                CMTimeRange(start: two, duration: CMTime(value: 3, timescale: 1)), of: track,
+                at: two)
+            target.insertEmptyTimeRange(
+                CMTimeRange(start: two, duration: CMTime(value: 5, timescale: 1)))
+            let exported = try await Self.passThrough(
+                composition, to: folder.appendingPathComponent("long.mp4"))
+
+            let sample = try await Qwen4ExpVideoSampler.sampleByPresentationTime(
+                .avAsset(AVURLAsset(url: exported)), config: Self.configuration(maxFrames: 64)
+            ) { image, _ in image.toSRGB() }
+            // 10 s at 10 fps, 2 fps: 20 times, every 0.5 s; those in 2-7 s move
+            // to source frame 19 (before the gap) or 20 (after it).
+            #expect(sample.indices.count == 20)
+            let levels = Self.levels(sample.frames)
+            let times = sample.indices.map { (Double($0) + 0.5) / 10 }
+            for (time, got) in zip(times, levels) {
+                let frame: Int =
+                    time < 2
+                    ? Int(time * 10) : time < 4.5 ? 19 : time < 7 ? 20 : Int(time * 10) - 50
+                #expect(abs(got - Float(12 * frame % 256) / 255) < 0.06, "\(time) s: \(levels)")
+            }
+        }
+
+        private static func passThrough(_ asset: AVAsset, to url: URL) async throws -> URL {
+            let session = try #require(
+                AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough))
+            session.outputURL = url
+            session.outputFileType = .mp4
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                session.exportAsynchronously { done.resume() }
+            }
+            #expect(session.status == .completed, "\(String(describing: session.error))")
+            return url
+        }
     }
 }

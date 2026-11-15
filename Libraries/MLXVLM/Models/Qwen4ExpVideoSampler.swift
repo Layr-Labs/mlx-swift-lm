@@ -226,16 +226,22 @@ enum Qwen4ExpVideoSampler {
                 in: shown, halfFrame: 0.5 / fps)
         }
         let resize = { (image: CIImage) in try process(image, indices.count) }
-        var frames = try await generatedFrames(asset, times: times, resize)
-        // One more read of a frame the generator dropped, as the readers retry.
-        let missing = frames.indices.filter { frames[$0] == nil }
-        if !missing.isEmpty {
-            let retried = try await generatedFrames(asset, times: missing.map { times[$0] }, resize)
-            for (slot, frame) in zip(missing, retried) { frames[slot] = frame }
+        // Times moved out of a gap can coincide; the generator answers a repeated
+        // time once, so read each distinct time once and share its frame.
+        var distinct: [CMTime] = []
+        let owner = times.map { time -> Int in
+            if let index = distinct.firstIndex(of: time) { return index }
+            distinct.append(time)
+            return distinct.count - 1
         }
-        let complete = frames.compactMap { $0 }
-        guard complete.count == indices.count else { throw Failure.missingFrame }
-        return .init(frames: complete, indices: indices, sourceFPS: fps)
+        var read = try await generatedFrames(asset, times: distinct, resize)
+        // One more read of a frame the generator dropped, as the readers retry.
+        for index in read.indices where read[index] == nil {
+            read[index] = try await generatedFrames(asset, times: [distinct[index]], resize)[0]
+        }
+        let frames = owner.compactMap { read[$0] }
+        guard frames.count == indices.count else { throw Failure.missingFrame }
+        return .init(frames: frames, indices: indices, sourceFPS: fps)
     }
 
     /// The frame count of a shown span (its duration times the nominal rate,
