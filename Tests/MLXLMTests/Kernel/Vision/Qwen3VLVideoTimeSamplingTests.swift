@@ -299,8 +299,8 @@ extension KernelTests {
             #expect(sample.indices.count == 6, "3 s at 10 fps, 2 fps")
         }
 
-        /// 2 s, a 5 s empty edit, then 3 s: five sampled times fall in the gap
-        /// and move onto the frames at its edges, which several slots share.
+        /// 2 s, a 5 s empty edit, then 3 s: ten sampled times fall in the gap;
+        /// five move to each edge's frame, which they share.
         @Test
         func longInteriorEmptyEditSharesTheEdgeFrames() async throws {
             let (folder, url) = try await Self.temporaryClip(frames: 50, fps: 10)
@@ -334,7 +334,8 @@ extension KernelTests {
                 let frame: Int =
                     time < 2
                     ? Int(time * 10) : time < 4.5 ? 19 : time < 7 ? 20 : Int(time * 10) - 50
-                #expect(abs(got - Float(12 * frame % 256) / 255) < 0.06, "\(time) s: \(levels)")
+                // 0.02 tells frames 19 and 20 (12 / 255 apart) from each other.
+                #expect(abs(got - Float(12 * frame % 256) / 255) < 0.02, "\(time) s: \(levels)")
             }
         }
 
