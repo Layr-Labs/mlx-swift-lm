@@ -142,6 +142,27 @@ final class MiMoV2ToolCodecTests: XCTestCase {
         XCTAssertNotNil(parser.parse(content: frame("x"), tools: nil))
     }
 
+    func testValuesThatParsedBeforeReadTheSame() throws {
+        let parser = MiMoV2ToolCallParser()
+        for (schema, value, expected): ([String: any Sendable], String, JSONValue) in [
+            (["nullable": true], "1.0", .string("1.0")),
+            (["type": "string", "nullable": true], "null", .string("null")),
+            (["type": "string"], "123", .string("123")),
+            (["type": "integer"], "7", .int(7)),
+        ] {
+            let parameters: [String: any Sendable] = [
+                "properties": ["text": schema] as [String: any Sendable]
+            ]
+            let function: [String: any Sendable] = [
+                "name": "record_text", "parameters": parameters,
+            ]
+            XCTAssertEqual(
+                parser.parse(content: frame(value), tools: [["function": function]])?.function
+                    .arguments[
+                        "text"], expected, "\(schema) \(value)")
+        }
+    }
+
     func testMissingTypeRetainsRawAndAmbiguousTypesTakeTheirOtherType() throws {
         let parser = MiMoV2ToolCallParser()
         let checked = MiMoV2ToolCallParser(grammarOnly: false)

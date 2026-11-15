@@ -357,8 +357,7 @@ extension UnitTests {
             "An argument without usable type evidence is JSON when it parses, else its raw text",
             arguments: [
                 [:], ["description": "intent"], ["enum": ["null", 1] as [any Sendable]],
-                ["type": "future"], ["anyOf": [["type": "integer"], ["type": "null"]]],
-                ["$ref": "#/$defs/x"],
+                ["type": "future"], ["allOf": [["type": "integer"]]], ["$ref": "#/$defs/x"],
             ] as [[String: any Sendable]])
         func untypedArguments(schema: [String: any Sendable]) throws {
             let tools = [tool(properties: ["x": schema])]
@@ -377,6 +376,85 @@ extension UnitTests {
             let calls = parser.parseEOS(
                 frame(#""a"#) + frame(#"b""#), tools: tools)
             #expect(calls.map { $0.function.arguments["x"] } == [.string(#""a"#), .string(#"b""#)])
+        }
+
+        @Test("Pydantic's optional string keeps text that looks like JSON as text")
+        func optionalStrings() {
+            let schema: [String: any Sendable] = [
+                "anyOf": [["type": "string"], ["type": "null"]], "default": NSNull(),
+            ]
+            let optional = [tool(properties: ["x": schema])]
+            for (raw, value) in [
+                ("123", JSONValue.string("123")), ("1.0", .string("1.0")),
+                ("true", .string("true")),
+                (#""q""#, .string(#""q""#)), ("null", .null),
+            ] {
+                #expect(
+                    parser.parse(content: frame(raw), tools: optional)?.function.arguments["x"]
+                        == value,
+                    "\(raw)")
+            }
+        }
+
+        @Test("A value of a non-string type keeps its JSON reading, but never a top-level string")
+        func nonStringTypesKeepJSON() {
+            let integer = [tool(properties: ["n": ["type": "integer"]])]
+            #expect(
+                parser.parse(
+                    content: frame(#"{"cmd":"x </arg_value> y"}"#, key: "n"), tools: integer)?
+                    .function.arguments["n"] == .object(["cmd": .string("x </arg_value> y")]))
+            let calls = parser.parseEOS(
+                frame(#""12"#, key: "n") + frame(#"14""#, key: "n"), tools: integer)
+            #expect(
+                calls.map { $0.function.arguments["n"] } == [.string(#""12"#), .string(#"14""#)])
+        }
+
+        @Test("Schema-checked parsing (the switch off) keeps every refusal it had")
+        func schemaChecksRestoreTheOldRefusals() {
+            let checked = GLM5ToolCallParser(grammarOnly: false)
+            func refused(_ value: String, schema: [String: any Sendable], key: String = "x") -> Bool
+            {
+                checked.parse(
+                    content: frame(value, key: key), tools: [tool(properties: ["x": schema])])
+                    == nil
+            }
+            for (type, value) in [
+                ("integer", "true"), ("integer", "1.25"), ("boolean", "1"), ("boolean", "yes"),
+                ("null", "nil"), ("number", "\"1\""), ("array", "{}"), ("object", "[]"),
+                ("number", "18446744073709551615"), ("number", "9007199254740993.25"),
+                ("number", "0.10000000000000000000001"), ("number", "1e309"), ("number", "1e-400"),
+                ("number", "NaN"), ("number", "Infinity"), ("number", "+1"), ("number", "01"),
+                ("number", "1."), ("number", ".5"), ("number", "1e"),
+                ("object", #"{"bad":18446744073709551615}"#), ("object", #"{"x":1,"x":2}"#),
+                ("object", #"{"a":1,"\u0061":2}"#), ("object", #"{"x":1,}"#),
+                ("object", #"{"x":tru}"#),
+                ("object", #"{"x":01}"#), ("object", #"{"x":"\uD800"}"#),
+                ("object", #"{"x":1} trailing"#),
+                ("object", "{\"é\":1,\"e\\u0301\":2}"), ("array", "[1,]"),
+                (
+                    "array",
+                    String(repeating: "[", count: 66) + "0" + String(repeating: "]", count: 66)
+                ),
+            ] {
+                #expect(refused(value, schema: ["type": type]), "\(type) \(value)")
+            }
+            for schema: [String: any Sendable] in [
+                [:], ["enum": ["null", 1] as [any Sendable]], ["type": ["string", "null"]],
+                ["type": "string", "nullable": true], ["type": "future"],
+                ["anyOf": [["type": "string"], ["type": "null"]]],
+                ["type": "string", "$ref": "#/$defs/x"], ["type": "number", "nullable": 1],
+            ] {
+                #expect(refused("null", schema: schema), "\(schema)")
+            }
+            #expect(checked.parse(content: frame("null"), tools: [tool()]) == nil)
+            #expect(
+                checked.parse(
+                    content: "<tool_call>f</tool_call>",
+                    tools: [tool(properties: ["x": ["type": "integer"]], required: ["x"])]) == nil)
+            #expect(
+                checked.parse(
+                    content: frame("1", key: "e\u{301}"),
+                    tools: [tool(properties: ["é": ["type": "integer"]])]) == nil)
         }
 
         @Test("A union with string takes JSON only for its other declared types")

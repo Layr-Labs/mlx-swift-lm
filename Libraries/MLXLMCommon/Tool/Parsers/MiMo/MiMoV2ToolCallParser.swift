@@ -13,11 +13,12 @@ import Foundation
 /// cannot infer the caller's intended value from an otherwise valid collision.
 /// Declaration/schema/cardinality validation remains mandatory at the caller.
 ///
-/// A value is returned as generated: where its parameter declares only types
+/// A value schema-checked parsing would refuse (a union, a value of another
+/// type) is returned as generated: where its parameter declares only types
 /// other than `string`, JSON of any type when it parses; in a union with
 /// `string`, JSON only as one of the other types; otherwise its raw text.
-/// `grammarOnly` false (`GrammarOnlyToolParsing`) restores refusing a union
-/// and a value of another type.
+/// Every other value reads as before. `grammarOnly` false
+/// (`GrammarOnlyToolParsing`) restores the refusals.
 public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<tool_call>"
     public let endTag: String? = "</tool_call>"
@@ -98,7 +99,14 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
         guard let schema = properties[parameter] as? [String: any Sendable] else {
             return .string(raw)  // No type evidence: retain bytes; caller validates schema.
         }
-        if grammarOnly { return asGenerated(raw, schema: schema) }
+        if let checked = schemaCheckedValue(raw, schema: schema) { return checked }
+        return grammarOnly ? asGenerated(raw, schema: schema) : nil
+    }
+
+    /// The value schema-checked parsing reads, or nil where it refuses one.
+    private static func schemaCheckedValue(_ raw: String, schema: [String: any Sendable])
+        -> JSONValue?
+    {
         // Do not infer a type from a string-looking JSON literal or ambiguous
         // union. The native template has no discriminator for string "1" vs1.
         if schema["anyOf"] != nil || schema["oneOf"] != nil || schema["allOf"] != nil { return nil }

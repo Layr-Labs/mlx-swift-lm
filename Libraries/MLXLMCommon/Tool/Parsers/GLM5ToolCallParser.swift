@@ -58,9 +58,9 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
     }
 
     /// The JSON types `parameters` declares for the argument `key`: its
-    /// property schema's, else those of `additionalProperties`. Empty when
-    /// nothing declares a type. They choose between a value's raw and JSON
-    /// readings, never whether a call parses.
+    /// property schema's (with its `anyOf`/`oneOf` branches'), else those of
+    /// `additionalProperties`. Empty when nothing declares a type. They choose
+    /// between a value's raw and JSON readings, never whether a call parses.
     public static func argumentTypes(
         _ key: String, parameters: [String: any Sendable]
     ) -> Set<String> {
@@ -75,10 +75,13 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
         }
         guard let schema = schema as? [String: any Sendable] else { return [] }
         var types: Set<String> = []
-        if let type = schema["type"] as? String {
-            types = [type]
-        } else if let values = schema["type"] as? [String] {
-            types = Set(values)
+        let branches = (schema["anyOf"] ?? schema["oneOf"]) as? [[String: any Sendable]] ?? []
+        for node in [schema] + branches {
+            if let type = node["type"] as? String {
+                types.insert(type)
+            } else if let values = node["type"] as? [String] {
+                types.formUnion(values)
+            }
         }
         if let nullable = schema["nullable"], JSONValue.from(nullable) == .bool(true) {
             types.insert("null")
@@ -216,9 +219,11 @@ private struct GLM5ToolOutputReader {
 
     private mutating func argument(types: Set<String>) -> JSONValue? {
         let start = index
-        // Quoted delimiters inside a typed JSON value are data.
+        // Quoted delimiters inside a typed JSON value are data. A JSON string
+        // is kept only where a string is not written raw, never at the top.
         if !types.isEmpty, types != ["string"], let value = jsonValue(depth: 0),
             Self.matches(value, types: types)
+                || (!types.contains("string") && !Self.isString(value))
         {
             skipWhitespace()
             if consume("</arg_value>") { return value }
@@ -235,6 +240,11 @@ private struct GLM5ToolOutputReader {
             return value
         }
         return .string(raw)
+    }
+
+    private static func isString(_ value: JSONValue) -> Bool {
+        if case .string = value { return true }
+        return false
     }
 
     /// `text` as one JSON value, surrounding whitespace allowed.
