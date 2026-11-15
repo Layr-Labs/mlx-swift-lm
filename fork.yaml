@@ -394,8 +394,12 @@ def:
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
         channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
-        chat-template rendering. GLM5 has schema-disambiguated values and response-wide
-        validation before committing calls; this does not register a GLM5 model or qualify grammar decoding.
+        chat-template rendering. The GLM5, Gemma and MiMo V2 parsers read their frame grammar and
+        the declared function name only: a missing required or undeclared argument, a union or a
+        value of another type is returned as generated (`GrammarOnlyToolParsing`,
+        `DARKBLOOM_GRAMMAR_ONLY_TOOL_PARSING=0` restores their schema refusals); declared types
+        choose between a raw string and JSON, and one malformed GLM5 frame refuses the response's
+        whole batch; this does not register a GLM5 model or qualify grammar decoding.
         `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
         is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
         argument JSON that the complete-frame parse must agree with when the frame closes.
@@ -413,6 +417,7 @@ def:
         the Gemma streamer withholds those values until the complete parse. Default-off keeps existing
         string exposure. `GemmaQuotedNumberConformanceTests` runs with the flag off and on.
       globs:
+        - "changelog.d/glm5-tool-grammar-only.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"
