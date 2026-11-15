@@ -273,6 +273,167 @@ extension UnitTests {
             #expect(parse(String(repeating: "x", count: 1 << 20), type: "string") == nil)
         }
 
+        private func readTool(
+            additionalProperties: (any Sendable)? = nil
+        ) -> [[String: any Sendable]] {
+            var parameters: [String: any Sendable] = [
+                "type": "object",
+                "properties": [
+                    "i": ["type": "string"], "path": ["type": "string"],
+                ] as [String: any Sendable],
+                "required": ["path", "i"],
+            ]
+            if let additionalProperties {
+                parameters["additionalProperties"] = additionalProperties
+            }
+            let function: [String: any Sendable] = ["name": "read", "parameters": parameters]
+            return [["type": "function", "function": function]]
+        }
+
+        private func readFrame(_ path: String, intent: String? = nil) -> String {
+            let intentArgument = intent.map {
+                "<arg_key>i</arg_key><arg_value>\($0)</arg_value>"
+            }
+            return "<tool_call>read<arg_key>path</arg_key><arg_value>\(path)</arg_value>"
+                + (intentArgument ?? "") + "</tool_call>"
+        }
+
+        @Test("A call that omits a required argument is returned as generated")
+        func missingRequiredArguments() throws {
+            let tools = readTool()
+            let call = try #require(parser.parse(content: readFrame("CONTEXT.md"), tools: tools))
+            #expect(call.function.name == "read")
+            #expect(call.function.arguments == ["path": .string("CONTEXT.md")])
+            #expect(
+                parser.parse(content: "<tool_call>read</tool_call>", tools: tools)?
+                    .function.arguments.isEmpty == true)
+
+            let batch =
+                readFrame("a.md", intent: "first") + "\n" + readFrame("b.md") + "\n"
+                + readFrame("c.md", intent: "third")
+            let calls = parser.parseEOS(batch, tools: tools)
+            #expect(
+                calls.map { $0.function.arguments["path"] } == [
+                    .string("a.md"), .string("b.md"), .string("c.md"),
+                ])
+            #expect(
+                calls.map { $0.function.arguments["i"] } == [
+                    .string("first"), nil, .string("third"),
+                ])
+
+            let processor = ToolCallProcessor(format: .glm5, tools: tools)
+            for character in "Reading.\n" + batch {
+                _ = processor.processChunk(String(character))
+            }
+            #expect(processor.processEOS(returnBufferedText: true) == nil)
+            #expect(processor.drainToolCalls().count == 3)
+            #expect(processor.parseFailureCount == 0)
+        }
+
+        @Test(
+            "An undeclared argument is returned whatever additionalProperties says",
+            arguments: [nil, false, true, [:] as [String: any Sendable]] as [(any Sendable)?])
+        func undeclaredArguments(additionalProperties: (any Sendable)?) throws {
+            let tools = readTool(additionalProperties: additionalProperties)
+            for (raw, value) in [
+                ("plain text", JSONValue.string("plain text")), ("42", .int(42)),
+                (#"{"a":[1,null]}"#, .object(["a": .array([.int(1), .null])])),
+                ("{not json", .string("{not json")),
+            ] {
+                let frame =
+                    "<tool_call>read<arg_key>path</arg_key><arg_value>a.md</arg_value>"
+                    + "<arg_key>extra</arg_key><arg_value>\(raw)</arg_value></tool_call>"
+                let call = try #require(parser.parse(content: frame, tools: tools), "\(raw)")
+                #expect(call.function.arguments["extra"] == value, "\(raw)")
+                #expect(call.function.arguments["path"] == .string("a.md"))
+            }
+            // A key that only canonically equals a declared one is another key.
+            let accent = [tool(properties: ["\u{e9}": ["type": "string"]])]
+            let call = try #require(
+                parser.parse(content: frame("1", key: "e\u{301}"), tools: accent))
+            let key = try #require(call.function.arguments.keys.first)
+            #expect(Array(key.utf8) == Array("e\u{301}".utf8))
+            #expect(call.function.arguments[key] == .int(1))
+        }
+
+        @Test(
+            "An argument without usable type evidence is JSON when it parses, else its raw text",
+            arguments: [
+                [:], ["description": "intent"], ["enum": ["null", 1] as [any Sendable]],
+                ["type": "future"], ["anyOf": [["type": "integer"], ["type": "null"]]],
+                ["$ref": "#/$defs/x"],
+            ] as [[String: any Sendable]])
+        func untypedArguments(schema: [String: any Sendable]) throws {
+            let tools = [tool(properties: ["x": schema])]
+            for (raw, value) in [
+                ("null", JSONValue.null), (" 7 ", .int(7)),
+                (#"[1,"a"]"#, .array([.int(1), .string("a")])),
+                (#""quoted""#, .string("quoted")), ("hello world", .string("hello world")),
+                (#"{"a":"#, .string(#"{"a":"#)), ("1 2", .string("1 2")), ("", .string("")),
+            ] {
+                #expect(
+                    parser.parse(content: frame(raw), tools: tools)?.function.arguments["x"]
+                        == value,
+                    "\(raw)")
+            }
+            // Its value ends at its first `</arg_value>`, as a raw string's does.
+            let calls = parser.parseEOS(
+                frame(#""a"#) + frame(#"b""#), tools: tools)
+            #expect(calls.map { $0.function.arguments["x"] } == [.string(#""a"#), .string(#"b""#)])
+        }
+
+        @Test("A union with string takes JSON only for its other declared types")
+        func stringUnions() throws {
+            for schema in [
+                ["type": ["string", "null"]], ["type": "string", "nullable": true],
+            ] as [[String: any Sendable]] {
+                for (raw, value) in [
+                    ("null", JSONValue.null), ("123", .string("123")), ("hello", .string("hello")),
+                    (#""q""#, .string(#""q""#)),
+                ] {
+                    #expect(
+                        parser.parse(content: frame(raw), tools: [tool(properties: ["x": schema])])?
+                            .function.arguments["x"] == value, "\(schema) \(raw)")
+                }
+            }
+            let objectOrString = [tool(properties: ["x": ["type": ["string", "object"]]])]
+            #expect(
+                parser.parse(content: frame(#"{"m":"</arg_value>"}"#), tools: objectOrString)?
+                    .function.arguments["x"] == .object(["m": .string("</arg_value>")]))
+            #expect(
+                parser.parse(content: frame("{draft"), tools: objectOrString)?
+                    .function.arguments["x"] == .string("{draft"))
+        }
+
+        @Test("A typed value of another type is returned as generated")
+        func typeMismatches() {
+            for (type, raw, value) in [
+                ("integer", "true", JSONValue.bool(true)), ("integer", "1.25", .double(1.25)),
+                ("boolean", "1", .int(1)), ("boolean", "yes", .string("yes")),
+                ("null", "nil", .string("nil")), ("number", #""1""#, .string("1")),
+                ("array", "{}", .object([:])), ("object", "[]", .array([])),
+                ("number", "1e309", .string("1e309")), ("number", "01", .string("01")),
+                ("integer", "18446744073709551615", .string("18446744073709551615")),
+                ("object", #"{"x":1,"x":2}"#, .string(#"{"x":1,"x":2}"#)),
+            ] {
+                #expect(parse(raw, type: type)?.function.arguments["x"] == value, "\(type) \(raw)")
+            }
+        }
+
+        @Test("Frames that break the grammar still fail closed")
+        func grammarFailuresStayClosed() {
+            let tools = [tool(properties: ["x": ["type": "integer"]])]
+            for text in [
+                frame("1<tool_call>f</tool_call>"), frame("{\"a\":<arg_key>"),
+                "<tool_call>f<arg_key>x</arg_key><arg_value>1</arg_value>",
+                "<tool_call>f<arg_key></arg_key><arg_value>1</arg_value></tool_call>",
+                "<tool_call>g<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+            ] {
+                #expect(parser.parse(content: text, tools: tools) == nil, "\(text)")
+                #expect(parser.parseEOS(frame("2") + text, tools: tools).isEmpty, "\(text)")
+            }
+        }
+
         @Test("Argument names preserve leading combining scalars and reject semantic duplicates")
         func unicodeKeys() throws {
             let key = "\u{301}name"
