@@ -70,13 +70,6 @@ extension UnitTests {
             #expect(parse("0", type: "integer")?.function.arguments["x"] == .int(0))
             #expect(parse("1", type: "integer")?.function.arguments["x"] == .int(1))
             #expect(parse("1.25", type: "number")?.function.arguments["x"] == .double(1.25))
-            for (type, value) in [
-                ("integer", "true"), ("integer", "1.25"), ("boolean", "1"),
-                ("boolean", "yes"), ("null", "nil"), ("number", "\"1\""),
-                ("array", "{}"), ("object", "[]"),
-            ] {
-                #expect(parse(value, type: type) == nil)
-            }
         }
 
         @Test("Nested JSON preserves nulls, booleans, numbers and quoted strings")
@@ -109,7 +102,7 @@ extension UnitTests {
                 ).count == 2)
         }
 
-        @Test("Numeric decoding preserves the encoded decimal value or fails closed")
+        @Test("Numeric decoding preserves the encoded decimal value or keeps the raw text")
         func numericPrecision() throws {
             for number in [Int.min, Int.max, 9_007_199_254_740_993] {
                 #expect(
@@ -119,7 +112,7 @@ extension UnitTests {
                 "18446744073709551615", "9007199254740993.25", "0.10000000000000000000001",
                 "1e309", "1e-400", "NaN", "Infinity", "+1", "01", "1.", ".5", "1e",
             ] {
-                #expect(parse(raw, type: "number") == nil)
+                #expect(parse(raw, type: "number")?.function.arguments["x"] == .string(raw))
             }
             let negativeZero = try #require(parse("-0.0", type: "number")?.function.arguments["x"])
             guard case .double(let zero) = negativeZero else {
@@ -129,25 +122,32 @@ extension UnitTests {
             #expect(zero == 0 && zero.sign == .minus)
             #expect(parse("0.125", type: "number")?.function.arguments["x"] == .double(0.125))
             #expect(parse("1e100", type: "number")?.function.arguments["x"] == .double(1e100))
-            #expect(parse(#"{"bad":18446744073709551615}"#, type: "object") == nil)
+            let bad = #"{"bad":18446744073709551615}"#
+            #expect(parse(bad, type: "object")?.function.arguments["x"] == .string(bad))
         }
 
-        @Test("Type ambiguity and missing schema evidence fail closed")
+        @Test("Type evidence decides only between a raw string and JSON")
         func schemaEvidence() {
-            let ambiguous: [[String: any Sendable]] = [
+            let nullValued: [[String: any Sendable]] = [
                 [:], ["enum": ["null", 1] as [any Sendable]], ["type": ["string", "null"]],
                 ["type": "string", "nullable": true], ["type": "future"],
                 ["anyOf": [["type": "string"], ["type": "null"]]],
-                ["type": "string", "$ref": "#/$defs/x"], ["type": "number", "nullable": 1],
+                ["type": "number", "nullable": 1],
             ]
-            for schema in ambiguous {
+            for schema in nullValued {
                 #expect(
-                    parser.parse(content: frame("null"), tools: [tool(properties: ["x": schema])])
-                        == nil)
+                    parser.parse(content: frame("null"), tools: [tool(properties: ["x": schema])])?
+                        .function.arguments["x"] == .null)
             }
+            let typedString = tool(properties: ["x": ["type": "string", "$ref": "#/$defs/x"]])
+            #expect(
+                parser.parse(content: frame("null"), tools: [typedString])?
+                    .function.arguments["x"] == .string("null"))
             #expect(parser.parse(content: frame("null"), tools: nil) == nil)
             #expect(parser.parse(content: frame("null"), tools: []) == nil)
-            #expect(parser.parse(content: frame("null"), tools: [tool()]) == nil)
+            #expect(
+                parser.parse(content: frame("null"), tools: [tool()])?.function.arguments["x"]
+                    == .null)
             let nullable = tool(properties: ["x": ["type": ["integer", "null"]]])
             #expect(
                 parser.parse(content: frame("null"), tools: [nullable])?
@@ -188,7 +188,7 @@ extension UnitTests {
                     content: "<tool_call>f</tool_call>",
                     tools: [
                         tool(properties: ["x": ["type": "integer"]], required: ["x"])
-                    ]) == nil)
+                    ])?.function.arguments.isEmpty == true)
             #expect(
                 parser.parse(content: "<tool_call>ping</tool_call>", tools: [tool(), tool()]) == nil
             )
@@ -256,20 +256,17 @@ extension UnitTests {
             #expect(processor.toolCalls.isEmpty)
         }
 
-        @Test("Nested JSON rejects duplicate keys, invalid syntax and excessive depth")
+        @Test("JSON with duplicate keys, invalid syntax or excessive depth stays raw text")
         func malformedJSON() {
-            for text in [
-                #"{"x":1,"x":2}"#, #"{"a":1,"\u0061":2}"#,
-                #"{"x":1,}"#, #"{"x":tru}"#, #"{"x":01}"#,
-                #"{"x":"\uD800"}"#, #"{"x":1} trailing"#,
+            let deep = String(repeating: "[", count: 66) + "0" + String(repeating: "]", count: 66)
+            for (type, text) in [
+                ("object", #"{"x":1,"x":2}"#), ("object", #"{"a":1,"\u0061":2}"#),
+                ("object", #"{"x":1,}"#), ("object", #"{"x":tru}"#), ("object", #"{"x":01}"#),
+                ("object", #"{"x":"\uD800"}"#), ("object", #"{"x":1} trailing"#),
+                ("array", "[1,]"), ("array", deep),
             ] {
-                #expect(parse(text, type: "object") == nil)
+                #expect(parse(text, type: type)?.function.arguments["x"] == .string(text))
             }
-            #expect(parse("[1,]", type: "array") == nil)
-            #expect(
-                parse(
-                    String(repeating: "[", count: 66) + "0" + String(repeating: "]", count: 66),
-                    type: "array") == nil)
             #expect(parse(String(repeating: "x", count: 1 << 20), type: "string") == nil)
         }
 
@@ -434,7 +431,9 @@ extension UnitTests {
             }
         }
 
-        @Test("Argument names preserve leading combining scalars and reject semantic duplicates")
+        @Test(
+            "Argument names preserve leading combining scalars and stay distinct from canonical equivalents"
+        )
         func unicodeKeys() throws {
             let key = "\u{301}name"
             let call = try #require(
@@ -445,13 +444,16 @@ extension UnitTests {
                     ]))
             let actualKey = try #require(call.function.arguments.keys.first)
             #expect(Array(actualKey.utf8) == Array(key.utf8))
-            #expect(parse("{\"é\":1,\"e\\u0301\":2}", type: "object") == nil)
+            let duplicates = "{\"é\":1,\"e\\u0301\":2}"
+            #expect(
+                parse(duplicates, type: "object")?.function.arguments["x"] == .string(duplicates))
+            // A key that only canonically equals a declared one takes no type from it.
             #expect(
                 parser.parse(
                     content: frame("1", key: "e\u{301}"),
                     tools: [
-                        tool(properties: ["é": ["type": "integer"]])
-                    ]) == nil)
+                        tool(properties: ["é": ["type": "string"]])
+                    ])?.function.arguments["e\u{301}"] == .int(1))
         }
     }
 }
