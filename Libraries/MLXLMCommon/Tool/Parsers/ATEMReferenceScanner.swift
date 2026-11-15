@@ -237,6 +237,9 @@ struct ATEMDeclaredTools: Sendable {
 /// JSON types a parameter schema admits.
 enum ATEMReferenceValue {
     static let maximumDepth = 32
+    /// The most arrays and objects a decoded value opens at once:
+    /// `ToolArgumentNormalization.maximumValueDepth`.
+    static let maximumValueDepth = ToolArgumentNormalization.maximumValueDepth
 
     /// Keeps the text when the schema admits only a string. Otherwise decodes
     /// JSON; when the schema also admits a string, the decoded value is used
@@ -337,8 +340,16 @@ enum ATEMReferenceValue {
 
     /// Decodes any JSON value, a bare scalar included. A number written with
     /// a fraction or an exponent stays a floating-point number.
+    ///
+    /// The text is the model's, so it is bounded as a client's body is.
+    /// `JSONSerialization` reads 512 levels, and decoding, encoding,
+    /// comparing, hashing and releasing a value each recurse once per level,
+    /// on a cooperative thread's 512 KiB stack. A value nested deeper than
+    /// `maximumValueDepth` is not decoded: it stays text, as one that does not
+    /// parse does.
     static func decode(_ raw: String) -> JSONValue? {
-        guard let data = raw.data(using: .utf8),
+        guard !ToolArgumentNormalization.nestsPastTheBound(raw),
+            let data = raw.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(
                 with: data, options: [.fragmentsAllowed])
         else { return nil }

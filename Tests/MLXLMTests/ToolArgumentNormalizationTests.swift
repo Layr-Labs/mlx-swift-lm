@@ -162,6 +162,44 @@ struct ToolArgumentNormalizationTests {
         }
     }
 
+    /// The text is the model's, so it is bounded as a client's body is:
+    /// reading, encoding, comparing and releasing a value recurse once per
+    /// level. Past 63 levels of arrays and objects, JSON text keeps its
+    /// spelling, as a Python literal past 32 levels already does.
+    @Test("JSON text nested past the bound keeps its spelling")
+    func boundedJSONNesting() {
+        func nested(_ depth: Int, object: Bool) -> String {
+            object
+                ? String(repeating: "{\"a\":", count: depth) + "1"
+                    + String(repeating: "}", count: depth)
+                : String(repeating: "[", count: depth) + "1" + String(repeating: "]", count: depth)
+        }
+        func depth(of value: JSONValue?) -> Int {
+            switch value {
+            case .array(let items): 1 + depth(of: items.first)
+            case .object(let fields): 1 + depth(of: fields.values.first)
+            default: 0
+            }
+        }
+        for object in [false, true] {
+            let schema: [String: any Sendable] = ["type": object ? "object" : "array"]
+            let atBound = ToolArgumentNormalization.normalize(
+                .string(nested(63, object: object)), schema: schema)
+            #expect(depth(of: atBound) == 63)
+            for count in [64, 100] {
+                let past = nested(count, object: object)
+                #expect(
+                    ToolArgumentNormalization.normalize(.string(past), schema: schema)
+                        == .string(past))
+                let outer: [String: any Sendable] = [
+                    "type": "object", "properties": ["inner": schema],
+                ]
+                let member = JSONValue.object(["inner": .string(past)])
+                #expect(ToolArgumentNormalization.normalize(member, schema: outer) == member)
+            }
+        }
+    }
+
     @Test("Python container parsing is bounded and rejects incomplete structure")
     func boundedLiterals() {
         #expect(
