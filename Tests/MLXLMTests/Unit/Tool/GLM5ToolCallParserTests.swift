@@ -407,6 +407,12 @@ extension UnitTests {
                 frame(#""12"#, key: "n") + frame(#"14""#, key: "n"), tools: integer)
             #expect(
                 calls.map { $0.function.arguments["n"] } == [.string(#""12"#), .string(#"14""#)])
+            // A string union reads an object only where `object` is declared.
+            let optional: [String: any Sendable] = ["type": ["string", "null"]]
+            let split = parser.parseEOS(
+                frame(#"{"a":""#) + frame(#""}"#), tools: [tool(properties: ["x": optional])])
+            #expect(
+                split.map { $0.function.arguments["x"] } == [.string(#"{"a":""#), .string(#""}"#)])
         }
 
         @Test("Schema-checked parsing (the switch off) keeps every refusal it had")

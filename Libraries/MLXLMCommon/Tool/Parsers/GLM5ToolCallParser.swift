@@ -9,10 +9,12 @@ import Foundation
 
 /// Parses complete native GLM5 frames, not GLM4's permissive recovery dialect.
 /// The template emits top-level strings verbatim and other values as JSON. A
-/// value whose declared type is only `string` is raw text. A value of another
-/// declared type is JSON when it matches that type; any other value is JSON
-/// when its raw text parses (for a union with `string`, only as one of the
-/// other types), else that raw text, as vLLM and SGLang read it.
+/// value whose declared type is only `string` is raw text. A JSON value of a
+/// declared non-string type, or any JSON but a string where no `string` is
+/// declared, keeps its JSON reading (quoted delimiters in it are data); any
+/// other value is JSON when its raw text parses (for a union with `string`,
+/// only as one of the other types), else that raw text, as vLLM and SGLang
+/// read it. Types come from `argumentTypes`.
 ///
 /// Only the frame grammar and the declared function name are checked: a frame
 /// missing a required argument, with an undeclared argument or with a value of
