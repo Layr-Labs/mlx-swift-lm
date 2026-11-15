@@ -83,10 +83,12 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
         if let nullable = schema["nullable"], JSONValue.from(nullable) == .bool(true) {
             types.insert("null")
         }
-        return types.intersection([
-            "string", "integer", "number", "boolean", "null", "object", "array",
-        ])
+        return types.intersection(jsonTypeNames)
     }
+
+    fileprivate static let jsonTypeNames: Set<String> = [
+        "string", "integer", "number", "boolean", "null", "object", "array",
+    ]
 }
 
 private struct GLM5ToolOutputReader {
@@ -204,11 +206,7 @@ private struct GLM5ToolOutputReader {
                 guard case .bool(let enabled) = JSONValue.from(nullable) else { return true }
                 if enabled { types.insert("null") }
             }
-            guard
-                types.isSubset(of: [
-                    "string", "integer", "number", "boolean", "null", "object", "array",
-                ])
-            else { return true }
+            guard types.isSubset(of: GLM5ToolCallParser.jsonTypeNames) else { return true }
             if types.contains("string") ? types.count != 1 : !matches(value, types: types) {
                 return true
             }

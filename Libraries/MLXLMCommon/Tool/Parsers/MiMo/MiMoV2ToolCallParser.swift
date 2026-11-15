@@ -13,10 +13,9 @@ import Foundation
 /// cannot infer the caller's intended value from an otherwise valid collision.
 /// Declaration/schema/cardinality validation remains mandatory at the caller.
 ///
-/// A value whose parameter declares a type other than `string` is JSON when
-/// it parses as one of those types (for a union with `string`, only as one of
-/// the others; with only other types, as any JSON); any other value is its
-/// raw text, so a union or a value of another type is returned as generated.
+/// A value is returned as generated: where its parameter declares only types
+/// other than `string`, JSON of any type when it parses; in a union with
+/// `string`, JSON only as one of the other types; otherwise its raw text.
 /// `grammarOnly` false (`GrammarOnlyToolParsing`) restores refusing a union
 /// and a value of another type.
 public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {

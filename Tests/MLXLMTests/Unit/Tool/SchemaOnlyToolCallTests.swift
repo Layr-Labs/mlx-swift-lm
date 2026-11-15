@@ -157,6 +157,9 @@ extension UnitTests {
                 let call = parser.parse(content: frame, tools: Self.tools(shape))
                 #expect((call == nil) == shapes.contains(shape), "\(format) \(shape)")
             }
+        }
+
+        @Test func theSwitchIsOnUnlessItsVariableTurnsItOff() {
             #expect(GrammarOnlyToolParsing.enabled(environment: [:]))
             for value in ["0", "off", " FALSE ", "no"] {
                 #expect(
