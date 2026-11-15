@@ -167,7 +167,8 @@ enum Qwen4ExpVideoSampler {
     /// The same reference indices, read at presentation times: the frame count
     /// comes from the track's shown span (its first to its last non-empty edit)
     /// and nominal rate, and an image generator takes each selected frame at the
-    /// middle of its interval. A clip trimmed without re-encoding and a long clip
+    /// middle of its interval (a time in an empty edit moves to the nearer shown
+    /// frame). A clip trimmed without re-encoding, an empty edit and a long clip
     /// then need no full decode. A variable-rate clip is sampled evenly in time,
     /// where the reference samples it evenly in frame number.
     static func sampleByPresentationTime(
@@ -210,33 +211,26 @@ enum Qwen4ExpVideoSampler {
         guard duration.isFinite, duration > 0, rate.isFinite, rate > 0 else {
             throw Failure.invalidMetadata
         }
-        let frameCount = (duration * Double(rate)).rounded()
-        guard frameCount >= 1 else { throw Failure.invalidMetadata }
-        guard frameCount <= Double(maxIndexedFrames) else { throw Failure.excessiveMetadata }
-        // The rate of the rounded count: a Float rate of 30.000002 would sample
-        // one frame fewer than the reference's 30.
-        let fps = frameCount / duration
+        let (frameCount, fps) = try shownFrames(duration: duration, nominalRate: rate)
         let indices = try Qwen4ExpMediaGeometry.sampleIndices(
-            totalFrames: Int(frameCount), sourceFPS: fps,
+            totalFrames: frameCount, sourceFPS: fps,
             targetFPS: config.fps, minFrames: config.minFrames, maxFrames: config.maxFrames)
         let latest = max(0, duration - 0.001 / fps)
         let times = indices.map { index in
-            CMTimeAdd(
-                start,
-                CMTime(
-                    seconds: min((Double(index) + 0.5) / fps, latest),
-                    preferredTimescale: 1_000_000))
+            shownTime(
+                CMTimeAdd(
+                    start,
+                    CMTime(
+                        seconds: min((Double(index) + 0.5) / fps, latest),
+                        preferredTimescale: 1_000_000)),
+                in: shown, halfFrame: 0.5 / fps)
         }
         let resize = { (image: CIImage) in try process(image, indices.count) }
-        var frames = try await generatedFrames(asset, times: times, tolerance: .zero, resize)
-        // A time in a gap of the track has no image; read it again within one
-        // sampling step, which also retries a dropped frame.
+        var frames = try await generatedFrames(asset, times: times, resize)
+        // One more read of a frame the generator dropped, as the readers retry.
         let missing = frames.indices.filter { frames[$0] == nil }
         if !missing.isEmpty {
-            let step = CMTime(
-                seconds: duration / Double(indices.count), preferredTimescale: 1_000_000)
-            let retried = try await generatedFrames(
-                asset, times: missing.map { times[$0] }, tolerance: step, resize)
+            let retried = try await generatedFrames(asset, times: missing.map { times[$0] }, resize)
             for (slot, frame) in zip(missing, retried) { frames[slot] = frame }
         }
         let complete = frames.compactMap { $0 }
@@ -244,15 +238,40 @@ enum Qwen4ExpVideoSampler {
         return .init(frames: complete, indices: indices, sourceFPS: fps)
     }
 
+    /// The frame count of a shown span (its duration times the nominal rate,
+    /// rounded) and the rate it implies. A `Float` rate of 30.000002 would
+    /// otherwise sample one frame fewer than the reference's 30.
+    static func shownFrames(duration: Double, nominalRate: Float) throws -> (
+        count: Int, fps: Double
+    ) {
+        let count = (duration * Double(nominalRate)).rounded()
+        guard count.isFinite, count >= 1 else { throw Failure.invalidMetadata }
+        guard count <= Double(maxIndexedFrames) else { throw Failure.excessiveMetadata }
+        return (Int(count), count / duration)
+    }
+
+    /// `time` when a shown (non-empty) segment holds it; otherwise the nearer
+    /// edge of the shown segments, half a frame inside, since the generator has
+    /// no image in an empty edit at any tolerance.
+    static func shownTime(_ time: CMTime, in shown: [CMTimeRange], halfFrame: Double) -> CMTime {
+        guard !shown.isEmpty, !shown.contains(where: { $0.containsTime(time) }) else { return time }
+        let edges = shown.map { range -> CMTime in
+            let inset = CMTime(
+                seconds: min(halfFrame, range.duration.seconds / 2), preferredTimescale: 1_000_000)
+            return CMTimeCompare(time, range.start) < 0
+                ? CMTimeAdd(range.start, inset) : CMTimeSubtract(range.end, inset)
+        }
+        return edges.min { abs(($0 - time).seconds) < abs(($1 - time).seconds) }!
+    }
+
     /// The processed frame at each time, nil where the generator has no image.
     private static func generatedFrames(
-        _ asset: AVAsset, times: [CMTime], tolerance: CMTime,
-        _ process: (CIImage) throws -> CIImage
+        _ asset: AVAsset, times: [CMTime], _ process: (CIImage) throws -> CIImage
     ) async throws -> [MLXArray?] {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
         var frames = [MLXArray?](repeating: nil, count: times.count)
         for await result in generator.images(for: times) {
             try Task.checkCancellation()

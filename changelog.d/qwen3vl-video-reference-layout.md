@@ -17,10 +17,10 @@
 - The timestamped layout reads the selected frames at their presentation times
   (the frame count from the track's shown span, its first to last non-empty edit,
   and nominal rate; the rate then from that count), so a clip trimmed without
-  re-encoding, an empty edit and a long clip need no full decode; a time with no
-  image is read again within one sampling step. A variable-rate clip is sampled
-  evenly in time, the reference evenly in frame number. Qwen4 keeps its
-  frame-ordinal reader.
+  re-encoding, a late start or a gap (an empty edit) and a long clip need no full
+  decode. A time inside an empty edit moves to the nearer shown frame; a frame the
+  generator drops is read once more. A variable-rate clip is sampled evenly in
+  time, the reference evenly in frame number. Qwen4 keeps its frame-ordinal reader.
 - A template the tokenizer does not decode and re-encode unchanged expands in
   token space instead of failing. Video geometry and track failures of
   `Qwen3VLProcessor` are `VLMError.imageProcessingFailure` / `videoNotDecodable`,

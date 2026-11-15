@@ -227,18 +227,76 @@ extension KernelTests {
             }
         }
 
-        /// 360 frames at 29.97 fps (1,001 ticks of 1/30,000 s): the count, not
-        /// the Float nominal rate, sets the rate, so 2 fps asks for 24 frames.
+        /// The count, not the `Float` nominal rate, sets the rate: 12 s at
+        /// 30.000002 fps is 360 frames at 30 fps, and 2 fps then asks for 24
+        /// frames where the raw rate gives 23.
         @Test
-        func ntscRateGivesTheReferenceCount() async throws {
-            let (folder, url) = try await Self.temporaryClip(
-                frames: 360, fps: 30, step: 1_001, timescale: 30_000)
+        func frameCountSetsTheRate() throws {
+            let (count, fps) = try Qwen4ExpVideoSampler.shownFrames(
+                duration: 12, nominalRate: 30.000002)
+            #expect(count == 360)
+            #expect(fps == 30)
+            let reference = try Qwen4ExpMediaGeometry.sampleIndices(
+                totalFrames: count, sourceFPS: fps, maxFrames: 64)
+            let raw = try Qwen4ExpMediaGeometry.sampleIndices(
+                totalFrames: count, sourceFPS: Double(Float(30.000002)), maxFrames: 64)
+            #expect(reference.count == 24)
+            #expect(raw.count == 23, "what the raw Float rate would sample")
+        }
+
+        @Test
+        func timeInAnEmptyEditMovesToTheNearerShownFrame() {
+            let shown = [
+                CMTimeRange(start: .zero, end: CMTime(value: 1, timescale: 1)),
+                CMTimeRange(
+                    start: CMTime(value: 2, timescale: 1), end: CMTime(value: 3, timescale: 1)),
+            ]
+            func moved(_ seconds: Double) -> Double {
+                Qwen4ExpVideoSampler.shownTime(
+                    CMTime(seconds: seconds, preferredTimescale: 1_000_000), in: shown,
+                    halfFrame: 0.05
+                ).seconds
+            }
+            #expect(moved(0.5) == 0.5, "a shown time stays")
+            #expect(abs(moved(1.4) - 0.95) < 1e-6, "nearer the first segment's end")
+            #expect(abs(moved(1.6) - 2.05) < 1e-6, "nearer the second segment's start")
+            #expect(abs(moved(3.5) - 2.95) < 1e-6, "after the last segment")
+        }
+
+        /// A pass-through export of 0-1 s, a 1 s empty edit, then 1-2 s of the
+        /// clip: two of the six sampled times fall in the gap.
+        @Test
+        func interiorEmptyEditIsReadFromTheNearerFrames() async throws {
+            let (folder, url) = try await Self.temporaryClip(frames: 20, fps: 10)
             defer { try? FileManager.default.removeItem(at: folder) }
+            let source = AVURLAsset(url: url)
+            let track = try #require(try await source.loadTracks(withMediaType: .video).first)
+            let composition = AVMutableComposition()
+            let target = try #require(
+                composition.addMutableTrack(
+                    withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+            let second = CMTime(value: 1, timescale: 1)
+            try target.insertTimeRange(
+                CMTimeRange(start: .zero, duration: second), of: track, at: .zero)
+            try target.insertTimeRange(
+                CMTimeRange(start: second, duration: second), of: track, at: second)
+            target.insertEmptyTimeRange(CMTimeRange(start: second, duration: second))
+            let exported = folder.appendingPathComponent("gap.mp4")
+            let session = try #require(
+                AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough)
+            )
+            session.outputURL = exported
+            session.outputFileType = .mp4
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                session.exportAsynchronously { done.resume() }
+            }
+            #expect(session.status == .completed, "\(String(describing: session.error))")
+
             let sample = try await Qwen4ExpVideoSampler.sampleByPresentationTime(
-                .avAsset(AVURLAsset(url: url)), config: Self.configuration(maxFrames: 64)
+                .avAsset(AVURLAsset(url: exported)), config: Self.configuration(maxFrames: 64)
             ) { image, _ in image }
-            #expect(sample.indices.count == 24)
-            #expect(sample.indices.last == 359)
+            #expect(sample.frames.count == sample.indices.count)
+            #expect(sample.indices.count == 6, "3 s at 10 fps, 2 fps")
         }
     }
 }
