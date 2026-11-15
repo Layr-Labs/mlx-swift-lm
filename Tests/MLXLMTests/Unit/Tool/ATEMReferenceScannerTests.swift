@@ -344,7 +344,8 @@ extension UnitTests {
                     #expect(read(past, "v") == .string(past), "\(depth)")
                     let member = String(decoding: try JSONEncoder().encode(past), as: UTF8.self)
                     #expect(
-                        read("{\"v\": \(member)}", "o") == .object(["v": .string(past)]), "\(depth)")
+                        read("{\"v\": \(member)}", "o") == .object(["v": .string(past)]), "\(depth)"
+                    )
                 }
             }
         }
