@@ -79,6 +79,10 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         strict || escapeMarker != nil ? [] : ["<end_function_call>"]
     }
     private let strict: Bool
+    /// False restores the schema refusal: under `additionalProperties: false`
+    /// a call with an undeclared argument does not parse
+    /// (`GrammarOnlyToolParsing`).
+    private let grammarOnly: Bool
 
     private let quoteMarkers = ["<|\"|>", "<escape>"]
     private let wrapperTags = [
@@ -98,20 +102,25 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     /// The superset parser used by the fork's server. It accepts the Gemma 4
     /// `<|tool_call>` frame and the older `<start_function_call>` frame.
     /// `strict` accepts only the exact Gemma 4 template language.
-    public init(strict: Bool = false) {
+    public init(strict: Bool = false, grammarOnly: Bool = GrammarOnlyToolParsing.isEnabled) {
         self.startTag = "<|tool_call>"
         self.endTag = "<tool_call|>"
         self.escapeMarker = nil
         self.strict = strict
+        self.grammarOnly = grammarOnly
         self.scanner = StructuredTextScanner(quotes: ["\""])
     }
 
     /// A parser for one Gemma dialect with explicit tags and escape marker.
-    public init(startTag: String, endTag: String, escapeMarker: String) {
+    public init(
+        startTag: String, endTag: String, escapeMarker: String,
+        grammarOnly: Bool = GrammarOnlyToolParsing.isEnabled
+    ) {
         self.startTag = startTag
         self.endTag = endTag
         self.escapeMarker = escapeMarker
         self.strict = false
+        self.grammarOnly = grammarOnly
         self.scanner = StructuredTextScanner(quotes: ["\""], escapeMarker: escapeMarker)
     }
 
@@ -206,10 +215,11 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         tools: [[String: any Sendable]]?
     ) -> [String: JSONValue]? {
         let schema = argumentSchema(funcName: funcName, tools: tools)
+        let refusesUndeclared = !grammarOnly && !schema.allowsAdditional
         var parser = GemmaArgumentValueParser(text, rejectDuplicates: strict)
         if let parsed = parser.parseTopLevelArguments(),
             parser.isAtEnd,
-            schema.allowsAdditional || parsed.keys.allSatisfy(schema.names.contains)
+            !refusesUndeclared || parsed.keys.allSatisfy(schema.names.contains)
         {
             // A bare scalar is read as its parameter's schema asks, so
             // `zip:01000` for a string parameter stays "01000".
@@ -236,7 +246,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(
                 in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
-            guard schema.allowsAdditional || schema.names.contains(key) else { return nil }
+            guard !refusesUndeclared || schema.names.contains(key) else { return nil }
             let value = JSONValue.from(parseValue(rawValue))
             let parameter = Self.quotedMemberSchema(key, in: parameters)
             if case .string(let text) = value,
