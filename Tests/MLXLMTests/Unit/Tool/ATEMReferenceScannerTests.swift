@@ -331,6 +331,64 @@ extension UnitTests {
             }
         }
 
+        /// Both ATEM readers type each value, then normalize the call by its
+        /// schema, which reads an array or object parameter's text as JSON
+        /// again. Text kept for nesting past the bound stays text there too,
+        /// at the top of a parameter and inside a declared object.
+        @Test func aTypedValueNestedPastTheBoundStaysTextThroughNormalization() throws {
+            for object in [false, true] {
+                let read = Self.typedReader(object: object)
+                #expect(read(Self.nested(63, object: object), "v").map(Self.depth) == 63)
+                for depth in [64, 100] {
+                    let past = Self.nested(depth, object: object)
+                    #expect(read(past, "v") == .string(past), "\(depth)")
+                    let member = String(decoding: try JSONEncoder().encode(past), as: UTF8.self)
+                    #expect(
+                        read("{\"v\": \(member)}", "o") == .object(["v": .string(past)]), "\(depth)")
+                }
+            }
+        }
+
+        /// The same reading at `JSONSerialization`'s 512 levels, then the
+        /// walks a host makes over the call: encoding, comparing, hashing and
+        /// releasing it.
+        @Test func aTypedValueAtTheParsersLimitNeverExhaustsTheStack() throws {
+            for object in [false, true] {
+                let read = Self.typedReader(object: object)
+                let raw = Self.nested(512, object: object)
+                let member = String(decoding: try JSONEncoder().encode(raw), as: UTF8.self)
+                var arguments: [String: JSONValue]? = [
+                    "v": read(raw, "v") ?? .null, "o": read("{\"v\": \(member)}", "o") ?? .null,
+                ]
+                _ = try JSONEncoder().encode(arguments)
+                #expect(arguments == arguments)
+                #expect(Set(arguments.map { Array($0.values) } ?? []).count == 2)
+                #expect(arguments?["v"] == .string(raw))
+                #expect(arguments?["o"] == .object(["v": .string(raw)]))
+                arguments = nil
+            }
+        }
+
+        /// Reads parameter `v` (an array, or an object) or `o` (an object with
+        /// such a member) of tool `f` as `OnyxReferenceDecoder` and
+        /// `ATEMReferenceReader` read a call: typed, then normalized.
+        private static func typedReader(object: Bool) -> (String, String) -> JSONValue? {
+            let typed: [String: any Sendable] = ["type": object ? "object" : "array"]
+            let outer: [String: any Sendable] = ["type": "object", "properties": ["v": typed]]
+            let parameters: [String: any Sendable] = [
+                "type": "object", "properties": ["v": typed, "o": outer] as [String: any Sendable],
+            ]
+            let function: [String: any Sendable] = ["name": "f", "parameters": parameters]
+            let specs: [[String: any Sendable]] = [["function": function]]
+            let tools = ATEMDeclaredTools(specs)
+            return { raw, parameter in
+                let value = tools.value(raw[...], parameter: parameter, ofTool: "f")
+                let call = ToolCall(function: .init(name: "f", arguments: [parameter: value]))
+                return ToolArgumentNormalization.normalize(call, tools: specs)
+                    .function.arguments[parameter]
+            }
+        }
+
         @Test func undeclaredParametersDecodeWhenTheyParse() {
             let tools = ATEMDeclaredTools([["function": ["name": "f"] as [String: any Sendable]]])
             #expect(tools.value("12", parameter: "n", ofTool: "f") == .int(12))
