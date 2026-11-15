@@ -2508,8 +2508,10 @@ struct ToolTests {
         #expect(toolCall.function.arguments["sort"] == .string("recent"))
     }
 
-    @Test("Test Gemma 4 Tool Call Parser - rejects unknown strict-schema arguments")
-    func testGemma4ToolCallParserRejectsUnknownStrictArgument() {
+    @Test(
+        "Test Gemma 4 Tool Call Parser - returns undeclared arguments; the switch restores the refusal"
+    )
+    func testGemma4ToolCallParserReturnsUndeclaredArgument() throws {
         let parser = GemmaFunctionParser()
         let tools: [[String: any Sendable]] = [
             [
@@ -2530,7 +2532,10 @@ struct ToolTests {
 
         let content =
             "<|tool_call>call:weather{location:Paris,country:FR,unit:celsius}<tool_call|>"
-        #expect(parser.parse(content: content, tools: tools) == nil)
+        let call = try #require(parser.parse(content: content, tools: tools))
+        #expect(call.function.arguments["country"] == .string("FR"))
+        #expect(
+            GemmaFunctionParser(grammarOnly: false).parse(content: content, tools: tools) == nil)
     }
 
     @Test("Test Gemma Function Parser - Legacy Tags")
