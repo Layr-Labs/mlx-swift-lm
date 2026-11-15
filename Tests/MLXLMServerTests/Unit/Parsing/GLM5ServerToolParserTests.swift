@@ -44,6 +44,34 @@ extension UnitTests {
             #expect(handler.parseFailureCount == 0)
         }
 
+        @Test func providerStreamHandlerReturnsCallsThatMissRequiredArguments() {
+            let parameters: [String: any Sendable] = [
+                "type": "object",
+                "properties": [
+                    "i": ["type": "string"], "path": ["type": "string"],
+                ] as [String: any Sendable],
+                "required": ["path", "i"],
+            ]
+            let tools: [[String: any Sendable]] = [
+                [
+                    "type": "function",
+                    "function": ["name": "read", "parameters": parameters]
+                        as [String: any Sendable],
+                ]
+            ]
+            let handler = BatchedToolStreamHandler(format: .glm5, tools: tools)
+            let call =
+                "<tool_call>read<arg_key>path</arg_key><arg_value>CONTEXT.md</arg_value></tool_call>"
+            #expect(handler.processChunk(call) == nil)
+            #expect(handler.processChunk("\n" + call) == nil)
+            #expect(
+                handler.finish().map(\.function.arguments) == [
+                    ["path": .string("CONTEXT.md")], ["path": .string("CONTEXT.md")],
+                ])
+            #expect(handler.takeResidualText() == nil)
+            #expect(handler.parseFailureCount == 0)
+        }
+
         @Test func providerStreamHandlerReturnsWholeMalformedBatchOnce() {
             let tools: [[String: any Sendable]] = [
                 [
