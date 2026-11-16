@@ -702,6 +702,9 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 /// registration, and the watchdog — all lock-protected.
 public final class EngineLoopV2: @unchecked Sendable {
     let nativeShutdownState: CBv2NativeShutdownState?
+    /// Set before `start()` when the issued native contract qualifies
+    /// grammar-aware MTP verification (`grammarMTPEnabled`).
+    var nativeConstrainedMTPVerification = false
     private let blockBatchBudget: MiMoV26BlockBatchBudget?
     private let rectangularDenseBudget: MiMoV26RectangularDenseBudget?
     // Build-to-step handoff only; real ownership remains the existing native
@@ -885,6 +888,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Root must retain/charge every attached copy before its execution.
     var nativeHistoricalMTPCaptureBeforeCommit: ((CBv2InFlightStep) throws -> Void)?
     var nativeSubmittedWorkFailureForTesting: (() throws -> Void)?
+    var mtpGrammarColumnSubmittedForTesting: ((Int) throws -> Void)?
     var nativeRequiredAssistantFenceForTesting: ((any CBv2MTPRequestState) throws -> Void)?
     var nativePendingRetirementCountForTesting: Int { nativePendingRetirements.count }
     /// Engine-queue-confined fact only. Call within the existing test boundary;
