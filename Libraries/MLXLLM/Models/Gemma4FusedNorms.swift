@@ -170,6 +170,8 @@ enum Gemma4FusedNorms {
         func rotation(headDim: Int, base: Float?, frequencies: MLXArray?, dtype: DType)
             -> Rotation?
         {
+            // The kernels run only on the GPU (a test may make the CPU the default).
+            guard Device.defaultDevice().deviceType == .gpu else { return nil }
             if let known = lock.withLock({ rotations[dtype] }) { return known }
             var made: Rotation?
             if (1 ... 4096).contains(headDim),

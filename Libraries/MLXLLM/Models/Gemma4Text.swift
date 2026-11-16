@@ -1511,7 +1511,8 @@ public class Gemma4DecoderLayer: Module {
         let (dense, experts, weights) = layer.fusedFeedforwardMiddle(
             arguments[0], arguments[1], arguments[2], isExpertPrefill: false,
             routing: layer.compiledFusedMiddleRouting ?? nil,
-            expertRows: layer.compiledFusedMiddleExpertRows ?? false)
+            expertRows: layer.compiledFusedMiddleExpertRows ?? false,
+            exactGeGLU: layer.compiledFusedMiddleGeGLU ?? false)
         return [dense, experts] + (weights.map { [$0] } ?? [])
     }
     private let compiledFusedMiddleLock = NSLock()
@@ -1783,7 +1784,7 @@ public class Gemma4DecoderLayer: Module {
             } else {
                 (dense, expertOutput, expertWeights) = fusedFeedforwardMiddle(
                     norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill,
-                    routing: routing, expertRows: expertRows)
+                    routing: routing, expertRows: expertRows, exactGeGLU: exactGeGLU)
             }
             let (out, next) = Gemma4FusedNorms.feedforwardTail(
                 dense: dense,
@@ -1822,7 +1823,20 @@ public class Gemma4DecoderLayer: Module {
     /// weights instead (the feed-forward tail forms the sum).
     func fusedFeedforwardMiddle(
         _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
-        routing: Gemma4FusedNorms.Routing? = nil, expertRows: Bool = false
+        routing: Gemma4FusedNorms.Routing? = nil, expertRows: Bool = false,
+        exactGeGLU: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        // The dense MLP's and the experts' GeGLU may run as `ExactGeGLU` here.
+        ExactGeGLU.$inScope.withValue(exactGeGLU) {
+            fusedFeedforwardMiddleBody(
+                dense, experts, router, isExpertPrefill: isExpertPrefill, routing: routing,
+                expertRows: expertRows)
+        }
+    }
+
+    private func fusedFeedforwardMiddleBody(
+        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
+        routing: Gemma4FusedNorms.Routing?, expertRows: Bool
     ) -> (MLXArray, MLXArray, MLXArray?) {
         guard let routerModule = self.router, let expertsModule = self.experts else {
             preconditionFailure("Gemma4: the fused feed-forward middle needs experts")

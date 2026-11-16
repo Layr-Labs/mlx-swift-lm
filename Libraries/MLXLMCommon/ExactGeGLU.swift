@@ -20,6 +20,11 @@ public enum ExactGeGLU {
     @TaskLocal public static var enabledOverride: Bool?
     public static var isEnabled: Bool { enabledOverride ?? enabledByEnvironment }
 
+    /// Set by a caller whose decode-shaped forward may use the kernel (Gemma
+    /// 4's fused feed-forward middle). Elsewhere `compiledGeGLU` keeps its
+    /// contract: shape-agnostic compilation and gradients.
+    @TaskLocal public static var inScope = false
+
     /// The widest call covered (decode-shaped rows: 16 tokens of a dense MLP
     /// or of 8 experts). Prompt chunks keep `compiledGeGLU`.
     public static let maximumElements = 131_072
@@ -32,12 +37,12 @@ public enum ExactGeGLU {
             && Verification.shared.verified(dtype)
     }
 
-    /// Whether the kernel covers `gate` and `up`: same shape and dtype, at
-    /// most `maximumElements`, and `prepare` already matched this dtype. Never
-    /// measures, so it is safe inside a compiled trace.
+    /// Whether the kernel covers `gate` and `up`: inside `inScope`, same shape
+    /// and dtype, at most `maximumElements`, and `prepare` already matched this
+    /// dtype. Never measures, so it is safe inside a compiled trace.
     public static func supports(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-        guard isEnabled, gate.shape == up.shape, gate.dtype == up.dtype,
-            gate.size <= maximumElements
+        guard inScope, isEnabled, Device.defaultDevice().deviceType == .gpu, gate.shape == up.shape,
+            gate.dtype == up.dtype, gate.size <= maximumElements
         else { return false }
         return Verification.shared.known(gate.dtype) == true
     }

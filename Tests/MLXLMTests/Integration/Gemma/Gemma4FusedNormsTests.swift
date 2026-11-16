@@ -537,6 +537,13 @@ struct Gemma4FusedNormsTests {
             #expect(!ExactGeGLU.prepare(.bfloat16))
             return
         }
+        // Outside a caller's scope the compiled ops keep their contract.
+        let outside = MLXArray.zeros([1, 1, 8, 704], dtype: .bfloat16)
+        #expect(!ExactGeGLU.supports(outside, outside))
+        try ExactGeGLU.$inScope.withValue(true) { try checkExactGeGLU() }
+    }
+
+    private func checkExactGeGLU() throws {
         for dtype in [DType.bfloat16, .float16] {
             #expect(ExactGeGLU.prepare(dtype), "\(dtype)")
             for shape in [[1, 1, 8, 704], [3, 1, 8, 704], [2, 4, 2112], [1, 1, 2112]] {
