@@ -817,6 +817,10 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale?
 
     @ModuleInfo var rope: RoPELayer
+    /// The base `rope` was built with (a plain `RoPE` on sliding layers).
+    let ropeBase: Float
+    /// The fused prologue's measured rotation per activation dtype.
+    let prologueRotations = Gemma4FusedNorms.RotationCache()
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
@@ -863,6 +867,7 @@ class Gemma4Attention: Module {
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
         // RoPE: sliding uses default, full uses proportional with partial rotation
+        self.ropeBase = isSliding ? config.slidingRopeTheta : config.fullRopeTheta
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
@@ -1085,8 +1090,15 @@ class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+        let projectedQueries = Gemma4BatchDecodeProjection.linear(qProj, queryInput)
+        if lastQueryCache == nil, !usesSharedKV,
+            let rotation = fusedPrologueRotation(projectedQueries)
+        {
+            return forwardV2FusedPrologue(
+                x, projectedQueries: projectedQueries, layerCache: layerCache,
+                rotation: rotation, outputStart: outputStart)
+        }
+        var queries = projectedQueries.reshaped(B, queryLength, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
         queries = queries.transposed(0, 2, 1, 3)
 
@@ -1180,6 +1192,77 @@ class Gemma4Attention: Module {
 
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
+            output = output[0..., outputStart..., 0...]
+        }
+        if output.dtype != outputDType {
+            output = output.asType(outputDType)
+        }
+        return (projectV2Output(output), .regular(keys: k, values: v), captured)
+    }
+
+    /// The rotation for the fused prologue (`Gemma4FusedNorms.attentionPrologue`)
+    /// on decode-shaped calls (at most `Gemma4DecoderLayer.fusedNormsMaximumWidth`
+    /// tokens per row) of a layer with its own K/V, plain norms and a rotation
+    /// MLX's `rope` writes in one call; nil keeps the unfused ops.
+    func fusedPrologueRotation(_ projectedQueries: MLXArray) -> Gemma4FusedNorms.Rotation? {
+        let dtype = projectedQueries.dtype
+        guard Gemma4FusedNorms.isPrologueEnabled, !training, tensorParallel == nil,
+            !usesSharedKV, kProj != nil, let kNorm, let vNorm,
+            projectedQueries.ndim == 3,
+            projectedQueries.dim(1) <= Gemma4DecoderLayer.fusedNormsMaximumWidth,
+            projectedQueries.dim(2) == nHeads * effectiveHeadDim,
+            type(of: qNorm) == RMSNorm.self, type(of: kNorm) == RMSNorm.self,
+            type(of: vNorm) == RMSNormNoScale.self,
+            qNorm.eps == config.rmsNormEps, kNorm.eps == config.rmsNormEps,
+            vNorm.eps == config.rmsNormEps,
+            [qNorm.weight, kNorm.weight].allSatisfy({
+                $0.dtype == dtype && $0.ndim == 1 && $0.dim(0) == effectiveHeadDim
+            })
+        else { return nil }
+        if type(of: rope) == RoPE.self {
+            // `initializeRope` with no scaling: dims = head dim, scale 1,
+            // non-traditional, `ropeBase`.
+            return prologueRotations.rotation(
+                headDim: effectiveHeadDim, base: ropeBase, frequencies: nil, dtype: dtype)
+        }
+        if type(of: rope) == ProportionalRoPE.self,
+            let exact = (rope as? ProportionalRoPE)?.exactRotation,
+            exact.dimensions == effectiveHeadDim
+        {
+            return prologueRotations.rotation(
+                headDim: effectiveHeadDim, base: nil, frequencies: exact.frequencies, dtype: dtype)
+        }
+        return nil
+    }
+
+    /// `forwardV2` with the q/k/v norms and RoPE as one kernel; the same
+    /// values as the unfused path, bit for bit.
+    private func forwardV2FusedPrologue(
+        _ x: MLXArray, projectedQueries: MLXArray, layerCache: any CBv2AttendingLayerCache,
+        rotation: Gemma4FusedNorms.Rotation, outputStart: Int
+    ) -> (MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset) {
+        guard let kProj, let kNorm else {
+            preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
+        }
+        let (B, L) = (x.dim(0), x.dim(1))
+        // The pre-update snapshot, as in `forwardV2`.
+        let capturedOffsets = layerCache.positionOffsets
+        let captured = Gemma4.PositionOffset.batch(capturedOffsets)
+        let projectedKeys = Gemma4BatchDecodeProjection.linear(kProj, x)
+        let projectedValues = vProj.map { Gemma4BatchDecodeProjection.linear($0, x) } ?? projectedKeys
+        let (queries, k, v) = Gemma4FusedNorms.attentionPrologue(
+            queries: projectedQueries, keys: projectedKeys, values: projectedValues,
+            queryHeads: nHeads, keyValueHeads: nKvHeads, headDim: effectiveHeadDim,
+            queryWeight: qNorm.weight, keyWeight: kNorm.weight, offsets: capturedOffsets,
+            rotation: rotation, eps: config.rmsNormEps)
+
+        let outputDType = queries.dtype
+        let attentionQueries =
+            outputDType == .float16 ? queries.asType(.float32) : queries
+        let attention = layerCache.updateAndAttend(
+            queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+        var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        if outputStart > 0 {
             output = output[0..., outputStart..., 0...]
         }
         if output.dtype != outputDType {

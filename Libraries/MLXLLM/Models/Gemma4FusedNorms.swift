@@ -104,6 +104,158 @@ enum Gemma4FusedNorms {
         return (outputs[0].reshaped(shape), next == nil ? nil : outputs[1].reshaped(shape))
     }
 
+    // MARK: - Attention prologue
+
+    /// Diagnostic only: `DARKBLOOM_GEMMA4_FUSED_ATTENTION_PROLOGUE=0` keeps the
+    /// unfused q/k/v norms and RoPE.
+    static let prologueEnabledByEnvironment: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_ATTENTION_PROLOGUE"] != "0"
+    /// A test or bench's own choice (nil: the environment's).
+    @TaskLocal static var prologueOverride: Bool?
+    static var isPrologueEnabled: Bool {
+        isEnabled && (prologueOverride ?? prologueEnabledByEnvironment)
+    }
+
+    /// A layer's rotation: MLX `rope` over the whole head, non-traditional,
+    /// scale 1, from `base` or from `frequencies`, with its measured form.
+    struct Rotation {
+        let form: RoPEForm
+        let usesFrequencies: Bool
+        /// `[log2(base)]`, or a placeholder.
+        let baseArray: MLXArray
+        /// The frequencies, or a placeholder.
+        let frequencyArray: MLXArray
+    }
+
+    /// A layer's measured rotation per activation dtype.
+    final class RotationCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var rotations: [DType: Rotation?] = [:]
+
+        /// The rotation for heads of `headDim` in `dtype` where the norm's
+        /// mean form and the RoPE form are both measured; nil otherwise.
+        /// Callers check `isPrologueEnabled` first.
+        func rotation(headDim: Int, base: Float?, frequencies: MLXArray?, dtype: DType)
+            -> Rotation?
+        {
+            if let known = lock.withLock({ rotations[dtype] }) { return known }
+            var made: Rotation?
+            if (1 ... 4096).contains(headDim),
+                RMSNormMeanForm.measured(width: headDim, dtype: dtype) != nil,
+                let form = RoPEForm.measured(
+                    dimensions: headDim, base: base, frequencies: frequencies, dtype: dtype)
+            {
+                let baseArray = MLXArray([base.map { log2($0) } ?? 0])
+                let frequencyArray = frequencies ?? MLXArray([Float(1)])
+                eval(baseArray, frequencyArray)
+                made = Rotation(
+                    form: form, usesFrequencies: frequencies != nil, baseArray: baseArray,
+                    frequencyArray: frequencyArray)
+            }
+            lock.withLock { rotations[dtype] = made }
+            return made
+        }
+    }
+
+    /// Gemma 4 attention's prologue in one kernel. For each of the `B * L`
+    /// rows (row `b * L + t` sits at position `offsets[b] + t`) and head:
+    /// `rope(rmsNorm(q, queryWeight))`, `rope(rmsNorm(k, keyWeight))` and
+    /// `rmsNorm(v)` (no weight). Inputs are the projections, `[B, L, heads * D]`;
+    /// outputs are `[B, heads, L, D]`, the layout and bits of today's
+    /// `RMSNorm`, transpose and `MLXFast.RoPE` (one thread group per head
+    /// row, as MLX's norm, so a row's bits do not depend on the batch).
+    static func attentionPrologue(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        queryHeads: Int, keyValueHeads: Int, headDim: Int,
+        queryWeight: MLXArray, keyWeight: MLXArray, offsets: MLXArray,
+        rotation: Rotation, eps: Float
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
+        let (batch, tokens) = (queries.dim(0), queries.dim(1))
+        let dtype = queries.dtype
+        let threads = threads(headDim)
+        let outputs = attentionPrologueKernel(
+            [
+                queries, keys, values, queryWeight, keyWeight, offsets.asType(.int32),
+                rotation.baseArray, rotation.frequencyArray, ResidualRMSNorm.Constants.shared.epsilon(eps),
+            ],
+            template: [
+                ("T", dtype), ("D", headDim), ("HALF", headDim / 2), ("TPG", threads),
+                ("NQ", queryHeads), ("NK", keyValueHeads), ("TOKENS", tokens),
+                ("MEAN_FORM", meanForm(headDim, dtype)),
+                ("ROPE_FREQS", rotation.usesFrequencies ? 1 : 0),
+            ] + rotation.form.templates,
+            grid: ((queryHeads + 2 * keyValueHeads) * threads, batch * tokens, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [
+                [batch, queryHeads, tokens, headDim], [batch, keyValueHeads, tokens, headDim],
+                [batch, keyValueHeads, tokens, headDim],
+            ],
+            outputDTypes: [dtype, dtype, dtype])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    private static let attentionPrologueKernel = MLXFast.metalKernel(
+        name: "gemma4_attention_prologue",
+        inputNames: [
+            "q", "k", "v", "wq", "wk", "offsets", "rope_base", "rope_freqs", "eps",
+        ],
+        outputNames: ["qo", "ko", "vo"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int SIMD_SIZE = 32;
+            const uint slot = threadgroup_position_in_grid.x;
+            const uint r = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint axis_size = D;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            threadgroup T normed[D];
+            const uint b = r / TOKENS;
+            const uint t = r % TOKENS;
+            const bool is_q = slot < NQ;
+            const bool is_k = !is_q && slot < NQ + NK;
+            const uint head = is_q ? slot : (is_k ? slot - NQ : slot - NQ - NK);
+            const uint heads = is_q ? NQ : NK;
+            const device T* src = is_q ? q : (is_k ? k : v);
+            const size_t row = (size_t(r) * heads + head) * axis_size;
+            const size_t out_row = ((size_t(b) * heads + head) * TOKENS + t) * axis_size;
+            const uint base = lid * N_READS;
+            const bool full = base + N_READS <= axis_size;
+            float acc = 0;
+            float xv[N_READS];
+            for (int i = 0; i < N_READS; i++) {
+              xv[i] = (full || base + i < axis_size) ? static_cast<float>(src[row + base + i]) : 0;
+            }
+
+            """ + squares("xv") + reduce("inv") + """
+              if (is_q || is_k) {
+                const device T* w = is_q ? wq : wk;
+                for (int i = 0; i < N_READS; i++) {
+                  if (full || base + i < axis_size) {
+                    normed[base + i] = w[base + i] * static_cast<T>(xv[i] * inv);
+                  }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                device T* dst = is_q ? qo : ko;
+                const float position = static_cast<float>(t + uint(offsets[b]));
+                for (uint i = lid; i < HALF; i += TPG) {
+                  const float x1 = static_cast<float>(normed[i]);
+                  const float x2 = static_cast<float>(normed[i + HALF]);
+                  \(RoPEForm.rotationSource)
+                  dst[out_row + i] = static_cast<T>(rx1);
+                  dst[out_row + i + HALF] = static_cast<T>(rx2);
+                }
+              } else {
+                for (int i = 0; i < N_READS; i++) {
+                  if (full || base + i < axis_size) {
+                    vo[out_row + base + i] = static_cast<T>(xv[i] * inv);
+                  }
+                }
+              }
+            """)
+
     // MARK: - Kernels
 
     // rms_single_row's prologue.
