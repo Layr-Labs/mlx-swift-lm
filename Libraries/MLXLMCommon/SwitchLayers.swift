@@ -893,7 +893,9 @@ open class SwitchGLU: Module {
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
         } else if isGeluActivation {
-            activated = compiledGeGLU(xGate, xUp)
+            activated =
+                ExactGeGLU.supports(xGate, xUp)
+                ? ExactGeGLU.apply(xGate, xUp) : compiledGeGLU(xGate, xUp)
         } else {
             activated = activation(xGate) * xUp
         }

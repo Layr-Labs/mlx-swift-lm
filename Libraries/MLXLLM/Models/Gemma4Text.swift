@@ -220,6 +220,7 @@ func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
         gate.dtype == up.dtype,
         gate.dtype == .bfloat16 || gate.dtype == .float16 || gate.dtype == .float32
     else { return gemma4SafeGeluApproximate(gate) * up }
+    if ExactGeGLU.supports(gate, up) { return ExactGeGLU.apply(gate, up) }
     return compiledGeGLU(gate, up)
 }
 
@@ -1495,6 +1496,8 @@ public class Gemma4DecoderLayer: Module {
     private var compiledFusedMiddleHostRows: Bool?
     /// The routing the compiled middle was traced with (outer nil: none yet).
     private var compiledFusedMiddleRouting: Gemma4FusedNorms.Routing??
+    /// Whether the compiled middle was traced with `ExactGeGLU` available.
+    private var compiledFusedMiddleGeGLU: Bool?
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
     var fusedMiddleTraceIsCompiled: Bool { compiledFusedMiddle.isCompiled }
@@ -1730,6 +1733,7 @@ public class Gemma4DecoderLayer: Module {
             let (dense, expertOutput): (MLXArray, MLXArray)
             // Measured here, outside the compiled middle's trace.
             let routing = fusedRouting(norms[2])
+            let exactGeGLU = ExactGeGLU.prepare(x.dtype)
             if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
                 // A trace reads `suppliesHostRowIndices` and the routing once;
                 // retrace on a change.
@@ -1737,10 +1741,12 @@ public class Gemma4DecoderLayer: Module {
                 compiledFusedMiddleLock.withLock {
                     if compiledFusedMiddleHostRows != hostRows
                         || compiledFusedMiddleRouting != .some(routing)
+                        || compiledFusedMiddleGeGLU != exactGeGLU
                     {
                         compiledFusedMiddle.invalidate()
                         compiledFusedMiddleHostRows = hostRows
                         compiledFusedMiddleRouting = .some(routing)
+                        compiledFusedMiddleGeGLU = exactGeGLU
                     }
                 }
                 let outputs = compiledFusedMiddle(self, [norms[0], norms[1], norms[2]])

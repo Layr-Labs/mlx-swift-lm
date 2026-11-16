@@ -527,5 +527,29 @@ struct Gemma4FusedNormsTests {
             }
         }
     }
+
+    // MARK: - GeGLU
+
+    /// `ExactGeGLU` matches `compiledGeGLU` on every bf16 and f16 gate value
+    /// (its own check), and on decode-shaped expert and dense rows.
+    @Test func exactGeGLUWritesTheCompiledBits() throws {
+        guard verified else {
+            #expect(!ExactGeGLU.prepare(.bfloat16))
+            return
+        }
+        for dtype in [DType.bfloat16, .float16] {
+            #expect(ExactGeGLU.prepare(dtype), "\(dtype)")
+            for shape in [[1, 1, 8, 704], [3, 1, 8, 704], [2, 4, 2112], [1, 1, 2112]] {
+                let seed = UInt64(shape.reduce(1, *))
+                let gate = random(shape, seed, dtype, scale: 3)
+                let up = random(shape, seed + 1, dtype, scale: 2)
+                try #require(ExactGeGLU.supports(gate, up))
+                expectExact(ExactGeGLU.apply(gate, up), compiledGeGLU(gate, up))
+            }
+        }
+        // Prompt-sized calls keep the compiled ops.
+        let wide = MLXArray.zeros([64, 1, 8, 704], dtype: .bfloat16)
+        #expect(!ExactGeGLU.supports(wide, wide))
+    }
 }
 
