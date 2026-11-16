@@ -25,16 +25,39 @@ public enum RMSNormMeanForm: Int, Sendable {
             : metal::precise::rsqrt(acc / axis_size + eps[0]))
         """
 
-    /// The form that writes MLX's prebuilt bits for rows of `width` (MLX's
-    /// single-row kernel, at most 4096) in `dtype`; nil where none is shown.
-    /// Measured once per width and dtype.
+    /// How MLX's prebuilt norm multiplies a normalized value by its weight:
+    /// the source writes `w * T(x * inv)`, but with T = float the compiler may
+    /// reassociate the loop-invariant inverse (`(w * inv) * x`). Reads `w`
+    /// and `x` (as T), `inv` (float) and the template `PRODUCT_FORM`.
+    public static func productExpression(w: String, x: String, inv: String) -> String {
+        "(PRODUCT_FORM == 1 ? static_cast<T>((static_cast<float>(\(w)) * \(inv)) * static_cast<float>(\(x)))"
+            + " : \(w) * static_cast<T>(static_cast<float>(\(x)) * \(inv)))"
+    }
+
+    /// The product form (0: `w * T(x * inv)`, 1: `(w * inv) * x`) that writes
+    /// MLX's prebuilt bits for rows of `width` in `dtype`, with the mean in
+    /// `measured(width:dtype:)`'s form; nil where none is shown.
+    public static func measuredProduct(width: Int, dtype: DType) -> Int? {
+        guard measured(width: width, dtype: dtype) != nil else { return nil }
+        return Calibration.shared.product(width: width, dtype: dtype)
+    }
+
+    /// The form that writes MLX's prebuilt bits for rows of `width` in
+    /// `dtype` (MLX's single-row kernel up to 4096, its looped kernel with
+    /// `loopedThreads` threads above); nil where none is shown. Measured once
+    /// per width and dtype.
     public static func measured(width: Int, dtype: DType) -> RMSNormMeanForm? {
         guard Device.defaultDevice().deviceType == .gpu,
             ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family()),
-            [.bfloat16, .float16, .float32].contains(dtype), (1 ... 4096).contains(width)
+            [.bfloat16, .float16, .float32].contains(dtype), (1 ... 65_536).contains(width)
         else { return nil }
         return Calibration.shared.form(width: width, dtype: dtype)
     }
+
+    /// The widest row MLX's single-row kernel takes (`RMS_LOOPED_LIMIT`).
+    public static let singleRowLimit = 4096
+    /// The thread group of MLX's looped kernel (its pipeline's maximum).
+    public static let loopedThreads = 1024
 
     final class Calibration: @unchecked Sendable {
         static let shared = Calibration()
@@ -51,6 +74,63 @@ public enum RMSNormMeanForm: Int, Sendable {
         static let epsilon: Float = 1e-6
         static let separatingRows = 8
         static let plainRows = 24
+
+        private var products: [Key: Int?] = [:]
+
+        func product(width: Int, dtype: DType) -> Int? {
+            let key = Key(width: width, dtype: dtype)
+            if let known = lock.withLock({ products[key] }) { return known }
+            let measured = Self.measureProduct(width: width, dtype: dtype)
+            lock.withLock { products[key] = measured }
+            return measured
+        }
+
+        /// Random rows and weights against MLX with the measured mean form:
+        /// exactly one product form must match (with T = bf16/f16 the cast
+        /// between the products leaves only the first, unless they coincide).
+        static func measureProduct(width: Int, dtype: DType) -> Int? {
+            guard let mean = form(width, dtype) else { return nil }
+            let rows = 64
+            var state = 0x2545_F491_4F6C_DD1D ^ UInt64(width)
+            func next() -> Float {
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return Float(Int((state >> 33) % 8191) - 4095) / 1024
+            }
+            let x = MLXArray((0 ..< rows * width).map { _ in next() }, [rows, width]).asType(dtype)
+            let weight = MLXArray((0 ..< width).map { _ in 1 + next() / 8 }).asType(dtype)
+            let reference = MLXFast.rmsNorm(x, weight: weight, eps: epsilon)
+            let outputs = [0, 1].map { product in
+                copy(x, weight: weight, mean: mean, product: product).asData(access: .copy).data
+            }
+            let r = reference.asData(access: .copy).data
+            switch (outputs[0] == r, outputs[1] == r) {
+            case (true, false): return 0
+            case (false, true): return 1
+            case (true, true): return 0
+            default: return nil
+            }
+        }
+
+        private static func form(_ width: Int, _ dtype: DType) -> RMSNormMeanForm? {
+            shared.form(width: width, dtype: dtype)
+        }
+
+        /// The probe kernel (single-row or looped as MLX picks) over `x`.
+        static func copy(_ x: MLXArray, weight: MLXArray, mean: RMSNormMeanForm, product: Int)
+            -> MLXArray
+        {
+            let (rows, width) = (x.dim(0), x.dim(1))
+            let looped = width > singleRowLimit
+            let threads = looped ? loopedThreads : 32 * (((width + 3) / 4 + 31) / 32)
+            return (looped ? loopedKernel : kernel)(
+                [x, weight, MLXArray([epsilon])],
+                template: [
+                    ("T", x.dtype), ("D", width), ("MEAN_FORM", mean.rawValue),
+                    ("PRODUCT_FORM", product),
+                ],
+                grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[rows, width]], outputDTypes: [x.dtype])[0]
+        }
 
         func form(width: Int, dtype: DType) -> RMSNormMeanForm? {
             let key = Key(width: width, dtype: dtype)
@@ -92,11 +172,15 @@ public enum RMSNormMeanForm: Int, Sendable {
             let weight = MLXArray.ones([width], dtype: dtype)
             let eps = MLXArray([epsilon])
             let reference = MLXFast.rmsNorm(x, weight: weight, eps: epsilon)
-            let threads = 32 * (((width + 3) / 4 + 31) / 32)
+            let looped = width > singleRowLimit
+            let threads = looped ? loopedThreads : 32 * (((width + 3) / 4 + 31) / 32)
             func copy(_ form: RMSNormMeanForm) -> MLXArray {
-                kernel(
+                (looped ? loopedKernel : kernel)(
                     [x, weight, eps],
-                    template: [("T", dtype), ("D", width), ("MEAN_FORM", form.rawValue)],
+                    template: [
+                        ("T", dtype), ("D", width), ("MEAN_FORM", form.rawValue),
+                        ("PRODUCT_FORM", 0),
+                    ],
                     grid: (all.count * threads, 1, 1), threadGroup: (threads, 1, 1),
                     outputShapes: [[all.count, width]], outputDTypes: [dtype])[0]
             }
@@ -176,8 +260,60 @@ public enum RMSNormMeanForm: Int, Sendable {
             }
         }
 
+        // MLX's rms_looped (N_READS = 4) with the mean in either form.
+        fileprivate static let loopedKernel = MLXFast.metalKernel(
+            name: "rms_norm_mean_form_probe_looped", inputNames: ["x", "w", "eps"],
+            outputNames: ["out"],
+            source: """
+                constexpr int N_READS = 4;
+                constexpr int SIMD_SIZE = 32;
+                const uint gid = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lsize = threads_per_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                const uint axis_size = D;
+                threadgroup float local_inv_mean[1];
+                threadgroup float local_sums[SIMD_SIZE];
+                const size_t row = gid * size_t(axis_size) + lid * N_READS;
+                float acc = 0;
+                for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+                  if (r + lid * N_READS + N_READS <= axis_size) {
+                    for (int i = 0; i < N_READS; i++) {
+                      float xi = x[row + i + r];
+                      acc += xi * xi;
+                    }
+                  } else {
+                    for (int i = 0; i < N_READS; i++) {
+                      if ((r + lid * N_READS + i) < axis_size) {
+                        float xi = x[row + i + r];
+                        acc += xi * xi;
+                      }
+                    }
+                  }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) { local_sums[simd_lane_id] = 0; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_lane_id == 0) { local_sums[simd_group_id] = acc; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                  acc = simd_sum(local_sums[simd_lane_id]);
+                  if (simd_lane_id == 0) { local_inv_mean[0] = \(inverseMeanExpression); }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint wbase = lid * N_READS;
+                for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+                  for (int i = 0; i < N_READS; i++) {
+                    if ((r + lid * N_READS + i) < axis_size) {
+                      out[row + r + i] = \(productExpression(w: "w[wbase + i + r]", x: "x[row + r + i]", inv: "local_inv_mean[0]"));
+                    }
+                  }
+                }
+                """)
+
         // MLX's rms_single_row (N_READS = 4) with the mean in either form.
-        private static let kernel = MLXFast.metalKernel(
+        fileprivate static let kernel = MLXFast.metalKernel(
             name: "rms_norm_mean_form_probe", inputNames: ["x", "w", "eps"],
             outputNames: ["out"],
             source: """
@@ -210,7 +346,7 @@ public enum RMSNormMeanForm: Int, Sendable {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (int i = 0; i < N_READS; i++) {
                   if (base + i < axis_size) {
-                    out[row + base + i] = w[base + i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                    out[row + base + i] = \(productExpression(w: "w[base + i]", x: "thread_x[i]", inv: "local_inv_mean[0]"));
                   }
                 }
                 """)

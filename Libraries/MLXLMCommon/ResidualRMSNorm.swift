@@ -37,7 +37,18 @@ public enum ResidualRMSNorm {
             [.bfloat16, .float16, .float32].contains(x.dtype), weight.dtype == x.dtype,
             residual.dtype == x.dtype || residual.dtype == .float32
         else { return false }
-        return x.dim(-1) >= 1 && x.size > 0
+        return x.dim(-1) >= 1 && x.size > 0 && forms(x.dim(-1), x.dtype) != nil
+    }
+
+    /// How MLX's prebuilt norm rounds for these rows (`RMSNormMeanForm`): its
+    /// mean, and the order of its weight product (a float32 kernel may
+    /// reassociate it). A copy with another form differs from MLX on some
+    /// rows. Nil where either is not measured (the unfused ops run).
+    static func forms(_ width: Int, _ dtype: DType) -> (mean: RMSNormMeanForm, product: Int)? {
+        guard let mean = RMSNormMeanForm.measured(width: width, dtype: dtype),
+            let product = RMSNormMeanForm.measuredProduct(width: width, dtype: dtype)
+        else { return nil }
+        return (mean, product)
     }
 
     /// `(h, norm)` with `h = x + residual.asType(x.dtype)` and
@@ -51,12 +62,16 @@ public enum ResidualRMSNorm {
         let rows = x.size / width
         let looped = width > 4096
         let threads = looped ? 1024 : 32 * (((width + 3) / 4 + 31) / 32)
+        guard let forms = forms(width, x.dtype) else { return nil }
         let outputs = kernel(
             [
                 x.reshaped([rows, width]), residual.reshaped([rows, width]), weight,
                 Constants.shared.epsilon(eps),
             ],
-            template: [("T", x.dtype), ("RT", residual.dtype), ("D", width), ("LOOPED", looped)],
+            template: [
+                ("T", x.dtype), ("RT", residual.dtype), ("D", width), ("LOOPED", looped),
+                ("MEAN_FORM", forms.mean.rawValue), ("PRODUCT_FORM", forms.product),
+            ],
             grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, width], [rows, width]], outputDTypes: [x.dtype, x.dtype])
         return (outputs[0].reshaped(x.shape), outputs[1].reshaped(x.shape))
@@ -146,18 +161,18 @@ public enum ResidualRMSNorm {
           if (simd_group_id == 0) {
             acc = simd_sum(local_sums[simd_lane_id]);
             if (simd_lane_id == 0) {
-              local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps[0]);
+              local_inv_mean[0] = \(RMSNormMeanForm.inverseMeanExpression);
             }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (base + N_READS <= axis_size) {
             for (int i = 0; i < N_READS; i++) {
-              nr[base + i] = w[base + i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+              nr[base + i] = \(RMSNormMeanForm.productExpression(w: "w[base + i]", x: "thread_x[i]", inv: "local_inv_mean[0]"));
             }
           } else {
             for (int i = 0; i < N_READS; i++) {
               if (base + i < axis_size) {
-                nr[base + i] = w[base + i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                nr[base + i] = \(RMSNormMeanForm.productExpression(w: "w[base + i]", x: "thread_x[i]", inv: "local_inv_mean[0]"));
               }
             }
           }
@@ -194,7 +209,7 @@ public enum ResidualRMSNorm {
           if (simd_group_id == 0) {
             acc = simd_sum(local_sums[simd_lane_id]);
             if (simd_lane_id == 0) {
-              local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps[0]);
+              local_inv_mean[0] = \(RMSNormMeanForm.inverseMeanExpression);
             }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -204,12 +219,12 @@ public enum ResidualRMSNorm {
             const uint base = r + lid * N_READS;
             if (base + N_READS <= axis_size) {
               for (int i = 0; i < N_READS; i++) {
-                nr[base + i] = w[base + i] * static_cast<T>(hr[base + i] * local_inv_mean[0]);
+                nr[base + i] = \(RMSNormMeanForm.productExpression(w: "w[base + i]", x: "hr[base + i]", inv: "local_inv_mean[0]"));
               }
             } else {
               for (int i = 0; i < N_READS; i++) {
                 if (base + i < axis_size) {
-                  nr[base + i] = w[base + i] * static_cast<T>(hr[base + i] * local_inv_mean[0]);
+                  nr[base + i] = \(RMSNormMeanForm.productExpression(w: "w[base + i]", x: "hr[base + i]", inv: "local_inv_mean[0]"));
                 }
               }
             }
