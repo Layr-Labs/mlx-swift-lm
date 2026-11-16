@@ -453,5 +453,79 @@ struct Gemma4FusedNormsTests {
             for (a, b) in zip(recorded, expectedRecorded) { expectExact(a, b) }
         }
     }
+
+    // MARK: - Expert routing
+
+    @Test func softmaxFormIsMeasured() throws {
+        guard verified else {
+            #expect(SoftmaxForm.measured(axis: 8, dtype: .bfloat16) == nil)
+            return
+        }
+        for dtype in [DType.bfloat16, .float16, .float32] {
+            for axis in [8, 4, 3, 32, 128] {
+                let m = try #require(SoftmaxForm.Calibration.measurement(axis: axis, dtype: dtype))
+                #expect(m.preciseMatches || m.fastMatches, "\(axis) \(dtype)")
+                if m.formsDiffer {
+                    #expect(m.preciseMatches != m.fastMatches, "\(axis) \(dtype)")
+                }
+                #expect(SoftmaxForm.measured(axis: axis, dtype: dtype) != nil, "\(axis) \(dtype)")
+            }
+        }
+    }
+
+    /// The unfused routing after the projection.
+    private func unfusedRoute(_ scores: MLXArray, _ scale: MLXArray, topK: Int)
+        -> (MLXArray, MLXArray)
+    {
+        let kth = scores.dim(-1) - topK
+        let indices = MLX.argPartition(scores, kth: kth, axis: -1)[.ellipsis, kth...]
+        var weights = MLX.takeAlong(scores, indices, axis: -1)
+        weights = MLX.softmax(weights, axis: -1, precise: true)
+        return (indices, weights * scale[indices])
+    }
+
+    @Test func routeWritesTheUnfusedBits() throws {
+        guard verified else { return }
+        for dtype in [DType.bfloat16, .float16, .float32] {
+            for (experts, topK) in [(128, 8), (16, 4), (64, 6), (32, 32)] {
+                let routing = try #require(
+                    Gemma4FusedNorms.routing(experts: experts, topK: topK, dtype: dtype))
+                let scale = weight(experts, UInt64(experts * 13 + topK), dtype)
+                for rows in [1, 3, 8, 64] {
+                    let seed = UInt64(experts * 1_000 + topK * 10 + rows)
+                    let random = random([rows, 1, experts], seed, dtype, scale: 2)
+                    // Few distinct values: ties inside and at the edge of the top k.
+                    let tied = (MLXRandom.randInt(0 ..< 6, [rows, 1, experts], key: MLXRandom.key(seed + 1))
+                        .asType(.float32) / 4).asType(dtype)
+                    let equal = MLXArray.zeros([rows, 1, experts], dtype: dtype) + 1.5
+                    // Infinities, and a NaN, in the first columns.
+                    func column(_ value: Float) -> MLXArray {
+                        MLXArray.full([rows, 1, 1], values: MLXArray(value)).asType(dtype)
+                    }
+                    let rest = random[0..., 0..., 3...]
+                    let special = concatenated(
+                        [column(.infinity), column(-.infinity), random[0..., 0..., 2 ..< 3], rest],
+                        axis: -1)
+                    let nan = concatenated(
+                        [random[0..., 0..., 0 ..< 2], column(.nan), rest], axis: -1)
+                    let cases = [random, tied, equal, special, nan]
+                    for (index, scores) in cases.enumerated() {
+                        eval(scores)
+                        let (expectedIndices, expectedWeights) = unfusedRoute(scores, scale, topK: topK)
+                        let fused = Gemma4FusedNorms.route(
+                            scores: scores, perExpertScale: scale, topK: topK, routing: routing)
+                        #expect(
+                            bytes(fused.indices) == bytes(expectedIndices),
+                            "indices \(dtype) \(experts)/\(topK) rows \(rows) case \(index)")
+                        #expect(
+                            bytes(fused.weights) == bytes(expectedWeights),
+                            "weights \(dtype) \(experts)/\(topK) rows \(rows) case \(index)")
+                        #expect(fused.indices.shape == expectedIndices.shape)
+                        #expect(fused.weights.dtype == expectedWeights.dtype)
+                    }
+                }
+            }
+        }
+    }
 }
 

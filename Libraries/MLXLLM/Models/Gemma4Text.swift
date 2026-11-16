@@ -1314,8 +1314,17 @@ class Gemma4Router: Module {
     var normWeight: MLXArray { scale * rootSize }
 
     /// The routing of an input already normalized with `normWeight`.
-    func route(normalized normed: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func route(normalized normed: MLXArray, fused: Gemma4FusedNorms.Routing? = nil)
+        -> (topKIndices: MLXArray, topKWeights: MLXArray)
+    {
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        if let fused, expertScores.dtype == fused.dtype, perExpertScale.dtype == fused.dtype,
+            perExpertScale.ndim == 1, expertScores.dim(-1) == perExpertScale.dim(0)
+        {
+            let (indices, weights) = Gemma4FusedNorms.route(
+                scores: expertScores, perExpertScale: perExpertScale, topK: topK, routing: fused)
+            return (indices, weights)
+        }
 
         let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1478,11 +1487,14 @@ public class Gemma4DecoderLayer: Module {
     /// takes, so those shapes keep its fused element-wise kernels.
     private let compiledFusedMiddle = CompiledTrace<Gemma4DecoderLayer> { layer, arguments in
         let (dense, experts) = layer.fusedFeedforwardMiddle(
-            arguments[0], arguments[1], arguments[2], isExpertPrefill: false)
+            arguments[0], arguments[1], arguments[2], isExpertPrefill: false,
+            routing: layer.compiledFusedMiddleRouting ?? nil)
         return [dense, experts]
     }
     private let compiledFusedMiddleLock = NSLock()
     private var compiledFusedMiddleHostRows: Bool?
+    /// The routing the compiled middle was traced with (outer nil: none yet).
+    private var compiledFusedMiddleRouting: Gemma4FusedNorms.Routing??
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
     var fusedMiddleTraceIsCompiled: Bool { compiledFusedMiddle.isCompiled }
@@ -1716,20 +1728,27 @@ public class Gemma4DecoderLayer: Module {
                     router.normWeight,
                 ], eps: eps)
             let (dense, expertOutput): (MLXArray, MLXArray)
+            // Measured here, outside the compiled middle's trace.
+            let routing = fusedRouting(norms[2])
             if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
-                // A trace reads `suppliesHostRowIndices` once; retrace on a change.
+                // A trace reads `suppliesHostRowIndices` and the routing once;
+                // retrace on a change.
                 let hostRows = experts.switchGLU.suppliesHostRowIndices
                 compiledFusedMiddleLock.withLock {
-                    if compiledFusedMiddleHostRows != hostRows {
+                    if compiledFusedMiddleHostRows != hostRows
+                        || compiledFusedMiddleRouting != .some(routing)
+                    {
                         compiledFusedMiddle.invalidate()
                         compiledFusedMiddleHostRows = hostRows
+                        compiledFusedMiddleRouting = .some(routing)
                     }
                 }
                 let outputs = compiledFusedMiddle(self, [norms[0], norms[1], norms[2]])
                 (dense, expertOutput) = (outputs[0], outputs[1])
             } else {
                 (dense, expertOutput) = fusedFeedforwardMiddle(
-                    norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill)
+                    norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill,
+                    routing: routing)
             }
             let (out, next) = Gemma4FusedNorms.feedforwardTail(
                 dense: dense,
@@ -1754,13 +1773,22 @@ public class Gemma4DecoderLayer: Module {
     /// A mixture-of-experts layer's feed-forward between the fused norms:
     /// the dense MLP of `dense`, and the experts of `experts` routed by
     /// `router` (the router's own normalized input).
+    /// The fused routing for router inputs like `normalized` (decode-shaped
+    /// rows on the fused path); nil keeps the unfused routing ops.
+    func fusedRouting(_ normalized: MLXArray) -> Gemma4FusedNorms.Routing? {
+        guard let router, router.perExpertScale.ndim == 1 else { return nil }
+        return Gemma4FusedNorms.routing(
+            experts: router.perExpertScale.dim(0), topK: router.topK, dtype: normalized.dtype)
+    }
+
     func fusedFeedforwardMiddle(
-        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool
+        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
+        routing: Gemma4FusedNorms.Routing? = nil
     ) -> (MLXArray, MLXArray) {
         guard let routerModule = self.router, let expertsModule = self.experts else {
             preconditionFailure("Gemma4: the fused feed-forward middle needs experts")
         }
-        let (topKIndices, topKWeights) = routerModule.route(normalized: router)
+        let (topKIndices, topKWeights) = routerModule.route(normalized: router, fused: routing)
         return (
             mlp(dense),
             expertsModule(

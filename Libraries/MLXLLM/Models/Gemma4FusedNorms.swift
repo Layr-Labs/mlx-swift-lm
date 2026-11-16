@@ -256,6 +256,104 @@ enum Gemma4FusedNorms {
               }
             """)
 
+    // MARK: - Expert routing
+
+    /// Diagnostic only: `DARKBLOOM_GEMMA4_FUSED_ROUTING=0` keeps the unfused
+    /// routing ops.
+    static let routingEnabledByEnvironment: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_ROUTING"] != "0"
+    /// A test or bench's own choice (nil: the environment's).
+    @TaskLocal static var routingOverride: Bool?
+    static var isRoutingEnabled: Bool {
+        isEnabled && (routingOverride ?? routingEnabledByEnvironment)
+    }
+
+    /// A router's measured routing: scores in `dtype`, softmax in `form`.
+    struct Routing: Equatable {
+        let form: SoftmaxForm
+        let dtype: DType
+    }
+
+    /// The routing for `topK` of `experts` scores in `dtype`, where the
+    /// softmax form is measured; nil keeps the unfused ops. Measures on first
+    /// use, so callers run it outside any compiled trace.
+    static func routing(experts: Int, topK: Int, dtype: DType) -> Routing? {
+        guard isRoutingEnabled, (1 ... 1024).contains(experts), (1 ... min(128, experts)).contains(topK),
+            let form = SoftmaxForm.measured(axis: topK, dtype: dtype)
+        else { return nil }
+        return Routing(form: form, dtype: dtype)
+    }
+
+    /// Gemma 4's routing after the projection, in one kernel per row: the
+    /// `topK` highest scores in the order MLX's `argPartition` leaves them
+    /// (its GPU path is a stable merge sort, so the last `topK` of a stable
+    /// ascending order, NaN last), `softmax(precise: true)` of those scores,
+    /// times `perExpertScale` at those experts. The same indices and bits as
+    /// `argPartition`, `takeAlong`, `softmax` and the scale's gather and
+    /// product.
+    static func route(
+        scores: MLXArray, perExpertScale: MLXArray, topK: Int, routing: Routing
+    ) -> (indices: MLXArray, weights: MLXArray) {
+        let experts = scores.dim(-1)
+        let rows = scores.size / experts
+        let threads = 32 * ((experts + 31) / 32)
+        let shape = Array(scores.shape.dropLast()) + [topK]
+        let outputs = routeKernel(
+            [scores.reshaped(rows, experts), perExpertScale],
+            template: [
+                ("T", scores.dtype), ("E", experts), ("AXIS", topK), ("TPG", threads),
+                ("SOFTMAX_FORM", routing.form.rawValue),
+            ],
+            grid: (rows * threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[rows, topK], [rows, topK]], outputDTypes: [.uint32, scores.dtype])
+        return (outputs[0].reshaped(shape), outputs[1].reshaped(shape))
+    }
+
+    private static let routeKernel = MLXFast.metalKernel(
+        name: "gemma4_route",
+        inputNames: ["scores", "scale"],
+        outputNames: ["indices", "weights"],
+        source: """
+            const uint r = threadgroup_position_in_grid.x;
+            const uint j = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float vals[E];
+            threadgroup uint top_index[AXIS];
+            threadgroup float top_value[AXIS];
+            threadgroup float local_max[32];
+            threadgroup float local_normalizer[32];
+            const size_t row = size_t(r) * E;
+            for (uint e = j; e < E; e += TPG) { vals[e] = static_cast<float>(scores[row + e]); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // A stable ascending sort's position: the values before this one
+            // (MLX's LessThan: NaN last), then equal values with lower indices.
+            for (uint e = j; e < E; e += TPG) {
+              const float v = vals[e];
+              const bool vn = metal::isnan(v);
+              uint rank = 0;
+              for (uint i = 0; i < E; i++) {
+                const float u = vals[i];
+                const bool un = metal::isnan(u);
+                const bool before = (un | vn) ? (!un & vn) : (u < v);
+                const bool after = (un | vn) ? (!vn & un) : (v < u);
+                rank += (before || (!after && i < e)) ? 1u : 0u;
+              }
+              if (rank >= E - AXIS) {
+                top_index[rank - (E - AXIS)] = e;
+                top_value[rank - (E - AXIS)] = v;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #define softmax_load(p) top_value[(p)]
+            #define softmax_store(p, value) \
+              weights[size_t(r) * AXIS + (p)] = static_cast<T>(value) * scale[top_index[(p)]]
+            \(SoftmaxForm.rowSource)
+            #undef softmax_load
+            #undef softmax_store
+            for (uint p = j; p < AXIS; p += TPG) { indices[size_t(r) * AXIS + p] = top_index[p]; }
+            """)
+
     // MARK: - Kernels
 
     // rms_single_row's prologue.
