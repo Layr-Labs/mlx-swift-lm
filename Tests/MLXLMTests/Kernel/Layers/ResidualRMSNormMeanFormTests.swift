@@ -62,7 +62,8 @@ extension KernelTests {
                         width: width, dtype: dtype, separate: !coincide)
                     let all = separating + plain
                     let x = MLXArray(all.flatMap { $0 }, [all.count, width]).asType(dtype)
-                    let weight = (MLXRandom.normal([width], key: MLXRandom.key(UInt64(width))) / 4 + 1)
+                    let weight =
+                        (MLXRandom.normal([width], key: MLXRandom.key(UInt64(width))) / 4 + 1)
                         .asType(dtype)
                     // A zero residual: the sum is the row itself.
                     let zero = MLXArray.zeros([all.count, width], dtype: dtype)
@@ -71,7 +72,8 @@ extension KernelTests {
                     let sum = x + zero
                     #expect(bytes(fused.sum) == bytes(sum), "width \(width) \(dtype)")
                     #expect(
-                        bytes(fused.norm) == bytes(MLXFast.rmsNorm(sum, weight: weight, eps: Self.eps)),
+                        bytes(fused.norm)
+                            == bytes(MLXFast.rmsNorm(sum, weight: weight, eps: Self.eps)),
                         "width \(width) \(dtype)")
                 }
             }
@@ -85,8 +87,10 @@ extension KernelTests {
                         let seed = UInt64(width * 7 + rows)
                         let x = (MLXRandom.normal([rows, width], key: MLXRandom.key(seed)) * 3)
                             .asType(dtype)
-                        let residual = MLXRandom.normal([rows, width], key: MLXRandom.key(seed + 1))
-                        let weight = (MLXRandom.normal([width], key: MLXRandom.key(seed + 2)) / 4 + 1)
+                        let residual = MLXRandom.normal(
+                            [rows, width], key: MLXRandom.key(seed + 1))
+                        let weight =
+                            (MLXRandom.normal([width], key: MLXRandom.key(seed + 2)) / 4 + 1)
                             .asType(dtype)
                         for r in [residual.asType(dtype), residual] {
                             let fused = try #require(
