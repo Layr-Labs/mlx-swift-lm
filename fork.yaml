@@ -410,7 +410,9 @@ def:
             The same decode-shaped forwards run each paged attention layer's q/k/v norms and RoPE as one
             kernel, and the expert routing after the router's projection (MLX's stable-sort top k,
             softmax and per-expert scale) as one kernel per row, where `RoPEForm` and `SoftmaxForm` have
-            measured how MLX's prebuilt rope and softmax round; outputs keep their bits.
+            measured how MLX's prebuilt rope and softmax round; outputs keep their bits. The approximate-GELU
+            products run as one kernel (`ExactGeGLU`, checked against `compiledGeGLU` on every bf16/f16 gate
+            value), and the feed-forward tail forms the experts' weighted sum as `weightedExpertSum` does.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "changelog.d/exact-fused-norms.md"
