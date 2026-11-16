@@ -60,14 +60,12 @@ public struct Qwen3VLMediaProcessor {
     }
 
     /// Build the ordinary prompt processor with exactly the same checkpoint
-    /// image policy used by media-only native preparation.
+    /// image policy used by media-only native preparation, and this policy's
+    /// one vision block per video (`videoFrames`).
     public func makeUserInputProcessor(tokenizer: any Tokenizer) -> Qwen3VLProcessor {
-        if let checkpointImageBounds {
-            return Qwen3VLProcessor(
-                configuration, tokenizer: tokenizer,
-                checkpointImageBounds: checkpointImageBounds)
-        }
-        return Qwen3VLProcessor(configuration, tokenizer: tokenizer)
+        Qwen3VLProcessor(
+            configuration, tokenizer: tokenizer,
+            checkpointImageBounds: checkpointImageBounds, videoLayout: .singleBlock)
     }
 
     /// Exact standalone top-level merge: preprocessor values win, including
@@ -102,6 +100,13 @@ public struct Qwen3VLMediaProcessor {
         return min(ceiling, budget)
     }
 
+    /// The most pixels a still image keeps without an explicit `processing.maxPixels`.
+    var defaultImageMaxPixels: Int {
+        checkpointImageBounds?.max
+            ?? Self.defaultVisionTokenBudgetPixels(
+                factor: config.patchSize * config.mergeSize, ceiling: config.size.maxPixels)
+    }
+
     /// Exact pre-raster image patch geometry for the default processor policy.
     /// `height` and `width` are after any caller-requested resize. A still image
     /// pads to one temporal group; the language token count is h*w/merge².
@@ -120,10 +125,7 @@ public struct Qwen3VLMediaProcessor {
         // tokens = pixels / factor²), matching the video path's philosophy and
         // the sibling Qwen2.5-VL. An explicit `processing.maxPixels` overrides it.
         let factor = config.patchSize * config.mergeSize
-        let maxPixels =
-            processing?.maxPixels
-            ?? checkpointImageBounds?.max
-            ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.size.maxPixels)
+        let maxPixels = processing?.maxPixels ?? defaultImageMaxPixels
         let resizedHeight: Int
         let resizedWidth: Int
         if let bounds = checkpointImageBounds {
@@ -275,9 +277,9 @@ public struct Qwen3VLMediaProcessor {
             temporalPatchSize: config.temporalPatchSize)
     }
 
-    /// Exact full-clip sampling/preprocessing used by `Qwen3VLProcessor`.
-    /// One complete T×H×W grid is retained; temporal attention must not become
-    /// unrelated still-image invocations.
+    /// Exact full-clip sampling/preprocessing of the single-block layout
+    /// (`Qwen3VLProcessor.VideoLayout.singleBlock`). One complete T×H×W grid is
+    /// retained; temporal attention must not become unrelated still-image invocations.
     func videoFrames(_ video: UserInput.Video, processing: UserInput.Processing) async throws
         -> [MLXArray]
     {

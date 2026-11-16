@@ -840,8 +840,14 @@ def:
         fork callers use; upstream left only the typed entry point, so the protocol default aborted the
         process. The stateless call carries no M-RoPE delta: a decode step after a media prompt uses the
         typed call with the state that `prepare` returned (upstream 3f9c86f4), as the decode tests do.
+        Qwen3-VL video follows Transformers' timestamped layout (a `<t.t seconds>` label and a vision block
+        per frame pair, M-RoPE `t = 1` per block) under `UserInput.VideoProcessing.maxFrames`/`maxPixels`;
+        `Qwen3VLVideoReferenceLayoutTests` compares it with a golden of Transformers' own processor
+        (`scripts/qwen35_video_layout_golden.py`).
       globs:
         - "Libraries/MLXVLM/**"
+        - "changelog.d/qwen3vl-video-reference-layout.md"
+        - "scripts/qwen35_video_layout_golden.py"
         - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"
         - "Tests/MLXLMTests/ProcessorConfigLoadingTests.swift"
         - "Tests/MLXLMTests/Mistral3PixelLayoutAndMaskTests.swift"

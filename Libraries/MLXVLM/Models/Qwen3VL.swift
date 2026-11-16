@@ -20,37 +20,60 @@ private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")
 
 public struct Qwen3VLProcessor: UserInputProcessor {
 
-    /// Uniform linspace sample cap per clip. Qwen's tower attends over the full
-    /// T×H×W grid, so tower and prefill work scale with every sampled frame.
-    /// Eight frames preserve whole-clip coverage while fitting the serving
-    /// first-content budget; the previous 16-frame cap still missed it.
+    /// Default sampled-frame cap per clip; `processing.video.maxFrames` replaces
+    /// it in the timestamped layout. Prefill work grows with every sampled
+    /// frame, and eight frames fit the serving first-content budget.
     public static let maxVideoFrames = 8
 
-    /// Per-sampled-frame pixel ceiling for video. Artifact image processors can
-    /// advertise multi-megapixel image limits (16 MP in the Qwen 3.5 serving
-    /// artifact), but the video tower attends over every frame in one sequence:
-    /// keeping a 720p raster for eight frames creates a multi-GiB score tensor
-    /// on Qwen's unfused 72-dim attention heads. A 512² budget preserves useful
-    /// spatial detail while bounding tower memory and first-content latency.
+    /// Per-sampled-frame pixel ceiling of the single-block layout. Artifact
+    /// image processors can advertise multi-megapixel image limits (16 MP in
+    /// the Qwen 3.5 serving artifact); a 512² budget preserves useful spatial
+    /// detail while bounding tower memory and first-content latency.
     public static let maxVideoFramePixels = 512 * 512
+
+    /// Default clip budget of the timestamped layout: `maxVideoFrames` frames of
+    /// `maxVideoFramePixels`, about 1,024 visual tokens. `processing.video.maxPixels`
+    /// replaces it.
+    public static let defaultVideoPixels = maxVideoFrames * maxVideoFramePixels
+
+    /// How a clip enters the prompt.
+    enum VideoLayout: Sendable {
+        /// Transformers' Qwen3-VL layout: each temporal group gets a
+        /// `<t.t seconds>` label and its own vision block.
+        case timestamped
+        /// One vision block per clip without timestamps: the layout of the pair
+        /// media contract (`Qwen3VLMediaProcessor.policyID`).
+        case singleBlock
+    }
+
+    /// The video sampling the Qwen3.5/3.6/3.8 checkpoints declare in
+    /// `video_preprocessor_config.json` (Transformers' `Qwen3VLVideoProcessor`
+    /// defaults). Serving caps (`maxVideoFrames`, `defaultVideoPixels`) apply on top.
+    private static let referenceVideoFPS = 2.0
+    private static let referenceMinVideoFrames = 4
+    private static let referenceMaxVideoFrames = 768
+    private static let referenceMinVideoPixels = 4096
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
     private let checkpointImageBounds: (min: Int, max: Int)?
+    let videoLayout: VideoLayout
 
     public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
         self.checkpointImageBounds = nil
+        self.videoLayout = .timestamped
     }
 
     init(
         _ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer,
-        checkpointImageBounds: (min: Int, max: Int)
+        checkpointImageBounds: (min: Int, max: Int)?, videoLayout: VideoLayout = .timestamped
     ) {
         self.config = config
         self.tokenizer = tokenizer
         self.checkpointImageBounds = checkpointImageBounds
+        self.videoLayout = videoLayout
     }
 
     private var mediaProcessor: Qwen3VLMediaProcessor {
@@ -68,6 +91,58 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        guard videoLayout == .timestamped, !input.videos.isEmpty else {
+            return try await prepareSingleBlock(input: input)
+        }
+        // Images take the ordinary path; the rendered video placeholders stay
+        // in its tokens for the timestamped expansion.
+        var imagesOnly = input
+        imagesOnly.videos = []
+        let imageInput = try await prepareSingleBlock(input: imagesOnly)
+        let video = try timestampedVideoConfiguration(input.processing.video)
+        // No frame keeps more pixels than one still image gets by default.
+        do {
+            return try await Qwen4ExpVideoPreparation.prepare(
+                input: input, imageInput: imageInput, tokenizer: tokenizer, config: video,
+                minPixels: video.size.shortestEdge, maxPixels: video.size.longestEdge,
+                maxFramePixels: mediaProcessor.defaultImageMaxPixels, byPresentationTime: true)
+        } catch Qwen4ExpMediaGeometry.Failure.invalidFrameMetadata {
+            throw VLMError.videoNotDecodable
+        } catch is Qwen4ExpMediaGeometry.Failure {
+            // A side below 32 px or an aspect ratio above 200, as the single-block resize.
+            throw VLMError.imageProcessingFailure("Qwen video frames cannot be resized")
+        } catch let failure as Qwen4ExpVideoSampler.Failure where failure != .missingFrame {
+            throw VLMError.videoNotDecodable
+        }
+    }
+
+    /// Reference sampling under this request's frame and pixel caps. A frame
+    /// count request samples exactly that many frames (at most the clip's).
+    private func timestampedVideoConfiguration(_ video: UserInput.VideoProcessing) throws
+        -> Qwen4ExpVideoConfiguration
+    {
+        var maxFrames = min(video.maxFrames ?? Self.maxVideoFrames, Self.referenceMaxVideoFrames)
+        var minFrames = Self.referenceMinVideoFrames
+        if let target = video.targetFrames {
+            maxFrames = min(maxFrames, target)
+            minFrames = maxFrames
+        }
+        let maxPixels = video.maxPixels ?? Self.defaultVideoPixels
+        let fps = video.targetFramesPerSecond ?? Self.referenceVideoFPS
+        guard maxFrames > 0, maxPixels > 0, fps.isFinite, fps > 0 else {
+            throw VLMError.processing("Qwen video sampling caps must be positive")
+        }
+        return Qwen4ExpVideoConfiguration(
+            size: .init(
+                shortestEdge: min(Self.referenceMinVideoPixels, maxPixels), longestEdge: maxPixels),
+            patchSize: config.patchSize, mergeSize: config.mergeSize,
+            temporalPatchSize: config.temporalPatchSize,
+            imageMean: config.imageMean, imageStd: config.imageStd,
+            fps: fps, minFrames: min(minFrames, maxFrames), maxFrames: maxFrames)
+    }
+
+    /// Text and images, and in the single-block layout each clip as one vision block.
+    private func prepareSingleBlock(input: UserInput) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(
             from: input.removingSpecialTokenLabels(using: tokenizer))
         var promptTokens = try tokenizer.applyChatTemplate(
@@ -1704,6 +1779,10 @@ extension Qwen3VLLanguage {
                 Int.self)
 
             let inputTokens = batchInputIds.asArray(Int32.self).map { Int($0) }
+            let videoGrids = videoGridTHW.map {
+                QwenVL.positionVideoGrids(
+                    $0, tokens: inputTokens, videoToken: videoTokenId, merge: spatialMergeSize)
+            }
             var llmPosIdsList: [MLXArray] = []
 
             var st = 0
@@ -1739,7 +1818,7 @@ extension Qwen3VLLanguage {
                     ed = edImage
                 } else {
                     // Process video
-                    guard let grid = videoGridTHW, videoIndex < grid.count else { break }
+                    guard let grid = videoGrids, videoIndex < grid.count else { break }
                     (t, h, w) = grid[videoIndex].values
                     videoIndex += 1
                     remainVideos -= 1
@@ -2015,6 +2094,9 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         guard tokens.dim(0) == 1 else { return }
         let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
         let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
+        let videoGrids = QwenVL.positionVideoGrids(
+            videoGrids, tokens: values, mask: maskValues, videoToken: config.videoTokenIndex,
+            merge: merge)
         var imageIndex = 0
         var videoIndex = 0
         var cursor = 0
