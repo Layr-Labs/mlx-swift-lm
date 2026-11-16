@@ -551,5 +551,45 @@ struct Gemma4FusedNormsTests {
         let wide = MLXArray.zeros([64, 1, 8, 704], dtype: .bfloat16)
         #expect(!ExactGeGLU.supports(wide, wide))
     }
+
+    // MARK: - Experts' weighted sum
+
+    /// The feed-forward tail given the experts' rows and weights writes what it
+    /// writes given `weightedExpertSum(rows, weights)`.
+    @Test func feedforwardTailSumsExpertRowsAsWeightedExpertSum() throws {
+        guard verified else { return }
+        let eps = Self.eps
+        for dtype in [DType.bfloat16, .float16, .float32] {
+            for width in [2816, 128, 1000] {
+                try #require(Gemma4FusedNorms.supports(width: width, dtype: dtype))
+                for (rows, experts) in [(1, 8), (3, 8), (8, 4), (2, 6)] {
+                    let seed = UInt64(width * 13 + rows * 3 + experts)
+                    var expertRows = random([rows, experts, width], seed, dtype, scale: 2)
+                    // Negative zeros: MLX's reduction adds +0 to each product.
+                    let mask = MLXRandom.uniform(0 ..< 1, [rows, experts, width], key: MLXRandom.key(seed + 9)) .< 0.05
+                    expertRows = MLX.where(mask, MLXArray(-0.0).asType(dtype), expertRows)
+                    let weights = (MLXRandom.uniform(0 ..< 1, [rows, experts], key: MLXRandom.key(seed + 1)))
+                        .asType(dtype)
+                    let dense = random([rows, 1, width], seed + 2, dtype, scale: 2)
+                    let residual = random([rows, 1, width], seed + 3, dtype, scale: 4)
+                    let (postDense, postExperts, post, next) = (
+                        weight(width, seed + 4, dtype), weight(width, seed + 5, dtype),
+                        weight(width, seed + 6, dtype), weight(width, seed + 7, dtype)
+                    )
+                    let scalar = MLXArray([Float(0.875)]).asType(dtype)
+                    let summed = weightedExpertSum(expertRows, weights).reshaped(rows, 1, width)
+                    let expected = Gemma4FusedNorms.feedforwardTail(
+                        dense: dense, experts: (summed, postDense, postExperts), residual: residual,
+                        post: post, layerScalar: scalar, next: next, eps: eps)
+                    let fused = Gemma4FusedNorms.feedforwardTail(
+                        dense: dense, experts: (expertRows, postDense, postExperts),
+                        expertWeights: weights, residual: residual, post: post, layerScalar: scalar,
+                        next: next, eps: eps)
+                    expectExact(fused.out, expected.out)
+                    expectExact(try #require(fused.next), try #require(expected.next))
+                }
+            }
+        }
+    }
 }
 

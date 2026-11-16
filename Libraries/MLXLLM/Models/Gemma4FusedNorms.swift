@@ -70,38 +70,70 @@ enum Gemma4FusedNorms {
     /// without: `s = dense` (the dense layer's MLP output). Then
     /// `out = (residual + rmsNorm(s, post)) * layerScalar`, and, with `next`,
     /// `rmsNorm(out, next)` (the next layer's input norm or the final norm).
+    ///
+    /// With `expertWeights` (`[N, K]`), `experts.output` is the experts' rows
+    /// before their weighted sum (`[N, K, D]`), and the kernel forms that sum
+    /// as `weightedExpertSum` writes it: each product in the activation dtype,
+    /// then MLX's small column reduction (`col_reduce_small`: each row plus
+    /// zero, then added to the running sum in expert order).
     static func feedforwardTail(
         dense: MLXArray, experts: (output: MLXArray, postDense: MLXArray, postExperts: MLXArray)?,
+        expertWeights: MLXArray? = nil,
         residual: MLXArray, post: MLXArray, layerScalar: MLXArray, next: MLXArray?, eps: Float
     ) -> (out: MLXArray, next: MLXArray?) {
         let width = dense.dim(-1)
         let rows = dense.size / width
         let flat = [rows, width]
         var inputs = [dense.reshaped(flat)]
+        var expertCount = 0
         if let experts {
-            inputs += [experts.output.reshaped(flat), experts.postDense, experts.postExperts]
+            if let expertWeights {
+                expertCount = expertWeights.dim(-1)
+                inputs += [
+                    experts.output.reshaped(rows, expertCount, width),
+                    expertWeights.reshaped(rows, expertCount),
+                ]
+            } else {
+                inputs.append(experts.output.reshaped(flat))
+            }
+            inputs += [experts.postDense, experts.postExperts]
         }
         inputs += [residual.reshaped(flat), post, layerScalar.reshaped([1])]
         if let next { inputs.append(next) }
         inputs.append(ResidualRMSNorm.Constants.shared.epsilon(eps))
         let kernel: MLXFast.MLXFastKernel
-        switch (experts != nil, next != nil) {
-        case (true, true): kernel = feedforwardTailExpertsNext
-        case (true, false): kernel = feedforwardTailExperts
-        case (false, true): kernel = feedforwardTailDenseNext
-        case (false, false): kernel = feedforwardTailDense
+        switch (experts != nil, expertCount > 0, next != nil) {
+        case (true, true, true): kernel = feedforwardTailExpertRowsNext
+        case (true, true, false): kernel = feedforwardTailExpertRows
+        case (true, false, true): kernel = feedforwardTailExpertsNext
+        case (true, false, false): kernel = feedforwardTailExperts
+        case (false, _, true): kernel = feedforwardTailDenseNext
+        case (false, _, false): kernel = feedforwardTailDense
         }
         let count = next == nil ? 1 : 2
         let outputs = kernel(
             inputs,
             template: [
                 ("T", dense.dtype), ("D", width), ("MEAN_FORM", meanForm(width, dense.dtype)),
+                ("KE", max(1, expertCount)),
             ],
             grid: (rows * threads(width), 1, 1), threadGroup: (threads(width), 1, 1),
             outputShapes: Array(repeating: flat, count: count),
             outputDTypes: Array(repeating: dense.dtype, count: count))
         let shape = dense.shape
         return (outputs[0].reshaped(shape), next == nil ? nil : outputs[1].reshaped(shape))
+    }
+
+    // MARK: - Experts' weighted sum
+
+    /// Diagnostic only: `DARKBLOOM_GEMMA4_FUSED_EXPERT_SUM=0` keeps
+    /// `weightedExpertSum` before the feed-forward tail.
+    static let expertSumEnabledByEnvironment: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_EXPERT_SUM"] != "0"
+    /// A test or bench's own choice (nil: the environment's).
+    @TaskLocal static var expertSumOverride: Bool?
+    static var isExpertSumEnabled: Bool {
+        isEnabled && (expertSumOverride ?? expertSumEnabledByEnvironment)
     }
 
     // MARK: - Attention prologue
@@ -444,7 +476,28 @@ enum Gemma4FusedNorms {
                 """
     }
 
-    private static func feedforwardTailSource(experts: Bool, next: Bool) -> String {
+    // The experts' weighted sum as `weightedExpertSum` writes it.
+    private static let expertRowsSum = """
+          float ev[N_READS];
+          for (int i = 0; i < N_READS; i++) {
+            if (full || base + i < axis_size) {
+              T acc = T(0);
+              for (int j = 0; j < KE; j++) {
+                const T product = rows[(size_t(gid) * KE + j) * axis_size + base + i] * rw[size_t(gid) * KE + j];
+                const T lane = product + T(0);
+                acc = j == 0 ? lane : static_cast<T>(lane + acc);
+              }
+              ev[i] = acc;
+            } else {
+              ev[i] = 0;
+            }
+          }
+
+        """
+
+    private static func feedforwardTailSource(experts: Bool, next: Bool, rows: Bool = false)
+        -> String
+    {
         var s = prologue + load("dense", into: "dv")
         if experts {
             s +=
@@ -454,7 +507,8 @@ enum Gemma4FusedNorms {
                         dn[i] = (full || base + i < axis_size) ? wd[base + i] * static_cast<T>(dv[i] * inv_d) : T(0);
                       }
 
-                    """ + load("experts", into: "ev") + squares("ev") + reduce("inv_e") + """
+                    """ + (rows ? expertRowsSum : load("experts", into: "ev")) + squares("ev")
+                + reduce("inv_e") + """
                       float sv[N_READS];
                       for (int i = 0; i < N_READS; i++) {
                         if (full || base + i < axis_size) {
@@ -513,17 +567,24 @@ enum Gemma4FusedNorms {
         inputNames: ["attn", "res", "wpa", "w1", "eps"],
         outputNames: ["h", "n1"], source: attentionTailSource(norms: 1))
 
-    private static func feedforwardTailKernel(experts: Bool, next: Bool) -> MLXFast.MLXFastKernel {
+    private static func feedforwardTailKernel(experts: Bool, next: Bool, rows: Bool = false)
+        -> MLXFast.MLXFastKernel
+    {
         var inputs = ["dense"]
-        if experts { inputs += ["experts", "wd", "we"] }
+        if experts { inputs += (rows ? ["rows", "rw"] : ["experts"]) + ["wd", "we"] }
         inputs += ["res", "wp", "ls"]
         if next { inputs.append("wn") }
         inputs.append("eps")
         return MLXFast.metalKernel(
-            name: "gemma4_feedforward_tail_\(experts ? "moe" : "dense")\(next ? "_next" : "")",
+            name:
+                "gemma4_feedforward_tail_\(experts ? (rows ? "moe_rows" : "moe") : "dense")\(next ? "_next" : "")",
             inputNames: inputs, outputNames: next ? ["out", "nn"] : ["out"],
-            source: feedforwardTailSource(experts: experts, next: next))
+            source: feedforwardTailSource(experts: experts, next: next, rows: rows))
     }
+    private static let feedforwardTailExpertRowsNext = feedforwardTailKernel(
+        experts: true, next: true, rows: true)
+    private static let feedforwardTailExpertRows = feedforwardTailKernel(
+        experts: true, next: false, rows: true)
     private static let feedforwardTailExpertsNext = feedforwardTailKernel(experts: true, next: true)
     private static let feedforwardTailExperts = feedforwardTailKernel(experts: true, next: false)
     private static let feedforwardTailDenseNext = feedforwardTailKernel(experts: false, next: true)

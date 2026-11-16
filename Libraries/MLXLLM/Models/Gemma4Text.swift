@@ -1394,6 +1394,27 @@ class Gemma4Experts: Module {
         return y.reshaped(B, S, H)
     }
 
+    /// The experts' rows (`[N, K, D]`) whose `weightedExpertSum` with the
+    /// routing weights is `callAsFunction`'s output on this call, from the same
+    /// calls `callAsFunction` makes; nil where it forms its output another way.
+    func rowsBeforeSum(
+        _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray, isExpertPrefill: Bool
+    ) -> MLXArray? {
+        guard !isExpertPrefill else { return nil }
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        let flat = x.reshaped(B * S, H)
+        let indices = topKIndices.reshaped(B * S, K)
+        if Gemma4PrefillProjection.appliesExperts(
+            x, indices: topKIndices, weights: topKWeights, isExpertPrefill: isExpertPrefill)
+            || Gemma4BatchDecodeProjection.applies(x)
+        {
+            return switchGLU.expertRowsByRow(flat, indices)
+        }
+        // `callAndWeightedReduce` without a production prompt frame.
+        return switchGLU(flat, indices)
+    }
+
     /// One shared expert call in which every row keeps its own one-row bytes.
     private func reduceRows(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
@@ -1487,10 +1508,11 @@ public class Gemma4DecoderLayer: Module {
     /// routing, experts), compiled for the shapes the compiled feed-forward
     /// takes, so those shapes keep its fused element-wise kernels.
     private let compiledFusedMiddle = CompiledTrace<Gemma4DecoderLayer> { layer, arguments in
-        let (dense, experts) = layer.fusedFeedforwardMiddle(
+        let (dense, experts, weights) = layer.fusedFeedforwardMiddle(
             arguments[0], arguments[1], arguments[2], isExpertPrefill: false,
-            routing: layer.compiledFusedMiddleRouting ?? nil)
-        return [dense, experts]
+            routing: layer.compiledFusedMiddleRouting ?? nil,
+            expertRows: layer.compiledFusedMiddleExpertRows ?? false)
+        return [dense, experts] + (weights.map { [$0] } ?? [])
     }
     private let compiledFusedMiddleLock = NSLock()
     private var compiledFusedMiddleHostRows: Bool?
@@ -1498,6 +1520,8 @@ public class Gemma4DecoderLayer: Module {
     private var compiledFusedMiddleRouting: Gemma4FusedNorms.Routing??
     /// Whether the compiled middle was traced with `ExactGeGLU` available.
     private var compiledFusedMiddleGeGLU: Bool?
+    /// Whether the compiled middle was traced returning the experts' rows.
+    private var compiledFusedMiddleExpertRows: Bool?
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
     var fusedMiddleTraceIsCompiled: Bool { compiledFusedMiddle.isCompiled }
@@ -1731,9 +1755,11 @@ public class Gemma4DecoderLayer: Module {
                     router.normWeight,
                 ], eps: eps)
             let (dense, expertOutput): (MLXArray, MLXArray)
+            var expertWeights: MLXArray?
             // Measured here, outside the compiled middle's trace.
             let routing = fusedRouting(norms[2])
             let exactGeGLU = ExactGeGLU.prepare(x.dtype)
+            let expertRows = Gemma4FusedNorms.isExpertSumEnabled && !isExpertPrefill
             if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
                 // A trace reads `suppliesHostRowIndices` and the routing once;
                 // retrace on a change.
@@ -1742,19 +1768,22 @@ public class Gemma4DecoderLayer: Module {
                     if compiledFusedMiddleHostRows != hostRows
                         || compiledFusedMiddleRouting != .some(routing)
                         || compiledFusedMiddleGeGLU != exactGeGLU
+                        || compiledFusedMiddleExpertRows != expertRows
                     {
                         compiledFusedMiddle.invalidate()
                         compiledFusedMiddleHostRows = hostRows
                         compiledFusedMiddleRouting = .some(routing)
                         compiledFusedMiddleGeGLU = exactGeGLU
+                        compiledFusedMiddleExpertRows = expertRows
                     }
                 }
                 let outputs = compiledFusedMiddle(self, [norms[0], norms[1], norms[2]])
                 (dense, expertOutput) = (outputs[0], outputs[1])
+                expertWeights = outputs.count > 2 ? outputs[2] : nil
             } else {
-                (dense, expertOutput) = fusedFeedforwardMiddle(
+                (dense, expertOutput, expertWeights) = fusedFeedforwardMiddle(
                     norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill,
-                    routing: routing)
+                    routing: routing, expertRows: expertRows)
             }
             let (out, next) = Gemma4FusedNorms.feedforwardTail(
                 dense: dense,
@@ -1762,6 +1791,7 @@ public class Gemma4DecoderLayer: Module {
                     expertOutput, postFeedforwardLayernorm1.weight,
                     postFeedforwardLayernorm2.weight
                 ),
+                expertWeights: expertWeights,
                 residual: sum, post: postFeedforwardLayernorm.weight, layerScalar: layerScalar,
                 next: nextNorm, eps: eps)
             return (out, kvPair, attnPositionOffset, next)
@@ -1787,19 +1817,32 @@ public class Gemma4DecoderLayer: Module {
             experts: router.perExpertScale.dim(0), topK: router.topK, dtype: normalized.dtype)
     }
 
+    /// The dense MLP and the experts. With `expertRows`, where the experts'
+    /// output is `weightedExpertSum(rows, weights)`, returns those rows and
+    /// weights instead (the feed-forward tail forms the sum).
     func fusedFeedforwardMiddle(
         _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
-        routing: Gemma4FusedNorms.Routing? = nil
-    ) -> (MLXArray, MLXArray) {
+        routing: Gemma4FusedNorms.Routing? = nil, expertRows: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray?) {
         guard let routerModule = self.router, let expertsModule = self.experts else {
             preconditionFailure("Gemma4: the fused feed-forward middle needs experts")
         }
         let (topKIndices, topKWeights) = routerModule.route(normalized: router, fused: routing)
+        if expertRows,
+            let rows = expertsModule.rowsBeforeSum(
+                experts, topKIndices: topKIndices, topKWeights: topKWeights,
+                isExpertPrefill: isExpertPrefill),
+            rows.dtype == experts.dtype, topKWeights.dtype == experts.dtype,
+            topKIndices.dim(-1) <= 32
+        {
+            return (mlp(dense), rows, topKWeights)
+        }
         return (
             mlp(dense),
             expertsModule(
                 experts, topKIndices: topKIndices, topKWeights: topKWeights,
-                isExpertPrefill: isExpertPrefill)
+                isExpertPrefill: isExpertPrefill),
+            nil
         )
     }
 
