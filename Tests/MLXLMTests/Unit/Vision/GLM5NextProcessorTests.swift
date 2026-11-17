@@ -167,7 +167,8 @@ extension UnitTests {
             let frameBytes = 47 * 29 * 3
             let frames = try (0 ..< 30).map { value in
                 try GLM5NextRGBImage(
-                    width: 47, height: 29, pixels: Array(repeating: UInt8(value), count: frameBytes))
+                    width: 47, height: 29, pixels: Array(repeating: UInt8(value), count: frameBytes)
+                )
             }
             func video(_ indices: [Int]) throws -> GLM5NextDecodedVideo {
                 try GLM5NextDecodedVideo(
@@ -192,16 +193,20 @@ extension UnitTests {
             let spread = [0, 3, 6, 9, 12, 16, 19, 22, 25, 29]
             for cap in [10, 11] {
                 let fitted = try processor(frames: cap, fits: true)
-                #expect(fitted.configuration.maximumSampledVideoFrames(frameBytes: frameBytes) == 10)
+                #expect(
+                    fitted.configuration.maximumSampledVideoFrames(frameBytes: frameBytes) == 10)
                 let plan = try fitted.videoPreparationPlan(video(spread))
                 #expect(plan.frameIndices == spread && plan.framePositions == Array(0 ..< 10))
                 #expect(plan.resize.grid.temporal == 5)
-                #expect(throws: GLM5NextVisionError.invalidInput("sampled video frame was not retained")) {
+                #expect(
+                    throws: GLM5NextVisionError.invalidInput("sampled video frame was not retained")
+                ) {
                     try fitted.videoPreparationPlan(video(official))
                 }
             }
             for fits in [false, true] {
-                let plan = try processor(frames: 12, fits: fits).videoPreparationPlan(video(official))
+                let plan = try processor(frames: 12, fits: fits).videoPreparationPlan(
+                    video(official))
                 #expect(plan.frameIndices == official)
             }
             let unbounded = try GLM5NextProcessorConfiguration()

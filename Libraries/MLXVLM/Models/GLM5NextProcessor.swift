@@ -530,7 +530,9 @@ public struct GLM5NextProcessorConfiguration: Sendable {
     public func maximumSampledVideoFrames(frameBytes: Int) -> Int {
         guard fitsVideoSampleToDecodedBytes, frameBytes > 0 else { return 2048 }
         let renderBytes = frameBytes / 3 * 4
-        let frames = maximumDecodedBytes < renderBytes ? 0 : (maximumDecodedBytes - renderBytes) / frameBytes + 1
+        let frames =
+            maximumDecodedBytes < renderBytes
+            ? 0 : (maximumDecodedBytes - renderBytes) / frameBytes + 1
         return min(2048, max(2, frames / 2 * 2))
     }
 }
@@ -1241,7 +1243,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
         // as rendered, so the first frame is decoded alone to learn it.
         var frameBytes = 0
         if configuration.fitsVideoSampleToDecodedBytes {
-            frameBytes = try await read(retaining: [0], stoppingAfter: 1).frames.first?.pixels.count ?? 0
+            frameBytes =
+                try await read(retaining: [0], stoppingAfter: 1).frames.first?.pixels.count ?? 0
         }
         // The official sampler needs only the source frame count, so decoding
         // retains just its frames: first for the count the track metadata
