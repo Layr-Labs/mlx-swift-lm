@@ -22,6 +22,14 @@ extension KernelTests {
             return x.asData(access: .copy).data
         }
 
+        /// Byte parity is promised where the norm's form is measured: a GPU
+        /// whose family is verified. Elsewhere (CPU, a virtual GPU) the
+        /// product keeps the unfused ops.
+        private var verified: Bool {
+            Device.defaultDevice().deviceType == .gpu
+                && ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family())
+        }
+
         private func normal(_ shape: [Int], _ seed: UInt64, _ dtype: DType, scale: Float = 1)
             -> MLXArray
         {
@@ -41,7 +49,7 @@ extension KernelTests {
             for dtype in [DType.bfloat16, .float16] {
                 for width in [2880, 1024, 4096, 1000] {
                     guard GPTOSSFusedNorms.supports(width: width, dtype: dtype) else {
-                        #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype) \(width)")
+                        #expect(!verified, "\(dtype) \(width)")
                         continue
                     }
                     for rows in [1, 3, 8] {
@@ -71,7 +79,7 @@ extension KernelTests {
             for dtype in [DType.bfloat16, .float16] {
                 for width in [2880, 1024, 1000] {
                     guard GPTOSSFusedNorms.supports(width: width, dtype: dtype) else {
-                        #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype) \(width)")
+                        #expect(!verified, "\(dtype) \(width)")
                         continue
                     }
                     for (rows, topK) in [(1, 4), (3, 4), (8, 4), (2, 2), (1, 8)] {
@@ -121,7 +129,7 @@ extension KernelTests {
                         let form = GPTOSSFusedNorms.routingForm(
                             experts: experts, topK: topK, dtype: dtype)
                     else {
-                        #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype) \(experts)")
+                        #expect(!verified, "\(dtype) \(experts)")
                         continue
                     }
                     for rows in [1, 3, 64] {
@@ -193,7 +201,7 @@ extension KernelTests {
                     let rotation = Gemma4FusedNorms.RotationCache().rotation(
                         headDim: 64, base: nil, frequencies: exact.frequencies, dtype: dtype)
                 else {
-                    #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype)")
+                    #expect(!verified, "\(dtype)")
                     continue
                 }
                 for (batch, tokens, offsets) in [
