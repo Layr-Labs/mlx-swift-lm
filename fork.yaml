@@ -529,6 +529,7 @@ def:
             - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"
             - "Tests/MLXLMTests/Kernel/Layers/GatedDeltaConvolutionTests.swift"
             - "changelog.d/gdn-conv-precise-sigmoid.md"
+            - "changelog.d/qwen35-gdn-fused-conv-norm.md"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "changelog.d/cluster-model-runtime.md"
