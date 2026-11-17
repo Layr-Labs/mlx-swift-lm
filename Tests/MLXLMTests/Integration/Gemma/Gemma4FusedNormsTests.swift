@@ -495,7 +495,10 @@ struct Gemma4FusedNormsTests {
                     let seed = UInt64(experts * 1_000 + topK * 10 + rows)
                     let random = random([rows, 1, experts], seed, dtype, scale: 2)
                     // Few distinct values: ties inside and at the edge of the top k.
-                    let tied = (MLXRandom.randInt(0 ..< 6, [rows, 1, experts], key: MLXRandom.key(seed + 1))
+                    let tied =
+                        (MLXRandom.randInt(
+                            0 ..< 6, [rows, 1, experts], key: MLXRandom.key(seed + 1)
+                        )
                         .asType(.float32) / 4).asType(dtype)
                     let equal = MLXArray.zeros([rows, 1, experts], dtype: dtype) + 1.5
                     // Infinities, and a NaN, in the first columns.
@@ -511,7 +514,8 @@ struct Gemma4FusedNormsTests {
                     let cases = [random, tied, equal, special, nan]
                     for (index, scores) in cases.enumerated() {
                         eval(scores)
-                        let (expectedIndices, expectedWeights) = unfusedRoute(scores, scale, topK: topK)
+                        let (expectedIndices, expectedWeights) = unfusedRoute(
+                            scores, scale, topK: topK)
                         let fused = Gemma4FusedNorms.route(
                             scores: scores, perExpertScale: scale, topK: topK, routing: routing)
                         #expect(
@@ -573,9 +577,12 @@ struct Gemma4FusedNormsTests {
                     let seed = UInt64(width * 13 + rows * 3 + experts)
                     var expertRows = random([rows, experts, width], seed, dtype, scale: 2)
                     // Negative zeros: MLX's reduction adds +0 to each product.
-                    let mask = MLXRandom.uniform(0 ..< 1, [rows, experts, width], key: MLXRandom.key(seed + 9)) .< 0.05
+                    let mask =
+                        MLXRandom.uniform(
+                            0 ..< 1, [rows, experts, width], key: MLXRandom.key(seed + 9)) .< 0.05
                     expertRows = MLX.where(mask, MLXArray(-0.0).asType(dtype), expertRows)
-                    let weights = (MLXRandom.uniform(0 ..< 1, [rows, experts], key: MLXRandom.key(seed + 1)))
+                    let weights =
+                        (MLXRandom.uniform(0 ..< 1, [rows, experts], key: MLXRandom.key(seed + 1)))
                         .asType(dtype)
                     let dense = random([rows, 1, width], seed + 2, dtype, scale: 2)
                     let residual = random([rows, 1, width], seed + 3, dtype, scale: 4)
@@ -599,4 +606,3 @@ struct Gemma4FusedNormsTests {
         }
     }
 }
-

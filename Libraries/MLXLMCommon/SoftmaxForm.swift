@@ -153,7 +153,9 @@ public enum SoftmaxForm: Int, Sendable {
             // The product dtype: the chosen form(s) must match MLX there too.
             let product = x.asType(dtype)
             let productReference = bytes(softmax(product, axis: -1, precise: true))
-            if preciseMatches { preciseMatches = bytes(copy(product, .precise)) == productReference }
+            if preciseMatches {
+                preciseMatches = bytes(copy(product, .precise)) == productReference
+            }
             if fastMatches { fastMatches = bytes(copy(product, .fast)) == productReference }
             return Measurement(
                 preciseMatches: preciseMatches, fastMatches: fastMatches,

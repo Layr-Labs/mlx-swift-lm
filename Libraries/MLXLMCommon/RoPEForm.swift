@@ -42,15 +42,16 @@ public struct RoPEForm: Hashable, Sendable {
     /// Reads `i` (pair index), `HALF` (template, `dims / 2`), `ROPE_FREQS`
     /// (template: 1 reads `rope_freqs[i]`, 0 uses `rope_base[0] = log2(base)`),
     /// `position` (float), `x1`, `x2`; defines `rx1` and `rx2`.
-    public static let rotationSource = inverseFrequencySource + """
-        const float theta = position * inv_freq;
-        const float rope_c = metal::fast::cos(theta);
-        const float rope_s = metal::fast::sin(theta);
-        const float rx1 = ROPE_RX1 == 2 ? metal::fma(-x2, rope_s, x1 * rope_c)
-                                        : metal::fma(x1, rope_c, -(x2 * rope_s));
-        const float rx2 = ROPE_RX2 == 2 ? metal::fma(x2, rope_c, x1 * rope_s)
-                                        : metal::fma(x1, rope_s, x2 * rope_c);
-        """
+    public static let rotationSource =
+        inverseFrequencySource + """
+            const float theta = position * inv_freq;
+            const float rope_c = metal::fast::cos(theta);
+            const float rope_s = metal::fast::sin(theta);
+            const float rx1 = ROPE_RX1 == 2 ? metal::fma(-x2, rope_s, x1 * rope_c)
+                                            : metal::fma(x1, rope_c, -(x2 * rope_s));
+            const float rx2 = ROPE_RX2 == 2 ? metal::fma(x2, rope_c, x1 * rope_s)
+                                            : metal::fma(x1, rope_s, x2 * rope_c);
+            """
 
     /// The form that writes MLX's prebuilt bits for a non-traditional
     /// rotation over all `dimensions` with scale 1, either from `base` (where
@@ -246,7 +247,9 @@ public struct RoPEForm: Hashable, Sendable {
             let inverseFormsDiffer = inverses[0] != inverses[1]
             // Where they differ, the unit rows must tell the two forms apart.
             if inverseFormsDiffer, unitOutputs[false] == unitOutputs[true] { return nil }
-            func differ(_ a: RoPEForm, _ b: RoPEForm) -> Bool { randomOutputs[a] != randomOutputs[b] }
+            func differ(_ a: RoPEForm, _ b: RoPEForm) -> Bool {
+                randomOutputs[a] != randomOutputs[b]
+            }
             let p = RoPEForm(fastInverse: false, first: 1, second: 1)
             let productFormsDiffer =
                 differ(p, RoPEForm(fastInverse: false, first: 2, second: 1))

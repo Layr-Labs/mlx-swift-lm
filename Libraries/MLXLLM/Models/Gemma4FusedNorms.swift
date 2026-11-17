@@ -210,7 +210,8 @@ enum Gemma4FusedNorms {
         let outputs = attentionPrologueKernel(
             [
                 queries, keys, values, queryWeight, keyWeight, offsets.asType(.int32),
-                rotation.baseArray, rotation.frequencyArray, ResidualRMSNorm.Constants.shared.epsilon(eps),
+                rotation.baseArray, rotation.frequencyArray,
+                ResidualRMSNorm.Constants.shared.epsilon(eps),
             ],
             template: [
                 ("T", dtype), ("D", headDim), ("HALF", headDim / 2), ("TPG", threads),
@@ -264,31 +265,31 @@ enum Gemma4FusedNorms {
             }
 
             """ + squares("xv") + reduce("inv") + """
-              if (is_q || is_k) {
-                const device T* w = is_q ? wq : wk;
-                for (int i = 0; i < N_READS; i++) {
-                  if (full || base + i < axis_size) {
-                    normed[base + i] = w[base + i] * static_cast<T>(xv[i] * inv);
+                  if (is_q || is_k) {
+                    const device T* w = is_q ? wq : wk;
+                    for (int i = 0; i < N_READS; i++) {
+                      if (full || base + i < axis_size) {
+                        normed[base + i] = w[base + i] * static_cast<T>(xv[i] * inv);
+                      }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    device T* dst = is_q ? qo : ko;
+                    const float position = static_cast<float>(t + uint(offsets[b]));
+                    for (uint i = lid; i < HALF; i += TPG) {
+                      const float x1 = static_cast<float>(normed[i]);
+                      const float x2 = static_cast<float>(normed[i + HALF]);
+                      \(RoPEForm.rotationSource)
+                      dst[out_row + i] = static_cast<T>(rx1);
+                      dst[out_row + i + HALF] = static_cast<T>(rx2);
+                    }
+                  } else {
+                    for (int i = 0; i < N_READS; i++) {
+                      if (full || base + i < axis_size) {
+                        vo[out_row + base + i] = static_cast<T>(xv[i] * inv);
+                      }
+                    }
                   }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                device T* dst = is_q ? qo : ko;
-                const float position = static_cast<float>(t + uint(offsets[b]));
-                for (uint i = lid; i < HALF; i += TPG) {
-                  const float x1 = static_cast<float>(normed[i]);
-                  const float x2 = static_cast<float>(normed[i + HALF]);
-                  \(RoPEForm.rotationSource)
-                  dst[out_row + i] = static_cast<T>(rx1);
-                  dst[out_row + i + HALF] = static_cast<T>(rx2);
-                }
-              } else {
-                for (int i = 0; i < N_READS; i++) {
-                  if (full || base + i < axis_size) {
-                    vo[out_row + base + i] = static_cast<T>(xv[i] * inv);
-                  }
-                }
-              }
-            """)
+                """)
 
     // MARK: - Expert routing
 
@@ -312,7 +313,8 @@ enum Gemma4FusedNorms {
     /// softmax form is measured; nil keeps the unfused ops. Measures on first
     /// use, so callers run it outside any compiled trace.
     static func routing(experts: Int, topK: Int, dtype: DType) -> Routing? {
-        guard isRoutingEnabled, (1 ... 1024).contains(experts), (1 ... min(128, experts)).contains(topK),
+        guard isRoutingEnabled, (1 ... 1024).contains(experts),
+            (1 ... min(128, experts)).contains(topK),
             let form = SoftmaxForm.measured(axis: topK, dtype: dtype)
         else { return nil }
         return Routing(form: form, dtype: dtype)

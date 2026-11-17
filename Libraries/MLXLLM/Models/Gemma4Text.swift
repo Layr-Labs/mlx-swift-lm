@@ -1250,7 +1250,8 @@ class Gemma4Attention: Module {
         let capturedOffsets = layerCache.positionOffsets
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
         let projectedKeys = Gemma4BatchDecodeProjection.linear(kProj, x)
-        let projectedValues = vProj.map { Gemma4BatchDecodeProjection.linear($0, x) } ?? projectedKeys
+        let projectedValues =
+            vProj.map { Gemma4BatchDecodeProjection.linear($0, x) } ?? projectedKeys
         let (queries, k, v) = Gemma4FusedNorms.attentionPrologue(
             queries: projectedQueries, keys: projectedKeys, values: projectedValues,
             queryHeads: nHeads, keyValueHeads: nKvHeads, headDim: effectiveHeadDim,
