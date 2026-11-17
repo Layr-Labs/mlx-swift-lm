@@ -21,6 +21,14 @@ extension KernelTests {
             return x.asData(access: .copy).data
         }
 
+        /// Byte parity is promised where the norm's form is measured: a GPU
+        /// whose family is verified. Elsewhere (CPU, a virtual GPU) the
+        /// product keeps the unfused ops.
+        private var verified: Bool {
+            Device.defaultDevice().deviceType == .gpu
+                && ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family())
+        }
+
         private func normal(_ shape: [Int], _ seed: UInt64, _ dtype: DType, scale: Float = 1)
             -> MLXArray
         {
@@ -66,7 +74,7 @@ extension KernelTests {
             for dtype in [DType.bfloat16, .float16] {
                 for width in [2048, 1024, 4096, 128] {
                     guard Qwen35ExpertTail.supports(width: width, experts: 8, dtype: dtype) else {
-                        #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype) \(width)")
+                        #expect(!verified, "\(dtype) \(width)")
                         continue
                     }
                     for (count, experts) in [(1, 8), (3, 8), (2, 4), (1, 6)] {
@@ -82,7 +90,7 @@ extension KernelTests {
         @Test func everyGateValueKeepsTheUnfusedBits() throws {
             for dtype in [DType.bfloat16, .float16] {
                 guard Qwen35ExpertTail.supports(width: 8, experts: 8, dtype: dtype) else {
-                    #expect(Device.defaultDevice().deviceType != .gpu, "\(dtype)")
+                    #expect(!verified, "\(dtype)")
                     continue
                 }
                 let values: [Float] = (0 ..< 65_536).map { pattern in
