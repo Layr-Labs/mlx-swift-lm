@@ -44,9 +44,24 @@ extension KernelTests {
             let adapter = CBv2SteppableLanguageModelAdapter(try gemma4())
             #expect(adapter.decodeCommandBufferLimits == Gemma4DecodeCommandBuffers.limits)
             // MTP rounds of decode and verification rows take the same limits.
-            #expect(adapter.speculativeCommandBufferLimits == Gemma4DecodeCommandBuffers.limits)
+            let requested = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_MTP_COMMAND_BUFFERS"]
+            #expect(
+                adapter.speculativeCommandBufferLimits
+                    == (Gemma4DecodeCommandBuffers.speculativeEnabled(requested)
+                        ? Gemma4DecodeCommandBuffers.limits : nil))
             #expect(Gemma4DecodeCommandBuffers.limits.operations == 100)
             #expect(Gemma4DecodeCommandBuffers.limits.megabytes == 1 << 20)
+        }
+
+        @Test func mtpRoundLimitsSwitch() {
+            #expect(Gemma4DecodeCommandBuffers.speculativeEnabled(nil))
+            for on in ["1", "true", "YES", "on"] {
+                #expect(Gemma4DecodeCommandBuffers.speculativeEnabled(on))
+            }
+            for off in ["0", "false", "off", ""] {
+                #expect(!Gemma4DecodeCommandBuffers.speculativeEnabled(off))
+            }
         }
 
         @Test func verificationRowLimitsKeepExactBytes() throws {

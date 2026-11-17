@@ -499,7 +499,8 @@ open class SwitchGLU: Module {
     public var suppliesHostRowIndices = false
 
     /// Current arrays for the stock Gemma GeGLU decode graph, in a fixed order.
-    /// Only the existing affine BF16 route is admitted; adapters, custom modules,
+    /// Only the existing affine BF16 route is admitted, with 4-bit banks in
+    /// groups of 64 or 32 (the QAT-lattice experts); adapters, custom modules,
     /// fused layouts and other precision paths retain their ordinary execution.
     package func gemma4DecodeCompilationState()
         -> (parameters: [MLXArray], modules: [Module])?
@@ -514,7 +515,8 @@ open class SwitchGLU: Module {
         for projection in [gateProj, upProj, downProj] {
             guard let quantized = projection as? QuantizedSwitchLinear,
                 type(of: quantized) == QuantizedSwitchLinear.self, !quantized.training,
-                quantized.mode == .affine, quantized.bits == 4, quantized.groupSize == 64,
+                quantized.mode == .affine, quantized.bits == 4,
+                [32, 64].contains(quantized.groupSize),
                 quantized.weight.dtype == .uint32, quantized.scales.dtype == .bfloat16,
                 let biases = quantized.biases, biases.dtype == .bfloat16,
                 quantized.bias == nil, quantized.globalScales == nil

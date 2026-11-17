@@ -411,8 +411,12 @@ def:
             affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
             If Metal rejects one of its kernels, the route logs once and keeps the core path.
             Its report separates exact native-state evidence from two-order cold HTTP timing.
+            The compiled feed-forward also takes QAT-lattice expert banks (4 bits in groups of 32), and MTP
+            rounds of decode and verification rows commit by operation count like plain decode steps
+            (`DARKBLOOM_GEMMA4_MTP_COMMAND_BUFFERS=0` restores MLX's defaults for them); outputs keep their bits.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
+            - "changelog.d/gemma4-lattice-decode.md"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
