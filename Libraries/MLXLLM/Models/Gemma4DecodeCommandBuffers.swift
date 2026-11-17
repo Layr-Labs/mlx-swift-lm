@@ -29,6 +29,10 @@ enum Gemma4DecodeCommandBuffers {
         guard let raw else { return true }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }
+
+    /// Tests only: replaces the environment's choice for MTP rounds (nil: the
+    /// environment's). The engine reads it on its own queue at each round.
+    nonisolated(unsafe) static var speculativeOverrideForTesting: Bool?
 }
 
 extension Gemma4TextModel: CBv2DecodeCommandBufferLimitsProviding {
@@ -37,6 +41,9 @@ extension Gemma4TextModel: CBv2DecodeCommandBufferLimitsProviding {
     }
 
     public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
-        Gemma4DecodeCommandBuffers.speculativeEnabled ? Gemma4DecodeCommandBuffers.limits : nil
+        let enabled =
+            Gemma4DecodeCommandBuffers.speculativeOverrideForTesting
+            ?? Gemma4DecodeCommandBuffers.speculativeEnabled
+        return enabled ? Gemma4DecodeCommandBuffers.limits : nil
     }
 }

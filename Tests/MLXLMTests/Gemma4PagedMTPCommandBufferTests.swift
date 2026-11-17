@@ -11,8 +11,10 @@ import Testing
 /// Gemma 4's MTP rounds run under its op-count command buffers
 /// (`speculativeCommandBufferLimits`) on the paged KV backend that production
 /// uses, so a round's verification writes and the reads after them share a
-/// command buffer. Greedy output stays token-exact with the MTP-off engine,
-/// through sliding-window wraps.
+/// command buffer. Serial verification stays token-exact with the MTP-off
+/// engine; rectangular verification (production's `[B, 2]` window, written in
+/// bulk into segments of two pages, so each row spans several) gives the same
+/// tokens with and without the limits.
 @Suite("Gemma 4 paged MTP rounds under op-count command buffers", .serialized)
 struct Gemma4PagedMTPCommandBufferTests {
     private let vocabSize = 256
@@ -82,14 +84,15 @@ struct Gemma4PagedMTPCommandBufferTests {
     }
 
     private func makeEngine(
-        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel?
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel?,
+        verification: CBv2MTPVerificationMode = .serialTarget, segmentBytes: Int? = nil
     ) throws -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let backend = try PagedKVBackend(
             layerKinds: kinds,
             config: PagedKVPoolConfig(
                 capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: 16,
-                nominalMaxSequenceLength: 512))
+                nominalMaxSequenceLength: 512, segmentSizeBytes: segmentBytes))
         let mtpDrafter = try drafter.map {
             try Gemma4CBv2MTPDrafter(drafter: $0, target: target)
         }
@@ -104,7 +107,7 @@ struct Gemma4PagedMTPCommandBufferTests {
             mtpDrafter: mtpDrafter,
             mtpConfig: CBv2MTPConfig(
                 enabled: drafter != nil, maxDraftTokens: 1, maxSpeculativeBatch: 4,
-                fixedDraftTokens: 1, verificationMode: .serialTarget,
+                fixedDraftTokens: 1, verificationMode: verification,
                 maxAutomaticRectangularTokens: 8))
     }
 
@@ -150,5 +153,42 @@ struct Gemma4PagedMTPCommandBufferTests {
                 out.tokens == baselines[index],
                 "MTP-on output diverged: on=\(out.tokens) off=\(baselines[index])")
         }
+    }
+
+    /// Production verifies a `[B, 2]` window (rectangular), which is not
+    /// M=1-exact against plain decode, so the oracle is the same rounds with
+    /// MLX's default command buffers: the partitioning must not change a token.
+    @Test func rectangularRoundsGiveTheSameTokensWithAndWithoutTheLimits() async throws {
+        MLXRandom.seed(0x6E45)
+        let target = Gemma4TextModel(try targetConfig())
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        eval(target, drafter)
+        defer { Gemma4DecodeCommandBuffers.speculativeOverrideForTesting = nil }
+        let prompts = [
+            makePromptTokens(length: 24, seed: 51, vocabSize: vocabSize),
+            makePromptTokens(length: 40, seed: 52, vocabSize: vocabSize),
+        ]
+        var outputs: [Bool: [[Int]]] = [:]
+        for limited in [false, true] {
+            Gemma4DecodeCommandBuffers.speculativeOverrideForTesting = limited
+            let adapter = CBv2SteppableLanguageModelAdapter(target)
+            #expect((adapter.speculativeCommandBufferLimits != nil) == limited)
+            var tokens: [[Int]] = []
+            for (index, prompt) in prompts.enumerated() {
+                let engine = try makeEngine(
+                    target: target, drafter: drafter, verification: .rectangular,
+                    segmentBytes: 2 * 16 * 32 * 4 * 2)
+                let out = await cbv2SchedCollect(
+                    try engine.submit(
+                        greedy(id: UInt64(index + 1), prompt: prompt, maxTokens: 48)))
+                let metrics = try #require(engine.mtpMetricsSnapshot())
+                await engine.shutdown()
+                #expect(metrics.rounds >= 1, "no MTP round ran")
+                #expect(out.tokens.count == 48)
+                tokens.append(out.tokens)
+            }
+            outputs[limited] = tokens
+        }
+        #expect(outputs[true] == outputs[false])
     }
 }

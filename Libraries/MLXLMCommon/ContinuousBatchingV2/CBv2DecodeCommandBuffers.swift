@@ -25,8 +25,8 @@ extension EngineLoopV2 {
 
     /// Runs one step's graph construction and evaluation with the model's
     /// decode command-buffer limits when `plan` is a plain decode step, or its
-    /// speculative limits when `plan` is a speculative round of decode and
-    /// verification rows.
+    /// speculative limits when `plan` is a speculative round whose rows each
+    /// carry at most `speculativeCommandBufferRowTokens` tokens.
     func withDecodeCommandBuffers<R>(
         _ plan: CBv2StepPlan, speculative: Bool = false, _ body: () throws -> R
     ) rethrows -> R {
