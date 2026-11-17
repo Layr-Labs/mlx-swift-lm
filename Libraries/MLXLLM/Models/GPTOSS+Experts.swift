@@ -19,10 +19,19 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
     return outGlu * (xLinear + 1)
 }
 
-private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
 ) { xLinear, xGlu in
     swiglu(xLinear, xGlu)
+}
+
+/// `swiglu(xLinear + linearBias, xGlu + gluBias)` as one compiled kernel: the
+/// gate/up projection's bias add (`QuantizedSwitchLinear`'s `result + bias`)
+/// folded into the SwiGLU, each op at its traced dtype, so the same values.
+let compiledBiasedSwiglu: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+    shapeless: true
+) { args in
+    [swiglu(args[0] + args[2], args[1] + args[3])]
 }
 
 class SwiGLUSwitchGLU: Module {
@@ -110,7 +119,22 @@ class SwiGLUSwitchGLU: Module {
         return uncompiledExpertForward(x, indices)
     }
 
-    func uncompiledExpertForward(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+    /// The experts' output rows `[..., K, D]` before the down projection's
+    /// bias (`downProj`'s bias table is added by `GPTOSSFusedNorms.expertTail`
+    /// with the same values); nil where the down projection is not a quantized
+    /// switch layer with a bias, or the call would sort its rows.
+    func rowsBeforeDownBias(_ x: MLXArray, _ indices: MLXArray) -> (
+        rows: MLXArray, biases: MLXArray
+    )? {
+        guard let down = downProj as? QuantizedSwitchLinear, let biases = down.linearBias,
+            biases.dtype == x.dtype, indices.size < 64
+        else { return nil }
+        return (uncompiledExpertForward(x, indices, downBias: false), biases)
+    }
+
+    func uncompiledExpertForward(_ x: MLXArray, _ indices: MLXArray, downBias: Bool = true)
+        -> MLXArray
+    {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
         let doSort = indices.size >= 64
@@ -124,6 +148,26 @@ class SwiGLUSwitchGLU: Module {
 
         let xUp: MLXArray
         let xGate: MLXArray
+        if !downBias, GPTOSSFusedNorms.isExpertBiasEnabled,
+            let gateUp = gateUpProj as? QuantizedSwitchLinear, let bias = gateUp.linearBias,
+            bias.dtype == x.dtype
+        {
+            // The fused decode path: the gate/up bias inside the compiled SwiGLU.
+            let projected = gateUp.projectWithoutBias(x, idx, sortedIndices: doSort)
+            let rowBias = MLX.expandedDimensions(bias[idx], axis: -2)
+            let activated = compiledBiasedSwiglu([
+                projected[.ellipsis, hiddenDims...], projected[.ellipsis, ..<hiddenDims],
+                rowBias[.ellipsis, hiddenDims...], rowBias[.ellipsis, ..<hiddenDims],
+            ])[0]
+            guard let down = downProj as? QuantizedSwitchLinear else {
+                preconditionFailure("GPTOSSFusedNorms: called where the experts are not covered")
+            }
+            x = down.projectWithoutBias(activated, idx, sortedIndices: doSort)
+            if doSort {
+                x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+            }
+            return x.squeezed(axis: -2)
+        }
         if let gateUpProj {
             let projected = gateUpProj(x, idx, sortedIndices: doSort)
             xGate = projected[.ellipsis, ..<hiddenDims]
@@ -135,7 +179,12 @@ class SwiGLUSwitchGLU: Module {
             xUp = upProj(x, idx, sortedIndices: doSort)
             xGate = gateProj(x, idx, sortedIndices: doSort)
         }
-        x = downProj(compiledSwiglu(xUp, xGate), idx, sortedIndices: doSort)
+        let activated = compiledSwiglu(xUp, xGate)
+        if !downBias, let down = downProj as? QuantizedSwitchLinear {
+            x = down.projectWithoutBias(activated, idx, sortedIndices: doSort)
+        } else {
+            x = downProj(activated, idx, sortedIndices: doSort)
+        }
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
