@@ -349,7 +349,7 @@ extension KernelTests {
             let input = UserInput(
                 prompt: .text("hi"), videos: [Self.clip(sizes: [16, 32, 16, 32])])
             await #expect(
-                throws: VLMError.processing("Qwen4 video changes frame geometry within a clip")
+                throws: VLMError.processing("Qwen video changes frame geometry within a clip")
             ) {
                 _ = try await Self.processor().prepare(input: input)
             }
@@ -386,7 +386,7 @@ extension KernelTests {
                 prompt: .text("hi"), videos: [Self.clip(sizes: [16, 16, 16, 16])])
             await #expect(
                 throws: VLMError.processing(
-                    "Qwen4 video placeholder count does not match supplied clips")
+                    "Qwen video placeholder count does not match supplied clips")
             ) {
                 _ = try await Self.processor(template: "hi").prepare(input: input)
             }

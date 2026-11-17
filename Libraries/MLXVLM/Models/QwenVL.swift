@@ -294,6 +294,33 @@ public struct QwenVL {
         return (flattenedPatches, .init(gridT, gridH, gridW))
     }
 
+    /// The grids that position video in M-RoPE, as Transformers' `get_rope_index`
+    /// does: a clip whose `t` groups are separate token runs (one timestamped
+    /// block each) becomes `t` grids of `t = 1`; a clip in one run keeps its grid.
+    static func positionVideoGrids(
+        _ grids: [THW], tokens: [Int], mask: [Int32]? = nil, videoToken: Int, merge: Int
+    ) -> [THW] {
+        guard merge > 0, grids.contains(where: { $0.t > 1 }) else { return grids }
+        // Lengths of the unmasked video-token runs, in prompt order.
+        let isVideo: [Bool] =
+            mask.map { zip(tokens, $0).map { $0 == videoToken && $1 == 1 } }
+            ?? tokens.map { $0 == videoToken }
+        let runs = isVideo.split(separator: false).map(\.count)
+        var result: [THW] = []
+        var run = 0
+        for grid in grids {
+            let groupTokens = (grid.h / merge) * (grid.w / merge)
+            if grid.t > 1, run < runs.count, runs[run] == groupTokens {
+                result.append(contentsOf: repeatElement(THW(1, grid.h, grid.w), count: grid.t))
+                run += grid.t
+            } else {
+                result.append(grid)
+                run += 1
+            }
+        }
+        return result
+    }
+
     // MARK: - Prepared input splitting
 
     /// Split a Qwen VL prepared input at `prefixTokenCount`, keeping only the media

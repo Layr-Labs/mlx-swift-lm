@@ -78,6 +78,20 @@ extension UnitTests {
             #expect(result == tokens(expected), "a bare slot gets a full block")
         }
 
+        /// Python's `f"{t:.1f}"` rounds the binary value: 0.05 is just above
+        /// a half and 0.35 just below.
+        @Test
+        func timestampsRoundLikePython() throws {
+            let result = try expand(
+                pad, grids: [THW(4, 2, 2)], timestamps: [[0.05, 0.35, 2.45, 0.15]])
+            let block = start + pad + end
+            #expect(
+                result
+                    == tokens(
+                        "<0.1 seconds>\(block)<0.3 seconds>\(block)<2.5 seconds>\(block)"
+                            + "<0.1 seconds>\(block)"))
+        }
+
         @Test
         func twoClipsExpandInPromptOrder() throws {
             let result = try expand(
@@ -89,13 +103,15 @@ extension UnitTests {
             #expect(result == tokens(expected), "each clip fills its own slot")
         }
 
+        /// Without single-token marker ids a template that does not round-trip
+        /// cannot expand in token space either.
         @Test
-        func templateThatDoesNotRoundTripIsRejected() {
+        func templateWithoutMarkerIdsIsRejected() {
             // 0xD800 is not a valid scalar, so decode drops it.
             let input = [0xD800] + tokens(pad)
             #expect(
                 throws: VLMError.processing(
-                    "Qwen4 video prompt could not preserve its rendered template")
+                    "Qwen video prompt could not preserve its rendered template")
             ) {
                 try Qwen4ExpVideoPrompt.expandedTokens(
                     input, tokenizer: tokenizer, grids: [THW(1, 2, 2)], timestamps: [[0]],
@@ -105,7 +121,7 @@ extension UnitTests {
 
         @Test
         func mismatchedGridAndTimestampListsAreRejected() {
-            let message = "Qwen4 video prompt could not preserve its rendered template"
+            let message = "Qwen video prompt could not preserve its rendered template"
             #expect(throws: VLMError.processing(message), "two grids, one timestamp list") {
                 try expand(pad, grids: [THW(1, 2, 2), THW(1, 2, 2)], timestamps: [[0]])
             }
@@ -114,11 +130,72 @@ extension UnitTests {
             }
         }
 
+        /// Specials are single ids; every other scalar is its own id, and
+        /// `decode` drops `~`, so a template with `~` does not round-trip.
+        private struct LossyTokenizer: Tokenizer {
+            static let specials = [
+                "<|vision_start|>": 1_000_001, "<|video_pad|>": 1_000_002,
+                "<|vision_end|>": 1_000_003,
+            ]
+            let bosToken: String? = nil
+            let eosToken: String? = nil
+            let unknownToken: String? = nil
+
+            func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+                var ids: [Int] = []
+                var rest = Substring(text)
+                while let scalar = rest.unicodeScalars.first {
+                    if let special = Self.specials.first(where: { rest.hasPrefix($0.key) }) {
+                        ids.append(special.value)
+                        rest = rest.dropFirst(special.key.count)
+                    } else {
+                        ids.append(Int(scalar.value))
+                        rest = rest.dropFirst()
+                    }
+                }
+                return ids
+            }
+
+            func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+                var text = ""
+                for id in tokenIds where id != 0x7E {
+                    if let name = Self.specials.first(where: { $0.value == id })?.key {
+                        text += name
+                    } else if let scalar = Unicode.Scalar(UInt32(id)) {
+                        text.unicodeScalars.append(scalar)
+                    }
+                }
+                return text
+            }
+
+            func convertTokenToId(_ token: String) -> Int? { Self.specials[token] }
+            func convertIdToToken(_ id: Int) -> String? { nil }
+
+            func applyChatTemplate(
+                messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                additionalContext: [String: any Sendable]?
+            ) throws -> [Int] { [] }
+        }
+
+        @Test
+        func templateThatDoesNotRoundTripExpandsInTokenSpace() throws {
+            let lossy = LossyTokenizer()
+            let template = lossy.encode(text: "~a\(start)\(pad)\(end)b", addSpecialTokens: false)
+            let result = try Qwen4ExpVideoPrompt.expandedTokens(
+                template, tokenizer: lossy, grids: [THW(2, 4, 4)], timestamps: [[0.5, 1.5]],
+                merge: 2)
+            let block = [1_000_001] + Array(repeating: 1_000_002, count: 4) + [1_000_003]
+            let text = { (value: String) in lossy.encode(text: value, addSpecialTokens: false) }
+            #expect(
+                result == text("~a") + text("<0.5 seconds>") + block + text("<1.5 seconds>") + block
+                    + text("b"), "each label is encoded on its own")
+        }
+
         @Test
         func placeholderCountMustMatchClips() {
             #expect(
                 throws: VLMError.processing(
-                    "Qwen4 video placeholder count does not match supplied clips")
+                    "Qwen video placeholder count does not match supplied clips")
             ) {
                 try expand(
                     "one \(pad)", grids: [THW(1, 2, 2), THW(1, 2, 2)], timestamps: [[0], [1]])
@@ -127,7 +204,7 @@ extension UnitTests {
 
         @Test
         func gridMustAgreeWithMergeAndTimestamps() {
-            let message = "Qwen4 video grid and timestamps disagree"
+            let message = "Qwen video grid and timestamps disagree"
             #expect(throws: VLMError.processing(message), "height 3 is not a multiple of 2") {
                 try expand(pad, grids: [THW(1, 3, 4)], timestamps: [[0]])
             }
@@ -141,7 +218,7 @@ extension UnitTests {
 
         @Test
         func startTokenWithoutEndTokenIsMalformed() {
-            #expect(throws: VLMError.processing("Qwen4 video placeholder is malformed")) {
+            #expect(throws: VLMError.processing("Qwen video placeholder is malformed")) {
                 try expand("\(start)\(pad)z", grids: [THW(1, 2, 2)], timestamps: [[0]])
             }
         }

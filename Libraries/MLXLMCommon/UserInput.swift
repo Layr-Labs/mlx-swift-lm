@@ -352,8 +352,17 @@ public struct UserInput {
         /// The sampling strategy to use, or `nil` to use model default behavior.
         public var sampling: SamplingMethod?
 
-        public init(sampling: SamplingMethod? = nil) {
+        /// The most frames to sample from one clip, or `nil` for the model's default.
+        public var maxFrames: Int?
+
+        /// The most pixels one clip may keep after resizing, summed over its sampled frames
+        /// (frames × height × width), or `nil` for the model's default.
+        public var maxPixels: Int?
+
+        public init(sampling: SamplingMethod? = nil, maxFrames: Int? = nil, maxPixels: Int? = nil) {
             self.sampling = sampling
+            self.maxFrames = maxFrames
+            self.maxPixels = maxPixels
         }
 
         /// Convenience initializer to sample a fixed number of frames across the video.

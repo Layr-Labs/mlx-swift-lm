@@ -177,8 +177,12 @@ def:
             row-local grammar verification: retain raw target logits and mask/sample only the
             committed prefix at finalization, never advance grammar over rejected drafts.
             Unset/off retains target-only constrained rows. Native-completion engines remain
-            target-only for constrained requests. Each committed grammar position adds a bounded
-            host readback; this is not a performance qualification.
+            target-only for constrained requests unless their issued contract qualifies the
+            verification (GLM page-bank profiles): each committed position is then sampled under
+            the native work protocol, outside finalize's commit lock. Any failure there seals
+            native completion, so finalize commits nothing more and the fault path ends the
+            requests. Each committed grammar position adds a bounded host readback; this is not
+            a performance qualification.
             A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
             row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
@@ -291,8 +295,12 @@ def:
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
         channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
-        chat-template rendering. GLM5 has schema-disambiguated values and response-wide
-        validation before committing calls; this does not register a GLM5 model or qualify grammar decoding.
+        chat-template rendering. The GLM5, Gemma and MiMo V2 parsers read their frame grammar and
+        the declared function name only: a missing required or undeclared argument, a union or a
+        value of another type is returned as generated (`GrammarOnlyToolParsing`,
+        `DARKBLOOM_GRAMMAR_ONLY_TOOL_PARSING=0` restores their schema refusals); declared types
+        choose between a raw string and JSON, and one malformed GLM5 frame refuses the response's
+        whole batch; this does not register a GLM5 model or qualify grammar decoding.
         `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
         is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
         argument JSON that the complete-frame parse must agree with when the frame closes.
@@ -310,6 +318,7 @@ def:
         the Gemma streamer withholds those values until the complete parse. Default-off keeps existing
         string exposure. `GemmaQuotedNumberConformanceTests` runs with the flag off and on.
       globs:
+        - "changelog.d/glm5-tool-grammar-only.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"
@@ -362,6 +371,8 @@ def:
             allocator slack remain separate consumer admission obligations.
             The issued GLM pool returns its free segments once the engine idles and before a
             lone row whose step scratch was refused is retried (`DARKBLOOM_NATIVE_SEGMENT_RELEASE`).
+            GLM page-bank contracts accept token-constrained rows, which never chain; with
+            `DARKBLOOM_CBV2_MTP_GRAMMAR` they draft under grammar-aware verification.
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"
@@ -843,8 +854,14 @@ def:
         fork callers use; upstream left only the typed entry point, so the protocol default aborted the
         process. The stateless call carries no M-RoPE delta: a decode step after a media prompt uses the
         typed call with the state that `prepare` returned (upstream 3f9c86f4), as the decode tests do.
+        Qwen3-VL video follows Transformers' timestamped layout (a `<t.t seconds>` label and a vision block
+        per frame pair, M-RoPE `t = 1` per block) under `UserInput.VideoProcessing.maxFrames`/`maxPixels`;
+        `Qwen3VLVideoReferenceLayoutTests` compares it with a golden of Transformers' own processor
+        (`scripts/qwen35_video_layout_golden.py`).
       globs:
         - "Libraries/MLXVLM/**"
+        - "changelog.d/qwen3vl-video-reference-layout.md"
+        - "scripts/qwen35_video_layout_golden.py"
         - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"
         - "Tests/MLXLMTests/ProcessorConfigLoadingTests.swift"
         - "Tests/MLXLMTests/Mistral3PixelLayoutAndMaskTests.swift"

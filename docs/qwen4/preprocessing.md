@@ -11,6 +11,10 @@ Transformers v5.8.0, commit `049d2bf1220747b6d39e2a978b9f5fe0defa1dca`:
 - `src/transformers/models/qwen3_vl/processing_qwen3_vl.py`
 - `src/transformers/video_processing_utils.py`
 
+`Qwen3VLProcessor` (Qwen3-VL, Qwen3.5) uses the same sampling, resize and
+timestamp code for video; its M-RoPE grid split (`QwenVL.positionVideoGrids`)
+follows the same reference.
+
 The Qwen4 wrapper's per-temporal-group position-grid expansion follows
 `src/transformers/models/qwen3_vl/modeling_qwen3_vl.py`. AVFoundation extraction
 and memory-backed ownership in `Qwen4ExpVideoSampler.swift` are native Swift

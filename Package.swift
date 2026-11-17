@@ -261,6 +261,7 @@ let package = Package(
                 .process("Resources/gemma4-E4B-assistant-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
                 .process("Resources/block_hash_vectors.json"),
+                .process("Resources/qwen35-video-layout-golden.json"),
             ]
         ),
         .testTarget(

@@ -71,7 +71,8 @@ public enum QwenVisionSeamSupport {
             guard attentionMask.ndim == 1 || attentionMask.ndim == 2 else {
                 throw Qwen35PositionSeamError.invalidAttentionMaskRank(attentionMask.ndim)
             }
-            mask = attentionMask.ndim == 1
+            mask =
+                attentionMask.ndim == 1
                 ? attentionMask.expandedDimensions(axis: 0) : attentionMask
             guard mask?.shape == tokens.shape else {
                 throw Qwen35PositionSeamError.attentionMaskShapeMismatch
@@ -80,7 +81,7 @@ public enum QwenVisionSeamSupport {
 
         let imageGrids = imageGrids.flatMap { $0.isEmpty ? nil : $0 }
         let videoGrids = videoGrids.flatMap { $0.isEmpty ? nil : $0 }
-        if (imageGrids != nil || videoGrids != nil), tokens.dim(0) != 1 {
+        if imageGrids != nil || videoGrids != nil, tokens.dim(0) != 1 {
             throw Qwen35PositionSeamError.multimodalBatchUnsupported(tokens.dim(0))
         }
 
@@ -125,6 +126,9 @@ public enum QwenVisionSeamSupport {
         guard tokens.dim(0) == 1 else { return }
         let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
         let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
+        let videoGrids = QwenVL.positionVideoGrids(
+            videoGrids, tokens: values, mask: maskValues, videoToken: seam.videoPositionTokenId,
+            merge: merge)
         let imageToken = seam.imagePositionTokenId
         let videoToken = seam.videoPositionTokenId
         var imageIndex = 0
@@ -144,7 +148,7 @@ public enum QwenVisionSeamSupport {
             let grids = kind == "image" ? imageGrids : videoGrids
             var end = cursor + 1
             while end < values.count,
-                (maskValues.map { $0[end] == 1 } ?? true), values[end] == token
+                maskValues.map { $0[end] == 1 } ?? true, values[end] == token
             {
                 end += 1
             }

@@ -43,7 +43,12 @@ All changes are additive; implementations were updated consistently.
   bounded state and must not preview rejected drafts. Common-width rounds walk
   constrained rows together and cap their state transitions at the committed
   width. Unconstrained verifier semantics are unchanged. Native-completion
-  engines keep constrained rows target-only pending resource-ownership validation.
+  engines keep constrained rows target-only unless the issued contract sets
+  `supportsConstrainedMTPVerification` (GLM page-bank profiles). Then each
+  committed position is submitted and read back under the native work protocol,
+  with finalize's commit lock released around it. Any failure there seals native
+  completion (the first fault wins), so finalize commits nothing more and the fault
+  path ends the requests; output committed before the fault stays delivered.
   On opted-in ordinary seed/fallback steps, raw non-finite samples terminate
   without advancing grammar state. Flag-off ordinary confirmation is unchanged.
   Each grammar position adds a host readback; full-model acceptance and throughput
