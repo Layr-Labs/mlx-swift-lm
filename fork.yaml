@@ -509,7 +509,11 @@ def:
             and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm
             (a stream narrower than its norms, as in the Prism packs, keeps the unfused promoting sum),
             the Gated DeltaNet convolution step and q/k norm, SwiGLU and the output gate on GPU families
-            measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`).
+            measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`). The fused residual+RMSNorm
+            (`ResidualRMSNorm`) rounds the norm's mean and orders its weight product as `RMSNormMeanForm`
+            measures MLX's prebuilt norm doing it (the compiler that built MLX's metallib chooses both;
+            a float32 looped kernel may reassociate the inverse), and keeps the unfused ops where a form
+            is not measured.
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
@@ -544,6 +548,8 @@ def:
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "changelog.d/cluster-model-runtime.md"
+            - "changelog.d/exact-residual-rms-norm.md"
+            - "Tests/MLXLMTests/Kernel/Layers/ResidualRMSNormMeanFormTests.swift"
             - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2QwenClusterCarrierTests.swift"
             - "Tests/MLXLMTests/Integration/Qwen/**"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
