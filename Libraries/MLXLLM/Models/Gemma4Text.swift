@@ -1623,6 +1623,22 @@ public class Gemma4DecoderLayer: Module {
             v2SharedSource: v2SharedSource, outputStart: 0,
             useLastQueryPrefill: useLastQueryPrefill)
         let eps = config.rmsNormEps
+        // The kernels read every input in the activation dtype. An output in
+        // another dtype keeps the unfused ops (and their promotion) instead.
+        func unfusedEnd(_ out: MLXArray) -> (
+            MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset, MLXArray?
+        ) {
+            let scaled = out * layerScalar
+            return (
+                scaled, kvPair, attnPositionOffset,
+                nextNorm.map { MLXFast.rmsNorm(scaled, weight: $0, eps: eps) }
+            )
+        }
+        guard attnOut.dtype == x.dtype else {
+            return unfusedEnd(
+                feedforwardWithCompilation(
+                    x + postAttentionLayernorm(attnOut), isExpertPrefill: isExpertPrefill))
+        }
         if isMoE, let router, let experts, let postFeedforwardLayernorm1,
             let preFeedforwardLayernorm2, let postFeedforwardLayernorm2
         {
@@ -1648,6 +1664,11 @@ public class Gemma4DecoderLayer: Module {
                 (dense, expertOutput) = fusedFeedforwardMiddle(
                     norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill)
             }
+            guard dense.dtype == x.dtype, expertOutput.dtype == x.dtype else {
+                let branches =
+                    postFeedforwardLayernorm1(dense) + postFeedforwardLayernorm2(expertOutput)
+                return unfusedEnd(sum + postFeedforwardLayernorm(branches))
+            }
             let (out, next) = Gemma4FusedNorms.feedforwardTail(
                 dense: dense,
                 experts: (
@@ -1661,8 +1682,12 @@ public class Gemma4DecoderLayer: Module {
         let (sum, norms) = Gemma4FusedNorms.attentionTail(
             attnOut, residual: x, postAttention: postAttentionLayernorm.weight,
             sumNorms: [preFeedforwardLayernorm.weight], eps: eps)
+        let dense = mlp(norms[0])
+        guard dense.dtype == x.dtype else {
+            return unfusedEnd(sum + postFeedforwardLayernorm(dense))
+        }
         let (out, next) = Gemma4FusedNorms.feedforwardTail(
-            dense: mlp(norms[0]), experts: nil, residual: sum,
+            dense: dense, experts: nil, residual: sum,
             post: postFeedforwardLayernorm.weight, layerScalar: layerScalar, next: nextNorm,
             eps: eps)
         return (out, kvPair, attnPositionOffset, next)

@@ -14,10 +14,40 @@ struct Gemma4FusedNormsTests {
     private static let eps: Float = 1e-6
 
     /// Byte parity is promised only where the mean form is measured
-    /// (`RMSNormMeanForm.measured`); elsewhere the product keeps the unfused ops.
+    /// (`RMSNormMeanForm.measured`) on a family whose kernels were checked
+    /// (`Gemma4FusedNorms.verifiedFamilies`); elsewhere the unfused ops run.
     private var verified: Bool {
         Device.defaultDevice().deviceType == .gpu
             && ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family())
+            && Gemma4FusedNorms.verifiedFamilies.contains(AffineQuantizedVectors.family())
+    }
+
+    @Test func onlyCheckedFamiliesFuse() {
+        #expect(Gemma4FusedNorms.verifiedFamilies == [17])
+        if !Gemma4FusedNorms.verifiedFamilies.contains(AffineQuantizedVectors.family()) {
+            #expect(!Gemma4FusedNorms.supports(width: 2816, dtype: .bfloat16))
+        }
+    }
+
+    /// The kernels' own check runs on the rows that separate the two mean
+    /// forms, and it sees a kernel compiled with the other form.
+    @Test func readinessCheckSeesTheWrongMeanForm() throws {
+        guard verified else { return }
+        for dtype in [DType.bfloat16, .float16] {
+            let width = 2816
+            let form = try #require(RMSNormMeanForm.measured(width: width, dtype: dtype))
+            #expect(Gemma4FusedNorms.Readiness.check(width: width, dtype: dtype) == nil)
+            let (separating, _) = RMSNormMeanForm.Calibration.rows(width: width, dtype: dtype)
+            try #require(!separating.isEmpty)
+            let x = MLXArray(separating.flatMap { $0 }, [separating.count, 1, width])
+                .asType(dtype)
+            let other: RMSNormMeanForm = form == .divide ? .fusedMultiplyAdd : .divide
+            let caught = Gemma4FusedNorms.$meanFormOverride.withValue(other) {
+                Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype)
+            }
+            #expect(caught != nil, "\(dtype)")
+            #expect(Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype) == nil)
+        }
     }
 
     @Test func meanFormIsMeasuredOnRowsThatSeparateTheForms() throws {
@@ -134,7 +164,9 @@ struct Gemma4FusedNormsTests {
         }
     }
 
-    private func configuration(moe: Bool, layers: Int) throws -> Gemma4TextConfiguration {
+    private func configuration(moe: Bool, layers: Int, hidden: Int = 128) throws
+        -> Gemma4TextConfiguration
+    {
         let types = (0 ..< layers).map {
             $0 % 2 == 1 ? "\"full_attention\"" : "\"sliding_attention\""
         }
@@ -148,7 +180,7 @@ struct Gemma4FusedNormsTests {
                 """
                 {
                     "model_type": "gemma4_text", "vocab_size": 64,
-                    "hidden_size": 128, "intermediate_size": 256,
+                    "hidden_size": \(hidden), "intermediate_size": 256,
                     "num_hidden_layers": \(layers), "num_attention_heads": 2,
                     "num_key_value_heads": 1, "head_dim": 64, "global_head_dim": 64,
                     "layer_types": [\(types.joined(separator: ", "))], "num_kv_shared_layers": 0,
@@ -208,6 +240,89 @@ struct Gemma4FusedNormsTests {
                 useLastQueryPrefill: false, isExpertPrefill: false)
             expectExact(again, expected)
         }
+    }
+
+    /// Gemma 4 26B's width with its quantized projections (8-bit dense and
+    /// router, 4-bit experts): the fused path, with the compiled middle where
+    /// the shape takes it, keeps the bits.
+    @Test func quantizedLayerAtModelWidthKeepsItsBits() throws {
+        guard verified else { return }
+        let layer = Gemma4DecoderLayer(
+            try configuration(moe: true, layers: 1, hidden: 2816), layerIdx: 0)
+        try randomize(layer, seed: 12_000)
+        quantize(model: layer) { path, _ in
+            path.hasPrefix("experts.")
+                ? (groupSize: 64, bits: 4, mode: .affine) : (groupSize: 64, bits: 8, mode: .affine)
+        }
+        layer.train(false)
+        eval(layer)
+        #expect(layer.feedforwardCompilationState() != nil)
+        for (rows, width) in [(1, 1), (3, 1), (1, 2), (2, 2)] {
+            let x = random(
+                [rows, width, 2816], UInt64(12_100 + rows * 10 + width), .bfloat16, scale: 4)
+            try #require(layer.supportsFusedNorms(x, outputTailRows: nil))
+            let (expected, _, _) = Gemma4FusedNorms.$enabledOverride.withValue(false) {
+                layer(x)
+            }
+            let next = weight(2816, 12_200, .bfloat16)
+            let (out, _, _, fusedNext) = layer.forwardFusedNorms(
+                x, normalizedInput: nil, nextNorm: next, mask: nil, cache: nil, sharedKV: nil,
+                positionOffset: nil, v2SharedSource: nil, useLastQueryPrefill: false,
+                isExpertPrefill: false)
+            expectExact(out, expected)
+            expectExact(
+                try #require(fusedNext), MLXFast.rmsNorm(expected, weight: next, eps: Self.eps))
+        }
+    }
+
+    /// An attention output in another dtype (a float32 output projection)
+    /// keeps the unfused tail and its promotion.
+    @Test func anotherOutputDtypeKeepsTheUnfusedOps() throws {
+        guard verified else { return }
+        let layer = Gemma4DecoderLayer(try configuration(moe: true, layers: 1), layerIdx: 0)
+        try randomize(layer, seed: 13_000)
+        let o = try #require(
+            layer.namedModules().first { $0.0 == "self_attn.o_proj" }?.1 as? Linear)
+        o.update(parameters: .unflattened(["weight": o.weight.asType(.float32)]))
+        eval(layer)
+        let x = random([2, 1, 128], 13_100, .bfloat16, scale: 4)
+        try #require(layer.supportsFusedNorms(x, outputTailRows: nil))
+        let (expected, _, _) = Gemma4FusedNorms.$enabledOverride.withValue(false) { layer(x) }
+        #expect(expected.dtype == .float32)
+        let next = weight(128, 13_200, .bfloat16)
+        let (out, _, _, fusedNext) = layer.forwardFusedNorms(
+            x, normalizedInput: nil, nextNorm: next, mask: nil, cache: nil, sharedKV: nil,
+            positionOffset: nil, v2SharedSource: nil, useLastQueryPrefill: false,
+            isExpertPrefill: false)
+        expectExact(out, expected)
+        expectExact(
+            try #require(fusedNext), MLXFast.rmsNorm(expected, weight: next, eps: Self.eps))
+    }
+
+    /// Two rows of verification width (2 tokens each) after a two-row prompt.
+    @Test(arguments: [true, false])
+    func verificationRowsKeepTheirBits(moe: Bool) throws {
+        guard verified else { return }
+        try #require(Gemma4FusedNorms.supports(width: 128, dtype: .bfloat16))
+        let model = Gemma4TextModel(try configuration(moe: moe, layers: 4))
+        try randomize(model, seed: moe ? 14_000 : 15_000)
+        let prompt = MLXArray((0 ..< 24).map { Int32(($0 * 5 + 1) % 64) }).reshaped(2, 12)
+        func run(_ fused: Bool) -> [Data] {
+            Gemma4FusedNorms.$enabledOverride.withValue(fused) {
+                let cache = model.newCache(parameters: nil)
+                var outputs = [bytes(model(prompt, cache: cache))]
+                for step in 0 ..< 4 {
+                    let tokens = MLXArray((0 ..< 4).map { Int32((step * 13 + $0 * 7 + 2) % 64) })
+                        .reshaped(2, 2)
+                    outputs.append(bytes(model(tokens, cache: cache)))
+                }
+                return outputs
+            }
+        }
+        let unfused = run(false)
+        let fused = run(true)
+        #expect(fused.count == unfused.count)
+        for (a, b) in zip(fused, unfused) { #expect(a == b) }
     }
 
     @Test(arguments: [true, false])

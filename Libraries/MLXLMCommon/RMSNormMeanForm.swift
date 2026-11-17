@@ -36,7 +36,7 @@ public enum RMSNormMeanForm: Int, Sendable {
         return Calibration.shared.form(width: width, dtype: dtype)
     }
 
-    final class Calibration: @unchecked Sendable {
+    package final class Calibration: @unchecked Sendable {
         static let shared = Calibration()
 
         private struct Key: Hashable {
@@ -48,7 +48,7 @@ public enum RMSNormMeanForm: Int, Sendable {
         private var forms: [Key: RMSNormMeanForm?] = [:]
 
         /// The form is the compiler's lowering, not a function of epsilon.
-        static let epsilon: Float = 1e-6
+        package static let epsilon: Float = 1e-6
         static let separatingRows = 8
         static let plainRows = 24
 
@@ -114,7 +114,7 @@ public enum RMSNormMeanForm: Int, Sendable {
 
         /// Rows on which the two forms' outputs differ (with a correctly rounded
         /// inverse square root), and plain rows.
-        static func rows(width: Int, dtype: DType, separate: Bool = true) -> (
+        package static func rows(width: Int, dtype: DType, separate: Bool = true) -> (
             separating: [[Float]], plain: [[Float]]
         ) {
             var state = 0x243F_6A88_85A3_08D3 ^ UInt64(width) &* 0x9E37_79B9_7F4A_7C15

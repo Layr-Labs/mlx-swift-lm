@@ -13,27 +13,136 @@ import MLX
 import MLXFast
 import MLXLMCommon
 import MLXNN
+import os
 
 enum Gemma4FusedNorms {
-    /// Diagnostic only: `DARKBLOOM_GEMMA4_FUSED_NORMS=0` keeps the unfused ops.
+    /// `DARKBLOOM_GEMMA4_FUSED_NORMS=0` keeps the unfused ops (the rollback).
     static let enabledByEnvironment: Bool =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_NORMS"] != "0"
     /// A test or bench's own choice (nil: the environment's).
     @TaskLocal static var enabledOverride: Bool?
     static var isEnabled: Bool { enabledOverride ?? enabledByEnvironment }
 
+    /// GPU families where the kernels were checked against MLX's norm on
+    /// real weights (M5). Others keep the unfused ops.
+    static let verifiedFamilies: Set<Int> = [17]
+
+    /// Tests only: the mean form the kernels use (nil: the measured one).
+    @TaskLocal static var meanFormOverride: RMSNormMeanForm?
+
+    private static let logger = Logger(subsystem: "darkbloom", category: "Gemma4FusedNorms")
+
     /// Whether the kernels cover rows of `width` in `dtype` (MLX's looped norm,
-    /// above 4096, is not copied).
+    /// above 4096, is not copied): a verified family, a measured mean form,
+    /// and the kernels' own check against the unfused ops (`Readiness`).
     static func supports(width: Int, dtype: DType) -> Bool {
-        isEnabled && (1 ... 4096).contains(width)
-            && RMSNormMeanForm.measured(width: width, dtype: dtype) != nil
+        guard isEnabled, (1 ... 4096).contains(width),
+            Device.defaultDevice().deviceType == .gpu,
+            verifiedFamilies.contains(AffineQuantizedVectors.family()),
+            RMSNormMeanForm.measured(width: width, dtype: dtype) != nil
+        else { return false }
+        return Readiness.shared.ready(width: width, dtype: dtype)
     }
 
     private static func meanForm(_ width: Int, _ dtype: DType) -> Int {
+        if let meanFormOverride { return meanFormOverride.rawValue }
         guard let form = RMSNormMeanForm.measured(width: width, dtype: dtype) else {
             preconditionFailure("Gemma4FusedNorms: called where `supports` is false")
         }
         return form.rawValue
+    }
+
+    /// Each (width, dtype)'s kernels run once on the mean-form calibration rows
+    /// and must write the unfused ops' bytes. A Metal error or any difference
+    /// keeps the unfused ops for that key, logged once.
+    final class Readiness: @unchecked Sendable {
+        static let shared = Readiness()
+
+        private struct Key: Hashable {
+            let width: Int
+            let dtype: DType
+        }
+
+        private let lock = NSLock()
+        private var results: [Key: Bool] = [:]
+
+        func ready(width: Int, dtype: DType) -> Bool {
+            lock.withLock {
+                let key = Key(width: width, dtype: dtype)
+                if let known = results[key] { return known }
+                let failure = Self.check(width: width, dtype: dtype)
+                if let failure {
+                    Gemma4FusedNorms.logger.error(
+                        "gemma4_fused_norms_unavailable width=\(width) dtype=\(String(describing: dtype), privacy: .public) fallback=unfused reason=\(failure, privacy: .public)"
+                    )
+                }
+                results[key] = failure == nil
+                return failure == nil
+            }
+        }
+
+        /// Nil when all six kernels write the unfused ops' bytes on the rows
+        /// that separate the two mean forms (and on plain rows), else why not.
+        static func check(width: Int, dtype: DType) -> String? {
+            do {
+                return try withError { () -> String? in
+                    let (separating, plain) = RMSNormMeanForm.Calibration.rows(
+                        width: width, dtype: dtype, separate: width & (width - 1) != 0)
+                    let rows = separating + plain
+                    let x = MLXArray(rows.flatMap { $0 }, [rows.count, 1, width]).asType(dtype)
+                    let y = MLXArray(rows.reversed().flatMap { $0 }, [rows.count, 1, width])
+                        .asType(dtype)
+                    return mismatch(x, y, width: width, dtype: dtype)
+                }
+            } catch {
+                return "\(error)"
+            }
+        }
+
+        /// The first kernel output that differs from the unfused ops, with
+        /// unit weights so each norm's rounding of the mean shows.
+        static func mismatch(_ x: MLXArray, _ y: MLXArray, width: Int, dtype: DType) -> String? {
+            let eps = RMSNormMeanForm.Calibration.epsilon
+            let one = MLXArray.ones([width], dtype: dtype)
+            let zero = MLXArray.zeros(x.shape, dtype: dtype)
+            let scalar = MLXArray([Float(1)]).asType(dtype)
+            func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+                eval(a, b)
+                return a.dtype == b.dtype && a.shape == b.shape
+                    && a.asData(access: .copy).data == b.asData(access: .copy).data
+            }
+            for count in [1, 3] {
+                let tail = attentionTail(
+                    x, residual: zero, postAttention: one,
+                    sumNorms: Array(repeating: one, count: count), eps: eps)
+                let sum = zero + MLXFast.rmsNorm(x, weight: one, eps: eps)
+                guard same(tail.sum, sum) else { return "attentionTail(\(count)) sum" }
+                for norm in tail.norms
+                where !same(norm, MLXFast.rmsNorm(sum, weight: one, eps: eps)) {
+                    return "attentionTail(\(count)) norm"
+                }
+            }
+            for experts in [true, false] {
+                let s =
+                    experts
+                    ? MLXFast.rmsNorm(x, weight: one, eps: eps)
+                        + MLXFast.rmsNorm(y, weight: one, eps: eps)
+                    : x
+                let out = (zero + MLXFast.rmsNorm(s, weight: one, eps: eps)) * scalar
+                for next in [true, false] {
+                    let tail = feedforwardTail(
+                        dense: x, experts: experts ? (y, one, one) : nil, residual: zero,
+                        post: one, layerScalar: scalar, next: next ? one : nil, eps: eps)
+                    guard same(tail.out, out) else { return "feedforwardTail out" }
+                    if next, let n = tail.next,
+                        !same(n, MLXFast.rmsNorm(out, weight: one, eps: eps))
+                    {
+                        return "feedforwardTail next"
+                    }
+                }
+            }
+            return nil
+        }
     }
 
     private static func threads(_ width: Int) -> Int { 32 * (((width + 3) / 4 + 31) / 32) }
