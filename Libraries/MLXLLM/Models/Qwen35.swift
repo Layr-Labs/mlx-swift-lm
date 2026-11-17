@@ -1814,6 +1814,36 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 }
 
 extension Qwen35SparseMoeBlock {
+    /// One-stream decode (`[1, 1, D]`): the block's output before its sum, for
+    /// `Qwen35ExpertTail` to finish with the next residual norm; nil where the
+    /// kernel does not cover the call (the caller runs `callAsFunction`). The
+    /// routing and projections are `callAsFunction`'s, unchanged.
+    func decodeTailParts(_ x: MLXArray) -> Qwen35ExpertTail.Parts? {
+        guard !useQwen4AffineQMM, Qwen35DecodeFusions.isEnabledV2,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1,
+            !Qwen35BatchDecodeProjection.applies(x), !Qwen35BatchDecodeProjection.exactApplies(x),
+            !(switchMLP.downProjection is Qwen35TensorParallelSwitchLinear),
+            !(sharedExpert.downProj is any Qwen35TensorParallelPackedPartial),
+            Qwen35ExpertTail.supports(width: x.dim(-1), experts: topK, dtype: x.dtype)
+        else { return nil }
+        let gates = MLX.softmax(gate(x), axis: -1, precise: true)
+        let (inds, scores) = routerFinalizer(gates)
+        let flattened = qwen35FlattenMoEInputs(x: x, indices: inds, scores: scores)
+        // `callAndWeightedReduce`'s one-stream path is
+        // `weightedExpertSum(callAsFunction(x, indices), weights)`.
+        let rows = switchMLP(flattened.x, flattened.indices)
+        let weights = flattened.scores.asType(x.dtype)
+        guard rows.dtype == x.dtype, rows.dim(-1) == x.dim(-1), rows.size == topK * x.dim(-1)
+        else { return nil }
+        let shared = sharedExpert.qwen35TargetVerify(x, exact: false)
+        let sharedGate = sharedExpertGate(x)
+        guard shared.dtype == x.dtype, sharedGate.dtype == x.dtype else { return nil }
+        return Qwen35ExpertTail.Parts(
+            rows: rows, weights: weights, sharedGate: sharedGate, shared: shared)
+    }
+}
+
+extension Qwen35SparseMoeBlock {
     /// Tensor parallel, a batched decode or verify rectangle `[B, S, H]`:
     /// each row's router, shared expert and selected experts compute exactly
     /// what that row's own call computes (`[1, S, H]`, routes unsorted below
@@ -2083,15 +2113,49 @@ final class Qwen35DecoderLayer: Module {
     /// residual stream and its own feed-forward output, still to be added by
     /// the next layer's input norm (or the final norm). Every value is the one
     /// `cbv2Forward` computes.
+    /// A layer's output still to be added to the residual stream by the next
+    /// residual norm: an array, or a sparse block's parts before their sum
+    /// (`Qwen35ExpertTail` adds them in the norm's kernel).
+    enum Pending {
+        case add(MLXArray)
+        case experts(Qwen35ExpertTail.Parts)
+
+        /// The value to add, as the unfused ops write it.
+        var value: MLXArray {
+            switch self {
+            case .add(let add): return add
+            case .experts(let parts): return parts.output
+            }
+        }
+    }
+
+    /// `residualNorm` for a pending output of either kind.
+    static func residualNorm(_ x: MLXArray, _ pending: Pending?, _ norm: RMSNorm) -> (
+        MLXArray, MLXArray
+    ) {
+        switch pending {
+        case .experts(let parts)
+        where type(of: norm) == RMSNorm.self && norm.weight.dtype == x.dtype
+            && parts.shared.dtype == x.dtype:
+            return Qwen35ExpertTail.apply(x, parts, weight: norm.weight, eps: norm.eps)
+        case .experts(let parts):
+            return residualNorm(x, parts.output, norm)
+        case .add(let add):
+            return residualNorm(x, add, norm)
+        case nil:
+            return residualNorm(x, nil as MLXArray?, norm)
+        }
+    }
+
     func cbv2ForwardResidual(
-        _ residual: MLXArray, pending: MLXArray?,
+        _ residual: MLXArray, pending: Pending?,
         modelLayerIndex: Int,
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray? = nil,
         captureRecurrentWindow: Bool = false,
         exactTargetVerify: Bool = false
-    ) -> (residual: MLXArray, pending: MLXArray) {
+    ) -> (residual: MLXArray, pending: Pending) {
         let (x, normalizedInput) = Self.residualNorm(residual, pending, inputLayerNorm)
         let r: MLXArray
         if isLinear {
@@ -2117,6 +2181,11 @@ final class Qwen35DecoderLayer: Module {
         let (h, normalized) = Self.residualNorm(x, r, postAttentionLayerNorm)
         let feedForward: MLXArray
         if let sparse = mlp as? Qwen35SparseMoeBlock {
+            if !exactTargetVerify, !captureRecurrentWindow,
+                let parts = sparse.decodeTailParts(normalized)
+            {
+                return (h, .experts(parts))
+            }
             feedForward = sparse(
                 normalized, exactTargetVerify: exactTargetVerify)
         } else if let dense = mlp as? Qwen3NextMLP {
@@ -2125,7 +2194,7 @@ final class Qwen35DecoderLayer: Module {
         } else {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
-        return (h, feedForward)
+        return (h, .add(feedForward))
     }
 
     /// A prompt chunk's stream between layer phases (`cbv2Forward` or `cbv2ForwardResidual`).
@@ -2446,7 +2515,7 @@ public class Qwen35TextModelInner: Module {
         ) {
             Qwen35BatchDecodeScope.$deferRowParallelCast.withValue(true) {
                 var residual = inputEmbeddings ?? embedTokens(inputs)
-                var pending: MLXArray?
+                var pending: Qwen35DecoderLayer.Pending?
                 var attentionIndex = 0
                 let submissionStride = Qwen35LayerSubmission.stride
                 let observer = Qwen35LayerSubmission.observer
@@ -2472,11 +2541,16 @@ public class Qwen35TextModelInner: Module {
                         exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
                     if let observer {
                         // The layer's output h = x + T(r), as the next residual norm sums it.
-                        observer(modelLayerIndex, residual + pending!.asType(residual.dtype))
+                        observer(modelLayerIndex, residual + pending!.value.asType(residual.dtype))
                     } else if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
                         modelLayerIndex + 1 < layers.count
                     {
-                        asyncEval(residual, pending!)
+                        switch pending! {
+                        case .add(let add): asyncEval(residual, add)
+                        case .experts(let parts):
+                            asyncEval(
+                                residual, parts.rows, parts.weights, parts.sharedGate, parts.shared)
+                        }
                     }
                 }
                 let (hidden, normalized) = Qwen35DecoderLayer.residualNorm(residual, pending, norm)
