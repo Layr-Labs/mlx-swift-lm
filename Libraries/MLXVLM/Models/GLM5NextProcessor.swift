@@ -530,9 +530,7 @@ public struct GLM5NextProcessorConfiguration: Sendable {
     public func maximumSampledVideoFrames(frameBytes: Int) -> Int {
         guard fitsVideoSampleToDecodedBytes, frameBytes > 0 else { return 2048 }
         let renderBytes = frameBytes / 3 * 4
-        let frames =
-            maximumDecodedBytes < renderBytes
-            ? 0 : (maximumDecodedBytes - renderBytes) / frameBytes + 1
+        let frames = 1 + max(0, maximumDecodedBytes - renderBytes) / frameBytes
         return min(2048, max(2, frames / 2 * 2))
     }
 }
@@ -1277,7 +1275,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
     /// does not complete throws `VideoReaderFailure`.
     private func decodeFrames(
         _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform,
-        retaining retained: Set<Int>?, stoppingAfter limit: Int? = nil
+        retaining retained: Set<Int>?, stoppingAfter limit: Int?
     ) throws -> (frames: [GLM5NextRGBImage], indices: [Int], decoded: Int) {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(
