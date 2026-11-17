@@ -66,13 +66,15 @@ enum GPTOSSFusedNorms {
     /// `indices` and `weights` `[N, K]`, the bias table `[E, D]` and
     /// `residual` `[N, D]`. The sum is MLX's `sum(axis: -2)` of the weighted
     /// rows: each row plus zero, then added to the running sum in expert
-    /// order, in the activation dtype (`col_reduce_small`).
+    /// order, in the activation dtype (`col_reduce_small`, whose lanes hold
+    /// one row each for at most 8 rows; K must be at most 8).
     static func expertTail(
         rows: MLXArray, indices: MLXArray, biases: MLXArray, weights: MLXArray,
         residual: MLXArray, next: MLXArray, eps: Float
     ) -> (out: MLXArray, normed: MLXArray) {
         let width = rows.dim(-1)
         let experts = indices.dim(-1)
+        precondition(experts <= 8, "GPTOSSFusedNorms: more than 8 expert rows")
         let count = indices.size / experts
         let flat = [count, width]
         let outputs = expertTailKernel(

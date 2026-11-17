@@ -644,7 +644,7 @@ public class GPTOSSModelInner: Module {
         for (layer, entry) in zip(layers, cache) {
             guard !(entry is any GPTOSSPerRowAttentionCache),
                 let layerCache = entry as? (any CBv2AttendingLayerCache),
-                layer.mlp.numExpertsPerTok * x.dim(0) < 64,
+                layer.mlp.numExpertsPerTok * x.dim(0) < 64, layer.mlp.numExpertsPerTok <= 8,
                 layer.fusedForwardCovers(dtype: x.dtype)
             else { return nil }
             attending.append(layerCache)
