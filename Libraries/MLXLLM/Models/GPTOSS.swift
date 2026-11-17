@@ -127,6 +127,8 @@ class AttentionBlock: Module {
 
     let rope: YarnRoPE
     private var cachedSinksActive: Bool?
+    /// The measured rotation of `GPTOSSFusedNorms.attentionPrologue`.
+    let prologueRotations = Gemma4FusedNorms.RotationCache()
 
     public init(_ config: GPTOSSConfiguration) {
         self.headDim = config.headDim
@@ -219,16 +221,8 @@ class AttentionBlock: Module {
         // Bool cached at load (`prepareSinksActivation`), so this path never
         // performs the `.item()` sinks probe on the step loop.
         if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
-            // Snapshot per-row absolute RoPE offsets BEFORE updateAndAttend
-            // advances the rows (`+ 0` = graph-safe copy; invariant 1).
-            let offsets = layerCacheV2.positionOffsets + 0
-            q = rope(q, offset: offsets)
-            k = rope(k, offset: offsets)
-            let vHat = layerCacheV2.updateAndAttend(
-                queries: q, keys: k, values: v,
-                scale: smScale,
-                sinks: sinksActiveResolved() ? sinks : nil)
-            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+            let attended = cbv2Attend(q: q, k: k, v: v, cache: layerCacheV2)
+            return oProj(attended.reshaped(B, L, -1))
         }
 
         let sinksActive = sinksActiveResolved()
@@ -276,6 +270,96 @@ class AttentionBlock: Module {
     }
 }
 
+extension AttentionBlock {
+    /// The CBv2 attention before the output projection, `[B, L, heads, D]`.
+    fileprivate func cbv2Attend(
+        q: MLXArray, k: MLXArray, v: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> MLXArray {
+        // Snapshot per-row absolute RoPE offsets BEFORE updateAndAttend
+        // advances the rows (`+ 0` = graph-safe copy; invariant 1).
+        let offsets = cache.positionOffsets + 0
+        let vHat = cache.updateAndAttend(
+            queries: rope(q, offset: offsets), keys: rope(k, offset: offsets), values: v,
+            scale: smScale,
+            sinks: sinksActiveResolved() ? sinks : nil)
+        return vHat.swappedAxes(1, 2)
+    }
+
+    /// The output projection's quantized product before its bias, and the
+    /// bias; nil where `oProj` is not a quantized linear with a bias of the
+    /// activation dtype (no global scale).
+    var outputProjectionParts: (layer: QuantizedLinear, bias: MLXArray)? {
+        guard let layer = oProj as? QuantizedLinear, let bias = layer.bias,
+            layer.globalScale == nil
+        else { return nil }
+        return (layer, bias)
+    }
+
+    /// A quantized linear's product before its bias, as `QuantizedLinear`
+    /// computes it, and the bias; nil where `layer` is not a quantized linear
+    /// with a bias of `dtype` (no global scale).
+    static func biasedParts(_ layer: Linear, dtype: DType) -> (
+        layer: QuantizedLinear, bias: MLXArray
+    )? {
+        guard let quantized = layer as? QuantizedLinear, let bias = quantized.bias,
+            quantized.globalScale == nil, bias.dtype == dtype
+        else { return nil }
+        return (quantized, bias)
+    }
+
+    static func product(_ layer: QuantizedLinear, _ x: MLXArray) -> MLXArray {
+        quantizedMM(
+            x, layer.weight, scales: layer.scales, biases: layer.biases, transpose: true,
+            groupSize: layer.groupSize, bits: layer.bits, mode: layer.mode)
+    }
+
+    /// The CBv2 decode path's attention up to the output projection's bias:
+    /// `oProj(attention) - bias` as `quantizedMM` computes it, with the bias.
+    /// Where `GPTOSSFusedNorms.attentionPrologue` covers the layer, the
+    /// projections' biases, YaRN's scale and the rotation are one kernel.
+    func cbv2BeforeOutputBias(_ x: MLXArray, cache: any CBv2AttendingLayerCache) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let D = headDim
+        let attended: MLXArray
+        if GPTOSSFusedNorms.isPrologueEnabled, let yarn = rope.exactRotation,
+            yarn.dimensions == D,
+            let qParts = Self.biasedParts(qProj, dtype: x.dtype),
+            let kParts = Self.biasedParts(kProj, dtype: x.dtype),
+            let vParts = Self.biasedParts(vProj, dtype: x.dtype),
+            let rotation = prologueRotations.rotation(
+                headDim: D, base: nil, frequencies: yarn.frequencies, dtype: x.dtype)
+        {
+            let qLinear = Self.product(qParts.layer, x)
+            let kLinear = Self.product(kParts.layer, x)
+            let vLinear = Self.product(vParts.layer, x)
+            // Per-row positions before updateAndAttend advances the rows.
+            let offsets = cache.positionOffsets + 0
+            let (q, k, v) = GPTOSSFusedNorms.attentionPrologue(
+                queries: qLinear, keys: kLinear, values: vLinear,
+                queryBias: qParts.bias, keyBias: kParts.bias, valueBias: vParts.bias,
+                queryHeads: numAttentionHeads, keyValueHeads: numKeyValueHeads, headDim: D,
+                mscale: yarn.mscale, offsets: offsets, rotation: rotation)
+            let vHat = cache.updateAndAttend(
+                queries: q, keys: k, values: v, scale: smScale,
+                sinks: sinksActiveResolved() ? sinks : nil)
+            attended = vHat.swappedAxes(1, 2).reshaped(B, L, -1)
+        } else {
+            let q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+            let k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+            let v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+            attended = cbv2Attend(q: q, k: k, v: v, cache: cache).reshaped(B, L, -1)
+        }
+        guard let parts = outputProjectionParts else {
+            preconditionFailure(
+                "GPTOSSFusedNorms: called where the output projection is not covered")
+        }
+        let layer = parts.layer
+        return quantizedMM(
+            attended, layer.weight, scales: layer.scales, biases: layer.biases, transpose: true,
+            groupSize: layer.groupSize, bits: layer.bits, mode: layer.mode)
+    }
+}
+
 class MLPBlock: Module {
     let hiddenSize: Int
     let numLocalExperts: Int
@@ -308,6 +392,79 @@ class MLPBlock: Module {
 
         x = x * expandedDimensions(expertWeights, axis: -1)
         return x.sum(axis: -2)
+    }
+
+    /// `callAsFunction` up to the experts' rows before the down projection's
+    /// bias: the rows, the routed experts, their weights and the bias table
+    /// (`GPTOSSFusedNorms.expertTail` finishes it with the same values).
+    func expertRowsBeforeSum(_ x: MLXArray) -> (
+        rows: MLXArray, indices: MLXArray, weights: MLXArray, biases: MLXArray
+    )? {
+        let (indices, expertWeights) = routed(x)
+        guard let parts = self.experts.rowsBeforeDownBias(x, indices) else { return nil }
+        return (parts.rows, indices, expertWeights, parts.biases)
+    }
+
+    /// `callAsFunction`'s routing: the experts and their weights. Through
+    /// `GPTOSSFusedNorms.route` (one kernel after the router's quantized
+    /// product) where it covers the router, else the unfused ops.
+    func routed(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+        if let layer = router as? QuantizedLinear, let bias = layer.bias, layer.globalScale == nil,
+            bias.dtype == x.dtype,
+            let form = GPTOSSFusedNorms.routingForm(
+                experts: numLocalExperts, topK: numExpertsPerTok, dtype: x.dtype)
+        {
+            let logits = quantizedMM(
+                x, layer.weight, scales: layer.scales, biases: layer.biases, transpose: true,
+                groupSize: layer.groupSize, bits: layer.bits, mode: layer.mode)
+            if logits.dtype == x.dtype {
+                return GPTOSSFusedNorms.route(
+                    logits: logits, bias: bias, topK: numExpertsPerTok, form: form)
+            }
+        }
+        let g = router(x)
+        let (experts, indices) = mlxTopK(g, k: numExpertsPerTok, axis: -1)
+        return (MLX.stopGradient(indices), softmax(experts, axis: -1, precise: true))
+    }
+}
+
+extension GPTOSSTransformerBlock {
+    /// One decoder layer on the CBv2 decode path with `GPTOSSFusedNorms`:
+    /// takes the residual stream and its input norm (the previous layer's
+    /// `expertTail`, or this layer's `inputLayerNorm`), returns the next
+    /// residual stream and `next`'s norm of it. The values of `callAsFunction`
+    /// followed by `next`.
+    func fusedForward(
+        _ residual: MLXArray, normalized: MLXArray, cache: any CBv2AttendingLayerCache,
+        next: RMSNorm
+    ) -> (residual: MLXArray, normalized: MLXArray) {
+        let projected = selfAttn.cbv2BeforeOutputBias(normalized, cache: cache)
+        guard let bias = selfAttn.outputProjectionParts?.bias else {
+            preconditionFailure(
+                "GPTOSSFusedNorms: called where the output projection is not covered")
+        }
+        let (h, postNormed) = GPTOSSFusedNorms.attentionTail(
+            projected, bias: bias, residual: residual, weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+        guard let routed = mlp.expertRowsBeforeSum(postNormed) else {
+            preconditionFailure("GPTOSSFusedNorms: called where the experts are not covered")
+        }
+        let tail = GPTOSSFusedNorms.expertTail(
+            rows: routed.rows, indices: routed.indices, biases: routed.biases,
+            weights: routed.weights, residual: h, next: next.weight, eps: next.eps)
+        return (tail.out, tail.normed)
+    }
+
+    /// Whether `fusedForward` covers this layer for activations of `dtype`.
+    func fusedForwardCovers(dtype: DType) -> Bool {
+        guard let bias = selfAttn.outputProjectionParts?.bias, bias.dtype == dtype,
+            let down = mlp.experts.downProj as? QuantizedSwitchLinear,
+            let biases = down.linearBias, biases.dtype == dtype,
+            type(of: postAttentionLayerNorm) == RMSNorm.self,
+            type(of: inputLayerNorm) == RMSNorm.self,
+            postAttentionLayerNorm.weight.dtype == dtype, inputLayerNorm.weight.dtype == dtype
+        else { return false }
+        return true
     }
 }
 
@@ -406,6 +563,10 @@ public class GPTOSSModelInner: Module {
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
         var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
 
+        if let fused = fusedDecode(x, mask: mask, cache: cache) {
+            return fused
+        }
+
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
             if cache[i] is any GPTOSSPerRowAttentionCache
@@ -464,6 +625,38 @@ public class GPTOSSModelInner: Module {
         for layer in layers {
             layer.selfAttn.prepareSinksActivation()
         }
+    }
+
+    /// A CBv2 decode step (one token per row, at most 15 rows, every layer
+    /// on a CBv2 attending cache) through `GPTOSSFusedNorms`: two kernels per
+    /// layer for the residual steps, the same values; nil elsewhere.
+    private func fusedDecode(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode?, cache: [KVCache?]
+    ) -> MLXArray? {
+        guard mask == nil, x.ndim == 3, x.dim(1) == 1, x.dim(0) * 4 < 64,
+            !GPTOSSCompiledExpertsPolicy.enabled,
+            GPTOSSFusedNorms.supports(width: x.dim(2), dtype: x.dtype),
+            type(of: norm) == RMSNorm.self, norm.weight.dtype == x.dtype,
+            cache.count == layers.count
+        else { return nil }
+        var attending: [any CBv2AttendingLayerCache] = []
+        attending.reserveCapacity(layers.count)
+        for (layer, entry) in zip(layers, cache) {
+            guard !(entry is any GPTOSSPerRowAttentionCache),
+                let layerCache = entry as? (any CBv2AttendingLayerCache),
+                layer.mlp.numExpertsPerTok * x.dim(0) < 64,
+                layer.fusedForwardCovers(dtype: x.dtype)
+            else { return nil }
+            attending.append(layerCache)
+        }
+        var residual = x
+        var normalized = layers[0].inputLayerNorm(x)
+        for (i, layer) in layers.enumerated() {
+            let next = i + 1 < layers.count ? layers[i + 1].inputLayerNorm : norm
+            (residual, normalized) = layer.fusedForward(
+                residual, normalized: normalized, cache: attending[i], next: next)
+        }
+        return normalized
     }
 }
 

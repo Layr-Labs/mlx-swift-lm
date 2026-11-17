@@ -1587,9 +1587,21 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             x, indices, sortedIndices: sortedIndices, nativeQwen4: false, lhsIndices: rows)
     }
 
+    /// `callAsFunction` without the per-expert bias (`linearBias`), for a
+    /// caller that adds `linearBias[indices]` itself with the same values
+    /// (GPT-OSS's fused expert tail).
+    public func projectWithoutBias(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+    ) -> MLXArray {
+        project(x, indices, sortedIndices: sortedIndices, nativeQwen4: false, includeBias: false)
+    }
+
+    /// The per-expert output bias `[experts, outputDims]`, if any.
+    public var linearBias: MLXArray? { bias }
+
     private func project(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool,
-        nativeQwen4: Bool, lhsIndices: MLXArray? = nil
+        nativeQwen4: Bool, lhsIndices: MLXArray? = nil, includeBias: Bool = true
     ) -> MLXArray {
         // Layr #126: the MLX hint is only safe when `x` already carries one
         // row per gathered index (see doc comment). The Fusion tiled kernel
@@ -1649,7 +1661,7 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             result = (result.asType(.float32) * scale).asType(result.dtype)
         }
 
-        if let bias = self.bias {
+        if includeBias, let bias = self.bias {
             // During transforms cachedCast returns nil, preserving the old
             // gather-then-promote ordering (including bias gradients).
             let bias = linearBiasCastCache.cachedCast(bias, to: result.dtype) ?? bias

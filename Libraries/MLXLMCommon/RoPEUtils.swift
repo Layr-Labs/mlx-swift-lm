@@ -259,6 +259,14 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dimensions: Int
     let traditional: Bool
 
+    /// The rotation as one non-traditional MLX `rope` over the first
+    /// `dimensions` values with scale 1 and `frequencies`, after the inputs'
+    /// first `dimensions` values are multiplied by `mscale` (in their dtype);
+    /// nil where it is traditional. For kernels that copy this layer.
+    public var exactRotation: (dimensions: Int, mscale: Float, frequencies: MLXArray)? {
+        traditional ? nil : (dimensions, _mscale, _freqs)
+    }
+
     private let _mscale: Float
     private let _freqs: MLXArray
 

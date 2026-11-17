@@ -29,14 +29,14 @@ enum Gemma4FusedNorms {
             && RMSNormMeanForm.measured(width: width, dtype: dtype) != nil
     }
 
-    private static func meanForm(_ width: Int, _ dtype: DType) -> Int {
+    static func meanForm(_ width: Int, _ dtype: DType) -> Int {
         guard let form = RMSNormMeanForm.measured(width: width, dtype: dtype) else {
             preconditionFailure("Gemma4FusedNorms: called where `supports` is false")
         }
         return form.rawValue
     }
 
-    private static func threads(_ width: Int) -> Int { 32 * (((width + 3) / 4 + 31) / 32) }
+    static func threads(_ width: Int) -> Int { 32 * (((width + 3) / 4 + 31) / 32) }
 
     /// `sum = residual + rmsNorm(attention, postAttention)` and
     /// `rmsNorm(sum, w)` for each `w` in `sumNorms` (one, or three for a
@@ -392,8 +392,8 @@ enum Gemma4FusedNorms {
 
     // MARK: - Kernels
 
-    // rms_single_row's prologue.
-    private static let prologue = """
+    // rms_single_row's prologue (shared with `GPTOSSFusedNorms`).
+    static let prologue = """
         constexpr int N_READS = 4;
         constexpr int SIMD_SIZE = 32;
         const uint gid = threadgroup_position_in_grid.x;
@@ -410,7 +410,7 @@ enum Gemma4FusedNorms {
 
         """
 
-    private static func reduce(_ into: String) -> String {
+    static func reduce(_ into: String) -> String {
         """
           acc = simd_sum(acc);
           if (simd_group_id == 0) { local_sums[simd_lane_id] = 0; }
@@ -432,7 +432,7 @@ enum Gemma4FusedNorms {
     }
 
     // Sum of squares of `values` (zero past the row's end).
-    private static func squares(_ values: String) -> String {
+    static func squares(_ values: String) -> String {
         """
           acc = 0;
           for (int i = 0; i < N_READS; i++) { acc += \(values)[i] * \(values)[i]; }
@@ -441,7 +441,7 @@ enum Gemma4FusedNorms {
     }
 
     // `name`'s row as floats, zero past its end.
-    private static func load(_ name: String, into: String) -> String {
+    static func load(_ name: String, into: String) -> String {
         """
           float \(into)[N_READS];
           for (int i = 0; i < N_READS; i++) {

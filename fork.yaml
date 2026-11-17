@@ -460,10 +460,16 @@ def:
             `Kernel/LLM/GPTOSSActivationDTypeTests.swift` checks the expert, layer and K/V dtypes.
             Independent-history cluster caches retain each request's original attention order,
             scalar rotary offsets and singleton projection, normalization and expert graphs.
+            CBv2 decode steps run `GPTOSSFusedNorms`: the attention prologue (biases, YaRN scale,
+            measured RoPE), the router (bias, stable top-k, measured softmax), the gate/up bias inside
+            the compiled SwiGLU, and the two residual steps (biases, expert weights and sum, residual
+            adds, norms with the measured mean form) as one kernel each, with the unfused ops' bits.
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
             - "Tests/MLXLMTests/Integration/GPTOSS/**"
+            - "Tests/MLXLMTests/Kernel/LLM/GPTOSSFusedNormsTests.swift"
+            - "changelog.d/gptoss-fused-decode.md"
         - title: "Granite MoE hybrid causal mask"
           description: |
             Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
