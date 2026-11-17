@@ -1761,7 +1761,10 @@ public class Gemma4DecoderLayer: Module {
             // Measured here, outside the compiled middle's trace.
             let routing = fusedRouting(norms[2])
             let exactGeGLU = ExactGeGLU.prepare(x.dtype)
-            let expertRows = Gemma4FusedNorms.isExpertSumEnabled && !isExpertPrefill
+            // At most 8 experts: MLX's small column reduction then gives each
+            // row its own lane, so the tail adds the rows in order.
+            let expertRows =
+                Gemma4FusedNorms.isExpertSumEnabled && !isExpertPrefill && router.topK <= 8
             if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
                 // A trace reads `suppliesHostRowIndices` and the routing once;
                 // retrace on a change.
