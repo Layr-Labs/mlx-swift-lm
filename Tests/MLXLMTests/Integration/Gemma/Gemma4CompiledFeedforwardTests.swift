@@ -81,6 +81,12 @@ struct Gemma4CompiledFeedforwardTests {
             compare(layer, input(rows: rows))
         }
         let experts = try #require(layer.modules().compactMap { $0 as? SwitchGLU }.first)
+        #expect(experts.suppliesHostRowIndices, "Gemma 4 decode gathers take host row indices")
+        let rows = input(rows: 2)
+        experts.suppliesHostRowIndices = false
+        let deviceRows = layer.feedforward(rows, isExpertPrefill: false)
+        experts.suppliesHostRowIndices = true
+        expectExact(layer.feedforward(rows, isExpertPrefill: false), deviceRows)
         for enabled in [false, true, false] {
             experts.suppliesHostRowIndices = enabled
             compare(layer, input(rows: 2))

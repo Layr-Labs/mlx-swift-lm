@@ -66,7 +66,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     package func advanceGLM5NextOffsets(by count: Int) {
         precondition(glm5NextModelBinding != nil)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+        advancePositionOffsets(by: count)
     }
     /// Optional attention-logit soft cap. Not part of the contract's
     /// `updateAndAttend` signature, so it is layer-cache configuration
@@ -80,22 +80,22 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     private var pagedRows: [PagedSequenceKV] = []
 
-    // Per-row absolute RoPE offsets `[B]` (int32, device array). REBUILT from
-    // host integers only on membership changes (`setRows`); ADVANCED
-    // on-device (`+ L`) inside `updateAndAttend`, mirroring `CBv2LayerCache`.
-    // The step loop therefore never uploads a fresh host array per layer per
-    // step, and never syncs — the model reads this each step and feeds it
-    // into the forward graph, which the step's `asyncEval` collapses so the
-    // lazy `+ L` chain cannot grow O(steps).
+    // Per-row absolute RoPE offsets `[B]` (int32). REBUILT from the rows'
+    // host integers only on membership changes (`setRows`, counted by
+    // `positionOffsetsHostRebuilds`); ADVANCED inside `updateAndAttend` from
+    // `hostPositionOffsets`, which moves in lockstep. The advanced array is
+    // built from those host integers, so a step launches no GPU kernel per
+    // layer for it and no lazy `+ L` chain forms; the values are the ones an
+    // on-device `+ L` would produce. The step loop never syncs on it.
     private var cachedPositionOffsets: MLXArray = MLXArray([] as [Int32])
-    /// Item 25: the host values `cachedPositionOffsets` holds once evaluated,
-    /// advanced in lockstep with every device advance. A per-step frontier
+    /// Item 25: the host values `cachedPositionOffsets` holds, advanced in
+    /// lockstep with it (every advance builds it from these). A per-step frontier
     /// check reads these instead of syncing the device array per layer.
     public private(set) var hostPositionOffsets: [Int32] = []
 
     private func advancePositionOffsets(by length: Int) {
-        cachedPositionOffsets = cachedPositionOffsets + Int32(length)
         hostPositionOffsets = hostPositionOffsets.map { $0 + Int32(length) }
+        cachedPositionOffsets = MLXArray(hostPositionOffsets)
     }
     /// Times `positionOffsets` was rebuilt from host integers (test hook);
     /// must only move on batch membership changes, never inside the step loop.
