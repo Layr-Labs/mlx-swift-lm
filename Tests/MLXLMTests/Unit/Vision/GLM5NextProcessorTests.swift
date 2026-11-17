@@ -157,6 +157,57 @@ extension UnitTests {
             }
         }
 
+        /// Past the decoded-frame cap, the official sample keeps at most the
+        /// frames the cap holds at the clip's frame size (whole pairs), spread
+        /// over the whole clip as the sampler spreads `maximumFrames`; without
+        /// `fitsVideoSampleToDecodedBytes` the clip is refused. Within the cap
+        /// the sample is the official one either way.
+        @Test func decodedByteCapSamplesDownAcrossTheClip() throws {
+            let frameBytes = 47 * 29 * 3
+            let frames = try (0 ..< 30).map { value in
+                try GLM5NextRGBImage(
+                    width: 47, height: 29, pixels: Array(repeating: UInt8(value), count: frameBytes))
+            }
+            func video(_ indices: [Int]) throws -> GLM5NextDecodedVideo {
+                try GLM5NextDecodedVideo(
+                    frames: indices.map { frames[$0] }, framesPerSecond: 5, duration: 6,
+                    sourceFrameCount: 30, sourceIndices: indices)
+            }
+            func processor(frames cap: Int, fits: Bool) throws -> GLM5NextProcessor {
+                try GLM5NextProcessor(
+                    configuration: .init(
+                        videoMaximumTokens: 128, maximumDecodedBytes: cap * frameBytes + 1,
+                        fitsVideoSampleToDecodedBytes: fits),
+                    tokenizer: GLM5NextTestTokenizer())
+            }
+            let official = try GLM5NextMediaGeometry.sampleFrameIndices(
+                totalFrames: 30, sourceFPS: 5, duration: 6)
+            #expect(official == [0, 3, 5, 8, 10, 13, 15, 18, 20, 23, 25, 28])
+            #expect(throws: GLM5NextVisionError.budgetExceeded("decoded source video")) {
+                try processor(frames: 10, fits: false).videoPreparationPlan(video(official))
+            }
+            let spread = [0, 3, 6, 9, 12, 16, 19, 22, 25, 29]
+            for cap in [10, 11] {
+                let fitted = try processor(frames: cap, fits: true)
+                #expect(fitted.configuration.maximumSampledVideoFrames(frameBytes: frameBytes) == 10)
+                let plan = try fitted.videoPreparationPlan(video(spread))
+                #expect(plan.frameIndices == spread && plan.framePositions == Array(0 ..< 10))
+                #expect(plan.resize.grid.temporal == 5)
+                #expect(throws: GLM5NextVisionError.invalidInput("sampled video frame was not retained")) {
+                    try fitted.videoPreparationPlan(video(official))
+                }
+            }
+            for fits in [false, true] {
+                let plan = try processor(frames: 12, fits: fits).videoPreparationPlan(video(official))
+                #expect(plan.frameIndices == official)
+            }
+            let unbounded = try GLM5NextProcessorConfiguration()
+            #expect(unbounded.maximumSampledVideoFrames(frameBytes: frameBytes) == 2048)
+            let tiny = try GLM5NextProcessorConfiguration(
+                maximumDecodedBytes: frameBytes, fitsVideoSampleToDecodedBytes: true)
+            #expect(tiny.maximumSampledVideoFrames(frameBytes: frameBytes) == 2)
+        }
+
         @Test func disabledSamplingRetainsLimitsAndQuotesAllPackedFrames() throws {
             let frame = try GLM5NextRGBImage(
                 width: 4, height: 4,
