@@ -220,6 +220,7 @@ func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
         gate.dtype == up.dtype,
         gate.dtype == .bfloat16 || gate.dtype == .float16 || gate.dtype == .float32
     else { return gemma4SafeGeluApproximate(gate) * up }
+    if ExactGeGLU.supports(gate, up) { return ExactGeGLU.apply(gate, up) }
     return compiledGeGLU(gate, up)
 }
 
@@ -817,6 +818,10 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale?
 
     @ModuleInfo var rope: RoPELayer
+    /// The base `rope` was built with (a plain `RoPE` on sliding layers).
+    let ropeBase: Float
+    /// The fused prologue's measured rotation per activation dtype.
+    let prologueRotations = Gemma4FusedNorms.RotationCache()
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
@@ -863,6 +868,7 @@ class Gemma4Attention: Module {
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
         // RoPE: sliding uses default, full uses proportional with partial rotation
+        self.ropeBase = isSliding ? config.slidingRopeTheta : config.fullRopeTheta
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
@@ -1085,8 +1091,15 @@ class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+        let projectedQueries = Gemma4BatchDecodeProjection.linear(qProj, queryInput)
+        if lastQueryCache == nil, !usesSharedKV,
+            let rotation = fusedPrologueRotation(projectedQueries)
+        {
+            return forwardV2FusedPrologue(
+                x, projectedQueries: projectedQueries, layerCache: layerCache,
+                rotation: rotation, outputStart: outputStart)
+        }
+        var queries = projectedQueries.reshaped(B, queryLength, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
         queries = queries.transposed(0, 2, 1, 3)
 
@@ -1188,6 +1201,78 @@ class Gemma4Attention: Module {
         return (projectV2Output(output), .regular(keys: k, values: v), captured)
     }
 
+    /// The rotation for the fused prologue (`Gemma4FusedNorms.attentionPrologue`)
+    /// on decode-shaped calls (at most `Gemma4DecoderLayer.fusedNormsMaximumWidth`
+    /// tokens per row) of a layer with its own K/V, plain norms and a rotation
+    /// MLX's `rope` writes in one call; nil keeps the unfused ops.
+    func fusedPrologueRotation(_ projectedQueries: MLXArray) -> Gemma4FusedNorms.Rotation? {
+        let dtype = projectedQueries.dtype
+        guard Gemma4FusedNorms.isPrologueEnabled, !training, tensorParallel == nil,
+            !usesSharedKV, kProj != nil, let kNorm, let vNorm,
+            projectedQueries.ndim == 3,
+            projectedQueries.dim(1) <= Gemma4DecoderLayer.fusedNormsMaximumWidth,
+            projectedQueries.dim(2) == nHeads * effectiveHeadDim,
+            type(of: qNorm) == RMSNorm.self, type(of: kNorm) == RMSNorm.self,
+            type(of: vNorm) == RMSNormNoScale.self,
+            qNorm.eps == config.rmsNormEps, kNorm.eps == config.rmsNormEps,
+            vNorm.eps == config.rmsNormEps,
+            [qNorm.weight, kNorm.weight].allSatisfy({
+                $0.dtype == dtype && $0.ndim == 1 && $0.dim(0) == effectiveHeadDim
+            })
+        else { return nil }
+        if type(of: rope) == RoPE.self {
+            // `initializeRope` with no scaling: dims = head dim, scale 1,
+            // non-traditional, `ropeBase`.
+            return prologueRotations.rotation(
+                headDim: effectiveHeadDim, base: ropeBase, frequencies: nil, dtype: dtype)
+        }
+        if type(of: rope) == ProportionalRoPE.self,
+            let exact = (rope as? ProportionalRoPE)?.exactRotation,
+            exact.dimensions == effectiveHeadDim
+        {
+            return prologueRotations.rotation(
+                headDim: effectiveHeadDim, base: nil, frequencies: exact.frequencies, dtype: dtype)
+        }
+        return nil
+    }
+
+    /// `forwardV2` with the q/k/v norms and RoPE as one kernel; the same
+    /// values as the unfused path, bit for bit.
+    private func forwardV2FusedPrologue(
+        _ x: MLXArray, projectedQueries: MLXArray, layerCache: any CBv2AttendingLayerCache,
+        rotation: Gemma4FusedNorms.Rotation, outputStart: Int
+    ) -> (MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset) {
+        guard let kProj, let kNorm else {
+            preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
+        }
+        let (B, L) = (x.dim(0), x.dim(1))
+        // The pre-update snapshot, as in `forwardV2`.
+        let capturedOffsets = layerCache.positionOffsets
+        let captured = Gemma4.PositionOffset.batch(capturedOffsets)
+        let projectedKeys = Gemma4BatchDecodeProjection.linear(kProj, x)
+        let projectedValues =
+            vProj.map { Gemma4BatchDecodeProjection.linear($0, x) } ?? projectedKeys
+        let (queries, k, v) = Gemma4FusedNorms.attentionPrologue(
+            queries: projectedQueries, keys: projectedKeys, values: projectedValues,
+            queryHeads: nHeads, keyValueHeads: nKvHeads, headDim: effectiveHeadDim,
+            queryWeight: qNorm.weight, keyWeight: kNorm.weight, offsets: capturedOffsets,
+            rotation: rotation, eps: config.rmsNormEps)
+
+        let outputDType = queries.dtype
+        let attentionQueries =
+            outputDType == .float16 ? queries.asType(.float32) : queries
+        let attention = layerCache.updateAndAttend(
+            queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+        var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        if outputStart > 0 {
+            output = output[0..., outputStart..., 0...]
+        }
+        if output.dtype != outputDType {
+            output = output.asType(outputDType)
+        }
+        return (projectV2Output(output), .regular(keys: k, values: v), captured)
+    }
+
     private func projectV2Output(_ output: MLXArray) -> MLXArray {
         tensorParallel?.reduce(oProj, output) ?? Gemma4BatchDecodeProjection.linear(oProj, output)
     }
@@ -1231,8 +1316,17 @@ class Gemma4Router: Module {
     var normWeight: MLXArray { scale * rootSize }
 
     /// The routing of an input already normalized with `normWeight`.
-    func route(normalized normed: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func route(normalized normed: MLXArray, fused: Gemma4FusedNorms.Routing? = nil)
+        -> (topKIndices: MLXArray, topKWeights: MLXArray)
+    {
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        if let fused, expertScores.dtype == fused.dtype, perExpertScale.dtype == fused.dtype,
+            perExpertScale.ndim == 1, expertScores.dim(-1) == perExpertScale.dim(0)
+        {
+            let (indices, weights) = Gemma4FusedNorms.route(
+                scores: expertScores, perExpertScale: perExpertScale, topK: topK, routing: fused)
+            return (indices, weights)
+        }
 
         let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1299,6 +1393,27 @@ class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
+    }
+
+    /// The experts' rows (`[N, K, D]`) whose `weightedExpertSum` with the
+    /// routing weights is `callAsFunction`'s output on this call, from the same
+    /// calls `callAsFunction` makes; nil where it forms its output another way.
+    func rowsBeforeSum(
+        _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray, isExpertPrefill: Bool
+    ) -> MLXArray? {
+        guard !isExpertPrefill else { return nil }
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        let flat = x.reshaped(B * S, H)
+        let indices = topKIndices.reshaped(B * S, K)
+        if Gemma4PrefillProjection.appliesExperts(
+            x, indices: topKIndices, weights: topKWeights, isExpertPrefill: isExpertPrefill)
+            || Gemma4BatchDecodeProjection.applies(x)
+        {
+            return switchGLU.expertRowsByRow(flat, indices)
+        }
+        // `callAndWeightedReduce` without a production prompt frame.
+        return switchGLU(flat, indices)
     }
 
     /// One shared expert call in which every row keeps its own one-row bytes.
@@ -1394,12 +1509,21 @@ public class Gemma4DecoderLayer: Module {
     /// routing, experts), compiled for the shapes the compiled feed-forward
     /// takes, so those shapes keep its fused element-wise kernels.
     private let compiledFusedMiddle = CompiledTrace<Gemma4DecoderLayer> { layer, arguments in
-        let (dense, experts) = layer.fusedFeedforwardMiddle(
-            arguments[0], arguments[1], arguments[2], isExpertPrefill: false)
-        return [dense, experts]
+        let (dense, experts, weights) = layer.fusedFeedforwardMiddle(
+            arguments[0], arguments[1], arguments[2], isExpertPrefill: false,
+            routing: layer.compiledFusedMiddleRouting ?? nil,
+            expertRows: layer.compiledFusedMiddleExpertRows ?? false,
+            exactGeGLU: layer.compiledFusedMiddleGeGLU ?? false)
+        return [dense, experts] + (weights.map { [$0] } ?? [])
     }
     private let compiledFusedMiddleLock = NSLock()
     private var compiledFusedMiddleHostRows: Bool?
+    /// The routing the compiled middle was traced with (outer nil: none yet).
+    private var compiledFusedMiddleRouting: Gemma4FusedNorms.Routing??
+    /// Whether the compiled middle was traced with `ExactGeGLU` available.
+    private var compiledFusedMiddleGeGLU: Bool?
+    /// Whether the compiled middle was traced returning the experts' rows.
+    private var compiledFusedMiddleExpertRows: Bool?
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
     var fusedMiddleTraceIsCompiled: Bool { compiledFusedMiddle.isCompiled }
@@ -1633,20 +1757,38 @@ public class Gemma4DecoderLayer: Module {
                     router.normWeight,
                 ], eps: eps)
             let (dense, expertOutput): (MLXArray, MLXArray)
+            var expertWeights: MLXArray?
+            // Measured here, outside the compiled middle's trace.
+            let routing = fusedRouting(norms[2])
+            let exactGeGLU = ExactGeGLU.prepare(x.dtype)
+            // At most 8 experts: MLX's small column reduction then gives each
+            // row its own lane, so the tail adds the rows in order.
+            let expertRows =
+                Gemma4FusedNorms.isExpertSumEnabled && !isExpertPrefill && router.topK <= 8
             if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
-                // A trace reads `suppliesHostRowIndices` once; retrace on a change.
+                // A trace reads `suppliesHostRowIndices` and the routing once;
+                // retrace on a change.
                 let hostRows = experts.switchGLU.suppliesHostRowIndices
                 compiledFusedMiddleLock.withLock {
-                    if compiledFusedMiddleHostRows != hostRows {
+                    if compiledFusedMiddleHostRows != hostRows
+                        || compiledFusedMiddleRouting != .some(routing)
+                        || compiledFusedMiddleGeGLU != exactGeGLU
+                        || compiledFusedMiddleExpertRows != expertRows
+                    {
                         compiledFusedMiddle.invalidate()
                         compiledFusedMiddleHostRows = hostRows
+                        compiledFusedMiddleRouting = .some(routing)
+                        compiledFusedMiddleGeGLU = exactGeGLU
+                        compiledFusedMiddleExpertRows = expertRows
                     }
                 }
                 let outputs = compiledFusedMiddle(self, [norms[0], norms[1], norms[2]])
                 (dense, expertOutput) = (outputs[0], outputs[1])
+                expertWeights = outputs.count > 2 ? outputs[2] : nil
             } else {
-                (dense, expertOutput) = fusedFeedforwardMiddle(
-                    norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill)
+                (dense, expertOutput, expertWeights) = fusedFeedforwardMiddle(
+                    norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill,
+                    routing: routing, expertRows: expertRows, exactGeGLU: exactGeGLU)
             }
             let (out, next) = Gemma4FusedNorms.feedforwardTail(
                 dense: dense,
@@ -1654,6 +1796,7 @@ public class Gemma4DecoderLayer: Module {
                     expertOutput, postFeedforwardLayernorm1.weight,
                     postFeedforwardLayernorm2.weight
                 ),
+                expertWeights: expertWeights,
                 residual: sum, post: postFeedforwardLayernorm.weight, layerScalar: layerScalar,
                 next: nextNorm, eps: eps)
             return (out, kvPair, attnPositionOffset, next)
@@ -1671,18 +1814,53 @@ public class Gemma4DecoderLayer: Module {
     /// A mixture-of-experts layer's feed-forward between the fused norms:
     /// the dense MLP of `dense`, and the experts of `experts` routed by
     /// `router` (the router's own normalized input).
+    /// The fused routing for router inputs like `normalized` (decode-shaped
+    /// rows on the fused path); nil keeps the unfused routing ops.
+    func fusedRouting(_ normalized: MLXArray) -> Gemma4FusedNorms.Routing? {
+        guard let router, router.perExpertScale.ndim == 1 else { return nil }
+        return Gemma4FusedNorms.routing(
+            experts: router.perExpertScale.dim(0), topK: router.topK, dtype: normalized.dtype)
+    }
+
+    /// The dense MLP and the experts. With `expertRows`, where the experts'
+    /// output is `weightedExpertSum(rows, weights)`, returns those rows and
+    /// weights instead (the feed-forward tail forms the sum).
     func fusedFeedforwardMiddle(
-        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool
-    ) -> (MLXArray, MLXArray) {
+        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
+        routing: Gemma4FusedNorms.Routing? = nil, expertRows: Bool = false,
+        exactGeGLU: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        // The dense MLP's and the experts' GeGLU may run as `ExactGeGLU` here.
+        ExactGeGLU.$inScope.withValue(exactGeGLU) {
+            fusedFeedforwardMiddleBody(
+                dense, experts, router, isExpertPrefill: isExpertPrefill, routing: routing,
+                expertRows: expertRows)
+        }
+    }
+
+    private func fusedFeedforwardMiddleBody(
+        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool,
+        routing: Gemma4FusedNorms.Routing?, expertRows: Bool
+    ) -> (MLXArray, MLXArray, MLXArray?) {
         guard let routerModule = self.router, let expertsModule = self.experts else {
             preconditionFailure("Gemma4: the fused feed-forward middle needs experts")
         }
-        let (topKIndices, topKWeights) = routerModule.route(normalized: router)
+        let (topKIndices, topKWeights) = routerModule.route(normalized: router, fused: routing)
+        if expertRows,
+            let rows = expertsModule.rowsBeforeSum(
+                experts, topKIndices: topKIndices, topKWeights: topKWeights,
+                isExpertPrefill: isExpertPrefill),
+            rows.dtype == experts.dtype, topKWeights.dtype == experts.dtype,
+            topKIndices.dim(-1) <= 32
+        {
+            return (mlp(dense), rows, topKWeights)
+        }
         return (
             mlp(dense),
             expertsModule(
                 experts, topKIndices: topKIndices, topKWeights: topKWeights,
-                isExpertPrefill: isExpertPrefill)
+                isExpertPrefill: isExpertPrefill),
+            nil
         )
     }
 

@@ -209,6 +209,14 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         super.init()
     }
 
+    /// The rotation as one non-traditional MLX `rope` over all `dims` with
+    /// scale 1 and `frequencies` (nil where nothing rotates or the rotation
+    /// is traditional), for kernels that copy MLX's `rope`.
+    public var exactRotation: (dimensions: Int, frequencies: MLXArray)? {
+        guard rotatedDims > 0, !traditional, let _freqs else { return nil }
+        return (dims, _freqs)
+    }
+
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
         guard rotatedDims > 0, let _freqs else {
             return x
