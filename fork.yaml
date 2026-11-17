@@ -373,9 +373,12 @@ def:
             lone row whose step scratch was refused is retried (`DARKBLOOM_NATIVE_SEGMENT_RELEASE`).
             GLM page-bank contracts accept token-constrained rows, which never chain; with
             `DARKBLOOM_CBV2_MTP_GRAMMAR` they draft under grammar-aware verification.
+            A clip past the decoded-frame cap can be sampled down across it
+            (`fitsVideoSampleToDecodedBytes`, off by default).
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"
+            - "changelog.d/glm5-video-decode-budget-sampling.md"
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
             - "Libraries/MLXVLM/Models/GLM5Next*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/**"
