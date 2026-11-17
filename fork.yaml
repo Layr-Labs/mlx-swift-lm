@@ -533,6 +533,7 @@ def:
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
             - "Libraries/MLXLMCommon/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"
+            - "changelog.d/qwen35-one-stream-fusions.md"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "changelog.d/cluster-model-runtime.md"
