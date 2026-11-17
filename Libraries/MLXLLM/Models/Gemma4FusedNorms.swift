@@ -71,11 +71,12 @@ enum Gemma4FusedNorms {
     /// `out = (residual + rmsNorm(s, post)) * layerScalar`, and, with `next`,
     /// `rmsNorm(out, next)` (the next layer's input norm or the final norm).
     ///
-    /// With `expertWeights` (`[N, K]`), `experts.output` is the experts' rows
-    /// before their weighted sum (`[N, K, D]`), and the kernel forms that sum
-    /// as `weightedExpertSum` writes it: each product in the activation dtype,
-    /// then MLX's small column reduction (`col_reduce_small`: each row plus
-    /// zero, then added to the running sum in expert order).
+    /// With `expertWeights` (`[N, K]`, K at most 8), `experts.output` is the
+    /// experts' rows before their weighted sum (`[N, K, D]`), and the kernel
+    /// forms that sum as `weightedExpertSum` writes it: each product in the
+    /// activation dtype, then MLX's small column reduction (`col_reduce_small`:
+    /// each row plus zero, then added to the running sum in expert order; with
+    /// more than 8 rows its lanes hold several rows, which this does not copy).
     static func feedforwardTail(
         dense: MLXArray, experts: (output: MLXArray, postDense: MLXArray, postExperts: MLXArray)?,
         expertWeights: MLXArray? = nil,
@@ -89,6 +90,7 @@ enum Gemma4FusedNorms {
         if let experts {
             if let expertWeights {
                 expertCount = expertWeights.dim(-1)
+                precondition(expertCount <= 8, "Gemma4FusedNorms: more than 8 expert rows")
                 inputs += [
                     experts.output.reshaped(rows, expertCount, width),
                     expertWeights.reshaped(rows, expertCount),
