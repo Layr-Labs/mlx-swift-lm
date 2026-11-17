@@ -490,11 +490,11 @@ public struct GLM5NextProcessorConfiguration: Sendable {
     /// Default `.official` resamples the source at 2 FPS. `.disabled` retains
     /// every supplied frame, then pads only the final temporal pair after resize.
     public let videoSamplingPolicy: GLM5NextVideoSamplingPolicy
-    /// When true, the official sample keeps at most the frames
-    /// `maximumDecodedBytes` holds at the clip's frame size
-    /// (`maximumSampledVideoFrames`), spread over the whole clip, instead of
-    /// the processor refusing a clip whose 2 FPS sample passes the cap. Off by
-    /// default: the reference sampler.
+    /// When true, a clip whose official sample has more distinct frames than
+    /// `maximumDecodedBytes` holds at its frame size keeps at most the frames
+    /// the cap holds (`maximumSampledVideoFrames`), spread over the whole clip
+    /// (`sampledVideoIndices`), instead of the processor refusing it. Any other
+    /// clip keeps the official sample. Off by default: the reference sampler.
     public let fitsVideoSampleToDecodedBytes: Bool
 
     public init(
@@ -523,15 +523,29 @@ public struct GLM5NextProcessorConfiguration: Sendable {
         self.fitsVideoSampleToDecodedBytes = fitsVideoSampleToDecodedBytes
     }
 
-    /// The most frames the official sampler keeps of a clip whose decoded RGB8
-    /// frames are `frameBytes` each: 2048, or with
-    /// `fitsVideoSampleToDecodedBytes` the whole pairs `maximumDecodedBytes`
-    /// holds (at least one pair), leaving the last frame's RGBA render room.
+    /// The most distinct frames of `frameBytes` each the decoder keeps: 2048,
+    /// or with `fitsVideoSampleToDecodedBytes` the RGB8 frames
+    /// `maximumDecodedBytes` holds, the last one as its RGBA render (at least one).
     public func maximumSampledVideoFrames(frameBytes: Int) -> Int {
         guard fitsVideoSampleToDecodedBytes, frameBytes > 0 else { return 2048 }
         let renderBytes = frameBytes / 3 * 4
-        let frames = 1 + max(0, maximumDecodedBytes - renderBytes) / frameBytes
-        return min(2048, max(2, frames / 2 * 2))
+        return min(2048, 1 + max(0, maximumDecodedBytes - renderBytes) / frameBytes)
+    }
+
+    /// The source frames the official sampler keeps of a clip whose decoded
+    /// frames are `frameBytes` each: the official sample, or with
+    /// `fitsVideoSampleToDecodedBytes` and more distinct frames than the cap
+    /// holds, the sampler's spread over `maximumSampledVideoFrames`.
+    public func sampledVideoIndices(
+        totalFrames: Int, sourceFPS: Double, duration: Double?, frameBytes: Int
+    ) throws -> [Int] {
+        let official = try GLM5NextMediaGeometry.sampleFrameIndices(
+            totalFrames: totalFrames, sourceFPS: sourceFPS, duration: duration)
+        let capacity = maximumSampledVideoFrames(frameBytes: frameBytes)
+        guard fitsVideoSampleToDecodedBytes, Set(official).count > capacity else { return official }
+        return try GLM5NextMediaGeometry.sampleFrameIndices(
+            totalFrames: totalFrames, sourceFPS: sourceFPS, duration: duration,
+            maximumFrames: capacity)
     }
 }
 
@@ -713,11 +727,10 @@ public struct GLM5NextProcessor: UserInputProcessor {
     {
         // Validate the source duration/frame metadata in both modes. Disabling
         // sampling must not disable the existing source or retained-frame caps.
-        let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(
+        let sampled = try configuration.sampledVideoIndices(
             totalFrames: video.sourceFrameCount,
             sourceFPS: video.framesPerSecond, duration: video.duration,
-            maximumFrames: configuration.maximumSampledVideoFrames(
-                frameBytes: video.frames[0].pixels.count))
+            frameBytes: video.frames[0].pixels.count)
         let indices: [Int]
         switch configuration.videoSamplingPolicy {
         case .official:
@@ -1249,9 +1262,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
         // predicts, and again only if the decoded count needs other frames.
         func sampled(_ count: Int) throws -> Set<Int> {
             Set(
-                try GLM5NextMediaGeometry.sampleFrameIndices(
-                    totalFrames: count, sourceFPS: fps, duration: duration,
-                    maximumFrames: configuration.maximumSampledVideoFrames(frameBytes: frameBytes)))
+                try configuration.sampledVideoIndices(
+                    totalFrames: count, sourceFPS: fps, duration: duration, frameBytes: frameBytes))
         }
         var pass = try await read(retaining: sampled(max(1, Int((duration * fps).rounded()))))
         let needed = try sampled(pass.decoded)
@@ -1309,18 +1321,19 @@ public struct GLM5NextProcessor: UserInputProcessor {
             previous = time
             let index = decoded
             decoded += 1
-            guard retained?.contains(index) ?? true else { continue }
-            let image = try autoreleasepool {
-                try GLM5NextRGBDecoder.render(
-                    CIImage(cvPixelBuffer: pixels).transformed(by: transform),
-                    maximumBytes: configuration.maximumDecodedBytes - bytes)
+            if retained?.contains(index) ?? true {
+                let image = try autoreleasepool {
+                    try GLM5NextRGBDecoder.render(
+                        CIImage(cvPixelBuffer: pixels).transformed(by: transform),
+                        maximumBytes: configuration.maximumDecodedBytes - bytes)
+                }
+                guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
+                    throw GLM5NextVisionError.budgetExceeded("decoded video frames")
+                }
+                bytes += image.pixels.count
+                frames.append(image)
+                indices.append(index)
             }
-            guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
-                throw GLM5NextVisionError.budgetExceeded("decoded video frames")
-            }
-            bytes += image.pixels.count
-            frames.append(image)
-            indices.append(index)
             if let limit, decoded >= limit { return (frames, indices, decoded) }
         }
         guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }

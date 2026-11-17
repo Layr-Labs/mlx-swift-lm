@@ -158,11 +158,11 @@ extension UnitTests {
         }
 
         /// Past the decoded-frame cap, the official sample keeps at most the
-        /// frames the cap holds at the clip's frame size (whole pairs, the last
-        /// frame's RGBA render included), spread over the whole clip as the
-        /// sampler spreads `maximumFrames`; without
-        /// `fitsVideoSampleToDecodedBytes` the clip is refused. Within the cap
-        /// the sample is the official one either way.
+        /// frames the cap holds at the clip's frame size (the last one as its
+        /// RGBA render), spread over the whole clip as the sampler spreads
+        /// `maximumFrames`, an odd count padded as usual; without
+        /// `fitsVideoSampleToDecodedBytes` the clip is refused. A sample whose
+        /// distinct frames fit is the official one either way.
         @Test func decodedByteCapSamplesDownAcrossTheClip() throws {
             let frameBytes = 47 * 29 * 3
             let frames = try (0 ..< 30).map { value in
@@ -190,14 +190,22 @@ extension UnitTests {
             #expect(throws: GLM5NextVisionError.budgetExceeded("decoded source video")) {
                 try processor(frames: 10, fits: false).videoPreparationPlan(video(official))
             }
-            let spread = [0, 3, 6, 9, 12, 16, 19, 22, 25, 29]
-            for cap in [10, 11] {
+            for (cap, spread) in [
+                (10, [0, 3, 6, 9, 12, 16, 19, 22, 25, 29]),
+                (11, [0, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29]),
+            ] {
                 let fitted = try processor(frames: cap, fits: true)
                 #expect(
-                    fitted.configuration.maximumSampledVideoFrames(frameBytes: frameBytes) == 10)
+                    fitted.configuration.maximumSampledVideoFrames(frameBytes: frameBytes) == cap)
+                let padded = spread.count.isMultiple(of: 2) ? spread : spread + [29]
+                #expect(
+                    try fitted.configuration.sampledVideoIndices(
+                        totalFrames: 30, sourceFPS: 5, duration: 6, frameBytes: frameBytes)
+                        == padded)
                 let plan = try fitted.videoPreparationPlan(video(spread))
-                #expect(plan.frameIndices == spread && plan.framePositions == Array(0 ..< 10))
-                #expect(plan.resize.grid.temporal == 5)
+                #expect(plan.frameIndices == padded)
+                #expect(plan.framePositions == padded.map { spread.firstIndex(of: $0)! })
+                #expect(plan.resize.grid.temporal == (cap + 1) / 2)
                 #expect(
                     throws: GLM5NextVisionError.invalidInput("sampled video frame was not retained")
                 ) {
@@ -209,15 +217,26 @@ extension UnitTests {
                     video(official))
                 #expect(plan.frameIndices == official)
             }
+            // An odd official sample (11 distinct frames, the last repeated)
+            // that the cap holds exactly is kept as it is.
+            let odd = try GLM5NextMediaGeometry.sampleFrameIndices(
+                totalFrames: 28, sourceFPS: 5, duration: 5.5)
+            #expect(Set(odd).count == 11 && odd.count == 12)
+            for fits in [false, true] {
+                #expect(
+                    try processor(frames: 11, fits: fits).configuration.sampledVideoIndices(
+                        totalFrames: 28, sourceFPS: 5, duration: 5.5, frameBytes: frameBytes) == odd
+                )
+            }
             let unbounded = try GLM5NextProcessorConfiguration()
             #expect(unbounded.maximumSampledVideoFrames(frameBytes: frameBytes) == 2048)
             let tiny = try GLM5NextProcessorConfiguration(
                 maximumDecodedBytes: frameBytes, fitsVideoSampleToDecodedBytes: true)
-            #expect(tiny.maximumSampledVideoFrames(frameBytes: frameBytes) == 2)
-            // 512 MiB at 720p and 1080p.
+            #expect(tiny.maximumSampledVideoFrames(frameBytes: frameBytes) == 1)
+            // 512 MiB at 720p and 1080p: the largest samples the decoder kept before.
             let product = try GLM5NextProcessorConfiguration(fitsVideoSampleToDecodedBytes: true)
-            #expect(product.maximumSampledVideoFrames(frameBytes: 1280 * 720 * 3) == 192)
-            #expect(product.maximumSampledVideoFrames(frameBytes: 1920 * 1080 * 3) == 84)
+            #expect(product.maximumSampledVideoFrames(frameBytes: 1280 * 720 * 3) == 193)
+            #expect(product.maximumSampledVideoFrames(frameBytes: 1920 * 1080 * 3) == 85)
         }
 
         @Test func disabledSamplingRetainsLimitsAndQuotesAllPackedFrames() throws {
