@@ -43,10 +43,28 @@ extension KernelTests {
         @Test func declaresDecodeLimitsOnlyThroughTheSteppableAdapter() throws {
             let adapter = CBv2SteppableLanguageModelAdapter(try gemma4())
             #expect(adapter.decodeCommandBufferLimits == Gemma4DecodeCommandBuffers.limits)
-            // MTP rounds keep MLX's defaults.
-            #expect(adapter.speculativeCommandBufferLimits == nil)
+            // MTP rounds of decode and verification rows take the same limits.
+            #expect(adapter.speculativeCommandBufferLimits == Gemma4DecodeCommandBuffers.limits)
             #expect(Gemma4DecodeCommandBuffers.limits.operations == 100)
             #expect(Gemma4DecodeCommandBuffers.limits.megabytes == 1 << 20)
+        }
+
+        @Test func verificationRowLimitsKeepExactBytes() throws {
+            #expect(EngineLoopV2.speculativeCommandBufferRowTokens == 8)
+            let model = try gemma4()
+            // MTP verification rows: a few rows of 2 to 8 tokens each.
+            for (rows, width) in [(1, 2), (3, 2), (2, 8)] {
+                let tokens = MLXArray((0 ..< rows * width).map { Int32(($0 * 7) % 64) })
+                    .reshaped(rows, width)
+                let expected = model(tokens, cache: nil)
+                eval(expected)
+                let actual = GPU.withCommandBufferLimits(Gemma4DecodeCommandBuffers.limits) {
+                    let logits = model(tokens, cache: nil)
+                    eval(logits)
+                    return logits
+                }
+                #expect(expected.asData(access: .copy).data == actual.asData(access: .copy).data)
+            }
         }
 
         @Test func decodeLimitsKeepExactBytes() throws {

@@ -15,7 +15,7 @@ private final class Gemma4OffsetQuantizedLinear: QuantizedLinear {
 
 @Suite("Gemma 4 compiled feed-forward", .tags(.integration), .serialized)
 struct Gemma4CompiledFeedforwardTests {
-    private func layer() throws -> Gemma4DecoderLayer {
+    private func layer(expertGroupSize: Int = 64) throws -> Gemma4DecoderLayer {
         let configuration = try JSONDecoder().decode(
             Gemma4TextConfiguration.self,
             from: Data(
@@ -45,7 +45,9 @@ struct Gemma4CompiledFeedforwardTests {
         }
         try layer.update(parameters: .unflattened(weights), verify: .all)
         quantize(model: layer) { path, _ in
-            (groupSize: 64, bits: path.hasPrefix("experts.") ? 4 : 8, mode: .affine)
+            path.hasPrefix("experts.")
+                ? (groupSize: expertGroupSize, bits: 4, mode: .affine)
+                : (groupSize: 64, bits: 8, mode: .affine)
         }
         layer.train(false)
         eval(layer)
@@ -129,6 +131,37 @@ struct Gemma4CompiledFeedforwardTests {
         // original two-column verification layout, without flattening/padding.
         for (rows, width) in [(1, 2), (2, 2), (3, 2), (1, 1), (1, 2)] {
             compare(layer, input(rows: rows, sequenceWidth: width))
+        }
+        layer.invalidateCompiledTraces()
+        compare(layer, input(rows: 2, sequenceWidth: 2), prefill: true)
+        #expect(!layer.feedforwardTraceIsCompiled)
+    }
+
+    /// QAT-lattice expert banks (4 bits in groups of 32, with 8-bit dense
+    /// projections) take the compiled trace with the same bytes as eager.
+    @Test func latticeExpertBanksCompileWithTheSameBytes() throws {
+        let layer = try layer(expertGroupSize: 32)
+        let experts = try #require(layer.modules().compactMap { $0 as? SwitchGLU }.first)
+        let banks = try [experts.gateProj, experts.upProj, experts.downProj].map {
+            try #require($0 as? QuantizedSwitchLinear)
+        }
+        #expect(banks.allSatisfy { $0.bits == 4 && $0.groupSize == 32 })
+        #expect(layer.feedforwardCompilationState() != nil)
+        let requested = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD"]
+        let enabled =
+            MLXHardwareInfo.isCompiledDecodeSupported
+            && (requested.map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
+        for (rows, width, eligible) in [
+            (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
+            (8, 1, false), (4, 2, false),
+        ] {
+            layer.invalidateCompiledTraces()
+            let x = input(rows: rows, sequenceWidth: width)
+            compare(layer, x)
+            #expect(layer.feedforwardTraceIsCompiled == (eligible && enabled))
+            let changed = x + Float(0.125)
+            eval(changed)
+            compare(layer, changed)
         }
         layer.invalidateCompiledTraces()
         compare(layer, input(rows: 2, sequenceWidth: 2), prefill: true)
