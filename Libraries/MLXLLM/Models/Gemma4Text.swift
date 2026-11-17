@@ -1629,9 +1629,12 @@ public class Gemma4DecoderLayer: Module {
             MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset, MLXArray?
         ) {
             let scaled = out * layerScalar
+            // A promoted output leaves the next layer's dtype; it takes the
+            // unfused ops and its own input norm.
             return (
                 scaled, kvPair, attnPositionOffset,
-                nextNorm.map { MLXFast.rmsNorm(scaled, weight: $0, eps: eps) }
+                scaled.dtype == x.dtype
+                    ? nextNorm.map { MLXFast.rmsNorm(scaled, weight: $0, eps: eps) } : nil
             )
         }
         guard attnOut.dtype == x.dtype else {
@@ -2123,6 +2126,9 @@ public class Gemma4TextModelInner: Module {
         let finalNormFuses =
             type(of: norm) == RMSNorm.self && norm.weight.dtype == h.dtype
             && norm.weight.ndim == 1 && norm.eps == config.rmsNormEps
+        // The plan above holds while rows keep this dtype (a layer's unfused
+        // fallback can promote them).
+        let fusedDType = h.dtype
         var pendingNormalized: MLXArray?
 
         for (idx, layer) in layers.enumerated() {
@@ -2154,7 +2160,7 @@ public class Gemma4TextModelInner: Module {
             let out: MLXArray
             let kvState: Gemma4SharedKVState
             let positionOffset: Gemma4.PositionOffset
-            if fusedLayers[idx] {
+            if fusedLayers[idx] && h.dtype == fusedDType {
                 let isLast = idx == layers.count - 1
                 let nextNorm: MLXArray? =
                     isLast

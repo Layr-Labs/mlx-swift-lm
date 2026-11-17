@@ -42,11 +42,27 @@ struct Gemma4FusedNormsTests {
             let x = MLXArray(separating.flatMap { $0 }, [separating.count, 1, width])
                 .asType(dtype)
             let other: RMSNormMeanForm = form == .divide ? .fusedMultiplyAdd : .divide
-            let caught = Gemma4FusedNorms.$meanFormOverride.withValue(other) {
-                Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype)
+            let caught = try Gemma4FusedNorms.$meanFormOverride.withValue(other) {
+                try Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype)
             }
             #expect(caught != nil, "\(dtype)")
-            #expect(Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype) == nil)
+            // The feed-forward tails see it on their own too (dense input on the rows).
+            let one = MLXArray.ones([width], dtype: dtype)
+            let zero = MLXArray.zeros(x.shape, dtype: dtype)
+            let scalar = MLXArray([Float(1)]).asType(dtype)
+            for experts in [true, false] {
+                func tail() -> MLXArray {
+                    Gemma4FusedNorms.feedforwardTail(
+                        dense: x, experts: experts ? (zero, one, one) : nil, residual: zero,
+                        post: one, layerScalar: scalar, next: nil, eps: 1e-6
+                    ).out
+                }
+                let right = bytes(tail())
+                let wrong = Gemma4FusedNorms.$meanFormOverride.withValue(other) { bytes(tail()) }
+                #expect(right != wrong, "feed-forward tail, experts \(experts), \(dtype)")
+            }
+            #expect(
+                try Gemma4FusedNorms.Readiness.mismatch(x, x, width: width, dtype: dtype) == nil)
         }
     }
 
@@ -297,6 +313,29 @@ struct Gemma4FusedNormsTests {
         expectExact(out, expected)
         expectExact(
             try #require(fusedNext), MLXFast.rmsNorm(expected, weight: next, eps: Self.eps))
+    }
+
+    /// A layer whose output is promoted (a float32 output projection) hands
+    /// the next layer float32 rows: that layer takes the unfused ops and its
+    /// own input norm, and the logits keep their bits.
+    @Test func promotedRowsKeepTheUnfusedOpsInTheNextLayer() throws {
+        guard verified else { return }
+        try #require(Gemma4FusedNorms.supports(width: 128, dtype: .bfloat16))
+        let model = Gemma4TextModel(try configuration(moe: true, layers: 2))
+        try randomize(model, seed: 16_000)
+        let o = try #require(
+            model.namedModules().first { $0.0.hasSuffix("layers.0.self_attn.o_proj") }?.1
+                as? Linear)
+        o.update(parameters: .unflattened(["weight": o.weight.asType(.float32)]))
+        eval(model)
+        let tokens = MLXArray((0 ..< 4).map { Int32(($0 * 9 + 2) % 64) }).reshaped(2, 2)
+        let unfused = Gemma4FusedNorms.$enabledOverride.withValue(false) {
+            bytes(model(tokens, cache: nil))
+        }
+        let fused = Gemma4FusedNorms.$enabledOverride.withValue(true) {
+            bytes(model(tokens, cache: nil))
+        }
+        #expect(fused == unfused)
     }
 
     /// Two rows of verification width (2 tokens each) after a two-row prompt.

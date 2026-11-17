@@ -28,12 +28,19 @@ public enum RMSNormMeanForm: Int, Sendable {
     /// The form that writes MLX's prebuilt bits for rows of `width` (MLX's
     /// single-row kernel, at most 4096) in `dtype`; nil where none is shown.
     /// Measured once per width and dtype.
+    /// The mean's code is the same for every dtype, so a 16-bit form is
+    /// reported only when float32 rows, whose outputs show the inverse mean
+    /// almost bit for bit, give the same form.
     public static func measured(width: Int, dtype: DType) -> RMSNormMeanForm? {
         guard Device.defaultDevice().deviceType == .gpu,
             ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family()),
-            [.bfloat16, .float16, .float32].contains(dtype), (1 ... 4096).contains(width)
+            [.bfloat16, .float16, .float32].contains(dtype), (1 ... 4096).contains(width),
+            let form = Calibration.shared.form(width: width, dtype: dtype)
         else { return nil }
-        return Calibration.shared.form(width: width, dtype: dtype)
+        guard dtype == .float32 else {
+            return Calibration.shared.form(width: width, dtype: .float32) == form ? form : nil
+        }
+        return form
     }
 
     package final class Calibration: @unchecked Sendable {
@@ -83,7 +90,15 @@ public enum RMSNormMeanForm: Int, Sendable {
             }
         }
 
+        /// Nil when the rows can't be built or MLX reports an error (a kernel
+        /// that does not compile, for one).
         static func measurement(width: Int, dtype: DType) -> Measurement? {
+            try? withError { error in try measurement(width: width, dtype: dtype, error: error) }
+        }
+
+        private static func measurement(width: Int, dtype: DType, error: ErrorBox) throws
+            -> Measurement?
+        {
             let coincide = width & (width - 1) == 0
             let (separating, plain) = rows(width: width, dtype: dtype, separate: !coincide)
             guard coincide || separating.count == separatingRows else { return nil }
@@ -103,6 +118,8 @@ public enum RMSNormMeanForm: Int, Sendable {
             let divide = copy(.divide)
             let fused = copy(.fusedMultiplyAdd)
             eval(reference, divide, fused)
+            // An array that failed to evaluate has no data to read.
+            try error.check()
             func bytes(_ a: MLXArray) -> Data { a.asData(access: .copy).data }
             let r = bytes(reference)
             let d = bytes(divide)

@@ -85,59 +85,91 @@ enum Gemma4FusedNorms {
         /// that separate the two mean forms (and on plain rows), else why not.
         static func check(width: Int, dtype: DType) -> String? {
             do {
-                return try withError { () -> String? in
+                return try withError { error -> String? in
                     let (separating, plain) = RMSNormMeanForm.Calibration.rows(
                         width: width, dtype: dtype, separate: width & (width - 1) != 0)
                     let rows = separating + plain
                     let x = MLXArray(rows.flatMap { $0 }, [rows.count, 1, width]).asType(dtype)
                     let y = MLXArray(rows.reversed().flatMap { $0 }, [rows.count, 1, width])
                         .asType(dtype)
-                    return mismatch(x, y, width: width, dtype: dtype)
+                    return try mismatch(x, y, width: width, dtype: dtype, error: error)
                 }
             } catch {
                 return "\(error)"
             }
         }
 
-        /// The first kernel output that differs from the unfused ops, with
-        /// unit weights so each norm's rounding of the mean shows.
-        static func mismatch(_ x: MLXArray, _ y: MLXArray, width: Int, dtype: DType) -> String? {
+        /// The first kernel output that differs from the unfused ops. With a
+        /// zero residual each norm's rounding shows in the sum; with a nonzero
+        /// one, and weights and a layer scalar that are exact multiples of 1/16
+        /// away from 0 and 1, a contracted multiply-add would show too.
+        static func mismatch(
+            _ x: MLXArray, _ y: MLXArray, width: Int, dtype: DType, error: ErrorBox? = nil
+        ) throws -> String? {
             let eps = RMSNormMeanForm.Calibration.epsilon
-            let one = MLXArray.ones([width], dtype: dtype)
-            let zero = MLXArray.zeros(x.shape, dtype: dtype)
-            let scalar = MLXArray([Float(1)]).asType(dtype)
-            func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            func weight(_ k: Int) -> MLXArray {
+                MLXArray((0 ..< width).map { Float(8 + ($0 * k + k) % 25) / 16 }).asType(dtype)
+            }
+            let (wa, w1, w2, w3, wd, we, wp, wn) = (
+                weight(3), weight(5), weight(7), weight(11), weight(13), weight(17), weight(19),
+                weight(23)
+            )
+            let scalar = MLXArray([Float(0.75)]).asType(dtype)
+            func same(_ a: MLXArray, _ b: MLXArray) throws -> Bool {
                 eval(a, b)
+                // An array that failed to evaluate has no data to read.
+                try error?.check()
                 return a.dtype == b.dtype && a.shape == b.shape
                     && a.asData(access: .copy).data == b.asData(access: .copy).data
             }
-            for count in [1, 3] {
+            for residual in [MLXArray.zeros(x.shape, dtype: dtype), y] {
+                if let found = try mismatch(
+                    x, y, residual: residual, weights: (wa, w1, w2, w3, wd, we, wp, wn),
+                    scalar: scalar, eps: eps, same: same)
+                {
+                    return found
+                }
+            }
+            return nil
+        }
+
+        private static func mismatch(
+            _ x: MLXArray, _ y: MLXArray, residual: MLXArray,
+            weights: (
+                MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray
+            ),
+            scalar: MLXArray, eps: Float, same: (MLXArray, MLXArray) throws -> Bool
+        ) throws -> String? {
+            let (wa, w1, w2, w3, wd, we, wp, wn) = weights
+            for norms in [[w1], [w1, w2, w3]] {
                 let tail = attentionTail(
-                    x, residual: zero, postAttention: one,
-                    sumNorms: Array(repeating: one, count: count), eps: eps)
-                let sum = zero + MLXFast.rmsNorm(x, weight: one, eps: eps)
-                guard same(tail.sum, sum) else { return "attentionTail(\(count)) sum" }
-                for norm in tail.norms
-                where !same(norm, MLXFast.rmsNorm(sum, weight: one, eps: eps)) {
-                    return "attentionTail(\(count)) norm"
+                    x, residual: residual, postAttention: wa, sumNorms: norms, eps: eps)
+                let sum = residual + MLXFast.rmsNorm(x, weight: wa, eps: eps)
+                guard try same(tail.sum, sum) else { return "attentionTail(\(norms.count)) sum" }
+                for (norm, w) in zip(tail.norms, norms) {
+                    guard try same(norm, MLXFast.rmsNorm(sum, weight: w, eps: eps)) else {
+                        return "attentionTail(\(norms.count)) norm"
+                    }
                 }
             }
             for experts in [true, false] {
                 let s =
                     experts
-                    ? MLXFast.rmsNorm(x, weight: one, eps: eps)
-                        + MLXFast.rmsNorm(y, weight: one, eps: eps)
+                    ? MLXFast.rmsNorm(x, weight: wd, eps: eps)
+                        + MLXFast.rmsNorm(y, weight: we, eps: eps)
                     : x
-                let out = (zero + MLXFast.rmsNorm(s, weight: one, eps: eps)) * scalar
+                let out = (residual + MLXFast.rmsNorm(s, weight: wp, eps: eps)) * scalar
                 for next in [true, false] {
                     let tail = feedforwardTail(
-                        dense: x, experts: experts ? (y, one, one) : nil, residual: zero,
-                        post: one, layerScalar: scalar, next: next ? one : nil, eps: eps)
-                    guard same(tail.out, out) else { return "feedforwardTail out" }
-                    if next, let n = tail.next,
-                        !same(n, MLXFast.rmsNorm(out, weight: one, eps: eps))
-                    {
-                        return "feedforwardTail next"
+                        dense: x, experts: experts ? (y, wd, we) : nil, residual: residual,
+                        post: wp, layerScalar: scalar, next: next ? wn : nil, eps: eps)
+                    guard try same(tail.out, out) else {
+                        return "feedforwardTail(experts: \(experts)) out"
+                    }
+                    if next, let n = tail.next {
+                        guard try same(n, MLXFast.rmsNorm(out, weight: wn, eps: eps)) else {
+                            return "feedforwardTail(experts: \(experts)) next"
+                        }
                     }
                 }
             }
