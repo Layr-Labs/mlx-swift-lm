@@ -435,7 +435,8 @@ extension KernelTests {
                     forResource: "input-video-url.mp4", withExtension: nil,
                     subdirectory: "MiMoOpenRouter"))
             let data = try Data(contentsOf: url)
-            let cap = 6 * 1280 * 720 * 3 + 1
+            // Five RGB8 frames and the sixth's RGBA render.
+            let cap = 5 * 1280 * 720 * 3 + 1280 * 720 * 4
             func prepare(fits: Bool) async throws -> GLM5NextPreparedInput {
                 let processor = try GLM5NextProcessor(
                     configuration: .init(
@@ -446,7 +447,7 @@ extension KernelTests {
                         prompt: "Describe the video.",
                         videos: [.memoryBacked(try MemoryBackedVideoAsset(videoData: data))]))
             }
-            await #expect(throws: GLM5NextVisionError.budgetExceeded("decoded video frames")) {
+            await #expect(throws: GLM5NextVisionError.budgetExceeded("decoded image")) {
                 _ = try await prepare(fits: false)
             }
             let prepared = try await prepare(fits: true)

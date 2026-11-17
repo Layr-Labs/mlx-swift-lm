@@ -158,8 +158,9 @@ extension UnitTests {
         }
 
         /// Past the decoded-frame cap, the official sample keeps at most the
-        /// frames the cap holds at the clip's frame size (whole pairs), spread
-        /// over the whole clip as the sampler spreads `maximumFrames`; without
+        /// frames the cap holds at the clip's frame size (whole pairs, the last
+        /// frame's RGBA render included), spread over the whole clip as the
+        /// sampler spreads `maximumFrames`; without
         /// `fitsVideoSampleToDecodedBytes` the clip is refused. Within the cap
         /// the sample is the official one either way.
         @Test func decodedByteCapSamplesDownAcrossTheClip() throws {
@@ -173,10 +174,12 @@ extension UnitTests {
                     frames: indices.map { frames[$0] }, framesPerSecond: 5, duration: 6,
                     sourceFrameCount: 30, sourceIndices: indices)
             }
+            // `cap` frames: all but the last kept as RGB8, the last as its RGBA render.
             func processor(frames cap: Int, fits: Bool) throws -> GLM5NextProcessor {
                 try GLM5NextProcessor(
                     configuration: .init(
-                        videoMaximumTokens: 128, maximumDecodedBytes: cap * frameBytes + 1,
+                        videoMaximumTokens: 128,
+                        maximumDecodedBytes: (cap - 1) * frameBytes + 47 * 29 * 4,
                         fitsVideoSampleToDecodedBytes: fits),
                     tokenizer: GLM5NextTestTokenizer())
             }
@@ -206,6 +209,10 @@ extension UnitTests {
             let tiny = try GLM5NextProcessorConfiguration(
                 maximumDecodedBytes: frameBytes, fitsVideoSampleToDecodedBytes: true)
             #expect(tiny.maximumSampledVideoFrames(frameBytes: frameBytes) == 2)
+            // 512 MiB at 720p and 1080p.
+            let product = try GLM5NextProcessorConfiguration(fitsVideoSampleToDecodedBytes: true)
+            #expect(product.maximumSampledVideoFrames(frameBytes: 1280 * 720 * 3) == 192)
+            #expect(product.maximumSampledVideoFrames(frameBytes: 1920 * 1080 * 3) == 84)
         }
 
         @Test func disabledSamplingRetainsLimitsAndQuotesAllPackedFrames() throws {

@@ -523,13 +523,15 @@ public struct GLM5NextProcessorConfiguration: Sendable {
         self.fitsVideoSampleToDecodedBytes = fitsVideoSampleToDecodedBytes
     }
 
-    /// The most frames the official sampler keeps of a clip whose decoded
+    /// The most frames the official sampler keeps of a clip whose decoded RGB8
     /// frames are `frameBytes` each: 2048, or with
     /// `fitsVideoSampleToDecodedBytes` the whole pairs `maximumDecodedBytes`
-    /// holds (at least one pair).
+    /// holds (at least one pair), leaving the last frame's RGBA render room.
     public func maximumSampledVideoFrames(frameBytes: Int) -> Int {
         guard fitsVideoSampleToDecodedBytes, frameBytes > 0 else { return 2048 }
-        return min(2048, max(2, maximumDecodedBytes / frameBytes / 2 * 2))
+        let renderBytes = frameBytes / 3 * 4
+        let frames = maximumDecodedBytes < renderBytes ? 0 : (maximumDecodedBytes - renderBytes) / frameBytes + 1
+        return min(2048, max(2, frames / 2 * 2))
     }
 }
 
