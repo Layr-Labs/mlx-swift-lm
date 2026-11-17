@@ -614,7 +614,15 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         if qkNormalization == .qwen35RMSScaled, case .silu = norm.gateActivation,
             Qwen35DecodeFusions.isEnabled
         {
-            // qwen3_5: `Qwen3NextRMSNormGated`'s silu tail as one compiled kernel.
+            // qwen3_5: the norm and its silu tail as one kernel
+            // (`GatedDeltaOutputNorm`) on decode-shaped calls, else the tail
+            // as one compiled kernel after the fast RMSNorm; the same values.
+            if Qwen35DecodeFusions.isEnabledV2,
+                let fused = GatedDeltaOutputNorm.apply(
+                    out, gate: gate, weight: norm.weight, eps: norm.eps)
+            {
+                return fused
+            }
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             return Qwen35DecodeFusions.gatedSiluNormTail(
                 normed: normed, gate: gate, dtype: out.dtype)
@@ -658,6 +666,29 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         return (fused.q, fused.k)
     }
 
+    /// `fusedConvolution` and `fusedNormalizedQK` as one kernel
+    /// (`GatedDeltaConvolutionQKNorm`, the same values) for decode-shaped
+    /// Qwen 3.5 chunks: the convolution input, the normalized q and k, and v
+    /// `[B, S, Hv, Dv]`; nil elsewhere.
+    private func fusedConvolutionNormalizedQK(_ convState: MLXArray, _ qkv: MLXArray) -> (
+        convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray
+    )? {
+        guard qkNormalization == .qwen35RMSScaled, Qwen35DecodeFusions.isEnabledV2,
+            conv1d.bias == nil, !(inProjQKV is HadamardQuantizedLinear),
+            qkv.ndim == 3, convDim == 2 * keyDim + valueDim
+        else { return nil }
+        let constants = Qwen35DecodeFusions.qkScales(headDim: headKDim, dtype: qkv.dtype)
+        guard
+            let fused = GatedDeltaConvolutionQKNorm.apply(
+                state: convState, inputs: qkv, weight: conv1d.weight, heads: numKHeads,
+                dim: headKDim, qScale: constants.q, kScale: constants.k, eps: 1e-6)
+        else { return nil }
+        return (
+            fused.convInput, fused.q, fused.k,
+            fused.v.reshaped(qkv.dim(0), qkv.dim(1), numVHeads, headVDim)
+        )
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -686,6 +717,15 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
     ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
+
+        if let joint = fusedConvolutionNormalizedQK(convState, qkv) {
+            let nKeep = convKernelSize - 1
+            let newConvState = joint.convInput[0..., (joint.convInput.dim(1) - nKeep)...]
+            let (out, newSsmState) = applyGatedDelta(
+                q: joint.q, k: joint.k, v: joint.v, a: a, b: b,
+                state: ssmState, mask: mask)
+            return (out, newConvState, newSsmState)
+        }
 
         let fused = fusedConvolution(convState, qkv)
         let convInput =

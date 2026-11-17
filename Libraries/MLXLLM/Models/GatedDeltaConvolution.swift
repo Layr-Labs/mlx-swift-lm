@@ -62,7 +62,8 @@ enum GatedDeltaConvolution {
 
     // MLX's `Sigmoid` functor (mlx/backend/metal/kernels/unary_ops.h), and row
     // `r` of the concatenation [state; inputs] read through their strides.
-    private static let header = """
+    // Shared with `GatedDeltaConvolutionQKNorm` and `GatedDeltaOutputNorm`.
+    static let header = """
         struct GdnSigmoid {
           template <typename U>
           U operator()(U x) thread {
@@ -184,6 +185,214 @@ enum GatedDeltaQKNorm {
           for (int i = 0; i < N_READS; i++) {
             const T normed = unit * static_cast<T>(thread_x[i] * inv_mean);
             dst[base + i] = scale * normed;
+          }
+        }
+        """
+}
+
+/// `GatedDeltaConvolution` and `GatedDeltaQKNorm` as one kernel for decode
+/// steps: one thread group per `dim` channels of the convolution writes those
+/// channels of `[state; inputs]`, their convolution and SiLU (the same
+/// expressions as `GatedDeltaConvolution`), and then either the scaled RMS
+/// norm of that q or k head (the same expressions as `GatedDeltaQKNorm`) or
+/// the value channels as they are. The convolution output's q and k channels
+/// are no longer written and read back, and the two launches on every Gated
+/// DeltaNet layer's critical path become one. The same values.
+enum GatedDeltaConvolutionQKNorm {
+    /// Diagnostic only: `DARKBLOOM_GDN_FUSED_CONV_QK_NORM=0` keeps the two kernels.
+    static let enabledByEnvironment: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GDN_FUSED_CONV_QK_NORM"] != "0"
+    @TaskLocal static var enabledOverride: Bool?
+    static var isEnabled: Bool { enabledOverride ?? enabledByEnvironment }
+
+    /// `(convInput [B, K-1+S, C], q [B, S, heads, dim], k [B, S, heads, dim],
+    /// v [B, S, C - 2*heads*dim])` for `state [B, K-1, C]`, `inputs [B, S, C]`
+    /// and the depthwise weight `[C, K, 1]`, where the convolution output's
+    /// channels `[0, heads*dim)` are q and the next `heads*dim` are k; nil
+    /// where not covered (the caller keeps the two kernels or the unfused ops).
+    static func apply(
+        state: MLXArray, inputs: MLXArray, weight: MLXArray, heads: Int, dim: Int,
+        qScale: MLXArray, kScale: MLXArray, eps: Float
+    ) -> (convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray)? {
+        guard isEnabled, GatedDeltaConvolution.isEnabled, GatedDeltaQKNorm.isEnabled,
+            Device.defaultDevice().deviceType == .gpu,
+            ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family()),
+            state.ndim == 3, inputs.ndim == 3, weight.ndim == 3, weight.dim(2) == 1,
+            state.dim(0) == inputs.dim(0), state.dim(2) == inputs.dim(2),
+            weight.dim(0) == inputs.dim(2), weight.dim(1) == state.dim(1) + 1,
+            state.dtype == inputs.dtype, weight.dtype == inputs.dtype,
+            [.bfloat16, .float16, .float32].contains(inputs.dtype),
+            inputs.dim(1) >= 1, inputs.dim(1) <= 8,
+            dim % 4 == 0, dim >= 4, dim <= 128, heads >= 1,
+            inputs.dim(2) > 2 * heads * dim, inputs.dim(2) % dim == 0,
+            qScale.dtype == inputs.dtype, kScale.dtype == inputs.dtype,
+            qScale.size == 1, kScale.size == 1
+        else { return nil }
+        let batch = inputs.dim(0)
+        let steps = inputs.dim(1)
+        let channels = inputs.dim(2)
+        let taps = weight.dim(1)
+        let kept = taps - 1
+        let outputs = kernel(
+            [
+                state, inputs, weight, qScale.reshaped([1]), kScale.reshaped([1]),
+                ResidualRMSNorm.Constants.shared.epsilon(eps),
+            ],
+            template: [
+                ("T", inputs.dtype), ("KS", taps), ("C", channels), ("S", steps), ("D", dim),
+                ("H", heads),
+            ],
+            grid: (32 * (channels / dim), batch, 1), threadGroup: (32, 1, 1),
+            outputShapes: [
+                [batch, kept + steps, channels], [batch, steps, heads, dim],
+                [batch, steps, heads, dim], [batch, steps, channels - 2 * heads * dim],
+            ],
+            outputDTypes: [inputs.dtype, inputs.dtype, inputs.dtype, inputs.dtype])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "gated_delta_conv_qk_norm", inputNames: ["st", "xin", "w", "qs", "ks", "eps"],
+        outputNames: ["conv_input", "qn", "kn", "vout"], source: source,
+        header: GatedDeltaConvolution.header, ensureRowContiguous: false)
+
+    // Lane `l` of thread group `block` owns channels `block * D + 4l ...`.
+    // The convolution is `GatedDeltaConvolution`'s expression per channel;
+    // the norm is `GatedDeltaQKNorm`'s (`rms_single_row` over one SIMD group,
+    // the unit weight, then the scale).
+    private static let source = """
+        constexpr int KEPT = KS - 1;
+        constexpr int N_READS = 4;
+        constexpr int VC = C - 2 * H * D;
+        const uint lane = thread_index_in_simdgroup;
+        const uint block = threadgroup_position_in_grid.x;
+        const uint b = threadgroup_position_in_grid.y;
+        const uint base = lane * N_READS;
+        const bool active = base < uint(D);
+        const uint c0 = block * D + base;
+        if (active) {
+          for (int r = 0; r < KEPT + S; ++r) {
+            for (int i = 0; i < N_READS; i++) {
+              conv_input[(size_t(b) * (KEPT + S) + r) * C + c0 + i] =
+                  gdn_conv_row<T>(st, st_strides, xin, xin_strides, KEPT, r, b, c0 + i);
+            }
+          }
+        }
+        const uint which = block < uint(H) ? 0 : (block < uint(2 * H) ? 1 : 2);
+        const uint head = which == 0 ? block : block - H;
+        const T unit = static_cast<T>(1);
+        const T scale = which == 0 ? qs[0] : ks[0];
+        for (int t = 0; t < S; ++t) {
+          T activated[N_READS];
+          float thread_x[N_READS];
+          for (int i = 0; i < N_READS; i++) {
+            if (active) {
+              const uint c = c0 + i;
+              float acc = 0.0;
+              for (int j = 0; j < KS; ++j) {
+                acc += static_cast<float>(gdn_conv_row<T>(st, st_strides, xin, xin_strides, KEPT, t + j, b, c))
+                    * w[c * w_strides[0] + j * w_strides[1]];
+              }
+              const T conv = static_cast<T>(acc);
+              const T sig = GdnSigmoid()(conv);
+              activated[i] = conv * sig;
+            } else {
+              activated[i] = static_cast<T>(0);
+            }
+          }
+          if (which == 2) {
+            if (active) {
+              for (int i = 0; i < N_READS; i++) {
+                vout[(size_t(b) * S + t) * VC + (c0 - 2 * H * D) + i] = activated[i];
+              }
+            }
+            continue;
+          }
+          float acc = 0;
+          for (int i = 0; i < N_READS; i++) {
+            thread_x[i] = active ? static_cast<float>(activated[i]) : 0;
+            acc += thread_x[i] * thread_x[i];
+          }
+          acc = simd_sum(acc);
+          const float inv_mean = metal::precise::rsqrt(acc / D + eps[0]);
+          if (active) {
+            device T* dst = (which == 0 ? qn : kn) + ((size_t(b) * S + t) * H + head) * D;
+            for (int i = 0; i < N_READS; i++) {
+              const T normed = unit * static_cast<T>(thread_x[i] * inv_mean);
+              dst[base + i] = scale * normed;
+            }
+          }
+        }
+        """
+}
+
+/// The Qwen 3.5 Gated DeltaNet's gated output norm (`Qwen3NextRMSNormGated`
+/// with the SiLU gate) as one kernel for decode steps: per head row,
+/// `MLXFast.rmsNorm` (MLX's `rms_single_row` over one SIMD group, as
+/// `GatedDeltaQKNorm`) and then the compiled tail `(silu(float(gate)) *
+/// float(normed))` rounded to the activation dtype, with MLX's `Sigmoid`
+/// functor. Two launches on every Gated DeltaNet layer's critical path
+/// become one; the same values. Heads of 4...128 values.
+enum GatedDeltaOutputNorm {
+    /// Diagnostic only: `DARKBLOOM_GDN_FUSED_OUTPUT_NORM=0` keeps the two kernels.
+    static let enabledByEnvironment: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GDN_FUSED_OUTPUT_NORM"] != "0"
+    @TaskLocal static var enabledOverride: Bool?
+    static var isEnabled: Bool { enabledOverride ?? enabledByEnvironment }
+
+    /// `gatedSiluNormTail(rmsNorm(out, weight), gate)` for `out` and `gate`
+    /// `[..., dim]` of one dtype and `weight [dim]` of that dtype; nil where
+    /// not covered.
+    static func apply(_ out: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float) -> MLXArray? {
+        guard isEnabled, Device.defaultDevice().deviceType == .gpu,
+            ResidualRMSNorm.verifiedFamilies.contains(AffineQuantizedVectors.family()),
+            out.ndim >= 2, out.shape == gate.shape, weight.ndim == 1,
+            weight.dim(0) == out.dim(-1), out.dtype == gate.dtype, weight.dtype == out.dtype,
+            [.bfloat16, .float16, .float32].contains(out.dtype),
+            out.dim(-1) % 4 == 0, out.dim(-1) >= 4, out.dim(-1) <= 128,
+            out.size / out.dim(-1) <= 4096
+        else { return nil }
+        let dim = out.dim(-1)
+        let rows = out.size / dim
+        return kernel(
+            [
+                out.reshaped([rows, dim]), gate.reshaped([rows, dim]), weight,
+                ResidualRMSNorm.Constants.shared.epsilon(eps),
+            ],
+            template: [("T", out.dtype), ("D", dim)],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [out.shape], outputDTypes: [out.dtype])[0]
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "gated_delta_output_norm", inputNames: ["x", "gate", "w", "eps"],
+        outputNames: ["y"], source: source, header: GatedDeltaConvolution.header,
+        ensureRowContiguous: false)
+
+    private static let source = """
+        constexpr int N_READS = 4;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint base = lane * N_READS;
+        const bool active = base < uint(D);
+        auto xr = x + row * x_strides[0];
+        auto gr = gate + row * gate_strides[0];
+        float thread_x[N_READS];
+        float acc = 0;
+        for (int i = 0; i < N_READS; i++) {
+          thread_x[i] = active ? static_cast<float>(xr[(base + i) * x_strides[1]]) : 0;
+          acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        const float inv_mean = metal::precise::rsqrt(acc / D + eps[0]);
+        if (active) {
+          for (int i = 0; i < N_READS; i++) {
+            const T normed = w[(base + i) * w_strides[0]] * static_cast<T>(thread_x[i] * inv_mean);
+            const float g = static_cast<float>(gr[(base + i) * gate_strides[1]]);
+            const float s = GdnSigmoid()(g);
+            const float activated = g * s;
+            const float product = activated * static_cast<float>(normed);
+            y[size_t(row) * D + base + i] = static_cast<T>(product);
           }
         }
         """
