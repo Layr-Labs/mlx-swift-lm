@@ -490,12 +490,19 @@ public struct GLM5NextProcessorConfiguration: Sendable {
     /// Default `.official` resamples the source at 2 FPS. `.disabled` retains
     /// every supplied frame, then pads only the final temporal pair after resize.
     public let videoSamplingPolicy: GLM5NextVideoSamplingPolicy
+    /// When true, the official sample keeps at most the frames
+    /// `maximumDecodedBytes` holds at the clip's frame size
+    /// (`maximumSampledVideoFrames`), spread over the whole clip, instead of
+    /// the processor refusing a clip whose 2 FPS sample passes the cap. Off by
+    /// default: the reference sampler.
+    public let fitsVideoSampleToDecodedBytes: Bool
 
     public init(
         patchSize: Int = 14, imageMinimumTokens: Int = 16, imageMaximumTokens: Int = 8000,
         videoMinimumTokens: Int = 16, videoMaximumTokens: Int = 240000,
         maximumDecodedBytes: Int = 512 * 1024 * 1024, maximumPreparedBytes: Int = 512 * 1024 * 1024,
-        videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official
+        videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official,
+        fitsVideoSampleToDecodedBytes: Bool = false
     ) throws {
         guard patchSize > 0, patchSize <= 128, imageMinimumTokens > 0,
             imageMaximumTokens >= imageMinimumTokens, imageMaximumTokens <= 8000,
@@ -513,6 +520,16 @@ public struct GLM5NextProcessorConfiguration: Sendable {
         self.maximumDecodedBytes = maximumDecodedBytes
         self.maximumPreparedBytes = maximumPreparedBytes
         self.videoSamplingPolicy = videoSamplingPolicy
+        self.fitsVideoSampleToDecodedBytes = fitsVideoSampleToDecodedBytes
+    }
+
+    /// The most frames the official sampler keeps of a clip whose decoded
+    /// frames are `frameBytes` each: 2048, or with
+    /// `fitsVideoSampleToDecodedBytes` the whole pairs `maximumDecodedBytes`
+    /// holds (at least one pair).
+    public func maximumSampledVideoFrames(frameBytes: Int) -> Int {
+        guard fitsVideoSampleToDecodedBytes, frameBytes > 0 else { return 2048 }
+        return min(2048, max(2, maximumDecodedBytes / frameBytes / 2 * 2))
     }
 }
 
@@ -696,7 +713,9 @@ public struct GLM5NextProcessor: UserInputProcessor {
         // sampling must not disable the existing source or retained-frame caps.
         let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(
             totalFrames: video.sourceFrameCount,
-            sourceFPS: video.framesPerSecond, duration: video.duration)
+            sourceFPS: video.framesPerSecond, duration: video.duration,
+            maximumFrames: configuration.maximumSampledVideoFrames(
+                frameBytes: video.frames[0].pixels.count))
         let indices: [Int]
         switch configuration.videoSamplingPolicy {
         case .official:
@@ -1199,12 +1218,14 @@ public struct GLM5NextProcessor: UserInputProcessor {
             duration * fps <= 100_000
         else { throw GLM5NextVisionError.invalidInput("video track metadata") }
         // A failed pass reruns once with a new reader over the same asset.
-        func read(retaining retained: Set<Int>?) async throws -> (
+        func read(retaining retained: Set<Int>?, stoppingAfter limit: Int? = nil) async throws -> (
             frames: [GLM5NextRGBImage], indices: [Int], decoded: Int
         ) {
             do {
                 return try await VideoReaderRetry.run {
-                    try decodeFrames(asset, track: track, transform: transform, retaining: retained)
+                    try decodeFrames(
+                        asset, track: track, transform: transform, retaining: retained,
+                        stoppingAfter: limit)
                 }
             } catch let failure as VideoReaderFailure {
                 throw GLM5NextVisionError.videoReader(failure)
@@ -1214,13 +1235,20 @@ public struct GLM5NextProcessor: UserInputProcessor {
             let all = try await read(retaining: nil)
             return try .init(frames: all.frames, framesPerSecond: fps, duration: duration)
         }
+        // A sample fitted to the decoded-frame cap depends on the frame size
+        // as rendered, so the first frame is decoded alone to learn it.
+        var frameBytes = 0
+        if configuration.fitsVideoSampleToDecodedBytes {
+            frameBytes = try await read(retaining: [0], stoppingAfter: 1).frames.first?.pixels.count ?? 0
+        }
         // The official sampler needs only the source frame count, so decoding
         // retains just its frames: first for the count the track metadata
         // predicts, and again only if the decoded count needs other frames.
         func sampled(_ count: Int) throws -> Set<Int> {
             Set(
                 try GLM5NextMediaGeometry.sampleFrameIndices(
-                    totalFrames: count, sourceFPS: fps, duration: duration))
+                    totalFrames: count, sourceFPS: fps, duration: duration,
+                    maximumFrames: configuration.maximumSampledVideoFrames(frameBytes: frameBytes)))
         }
         var pass = try await read(retaining: sampled(max(1, Int((duration * fps).rounded()))))
         let needed = try sampled(pass.decoded)
@@ -1236,15 +1264,15 @@ public struct GLM5NextProcessor: UserInputProcessor {
             sourceFrameCount: pass.decoded, sourceIndices: pass.indices)
     }
 
-    /// Decodes every frame in presentation order, but converts and retains
-    /// only `retaining` (every frame when nil). Timestamps need only increase:
-    /// like the reference loader, frame i is timed at i / `nominalFrameRate`,
-    /// the track's average rate, so a variable-frame-rate track is indexed
-    /// rather than refused. A reader that does not complete throws
-    /// `VideoReaderFailure`.
+    /// Decodes every frame in presentation order (or the first `stoppingAfter`),
+    /// but converts and retains only `retaining` (every frame when nil).
+    /// Timestamps need only increase: like the reference loader, frame i is
+    /// timed at i / `nominalFrameRate`, the track's average rate, so a
+    /// variable-frame-rate track is indexed rather than refused. A reader that
+    /// does not complete throws `VideoReaderFailure`.
     private func decodeFrames(
         _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform,
-        retaining retained: Set<Int>?
+        retaining retained: Set<Int>?, stoppingAfter limit: Int? = nil
     ) throws -> (frames: [GLM5NextRGBImage], indices: [Int], decoded: Int) {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(
@@ -1290,6 +1318,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
             bytes += image.pixels.count
             frames.append(image)
             indices.append(index)
+            if let limit, decoded >= limit { return (frames, indices, decoded) }
         }
         guard reader.status == .completed else { throw VideoReaderFailure(reader: reader) }
         return (frames, indices, decoded)
