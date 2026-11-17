@@ -5,15 +5,16 @@ import MLX
 import MLXLMCommon
 
 /// Command-buffer limits for Gemma 4's plain decode steps (every row one token)
-/// and its MTP rounds of decode and verification rows (see
+/// and its MTP rounds whose rows each carry at most 8 tokens (decode and
+/// verification rows, or a short prompt chunk; see
 /// `MLXLMCommon.CBv2DecodeCommandBufferLimitsProviding`). MLX's defaults commit
 /// every 40-50 operations or 40-50 M distinct input elements. A step's inputs
 /// include the weights and each 64 MiB KV segment the history reads, so decode
 /// committed many times per step, reached MLX's limit of ten command buffers in
 /// flight, and waited inside evaluation instead of encoding ahead of the GPU.
 /// These steps commit by operation count only: weights and segments add no
-/// memory. Prefill chunks, and MTP rounds that carry one, keep the defaults.
-/// Results do not depend on the partitioning.
+/// memory. Longer prefill chunks, and MTP rounds with a longer row, keep the
+/// defaults. Results do not depend on the partitioning.
 enum Gemma4DecodeCommandBuffers {
     /// Nemotron Super's measured value: 100 operations per command buffer; the
     /// input bound (1 TiB) never triggers.

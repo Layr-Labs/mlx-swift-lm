@@ -151,6 +151,7 @@ struct Gemma4CompiledFeedforwardTests {
         let enabled =
             MLXHardwareInfo.isCompiledDecodeSupported
             && (requested.map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
+        print("[Gemma4 FFN lattice] requested=\(requested ?? "unset") enabled=\(enabled)")
         for (rows, width, eligible) in [
             (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
             (8, 1, false), (4, 2, false),
