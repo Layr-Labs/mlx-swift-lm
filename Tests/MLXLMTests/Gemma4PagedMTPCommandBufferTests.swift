@@ -20,6 +20,7 @@ struct Gemma4PagedMTPCommandBufferTests {
     private let vocabSize = 256
     private let hiddenSize = 64
     private let slidingWindow = 16
+    // The paged kernels take head dims 64, 128, 256 and 512.
 
     private func targetConfig() throws -> Gemma4TextConfiguration {
         let json = """
@@ -29,8 +30,8 @@ struct Gemma4PagedMTPCommandBufferTests {
                 "num_hidden_layers": 4,
                 "intermediate_size": 128,
                 "num_attention_heads": 2,
-                "head_dim": 32,
-                "global_head_dim": 32,
+                "head_dim": 64,
+                "global_head_dim": 64,
                 "num_key_value_heads": 1,
                 "num_kv_shared_layers": 0,
                 "layer_types": ["sliding_attention", "full_attention",
@@ -63,8 +64,8 @@ struct Gemma4PagedMTPCommandBufferTests {
                     "num_hidden_layers": 2,
                     "intermediate_size": 64,
                     "num_attention_heads": 2,
-                    "head_dim": 32,
-                    "global_head_dim": 32,
+                    "head_dim": 64,
+                    "global_head_dim": 64,
                     "num_key_value_heads": 1,
                     "num_kv_shared_layers": 2,
                     "layer_types": ["sliding_attention", "full_attention"],
@@ -177,7 +178,7 @@ struct Gemma4PagedMTPCommandBufferTests {
             for (index, prompt) in prompts.enumerated() {
                 let engine = try makeEngine(
                     target: target, drafter: drafter, verification: .rectangular,
-                    segmentBytes: 2 * 16 * 32 * 4 * 2)
+                    segmentBytes: 2 * 16 * 64 * 4 * 2)
                 let out = await cbv2SchedCollect(
                     try engine.submit(
                         greedy(id: UInt64(index + 1), prompt: prompt, maxTokens: 48)))
