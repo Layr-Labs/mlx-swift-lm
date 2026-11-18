@@ -353,6 +353,76 @@ extension UnitTests {
             #expect(value == .array(Array(repeating: .string("1"), count: 1000)))
         }
 
+        /// A step costs what it reads: a pointer as long as the coordinator's
+        /// resolver allows at most, a `type` list by its names, a `nullable`
+        /// marker only as a scalar. 100 inner arrays under 84 references to a
+        /// 20,000-character pointer, 127 references to a 5,000-name `type`
+        /// list, or 127 references to a node whose `nullable` is an array of
+        /// 5,000 values read in bounded time.
+        @Test
+        func qwenXMLReferenceStepsCostWhatTheyRead() {
+            let key = String(repeating: "k", count: 20_000)
+            func tools(_ target: [String: any Sendable], _ references: Int)
+                -> [[String: any Sendable]]
+            {
+                let reference = ["$ref": "#/$defs/Y"] as [String: any Sendable]
+                return Self.referenceTools(
+                    defs: ["Y": target, key: ["type": "integer"] as [String: any Sendable]],
+                    properties: [
+                        "rows": [
+                            "type": "array",
+                            "items": [
+                                "type": "array",
+                                "items": [
+                                    "anyOf": Array(repeating: reference, count: references)
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable]
+                    ])
+            }
+            let names = (0 ..< 5_000).map { "int\($0)" }
+            let cases: [(String, [[String: any Sendable]], JSONValue)] = [
+                ("pointer", tools(["$ref": "#/$defs/\(key)"], 84), .string("1")),
+                ("type list", tools(["type": names], 127), .string("1")),
+                (
+                    "nullable",
+                    tools(["type": "integer", "nullable": Array(repeating: 0, count: 5_000)], 127),
+                    .int(1)
+                ),
+            ]
+            let text = "[" + Array(repeating: #"["1"]"#, count: 100).joined(separator: ",") + "]"
+            for (label, tools, element) in cases {
+                var value: JSONValue?
+                let elapsed = ContinuousClock().measure {
+                    value = JSONValue.from(
+                        convertParameterValue(
+                            text, paramName: "rows", funcName: "f", tools: tools,
+                            resolvingReferences: true))
+                }
+                #expect(elapsed < .milliseconds(250), "\(label): \(elapsed)")
+                #expect(
+                    value == .array(Array(repeating: .array([element]), count: 100)), "\(label)")
+            }
+        }
+
+        /// A union written out without references is read in full, however
+        /// wide: only a reading that has followed a reference is budgeted.
+        @Test
+        func qwenXMLWideUnionsWithoutReferencesStillConvert() {
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [:],
+                properties: [
+                    "v": ["anyOf": Array(repeating: integer, count: 300)] as [String: any Sendable]
+                ])
+            #expect(
+                JSONValue.from(
+                    convertParameterValue(
+                        "7", paramName: "v", funcName: "f", tools: tools, resolvingReferences: true)
+                )
+                    == .int(7))
+        }
+
         /// Pointers read as the coordinator's `$ref` resolver reads them: array
         /// members are walked (`#/$defs/U/anyOf/0`, as zod's root strategy
         /// writes), each token is percent-decoded before `~1`/`~0`, and a
