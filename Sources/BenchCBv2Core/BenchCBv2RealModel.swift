@@ -81,7 +81,8 @@ func syntheticPrompt(length: Int, seed: UInt64, vocabSize: Int) -> [Int] {
 func percentile(_ sorted: [Double], _ q: Double) -> Double {
     guard !sorted.isEmpty else { return 0 }
     let rank = q * Double(sorted.count - 1)
-    let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+    let lo = Int(rank.rounded(.down))
+    let hi = Int(rank.rounded(.up))
     if lo == hi { return sorted[lo] }
     let w = rank - Double(lo)
     return sorted[lo] * (1 - w) + sorted[hi] * w
@@ -291,12 +292,10 @@ func makeV2Engine(
         }
     case .paged:
         // Model-capability veto FIRST, mirroring the production factory:
-        // a model whose capabilities refuse paged KV (hybrid recurrent
-        // trunks — Qwen3.5/3.6 — set `supportsPagedKV: false`) would pass
-        // kernel eligibility (d256 is in the kernel's supported set) and
-        // then hit EngineV2.init's capability PRECONDITION — a process
-        // trap, not the graceful skip this function promises. Throw the
-        // same catchable ineligibility the kernel path uses.
+        // a model whose capabilities refuse paged KV would pass kernel
+        // eligibility and then hit EngineV2.init's capability PRECONDITION
+        // — a process trap, not the graceful skip this function promises.
+        // Throw the same catchable ineligibility the kernel path uses.
         let benchCapabilities =
             (hooks.model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities
             ?? .attentionOnly
@@ -310,12 +309,27 @@ func makeV2Engine(
         // `PagedKVBackend.init` — it throws `backendIneligible` before any
         // dispatch could trap. Gemma-4 global layers (headDim 512 / GQA 8)
         // are eligible via the kernel's head split.
-        let paged = try PagedKVBackend(
+        //
+        // The pool is the serving pool (`PagedKVBackend.segmented`), typed
+        // from the key/value number types the loaded model actually stores
+        // (the probe the serving factory runs). A pool of the default
+        // float16 type refuses every write of a bfloat16 checkpoint
+        // ("paged KV dtype mismatch"), and a model that requires the native
+        // segmented layout (Qwen3.5/3.6/3.8) fails EngineV2.init's
+        // capability precondition on an unsegmented pool.
+        let observed = try CBv2NativeKVTypeProbe.run(
+            model: CBv2SteppableLanguageModelAdapter(hooks.model),
             layerKinds: hooks.layerKinds,
-            config: PagedKVPoolConfig(
-                capacityBytes: kvBytes,
-                maxPrefillChunk: schedulerConfig.prefillChunkSize,
-                nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength))
+            caches: try hooks.buildCaches { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            })
+        let paged = try PagedKVBackend.segmented(
+            admittedGrantBytes: kvBytes,
+            layerKinds: hooks.layerKinds,
+            layerDTypes: observed.layerDTypes,
+            maxPrefillChunk: schedulerConfig.prefillChunkSize,
+            nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength,
+            maxBufferLength: GPU.deviceInfo().maxBufferSize)
         let pagedCaches = paged.makeLayerCaches()
         // Route through newCacheV2 so GPT-OSS primes its sinks probe.
         // newCacheV2 hands the MODEL layer index (kind.modelLayerIndex ??
@@ -501,9 +515,11 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
         func requireHexRevision(
             _ field: String, _ value: String, lengths: ClosedRange<Int>
         ) throws {
-            let isHex = !value.isEmpty && value.utf8.allSatisfy {
-                (48 ... 57).contains($0) || (97 ... 102).contains($0)
-            }
+            let isHex =
+                !value.isEmpty
+                && value.utf8.allSatisfy {
+                    (48 ... 57).contains($0) || (97 ... 102).contains($0)
+                }
             guard lengths.contains(value.count), isHex else {
                 throw CampaignReceiptError.invalidProvenance(field: field, value: value)
             }
@@ -617,12 +633,80 @@ actor TokenCounter {
     func add(_ n: Int) { count += n }
 }
 
+/// Bench-only scripted slow consumer. `BENCH_SLOW_CONSUMER=k:N`: in a cell of
+/// two or more requests, request k's consumer stops reading after N tokens,
+/// so its event buffer fills and the engine pauses it on backpressure exactly
+/// as it pauses a slow client. It reads again once every other request of the
+/// cell has finished and a short quiet window has passed; MLX's active memory
+/// is read in that window, when the paused request is the only one alive.
+/// The pause and resume points are counted in tokens, not time, so two runs
+/// step the same batches. Byte counts only.
+final class BenchSlowConsumerGate: @unchecked Sendable {
+    let request: Int
+    let afterTokens: Int
+    private let lock = NSLock()
+    private var othersRunning: Int
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var _parked = false
+    private var _quietActiveBytes = 0
+
+    var parked: Bool { lock.withLock { _parked } }
+    var quietActiveBytes: Int { lock.withLock { _quietActiveBytes } }
+
+    init?(cellRequests: Int) {
+        guard let raw = ProcessInfo.processInfo.environment["BENCH_SLOW_CONSUMER"] else {
+            return nil
+        }
+        let parts = raw.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 2, cellRequests > 1, parts[0] >= 0, parts[0] < cellRequests,
+            parts[1] > 0
+        else { return nil }
+        request = parts[0]
+        afterTokens = parts[1]
+        othersRunning = cellRequests - 1
+    }
+
+    /// The slow request's consumer waits here until the gate opens.
+    func park() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeNow = lock.withLock { () -> Bool in
+                _parked = true
+                if opened { return true }
+                waiter = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    /// Another request of the cell has finished.
+    func otherFinished() async {
+        let last = lock.withLock { () -> Bool in
+            othersRunning -= 1
+            return othersRunning == 0
+        }
+        guard last else { return }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let bytes = MLX.Memory.activeMemory
+        let parkedConsumer = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            _quietActiveBytes = bytes
+            opened = true
+            defer { waiter = nil }
+            return waiter
+        }
+        parkedConsumer?.resume()
+    }
+}
+
 func collectV2(
-    _ stream: AsyncStream<CBv2Event>, submittedAt: Double, counter: TokenCounter? = nil
+    _ stream: AsyncStream<CBv2Event>, submittedAt: Double, counter: TokenCounter? = nil,
+    slowConsumer gate: BenchSlowConsumerGate? = nil, index: Int = -1
 ) async -> RunResult {
     var r = RunResult()
     r.submittedAt = submittedAt
     var last: Double?
+    var parked = false
     for await event in stream {
         let now = CFAbsoluteTimeGetCurrent()
         switch event {
@@ -638,6 +722,10 @@ func collectV2(
                 r.tokens.append(contentsOf: tokens)
                 if let logprobs { r.logprobs.append(contentsOf: logprobs) }
                 if let counter { await counter.add(tokens.count) }
+                if let gate, index == gate.request, !parked, r.tokens.count >= gate.afterTokens {
+                    parked = true
+                    await gate.park()
+                }
             }
             r.text += text
         case .finished(let reason, let usage):
@@ -648,12 +736,33 @@ func collectV2(
         }
     }
     if r.finishedAt == 0 { r.finishedAt = CFAbsoluteTimeGetCurrent() }
+    if let gate, index != gate.request { await gate.otherFinished() }
     return r
+}
+
+/// SHA-256 over one request's output: token ids, then for each log-probability
+/// record the token id, the bit pattern of its log-probability and the same
+/// for its top alternatives. A hash only; no ids or text leave the process.
+func benchOutputDigest(_ r: RunResult) -> String {
+    var data = Data()
+    func put<T: FixedWidthInteger>(_ value: T) {
+        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+    }
+    for token in r.tokens { put(Int64(token)) }
+    for record in r.logprobs {
+        put(Int64(record.token))
+        put(record.logprob.bitPattern)
+        for top in record.topLogprobs {
+            put(Int64(top.token))
+            put(top.logprob.bitPattern)
+        }
+    }
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
 func runV2Request(
     engine: EngineV2, id: UInt64, promptTokens: [Int], maxTokens: Int, stopTokens: Set<Int>,
-    topLogprobs: Int = 0
+    topLogprobs: Int = 0, slowConsumer: BenchSlowConsumerGate? = nil, index: Int = -1
 ) async throws -> RunResult {
     let submittedAt = CFAbsoluteTimeGetCurrent()
     let stream = try engine.submit(
@@ -661,7 +770,8 @@ func runV2Request(
             id: CBv2RequestID(id), promptTokens: promptTokens,
             sampling: CBv2SamplingParams(temperature: 0, topLogprobs: topLogprobs),
             maxTokens: maxTokens, stopTokens: stopTokens))
-    return await collectV2(stream, submittedAt: submittedAt)
+    return await collectV2(
+        stream, submittedAt: submittedAt, slowConsumer: slowConsumer, index: index)
 }
 
 func qwen35CampaignConstructionProfile(
@@ -678,8 +788,9 @@ func runCampaignRequest(
     options: BenchOptions, kvBytes: Int,
     mtpDrafter: (any CBv2MTPDrafter)?
 ) async throws -> (result: RunResult, routeSummary: [String: String]) {
-    guard options.profile == .stock || options.profile == .prefill
-        || options.profile == .decode || options.profile == .full
+    guard
+        options.profile == .stock || options.profile == .prefill
+            || options.profile == .decode || options.profile == .full
     else {
         throw CampaignExecutionError.profileNotInstalled(options.profile)
     }
@@ -722,18 +833,21 @@ func runCampaignRequest(
     }
     await measured.shutdown()
 
-    let prefillRoute = options.soloStripe.map {
-        "chunk=\(options.prefillChunk),solo-stripe=\($0)"
-    } ?? "chunk=\(options.prefillChunk),solo-stripe=off"
+    let prefillRoute =
+        options.soloStripe.map {
+            "chunk=\(options.prefillChunk),solo-stripe=\($0)"
+        } ?? "chunk=\(options.prefillChunk),solo-stripe=off"
     let mtpRoute: String
     if let metrics = mtpMetrics {
-        mtpRoute = "inline-fixed-k\(options.mtpDepth),verify=\(metrics.verificationMode.rawValue),"
+        mtpRoute =
+            "inline-fixed-k\(options.mtpDepth),verify=\(metrics.verificationMode.rawValue),"
             + "rounds=\(metrics.rounds),proposed=\(metrics.proposedTokens),"
             + "accepted=\(metrics.acceptedTokens),emitted=\(metrics.emittedTokens)"
     } else {
         mtpRoute = "disabled"
     }
-    let targetRoute = options.profile == .decode || options.profile == .full
+    let targetRoute =
+        options.profile == .decode || options.profile == .full
         ? "row-owned-E256-K8+main-direct-expert-reduction"
         : "pinned-default"
     var routeSummary = [
@@ -762,9 +876,11 @@ func logprobDetail(_ r: RunResult, at index: Int, label: String) -> String {
         .joined(separator: " ")
     var gap = ""
     if lp.topLogprobs.count >= 2 {
-        gap = String(format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
+        gap = String(
+            format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
     }
-    return String(format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
+    return String(
+        format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
 }
 
 // MARK: - Perf cells
@@ -846,7 +962,6 @@ struct SafeR1Provenance: Codable, Sendable, Equatable {
             + fallbackTopology + fallbackAssignmentCount + fallbackGeometry
             + fallbackMetallibUnavailable
     }
-
 
     var guardFailure: String? {
         guard armed else {
@@ -1080,7 +1195,9 @@ func runV2Cell(
                 2_048, prefillChunkSize, soloPrefillStripeTokens ?? 0),
             prefillChunkSize: prefillChunkSize,
             soloPrefillStripeTokens: soloPrefillStripeTokens,
-            maxWaiting: 16),
+            // A cell submits `batch` requests at once: a waiting queue of 16
+            // refused every request past the 16th and reported it as zeros.
+            maxWaiting: max(16, batch)),
         kvBytes: kvBytes)
 
     // One shared measured boundary after all warmup. Performance cells arm
@@ -1095,6 +1212,12 @@ func runV2Cell(
         MLX.GPU.clearAndArmGemma4ExpertQMMDiagnostics()
         CBv2StepProfiler.armEvents()
     }
+    let digestLogprobs =
+        ProcessInfo.processInfo.environment["BENCH_OUTPUT_DIGEST"] == "1" ? 4 : 0
+    _ = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
+    _ = CBv2RecurrentRowOwnership.snapshotCount(reset: true)
+    _ = CBv2RecurrentRowOwnership.snapshotPauses(reset: true)
+    let slowConsumer = BenchSlowConsumerGate(cellRequests: promptLengths.count)
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -1102,7 +1225,13 @@ func runV2Cell(
             group.addTask { @Sendable in
                 let r = try? await runV2Request(
                     engine: engine, id: UInt64(1000 + i), promptTokens: prompt,
-                    maxTokens: steps, stopTokens: [])
+                    maxTokens: steps, stopTokens: [], topLogprobs: digestLogprobs,
+                    slowConsumer: slowConsumer, index: i)
+                // A refused submit never reaches the consumer loop: count it
+                // as finished so the slow request cannot wait on it forever.
+                if r == nil, let slowConsumer, i != slowConsumer.request {
+                    await slowConsumer.otherFinished()
+                }
                 return (i, r ?? RunResult())
             }
         }
@@ -1111,11 +1240,32 @@ func runV2Cell(
         return all.sorted { $0.0 < $1.0 }.map(\.1)
     }
     await engine.shutdown()
+    // Hashes and counts only: one digest per request over its token ids and,
+    // with BENCH_OUTPUT_DIGEST=1, the bit patterns of its log-probabilities.
+    let carry = CBv2RecurrentBatchCarry.snapshotCounts(reset: true)
+    print(
+        "    recurrent batch carry: enabled=\(CBv2RecurrentBatchCarry.enabled) "
+            + "carried=\(carry.carried) joined=\(carry.joined) "
+            + "reown=\(CBv2RecurrentRowOwnership.mode) "
+            + "reowned=\(CBv2RecurrentRowOwnership.snapshotCount(reset: true)) "
+            + "pauses=\(CBv2RecurrentRowOwnership.snapshotPauses(reset: true))")
+    if let slowConsumer {
+        print(
+            "    slow consumer: request=\(slowConsumer.request) "
+                + "after=\(slowConsumer.afterTokens) parked=\(slowConsumer.parked) "
+                + "quiet-window active bytes=\(slowConsumer.quietActiveBytes)")
+    }
+    for (i, r) in results.enumerated() {
+        print(
+            "    digest req \(i): tokens=\(r.tokens.count) logprobs=\(r.logprobs.count) "
+                + "sha=\(benchOutputDigest(r))")
+    }
 
     let optimizationProvenance: CellOptimizationProvenance?
     if trackOptimizationProvenance {
-        let layer18Submissions = CBv2StepProfiler.snapshotAndDisarmEvents()[
-            "v2.gemma4.prefill.chunk_eval"] ?? 0
+        let layer18Submissions =
+            CBv2StepProfiler.snapshotAndDisarmEvents()[
+                "v2.gemma4.prefill.chunk_eval"] ?? 0
         let weighted = weightedExpertUnsortProvenance(
             requested: hooks.optimizations.weightedUnsortEffective)
         let r1 = SafeR1Provenance(
@@ -1267,7 +1417,9 @@ func runCorrectness(
         await burstEngine.shutdown()
         let burstTarget = burst[2]
         let burstDiv = firstDivergence(soloTokens, burstTarget.tokens)
-        log("[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))")
+        log(
+            "[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))"
+        )
         if let d = burstDiv {
             log("[invariance] " + logprobDetail(solo, at: d, label: "solo @\(d)"))
             log("[invariance] " + logprobDetail(burstTarget, at: d, label: "burst @\(d)"))
@@ -1447,6 +1599,35 @@ func loadAverage1m() -> Double {
     return loads[0]
 }
 
+/// MLX's memory ceiling and buffer-cache limit as serving sets them (the
+/// provider's `MLXMemoryGuard`): ceiling = physical memory - 6 GiB, cache =
+/// min(0.75 x ceiling, 8 GiB), floored at 2 GiB and 1 GiB. Without a cache
+/// limit MLX keeps freed buffers up to its default ceiling, so the bench's
+/// memory use was far above serving's. `DARKBLOOM_MLX_MEMORY_RESERVE_GB` and
+/// `DARKBLOOM_MLX_CACHE_LIMIT_GB` override, as in serving; `BENCH_MLX_LIMITS=0`
+/// keeps MLX's defaults.
+func benchApplyServingMemoryLimits(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    physicalBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+) -> (memoryBytes: Int, cacheBytes: Int)? {
+    if environment["BENCH_MLX_LIMITS"] == "0" { return nil }
+    func gigabytes(_ key: String, _ fallback: Double) -> Double {
+        guard let raw = environment[key], let value = Double(raw), value.isFinite, value >= 0
+        else { return fallback }
+        return value
+    }
+    let gib = 1_073_741_824.0
+    let physical = Double(physicalBytes)
+    let reserve = gigabytes("DARKBLOOM_MLX_MEMORY_RESERVE_GB", 6) * gib
+    let memory = physical > reserve + 2 * gib ? physical - reserve : 2 * gib
+    let cap = gigabytes("DARKBLOOM_MLX_CACHE_LIMIT_GB", 8) * gib
+    let cache = min(max(gib, min(memory * 0.75, cap)), memory)
+    let limits = (memoryBytes: Int(memory), cacheBytes: Int(cache))
+    MLX.Memory.memoryLimit = limits.memoryBytes
+    MLX.Memory.cacheLimit = limits.cacheBytes
+    return limits
+}
+
 /// Contention sentinel for the report header: 1m load average plus whether
 /// any darkbloom provider process is alive (the usual GPU/CPU competitor on
 /// dev machines).
@@ -1541,7 +1722,8 @@ func parsePositiveInt(_ raw: String, option: String) throws -> Int {
 /// Comma-separated positive integers. Every element must be valid; an empty
 /// element (or an empty list) is an error rather than a silent omission.
 func parsePositiveIntList(_ raw: String, option: String) throws -> [Int] {
-    let elements = raw
+    let elements =
+        raw
         .split(separator: ",", omittingEmptySubsequences: false)
         .map { $0.trimmingCharacters(in: .whitespaces) }
     return try elements.map { try parsePositiveInt($0, option: option) }
@@ -1640,7 +1822,8 @@ struct BenchOptions: Equatable, Sendable {
                 options.mode = mode
             case "--engines":
                 let raw = try value(for: argument)
-                let names = raw
+                let names =
+                    raw
                     .split(separator: ",", omittingEmptySubsequences: false)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                 guard names.allSatisfy({ !$0.isEmpty }) else {
@@ -1690,7 +1873,7 @@ struct BenchOptions: Equatable, Sendable {
                         option: argument, value: raw,
                         requirement: "expected one of "
                             + BenchOutputParity.allCases.map(\.rawValue)
-                                .joined(separator: "|"))
+                            .joined(separator: "|"))
                 }
                 options.outputParity = outputParity
                 options.outputParityWasSpecified = true
@@ -1701,8 +1884,9 @@ struct BenchOptions: Equatable, Sendable {
                 options.steps = try parsePositiveInt(
                     try value(for: argument), option: argument)
             case "--kv-gb":
-                options.kvBytes = try parsePositiveInt(
-                    try value(for: argument), option: argument) << 30
+                options.kvBytes =
+                    try parsePositiveInt(
+                        try value(for: argument), option: argument) << 30
             case "--label": options.label = try value(for: argument)
             case "--out": options.outPath = try value(for: argument)
             case "--receipt": options.receiptPath = try value(for: argument)
@@ -1765,7 +1949,8 @@ struct BenchOptions: Equatable, Sendable {
                 else {
                     throw BenchOptionError.invalidValue(
                         option: "--profile", value: options.profile.rawValue,
-                        requirement: "stock requires prefillChunk=512, no solo stripe, and mtpDepth=0")
+                        requirement:
+                            "stock requires prefillChunk=512, no solo stripe, and mtpDepth=0")
                 }
             case .prefill:
                 guard options.mtpDepth == 0 else {
@@ -1852,8 +2037,10 @@ func reportHeader(
     if !options.label.isEmpty { rows.append(row("Label", options.label)) }
     rows += [
         row("Profile", options.profile.rawValue),
-        row("Prefill construction", "chunk=\(options.prefillChunk), soloStripe="
-            + (options.soloStripe.map(String.init) ?? "off")),
+        row(
+            "Prefill construction",
+            "chunk=\(options.prefillChunk), soloStripe="
+                + (options.soloStripe.map(String.init) ?? "off")),
         row("Chip", chip),
         row("RAM", "\(ramGB) GB"),
         row("OS", osVersion),
@@ -1924,18 +2111,31 @@ public enum BenchCBv2Driver {
         let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(options.modelPath)")
-        print("mode: \(options.mode)  engines: \(options.engines)"
-            + "  batches: \(options.batches)  steps: \(options.steps)")
+        print(
+            "mode: \(options.mode)  engines: \(options.engines)"
+                + "  batches: \(options.batches)  steps: \(options.steps)")
         if options.promptFile != nil {
-            print("campaign profile: \(options.profile.rawValue)"
-                + "  prefillChunk: \(options.prefillChunk)"
-                + "  soloStripe: \(options.soloStripe.map(String.init) ?? "off")"
-                + "  mtpDepth: \(options.mtpDepth)")
+            print(
+                "campaign profile: \(options.profile.rawValue)"
+                    + "  prefillChunk: \(options.prefillChunk)"
+                    + "  soloStripe: \(options.soloStripe.map(String.init) ?? "off")"
+                    + "  mtpDepth: \(options.mtpDepth)")
         }
-        print("prompt lengths: "
-            + (options.promptLengths.isEmpty ? "default mix" : options.promptLengths.description)
-            + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
+        print(
+            "prompt lengths: "
+                + (options.promptLengths.isEmpty
+                    ? "default mix" : options.promptLengths.description)
+                + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
         print("host: \(contention.line)")
+        if let limits = benchApplyServingMemoryLimits() {
+            print(
+                String(
+                    format: "mlx limits: memory %.1f GiB, cache %.1f GiB (as serving)",
+                    Double(limits.memoryBytes) / 1_073_741_824,
+                    Double(limits.cacheBytes) / 1_073_741_824))
+        } else {
+            print("mlx limits: MLX defaults (BENCH_MLX_LIMITS=0)")
+        }
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
         }
@@ -1970,8 +2170,9 @@ public enum BenchCBv2Driver {
                 container = try await LLMModelFactory.shared.loadContainer(
                     from: directory, using: #huggingFaceTokenizerLoader())
             }
-            print(String(
-                format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
+            print(
+                String(
+                    format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (options.mode, options.engines, options.batches, options.steps, options.kvBytes)
@@ -2001,10 +2202,11 @@ public enum BenchCBv2Driver {
                     safeR1Effective:
                         hooks.optimizations.safeR1GeometryEligible
                         && runR1.requested && runR1.aotAvailable && !runR1.naxAvailable)
-                emit("- optimization model: \(hooks.optimizations.markdown); "
-                    + "safeR1(requested=\(runR1.requested), "
-                    + "effective=\(runOptimizations.safeR1Effective), "
-                    + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
+                emit(
+                    "- optimization model: \(hooks.optimizations.markdown); "
+                        + "safeR1(requested=\(runR1.requested), "
+                        + "effective=\(runOptimizations.safeR1Effective), "
+                        + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
                 emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
 
                 if campaignOptions.outputParity == .byteExact,
@@ -2018,8 +2220,6 @@ public enum BenchCBv2Driver {
                     try qwen35A3BValidateLoadedExactTarget(
                         qwenTarget, contract: campaignContract)
                 }
-
-
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
                 // Use the exact model EngineV2 will drive so Gemma 4 VLM
@@ -2108,19 +2308,24 @@ public enum BenchCBv2Driver {
                     emit("- profile: \(campaignOptions.profile.rawValue)")
                     if campaignOptions.mtpDepth > 0 {
                         emit("- output parity: \(campaignOptions.outputParity.rawValue)")
-                        emit("- verification route: "
-                            + campaignOptions.outputParity.verificationRoute)
+                        emit(
+                            "- verification route: "
+                                + campaignOptions.outputParity.verificationRoute)
                     }
-                    emit("- prompt: \(promptTokenIDs.count) tokens; sha256 "
-                        + campaignPrompt.sha256)
-                    emit(String(
-                        format: "- prefill: %.3fs, %.1f tok/s",
-                        metrics.prefillSeconds, metrics.prefillTPS))
-                    emit(String(
-                        format: "- decode: %.1f tok/s (%d tokens after first token)",
-                        metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
-                    emit("- generated: \(campaign.result.tokens.count) greedy tokens; finish "
-                        + campaign.result.finish)
+                    emit(
+                        "- prompt: \(promptTokenIDs.count) tokens; sha256 "
+                            + campaignPrompt.sha256)
+                    emit(
+                        String(
+                            format: "- prefill: %.3fs, %.1f tok/s",
+                            metrics.prefillSeconds, metrics.prefillTPS))
+                    emit(
+                        String(
+                            format: "- decode: %.1f tok/s (%d tokens after first token)",
+                            metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
+                    emit(
+                        "- generated: \(campaign.result.tokens.count) greedy tokens; finish "
+                            + campaign.result.finish)
                     emit("- route: \(routeSummary)")
                     emit("- receipt: \(receiptPath)")
                     return out
@@ -2148,8 +2353,9 @@ public enum BenchCBv2Driver {
                     emit("\n## Decode-step profile (B=1, maxTokens \(stepsCopy))\n")
                     for engineName in enginesCopy {
                         guard resolveEngine(engineName) == .run(.contiguous) else {
-                            emit("- \(engineName): not profilable — "
-                                + "the phase timers only instrument v2 (contiguous)")
+                            emit(
+                                "- \(engineName): not profilable — "
+                                    + "the phase timers only instrument v2 (contiguous)")
                             continue
                         }
                         _ = try? await runV2Cell(
@@ -2168,8 +2374,9 @@ public enum BenchCBv2Driver {
                             soloPrefillStripeTokens: soloStripeCopy,
                             trackOptimizationProvenance: true)
                         CBv2StepProfiler.enabled = false
-                        emit("### v2 (contiguous) B=1 — decodeTPS "
-                            + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
+                        emit(
+                            "### v2 (contiguous) B=1 — decodeTPS "
+                                + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
                         emit(CBv2StepProfiler.summaryTable())
                         for line in try optimizationProvenanceLines(
                             cell, scope: "profile/v2/B1")
@@ -2215,8 +2422,9 @@ public enum BenchCBv2Driver {
                                 prefillChunkSize: prefillChunkCopy,
                                 soloPrefillStripeTokens: soloStripeCopy)
                         } catch {
-                            tableRows.append(refusalRow(
-                                engine: engineName, reason: "skipped: \(error)"))
+                            tableRows.append(
+                                refusalRow(
+                                    engine: engineName, reason: "skipped: \(error)"))
                             continue
                         }
 
@@ -2233,18 +2441,21 @@ public enum BenchCBv2Driver {
                             provenanceLines.append(
                                 contentsOf: try optimizationProvenanceLines(
                                     cell, scope: "perf/\(engineName)/B\(batch)"))
-                            details.append(String(
-                                format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
-                                cell.engine, batch,
-                                Double(MLX.GPU.activeMemory) / Double(1 << 30),
-                                Double(MLX.GPU.peakMemory) / Double(1 << 30)))
+                            details.append(
+                                String(
+                                    format:
+                                        "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
+                                    cell.engine, batch,
+                                    Double(MLX.GPU.activeMemory) / Double(1 << 30),
+                                    Double(MLX.GPU.peakMemory) / Double(1 << 30)))
                             details.append(
                                 "  \(cell.engine) B=\(batch):\n"
                                     + cell.perRequest.joined(separator: "\n"))
                         }
                     }
-                    emit(performanceMarkdown(
-                        rows: tableRows, provenanceLines: provenanceLines))
+                    emit(
+                        performanceMarkdown(
+                            rows: tableRows, provenanceLines: provenanceLines))
                     emit("\nPer-request detail:\n" + details.joined(separator: "\n"))
                 }
                 return out

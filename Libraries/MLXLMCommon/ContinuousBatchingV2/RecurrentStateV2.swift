@@ -190,10 +190,166 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
     public let ssm: MLXArray?
+    /// Set when this state is row `batchRow` of one batched step's new-state
+    /// tensors (`CBv2RecurrentBatchCarry`). Nil for every other state.
+    public let batchOrigin: CBv2RecurrentBatchOrigin?
+    public let batchRow: Int
 
     public init(conv: MLXArray?, ssm: MLXArray?) {
         self.conv = conv
         self.ssm = ssm
+        self.batchOrigin = nil
+        self.batchRow = 0
+    }
+
+    /// Row `row` of a batched step. `conv`/`ssm` are the same one-row views a
+    /// plain split of the batched tensors produces.
+    public init(origin: CBv2RecurrentBatchOrigin, row: Int) {
+        self.conv = origin.conv[row ..< row + 1]
+        self.ssm = origin.ssm[row ..< row + 1]
+        self.batchOrigin = origin
+        self.batchRow = row
+    }
+}
+
+/// The new-state tensors of one batched recurrent step, shared by the row
+/// states split from it. The row views already keep these allocations alive,
+/// so holding the tensors themselves retains nothing more.
+public final class CBv2RecurrentBatchOrigin {
+    public let conv: MLXArray
+    public let ssm: MLXArray
+    public let rows: Int
+
+    public init(conv: MLXArray, ssm: MLXArray) {
+        precondition(conv.dim(0) == ssm.dim(0), "recurrent batch origin row count mismatch")
+        self.conv = conv
+        self.ssm = ssm
+        self.rows = conv.dim(0)
+    }
+}
+
+/// Batched recurrent state carried from one step to the next.
+///
+/// A recurrent layer splits its new state into one-row views, one per
+/// request, and the next step used to join those views back into a batch: a
+/// copy of every row's state, per layer, per step. When the next step's rows
+/// are exactly the previous step's rows in the same order, the join of the
+/// views of X is X, so the layer can take X as it is. Any other case (a row
+/// joined or left, another order, a rollback to an older generation, a state
+/// built by another path) returns nil and the caller joins the rows as before.
+/// The values that reach the layer are the same either way.
+/// `DARKBLOOM_RECURRENT_BATCH_CARRY=0` turns the carry off.
+public enum CBv2RecurrentBatchCarry {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_RECURRENT_BATCH_CARRY"] != "0"
+
+    private final class Counts: @unchecked Sendable {
+        let lock = NSLock()
+        var carried = 0
+        var joined = 0
+    }
+    private static let counts = Counts()
+
+    /// The batch origin every state in `states` is a row of, in order; nil
+    /// when the rows must be joined.
+    public static func carried(_ states: [CBv2RecurrentLayerState?]) -> CBv2RecurrentBatchOrigin? {
+        guard states.count > 1 else { return nil }
+        let origin = match(states)
+        counts.lock.lock()
+        if origin != nil { counts.carried += 1 } else { counts.joined += 1 }
+        counts.lock.unlock()
+        return origin
+    }
+
+    private static func match(_ states: [CBv2RecurrentLayerState?]) -> CBv2RecurrentBatchOrigin? {
+        guard enabled, let origin = states[0]?.batchOrigin, origin.rows == states.count else {
+            return nil
+        }
+        for (row, state) in states.enumerated() {
+            guard let state, state.batchOrigin === origin, state.batchRow == row else {
+                return nil
+            }
+        }
+        return origin
+    }
+
+    /// Batched layer calls that took the carried tensors and that joined the
+    /// rows, since the last reset (counts only; for benchmarks and tests).
+    public static func snapshotCounts(reset: Bool = false) -> (carried: Int, joined: Int) {
+        counts.lock.lock()
+        defer { counts.lock.unlock() }
+        let value = (counts.carried, counts.joined)
+        if reset {
+            counts.carried = 0
+            counts.joined = 0
+        }
+        return value
+    }
+}
+
+/// Owned recurrent rows for a request that has stopped stepping.
+///
+/// A request's committed state is a one-row view of its last step's batched
+/// new-state tensors, and an MLX view keeps the whole allocation alive. While
+/// the request steps, that lasts one step. A request paused by backpressure
+/// would keep the batch of every lane it last stepped with alive until it
+/// resumes. A paused request therefore copies its own row out, when it is
+/// paused and on every plain commit that settles while it stays paused. The
+/// copy is a one-row gather: the same bits, no floating arithmetic.
+/// `DARKBLOOM_RECURRENT_REOWN_ON_PAUSE=0` turns the rule off; `=always`
+/// applies it to every request on every plain commit (measurement only).
+public enum CBv2RecurrentRowOwnership {
+    public enum Mode: Sendable { case off, onPause, always }
+
+    public static let mode: Mode = {
+        switch ProcessInfo.processInfo.environment["DARKBLOOM_RECURRENT_REOWN_ON_PAUSE"] {
+        case "0": return .off
+        case "always": return .always
+        default: return .onPause
+        }
+    }()
+
+    private final class Counts: @unchecked Sendable {
+        let lock = NSLock()
+        var layers = 0
+        var pauses = 0
+    }
+    private static let counts = Counts()
+
+    static func ownedRow(_ x: MLXArray) -> MLXArray {
+        take(x, MLXArray([Int32(0)]), axis: 0)
+    }
+
+    static func record(layers: Int) {
+        counts.lock.lock()
+        counts.layers += layers
+        counts.lock.unlock()
+    }
+
+    static func recordPause() {
+        counts.lock.lock()
+        counts.pauses += 1
+        counts.lock.unlock()
+    }
+
+    /// Layer states copied out since the last reset (a count only; for
+    /// benchmarks and tests).
+    public static func snapshotCount(reset: Bool = false) -> Int {
+        counts.lock.lock()
+        defer { counts.lock.unlock() }
+        let value = counts.layers
+        if reset { counts.layers = 0 }
+        return value
+    }
+
+    /// Pauses of requests with recurrent state since the last reset, in every
+    /// mode (a count only; for benchmarks and tests).
+    public static func snapshotPauses(reset: Bool = false) -> Int {
+        counts.lock.lock()
+        defer { counts.lock.unlock() }
+        let value = counts.pauses
+        if reset { counts.pauses = 0 }
+        return value
     }
 }
 
@@ -313,6 +469,8 @@ public final class CBv2RecurrentRequestState {
     /// committed generation or release. Inspection only (allocation checks).
     public var retainedTransitionArrays: [MLXArray] { committedTransitionRetainedRoots }
     private var pending: [Generation] = []
+    /// True while the request is paused (`CBv2RecurrentRowOwnership`).
+    private var ownsCommittedRows = CBv2RecurrentRowOwnership.mode == .always
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
     public private(set) var isReleased = false
@@ -512,6 +670,7 @@ public final class CBv2RecurrentRequestState {
             }
             clearOlderTransitionRetention()
             committed = first.layers
+            if ownsCommittedRows { reownCommittedRows() }
         }
         pending.removeFirst()
     }
@@ -527,6 +686,35 @@ public final class CBv2RecurrentRequestState {
     /// Test/integration inspection of the latest visible state.
     public func state(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
         pending.last?.layers[modelLayerIndex] ?? committed[modelLayerIndex]
+    }
+
+    /// The engine paused or resumed this request (backpressure). While it is
+    /// paused its committed rows are owned copies (`CBv2RecurrentRowOwnership`).
+    public func setPaused(_ paused: Bool) {
+        if paused { CBv2RecurrentRowOwnership.recordPause() }
+        let mode = CBv2RecurrentRowOwnership.mode
+        guard mode != .off else { return }
+        ownsCommittedRows = paused || mode == .always
+        if paused { reownCommittedRows() }
+    }
+
+    private func reownCommittedRows() {
+        // A settled verify window accounts for its own backing; leave it.
+        guard !isReleased, !committed.isEmpty, committedTransitionRetainedRoots.isEmpty,
+            committedTransitionGeneration == nil
+        else { return }
+        var owned: [Int: CBv2RecurrentLayerState] = [:]
+        var roots: [MLXArray] = []
+        for (index, state) in committed {
+            let conv = state.conv.map(CBv2RecurrentRowOwnership.ownedRow)
+            let ssm = state.ssm.map(CBv2RecurrentRowOwnership.ownedRow)
+            owned[index] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+            if let conv { roots.append(conv) }
+            if let ssm { roots.append(ssm) }
+        }
+        eval(roots)
+        committed = owned
+        CBv2RecurrentRowOwnership.record(layers: owned.count)
     }
 
     /// The engine has stopped and synchronized a failed planned cohort. No
@@ -598,7 +786,29 @@ public final class CBv2RecurrentStateEvaluation {
         try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
     }
 
+    /// Stage one layer's new state as the model built it. A state that is one
+    /// row of a batched step keeps its batch origin, so the next step can take
+    /// the batched tensors without joining the rows again
+    /// (`CBv2RecurrentBatchCarry`). Same transaction rules as
+    /// `stage(modelLayerIndex:conv:ssm:)`.
+    public func stage(modelLayerIndex: Int, state: CBv2RecurrentLayerState) throws {
+        guard stagedCapturedPositions == nil, stagedPrefixReplay.isEmpty else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "cannot mix captured, compact replay, and plain recurrent stages")
+        }
+        guard state.conv != nil, state.ssm != nil else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "plain recurrent stage for layer \(modelLayerIndex) needs conv and ssm")
+        }
+        try stageRaw(modelLayerIndex: modelLayerIndex, state: state)
+    }
+
     private func stageRaw(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+        try stageRaw(
+            modelLayerIndex: modelLayerIndex, state: CBv2RecurrentLayerState(conv: conv, ssm: ssm))
+    }
+
+    private func stageRaw(modelLayerIndex: Int, state: CBv2RecurrentLayerState) throws {
         guard !evaluated, requiredLayers.contains(modelLayerIndex) else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "stage for undeclared or already-evaluated recurrent layer \(modelLayerIndex)")
@@ -607,7 +817,7 @@ public final class CBv2RecurrentStateEvaluation {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "duplicate recurrent stage for layer \(modelLayerIndex)")
         }
-        staged[modelLayerIndex] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
+        staged[modelLayerIndex] = state
     }
 
     /// Stage one layer's CAPTURED per-position states for an MTP verify
