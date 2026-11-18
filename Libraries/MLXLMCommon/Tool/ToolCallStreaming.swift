@@ -46,7 +46,7 @@ public struct ToolCallStreamingOptions: Sendable {
     /// complete-frame behavior even when streaming is requested.
     public static func supports(_ format: ToolCallFormat) -> Bool {
         switch format {
-        case .gemma, .qwen35, .harmony, .json: true
+        case .gemma, .qwen35, .harmony, .json, .nemotron, .mimoV2: true
         default: false
         }
     }
@@ -70,12 +70,19 @@ protocol ToolCallArgumentStreamer {
     func remainder(completing arguments: [String: JSONValue]) -> String?
 }
 
+/// `startTag`: the tag that opened the frame (Nemotron also opens one with a
+/// bare `<function=`, which is part of its payload).
 func makeToolCallArgumentStreamer(
-    format: ToolCallFormat, tools: [[String: any Sendable]]?
+    format: ToolCallFormat, tools: [[String: any Sendable]]?, startTag: String = ""
 ) -> (any ToolCallArgumentStreamer)? {
     switch format {
     case .gemma: GemmaArgumentStreamer(tools: tools)
     case .qwen35: Qwen35ArgumentStreamer(tools: tools)
+    case .nemotron:
+        Qwen35ArgumentStreamer(
+            tools: tools, xmlOnly: true,
+            payloadPrefix: startTag == QwenXMLPayloadScanner.functionOpen ? startTag : "")
+    case .mimoV2: MiMoV2ArgumentStreamer(tools: tools)
     case .harmony: HarmonyArgumentStreamer()
     case .json: JSONFrameArgumentStreamer(tools: tools)
     default: nil

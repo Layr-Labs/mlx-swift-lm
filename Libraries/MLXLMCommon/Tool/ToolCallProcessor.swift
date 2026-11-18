@@ -1860,7 +1860,8 @@ public class ToolCallProcessor {
     private func beginCallStream(startTag: String) {
         callStream = nil
         guard streaming != nil,
-            let streamer = makeToolCallArgumentStreamer(format: format, tools: tools)
+            let streamer = makeToolCallArgumentStreamer(
+                format: format, tools: tools, startTag: startTag)
         else { return }
         callStream = CallStream(streamer: streamer, startTagScalars: startTag.unicodeScalars.count)
     }

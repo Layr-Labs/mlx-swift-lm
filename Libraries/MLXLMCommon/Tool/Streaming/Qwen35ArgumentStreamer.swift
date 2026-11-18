@@ -5,7 +5,9 @@ import Foundation
 /// Qwen 3.5 frames: the XML dialect `<function=NAME><parameter=K>V</parameter>`
 /// streams string parameters as they are generated and exposes converted
 /// values once their parameter closes; the framed JSON dialect delegates to
-/// `JSONFrameArgumentStreamer`.
+/// `JSONFrameArgumentStreamer`. Nemotron's `XMLFunctionParser` reads the same
+/// XML dialect (`QwenXMLPayloadScanner`) without the JSON one, and also
+/// accepts a bare `<function=` frame (`xmlOnly`, `payloadPrefix`).
 struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
     private enum Phase {
         case dialect
@@ -26,6 +28,7 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
     private static let tagLimit = 256
 
     private let tools: [[String: any Sendable]]?
+    private let xmlOnly: Bool
     private var jsonDialect: JSONFrameArgumentStreamer
     private var xmlName: String?
     private(set) var abandoned = false
@@ -34,9 +37,14 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
     private var lastStringScalar: Unicode.Scalar?
     private var exposed = ExposedArgumentObject()
 
-    init(tools: [[String: any Sendable]]?) {
+    /// `xmlOnly`: a payload starting `{` is not a call this streamer
+    /// exposes. `payloadPrefix`: markup the frame's start tag consumed (a
+    /// bare `<function=` frame's), fed before the payload.
+    init(tools: [[String: any Sendable]]?, xmlOnly: Bool = false, payloadPrefix: String = "") {
         self.tools = tools
+        self.xmlOnly = xmlOnly
         self.jsonDialect = JSONFrameArgumentStreamer(tools: tools)
+        if !payloadPrefix.isEmpty { _ = append(payloadPrefix) }
     }
 
     var name: String? {
@@ -75,7 +83,7 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
         case .dialect:
             if scalar.isFramingWhitespace { return "" }
             switch scalar {
-            case "{": phase = .json
+            case "{" where !xmlOnly: phase = .json
             case "<":
                 token = [scalar]
                 phase = .functionTag
