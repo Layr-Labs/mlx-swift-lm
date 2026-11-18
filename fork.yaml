@@ -421,9 +421,12 @@ def:
             The compiled feed-forward also takes QAT-lattice expert banks (4 bits in groups of 32), and MTP
             rounds of decode and verification rows commit by operation count like plain decode steps
             (`DARKBLOOM_GEMMA4_MTP_COMMAND_BUFFERS=0` restores MLX's defaults for them); outputs keep their bits.
+            Decode and verification steps of 8 to 16 rows (sorted expert assignments) take the same trace
+            (`DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED=0` keeps them eager); outputs keep their bits.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "changelog.d/gemma4-lattice-decode.md"
+            - "changelog.d/gemma4-sorted-feedforward.md"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
