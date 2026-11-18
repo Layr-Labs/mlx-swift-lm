@@ -82,7 +82,9 @@ struct MiMoV2ArgumentStreamer: ToolCallArgumentStreamer {
             } else if token == Self.parameterOpen {
                 token = []
                 phase = .parameterTag
-            } else if !Self.functionClose.starts(with: token), !Self.parameterOpen.starts(with: token) {
+            } else if !Self.functionClose.starts(with: token),
+                !Self.parameterOpen.starts(with: token)
+            {
                 phase = .finished
             }
             return ""
@@ -145,7 +147,9 @@ struct MiMoV2ArgumentStreamer: ToolCallArgumentStreamer {
         guard let function = name else { return true }
         let properties = getParameterConfig(funcName: function, tools: tools)
         guard let schema = properties[key] as? [String: any Sendable] else { return true }
-        if schema["anyOf"] != nil || schema["oneOf"] != nil || schema["allOf"] != nil { return false }
+        if schema["anyOf"] != nil || schema["oneOf"] != nil || schema["allOf"] != nil {
+            return false
+        }
         guard let type = schema["type"] else { return true }
         return type as? String == "string"
     }

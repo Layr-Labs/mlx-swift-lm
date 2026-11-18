@@ -12,7 +12,9 @@ extension UnitTests {
     @Suite
     struct NativeXMLToolCallStreamingTests {
 
-        private static func property(_ schema: [String: any Sendable]) -> [String: any Sendable] { schema }
+        private static func property(_ schema: [String: any Sendable]) -> [String: any Sendable] {
+            schema
+        }
 
         private static let tools: [[String: any Sendable]] = [
             [
@@ -28,7 +30,8 @@ extension UnitTests {
                             "append": property(["type": "boolean"]),
                             "meta": property(["type": "object"]),
                             "untyped": property(["description": "no type"]),
-                            "either": property(["anyOf": [["type": "string"], ["type": "integer"]]]),
+                            "either": property(["anyOf": [["type": "string"], ["type": "integer"]]]
+                            ),
                         ] as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
@@ -39,7 +42,8 @@ extension UnitTests {
                     "name": "get_weather",
                     "parameters": [
                         "type": "object",
-                        "properties": ["city": property(["type": "string"])] as [String: any Sendable],
+                        "properties": ["city": property(["type": "string"])]
+                            as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
             ],
@@ -56,7 +60,9 @@ extension UnitTests {
             }
 
             var failures: [ToolCallStreamFailure] {
-                segments.compactMap { if case .callFailed(let failure) = $0 { failure } else { nil } }
+                segments.compactMap {
+                    if case .callFailed(let failure) = $0 { failure } else { nil }
+                }
             }
 
             /// (name, arguments JSON, completed) per call, as a client sees it.
@@ -71,7 +77,8 @@ extension UnitTests {
                         calls[calls.count - 1].completed = call
                     case .call(let call):
                         let data = try! JSONEncoder().encode(call.function.arguments)
-                        calls.append((call.function.name, String(decoding: data, as: UTF8.self), call))
+                        calls.append(
+                            (call.function.name, String(decoding: data, as: UTF8.self), call))
                     case .text, .callFailed: break
                     }
                 }
@@ -88,12 +95,14 @@ extension UnitTests {
                 run.segments += processor.processChunkSegments(chunk)
                 if run.segments.contains(where: {
                     if case .callStarted = $0 { true } else { false }
-                }), !run.segments.contains(where: {
-                    switch $0 {
-                    case .callCompleted, .callFailed, .call: true
-                    default: false
-                    }
-                }) {
+                }),
+                    !run.segments.contains(where: {
+                        switch $0 {
+                        case .callCompleted, .callFailed, .call: true
+                        default: false
+                        }
+                    })
+                {
                     run.nameBeforeClose = true
                 }
             }
@@ -101,9 +110,13 @@ extension UnitTests {
             return run
         }
 
-        private static func complete(_ format: ToolCallFormat, _ text: String) -> (calls: [ToolCall], text: String) {
+        private static func complete(_ format: ToolCallFormat, _ text: String) -> (
+            calls: [ToolCall], text: String
+        ) {
             let processor = ToolCallProcessor(format: format, tools: tools)
-            let visible = (processor.processChunk(text) ?? "") + (processor.processEOS(returnBufferedText: true) ?? "")
+            let visible =
+                (processor.processChunk(text) ?? "")
+                + (processor.processEOS(returnBufferedText: true) ?? "")
             return (processor.toolCalls, visible)
         }
 
@@ -132,12 +145,14 @@ extension UnitTests {
             #expect(!expected.calls.isEmpty, "fixture parses", sourceLocation: sourceLocation)
             for chunks in splits(text) {
                 let run = run(format, chunks)
-                #expect(run.failures.isEmpty, "\(chunks.count) chunks", sourceLocation: sourceLocation)
+                #expect(
+                    run.failures.isEmpty, "\(chunks.count) chunks", sourceLocation: sourceLocation)
                 let calls = run.calls
                 #expect(calls.count == expected.calls.count, sourceLocation: sourceLocation)
                 for (call, whole) in zip(calls, expected.calls) {
                     #expect(call.name == whole.function.name, sourceLocation: sourceLocation)
-                    #expect(decode(call.arguments) == whole.function.arguments,
+                    #expect(
+                        decode(call.arguments) == whole.function.arguments,
                         "\(call.arguments)", sourceLocation: sourceLocation)
                 }
                 #expect(run.text == expected.text, sourceLocation: sourceLocation)
@@ -156,19 +171,27 @@ extension UnitTests {
         }
 
         @Test func mimoRawStringsStreamByteForByte() {
-            let value = "line 1\n  </tool_call><think>x</think> </function> &amp; \"q\" \\ café e\u{301}\r\n"
-            Self.checkAgreement(.mimoV2, Self.mimo("write_file", [("path", "a.py"), ("content", value)]))
+            let value =
+                "line 1\n  </tool_call><think>x</think> </function> &amp; \"q\" \\ café e\u{301}\r\n"
+            Self.checkAgreement(
+                .mimoV2, Self.mimo("write_file", [("path", "a.py"), ("content", value)]))
             // Framing whitespace between tags, and text around the frame.
-            Self.checkAgreement(.mimoV2,
+            Self.checkAgreement(
+                .mimoV2,
                 "Writing.\n<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n"
                     + "</function>\n</tool_call>\nDone.")
         }
 
         @Test func mimoTypedAndUnionValuesLeaveConvertedWhenTheyClose() {
-            Self.checkAgreement(.mimoV2, Self.mimo("write_file", [
-                ("path", "a.py"), ("mode", "420"), ("append", "true"), ("meta", #"{"k":[1,"two"]}"#),
-                ("untyped", "kept as text"), ("either", "7"), ("undeclared", "raw"),
-            ]))
+            Self.checkAgreement(
+                .mimoV2,
+                Self.mimo(
+                    "write_file",
+                    [
+                        ("path", "a.py"), ("mode", "420"), ("append", "true"),
+                        ("meta", #"{"k":[1,"two"]}"#),
+                        ("untyped", "kept as text"), ("either", "7"), ("undeclared", "raw"),
+                    ]))
         }
 
         @Test func mimoStringValueLeavesBeforeItsParameterCloses() {
@@ -178,58 +201,81 @@ extension UnitTests {
             let segments = processor.processChunkSegments(
                 "<tool_call><function=write_file><parameter=content>print('hi')\n")
             #expect(segments.contains(.callStarted(name: "write_file")))
-            let arguments = segments.compactMap { if case .callArguments(let a) = $0 { a } else { nil } }.joined()
+            let arguments = segments.compactMap {
+                if case .callArguments(let a) = $0 { a } else { nil }
+            }.joined()
             #expect(arguments == #"{"content":"print('hi')\n"#)
         }
 
         @Test func mimoTwoCallsStreamInOrder() {
-            Self.checkAgreement(.mimoV2,
-                Self.mimo("get_weather", [("city", "Paris")]) + "\n" + Self.mimo("write_file", [("path", "b")]))
+            Self.checkAgreement(
+                .mimoV2,
+                Self.mimo("get_weather", [("city", "Paris")]) + "\n"
+                    + Self.mimo("write_file", [("path", "b")]))
         }
 
         /// A frame the parser refuses after its name left fails; one that
         /// never named a declared function completes (or not) in one piece.
         @Test func mimoFramesThatDoNotParseFail() {
-            let duplicate = Self.run(.mimoV2, Self.mimo("write_file", [("path", "a"), ("path", "b")]).map { String($0) })
+            let duplicate = Self.run(
+                .mimoV2, Self.mimo("write_file", [("path", "a"), ("path", "b")]).map { String($0) })
             #expect(duplicate.failures == [.malformed])
             let open = Self.run(.mimoV2, ["<tool_call><function=write_file><parameter=path>a"])
             #expect(open.failures == [.unterminated])
-            let undeclared = Self.run(.mimoV2, Self.mimo("rm_rf", [("path", "/")]).map { String($0) })
+            let undeclared = Self.run(
+                .mimoV2, Self.mimo("rm_rf", [("path", "/")]).map { String($0) })
             #expect(undeclared.calls.isEmpty && undeclared.failures.isEmpty)
-            let json = Self.run(.mimoV2,
+            let json = Self.run(
+                .mimoV2,
                 [#"<tool_call>{"name":"write_file","arguments":{"path":"a"}}</tool_call>"#])
             #expect(json.calls.isEmpty && json.failures.isEmpty)
         }
 
         // MARK: - Nemotron
 
-        private static func nemotron(_ name: String, _ parameters: [(String, String)], wrapped: Bool = true)
+        private static func nemotron(
+            _ name: String, _ parameters: [(String, String)], wrapped: Bool = true
+        )
             -> String
         {
-            let function = "<function=\(name)>\n"
-                + parameters.map { "<parameter=\($0.0)>\n\($0.1)\n</parameter>\n" }.joined() + "</function>"
+            let function =
+                "<function=\(name)>\n"
+                + parameters.map { "<parameter=\($0.0)>\n\($0.1)\n</parameter>\n" }.joined()
+                + "</function>"
             return wrapped ? "<tool_call>\n" + function + "\n</tool_call>" : function
         }
 
         @Test func nemotronStringsStreamAndTypedValuesLeaveWhenTheyClose() {
-            Self.checkAgreement(.nemotron, Self.nemotron("write_file", [
-                ("path", "a.py"), ("content", "def f():\n    return \"x\" </function> café\n"), ("mode", "420"),
-                ("append", "false"), ("meta", #"{"k":1}"#),
-            ]))
+            Self.checkAgreement(
+                .nemotron,
+                Self.nemotron(
+                    "write_file",
+                    [
+                        ("path", "a.py"),
+                        ("content", "def f():\n    return \"x\" </function> café\n"),
+                        ("mode", "420"),
+                        ("append", "false"), ("meta", #"{"k":1}"#),
+                    ]))
         }
 
         @Test func nemotronBareFunctionFramesStreamToo() {
-            Self.checkAgreement(.nemotron,
-                "Sure.\n" + Self.nemotron("write_file", [("path", "a.py"), ("content", "x")], wrapped: false))
+            Self.checkAgreement(
+                .nemotron,
+                "Sure.\n"
+                    + Self.nemotron(
+                        "write_file", [("path", "a.py"), ("content", "x")], wrapped: false))
         }
 
         @Test func nemotronTwoCallsStreamInOrder() {
-            Self.checkAgreement(.nemotron,
-                Self.nemotron("get_weather", [("city", "Paris")]) + "\n" + Self.nemotron("write_file", [("path", "b")]))
+            Self.checkAgreement(
+                .nemotron,
+                Self.nemotron("get_weather", [("city", "Paris")]) + "\n"
+                    + Self.nemotron("write_file", [("path", "b")]))
         }
 
         @Test func nemotronFramesThatDoNotParseFailOrStayText() {
-            let open = Self.run(.nemotron, ["<tool_call>\n<function=write_file>\n<parameter=path>\na"])
+            let open = Self.run(
+                .nemotron, ["<tool_call>\n<function=write_file>\n<parameter=path>\na"])
             #expect(open.failures == [.unterminated])
             // The JSON dialect is not Nemotron's: never exposed, text as before.
             let json = #"<tool_call>{"name":"write_file","arguments":{"path":"a"}}</tool_call>"#
