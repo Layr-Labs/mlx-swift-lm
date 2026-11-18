@@ -322,6 +322,37 @@ extension UnitTests {
             #expect(elapsed < .milliseconds(250), "\(elapsed)")
         }
 
+        /// A small schema whose references fan out (64 references to a
+        /// definition that is itself a union of 100 types) costs a bounded
+        /// reading, taken once for all of an array's items, however many items
+        /// the model writes.
+        @Test
+        func qwenXMLReferenceReadingIsBoundedPerValue() {
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let reference = ["$ref": "#/$defs/X"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [
+                    "X": ["anyOf": Array(repeating: integer, count: 100)] as [String: any Sendable]
+                ],
+                properties: [
+                    "many": [
+                        "type": "array",
+                        "items": ["anyOf": Array(repeating: reference, count: 64)]
+                            as [String: any Sendable],
+                    ] as [String: any Sendable]
+                ])
+            let text = "[" + Array(repeating: #""1""#, count: 1000).joined(separator: ",") + "]"
+            var value: JSONValue?
+            let elapsed = ContinuousClock().measure {
+                value = JSONValue.from(
+                    convertParameterValue(
+                        text, paramName: "many", funcName: "f", tools: tools,
+                        resolvingReferences: true))
+            }
+            #expect(elapsed < .milliseconds(250), "\(elapsed)")
+            #expect(value == .array(Array(repeating: .string("1"), count: 1000)))
+        }
+
         /// Pointers read as the coordinator's `$ref` resolver reads them: array
         /// members are walked (`#/$defs/U/anyOf/0`, as zod's root strategy
         /// writes), each token is percent-decoded before `~1`/`~0`, and a
