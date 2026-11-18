@@ -357,8 +357,8 @@ extension UnitTests {
         /// resolver allows at most, a `type` list by its names, a `nullable`
         /// marker only as a scalar. 100 inner arrays under 84 references to a
         /// 20,000-character pointer, 127 references to a 5,000-name `type`
-        /// list, or 127 references to a node whose `nullable` is an array of
-        /// 5,000 values read in bounded time.
+        /// list, or 80 references (within the budget, so it converts) to a node
+        /// whose `nullable` is an array of 5,000 values read in bounded time.
         @Test
         func qwenXMLReferenceStepsCostWhatTheyRead() {
             let key = String(repeating: "k", count: 20_000)
@@ -386,7 +386,7 @@ extension UnitTests {
                 ("type list", tools(["type": names], 127), .string("1")),
                 (
                     "nullable",
-                    tools(["type": "integer", "nullable": Array(repeating: 0, count: 5_000)], 127),
+                    tools(["type": "integer", "nullable": Array(repeating: 0, count: 5_000)], 80),
                     .int(1)
                 ),
             ]

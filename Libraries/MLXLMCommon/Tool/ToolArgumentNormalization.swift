@@ -130,27 +130,35 @@ enum ToolArgumentNormalization {
     }
 
     /// The local references one reading may follow, those of `root`, and a
-    /// budget of steps: every `$ref` hop and every schema node the reading
-    /// enters. Union branches that name the same definitions again (a diamond,
-    /// a cycle, or many references to a wide union) would otherwise cost time
-    /// exponential in their depth, or the schema's width times its references;
-    /// past the budget the reading is unknown, so the value keeps its text, as
-    /// for a reference that names nothing (a sibling `type` hint is not read
-    /// then). Without references nothing can multiply a reading, which then
-    /// costs at most the schema's size.
+    /// budget of steps spent once the reading has followed one: each hop costs
+    /// by its pointer's length, each schema node entered one step, a `type`
+    /// list one step per name. Union branches that name the same definitions
+    /// again (a diamond, a cycle, or many references to a wide or costly node)
+    /// would otherwise cost time exponential in their depth, or the node's
+    /// size times its references; past the budget the reading is unknown, so
+    /// the value keeps its text, as for a reference that names nothing (a
+    /// sibling `type` hint is not read then). Before any hop a reading reads
+    /// only the schema as written, which bounds it, so it is not budgeted.
     private struct References {
         let root: [String: any Sendable]?
-        var remaining: Int
+        private var remaining = 256
+        private var followed = false
 
-        init(root: [String: any Sendable]?) {
-            self.root = root
-            self.remaining = root == nil ? .max : 256
+        init(root: [String: any Sendable]?) { self.root = root }
+
+        mutating func spend(_ cost: Int = 1) -> Bool {
+            guard followed else { return true }
+            guard cost <= remaining else {
+                remaining = 0
+                return false
+            }
+            remaining -= cost
+            return true
         }
 
-        mutating func spend() -> Bool {
-            guard remaining > 0 else { return false }
-            remaining -= 1
-            return true
+        mutating func follow(_ pointer: String) -> Bool {
+            followed = true
+            return spend(1 + pointer.utf8.count / 64)
         }
     }
 
@@ -190,8 +198,9 @@ enum ToolArgumentNormalization {
         var node = schema
         var hops = 0
         while let reference = node["$ref"] {
-            guard references.spend() else { return nil }
-            guard hops < maximumReferenceHops, let pointer = reference as? String,
+            let pointer = reference as? String
+            if let pointer, !references.follow(pointer) { return nil }
+            guard hops < maximumReferenceHops, let pointer,
                 let target = localTarget(pointer, in: root)
             else {
                 guard schema["type"] != nil else { return nil }
@@ -206,17 +215,20 @@ enum ToolArgumentNormalization {
     }
 
     /// The schema object a same-document JSON pointer (RFC 6901) names, read as
-    /// the coordinator's `$ref` resolver reads it: each token percent-decoded
-    /// (a malformed escape names nothing), then `~1` and `~0` unescaped, and
-    /// arrays walked by index (`#/$defs/U/anyOf/0`).
+    /// the coordinator's `$ref` resolver reads it: at most 1,024 bytes and 32
+    /// tokens, each token percent-decoded (a malformed escape names nothing),
+    /// then `~1` and `~0` unescaped, and arrays walked by index
+    /// (`#/$defs/U/anyOf/0`).
     private static func localTarget(
         _ pointer: String, in root: [String: any Sendable]
     ) -> [String: any Sendable]? {
-        guard pointer.hasPrefix("#") else { return nil }
+        guard pointer.hasPrefix("#"), pointer.utf8.count <= 1_024 else { return nil }
         let path = pointer.dropFirst()
         guard path.isEmpty || path.hasPrefix("/") else { return nil }
+        let tokens = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+        guard tokens.count <= 32 else { return nil }
         var node: any Sendable = root
-        for raw in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
+        for raw in tokens {
             guard let decoded = String(raw).removingPercentEncoding else { return nil }
             let token = decoded.replacingOccurrences(of: "~1", with: "/")
                 .replacingOccurrences(of: "~0", with: "~")
@@ -270,6 +282,7 @@ enum ToolArgumentNormalization {
         var result: Set<String>?
         if let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
+            guard references.spend(names.count) else { return nil }
             let mapped = names.compactMap(canonicalType)
             guard !names.isEmpty, mapped.count == names.count else { return nil }
             result = Set(mapped)
@@ -277,8 +290,11 @@ enum ToolArgumentNormalization {
             // allOf(number, integer) still describe an integer.
             if result?.contains("number") == true { result?.insert("integer") }
             // OpenAPI 3.0 `nullable: true` adds null to this node's own type.
-            // Only a real Boolean counts: a boxed 1 is not `true`.
-            if let marker = schema["nullable"], JSONValue.from(marker) == .bool(true) {
+            // Only a real Boolean counts: a boxed 1 is not `true`, and a value
+            // that is no scalar is not converted to find out.
+            if let marker = schema["nullable"], marker is Bool || marker is NSNumber,
+                JSONValue.from(marker) == .bool(true)
+            {
                 result?.insert("null")
             }
         }

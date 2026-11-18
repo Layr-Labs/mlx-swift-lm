@@ -16,10 +16,14 @@
   array or number parameter declared by reference is no longer returned as a
   string. A reference that names nothing and has no `type` keeps its text, as
   before. Other dialects read references as before.
-- A reading takes at most 256 steps (each `$ref` hop and each schema node it
-  enters), and an array's items, or an object's members outside `properties`,
-  share one reading, so union branches that name the same definitions again (a
-  cycle the coordinator keeps, a diamond, or many references to a wide union)
-  cost bounded time per value; past the bound the value keeps its text. Pointers are read as the
+- Once a reading follows a reference it has 256 steps: a hop costs by its
+  pointer's length, a schema node one step, a `type` list one step per name.
+  An array's items, or an object's members outside `properties`, share one
+  reading. So union branches that name the same definitions again (a cycle the
+  coordinator keeps, a diamond, or many references to a wide or costly node)
+  cost bounded time per value; past the bound the value keeps its text. A
+  reading that follows no reference is not budgeted, as before. Pointers over
+  1,024 bytes or 32 tokens name nothing, and a `nullable` marker is read only
+  when it is a scalar. Pointers are read as the
   coordinator's resolver reads them: each token percent-decoded (a malformed
   escape names nothing), then `~1`/`~0` unescaped, and arrays walked by index.
