@@ -282,6 +282,35 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         }
     }
 
+    /// Decode rows that may speculate together in one round (each row drafts
+    /// with its own history; one captured `[B, 1 + k]` verification scores
+    /// every row's window). Read by the engine once, when it binds the
+    /// assistant. Defaults to `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8), else 1.
+    public var speculativeBatchLimit: Int = Qwen35InlineMTPAssistant
+        .environmentSpeculativeBatchLimit
+    {
+        didSet {
+            precondition(
+                (1 ... 8).contains(speculativeBatchLimit),
+                "inline Qwen MTP speculative batch must be 1...8")
+        }
+    }
+
+    static let speculativeBatchEnvironmentKey = "DARKBLOOM_QWEN_MTP_MAX_BATCH"
+    static let environmentSpeculativeBatchLimit = speculativeBatchLimit(
+        environment: ProcessInfo.processInfo.environment)
+
+    /// `DARKBLOOM_QWEN_MTP_MAX_BATCH`: an integer 1...8 (trimmed); unset or any
+    /// other value keeps one row.
+    static func speculativeBatchLimit(environment: [String: String]) -> Int {
+        guard
+            let raw = environment[speculativeBatchEnvironmentKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            let value = Int(raw), (1 ... 8).contains(value)
+        else { return 1 }
+        return value
+    }
+
     var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
     {
         (
