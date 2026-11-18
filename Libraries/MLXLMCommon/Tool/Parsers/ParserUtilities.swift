@@ -200,16 +200,34 @@ func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
 
 /// Read a textual parameter using its declared schema; unknown or ambiguous
 /// schemas preserve the original text. Validation is a separate boundary.
+/// `resolvingReferences` reads a local `$ref` as the schema it names in the
+/// tool's parameters (the Qwen XML dialect, whose every value is text).
 func convertParameterValue(
-    _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
+    _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?,
+    resolvingReferences: Bool = false
 ) -> any Sendable {
     guard let tools,
         let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
         let properties = parameters["properties"] as? [String: any Sendable]
     else { return value }
     return ToolArgumentNormalization.normalize(
-        .string(value), schema: properties[paramName] as? [String: any Sendable]
+        .string(value), schema: properties[paramName] as? [String: any Sendable],
+        root: resolvingReferences ? parameters : nil
     ).sendableValue
+}
+
+/// Whether `convertParameterValue(_:paramName:funcName:tools:resolvingReferences: true)`
+/// keeps every text of the parameter as written, so a streamed call can
+/// expose it while it is generated and its complete parse still agrees.
+func parameterKeepsText(
+    paramName: String, funcName: String, tools: [[String: any Sendable]]?
+) -> Bool {
+    guard let tools,
+        let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
+        let properties = parameters["properties"] as? [String: any Sendable]
+    else { return true }
+    return ToolArgumentNormalization.keepsText(
+        schema: properties[paramName] as? [String: any Sendable], root: parameters)
 }
 
 // MARK: - String Utilities

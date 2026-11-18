@@ -236,7 +236,8 @@ extension QwenXMLPayloadScanner.Payload {
             if value.hasPrefix("\n") { value = String(value.dropFirst()) }
             if value.hasSuffix("\n") { value = String(value.dropLast()) }
             arguments[parameter.name] = convertParameterValue(
-                value, paramName: parameter.name, funcName: name, tools: tools)
+                value, paramName: parameter.name, funcName: name, tools: tools,
+                resolvingReferences: true)
         }
         return ToolCall(function: .init(name: name, arguments: arguments))
     }

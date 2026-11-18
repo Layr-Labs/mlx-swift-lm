@@ -179,7 +179,8 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
                     key,
                     JSONValue.from(
                         convertParameterValue(
-                            value, paramName: key, funcName: function, tools: tools)))
+                            value, paramName: key, funcName: function, tools: tools,
+                            resolvingReferences: true)))
             else {
                 phase = .finished
                 return ""
@@ -190,21 +191,13 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
         }
     }
 
-    /// Mirrors `convertParameterValue`: only these schema types change the
-    /// raw text; every other parameter is the raw string itself.
+    /// A parameter streams as text only when the complete parse keeps every
+    /// text of it as written (`parameterKeepsText`, the parse's own reading of
+    /// unions, type lists, `nullable` and local `$ref`s); any other waits for
+    /// its closing tag and leaves converted, so the parse never disagrees.
     private func streamsAsString(_ key: String) -> Bool {
-        guard let function = xmlName,
-            let type = getParameterType(funcName: function, paramName: key, tools: tools)?
-                .lowercased()
-        else { return true }
-        if ["string", "str", "text", "varchar", "char", "enum"].contains(type) { return true }
-        let converts =
-            type.hasPrefix("int") || type.hasPrefix("uint") || type.hasPrefix("long")
-            || type.hasPrefix("short") || type.hasPrefix("unsigned") || type.hasPrefix("num")
-            || type.hasPrefix("float") || ["boolean", "bool", "binary"].contains(type)
-            || ["object", "array"].contains(type) || type.hasPrefix("dict")
-            || type.hasPrefix("list")
-        return !converts
+        guard let function = xmlName else { return true }
+        return parameterKeepsText(paramName: key, funcName: function, tools: tools)
     }
 
     private mutating func abandon() {

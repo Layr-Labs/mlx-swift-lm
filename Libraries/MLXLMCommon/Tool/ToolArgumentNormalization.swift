@@ -26,22 +26,19 @@ enum ToolArgumentNormalization {
             function: .init(name: call.function.name, arguments: arguments), id: call.id)
     }
 
+    /// `root` is the parameters schema the value's `schema` belongs to. With
+    /// it, a local `$ref` reads as the schema it names (`resolved`); without
+    /// it a reference is unknown and the value keeps its spelling.
     static func normalize(
-        _ value: JSONValue, schema: [String: any Sendable]?, depth: Int = 0
+        _ value: JSONValue, schema: [String: any Sendable]?, depth: Int = 0,
+        root: [String: any Sendable]? = nil
     ) -> JSONValue {
         switch value {
         case .string, .array, .object: break
         default: return value
         }
-        if schema?["type"] as? String == "string" { return value }
-        guard depth < 32, let schema, let types = declaredTypes(schema, depth: depth) else {
-            return value
-        }
-        var nonNull = types.subtracting(["null"])
-        if nonNull.contains("number") { nonNull.remove("integer") }
-        // An admitted string or multiple interpretations is not an invitation
-        // to guess which union branch the model meant (for example "001").
-        guard !types.contains("string"), nonNull.count <= 1 else { return value }
+        guard let reading = reading(schema, depth: depth, root: root) else { return value }
+        let (schema, types, nonNull) = (reading.schema, reading.types, reading.nonNull)
         var result = value
         if case .string(let text) = value {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -79,7 +76,7 @@ enum ToolArgumentNormalization {
             for (key, value) in object {
                 let converted = normalize(
                     value, schema: properties[key] as? [String: any Sendable] ?? extra,
-                    depth: depth + 1)
+                    depth: depth + 1, root: root)
                 if converted != value { normalized[key] = converted }
             }
             return .object(normalized)
@@ -87,12 +84,95 @@ enum ToolArgumentNormalization {
             guard let items = schema["items"] as? [String: any Sendable] else { return result }
             var normalized = array
             for index in array.indices {
-                let converted = normalize(array[index], schema: items, depth: depth + 1)
+                let converted = normalize(
+                    array[index], schema: items, depth: depth + 1, root: root)
                 if converted != array[index] { normalized[index] = converted }
             }
             return .array(normalized)
         default: return result
         }
+    }
+
+    /// Whether `normalize` keeps every text written for `schema` as it is: a
+    /// value it would never read as another JSON type, so a streamed call can
+    /// expose it while it is generated and the complete parse still agrees.
+    static func keepsText(
+        schema: [String: any Sendable]?, root: [String: any Sendable]? = nil
+    ) -> Bool {
+        reading(schema, depth: 0, root: root) == nil
+    }
+
+    private struct Reading {
+        let schema: [String: any Sendable]
+        let types: Set<String>
+        let nonNull: Set<String>
+    }
+
+    /// The one non-string reading `normalize` gives a value under `schema`, or
+    /// nil when every value keeps its spelling: no schema, a string schema,
+    /// an unknown one, or one that admits a string or several types.
+    private static func reading(
+        _ schema: [String: any Sendable]?, depth: Int, root: [String: any Sendable]?
+    ) -> Reading? {
+        guard depth < 32, let declared = schema, let schema = resolved(declared, root: root),
+            schema["type"] as? String != "string",
+            let types = declaredTypes(schema, depth: depth, root: root)
+        else { return nil }
+        var nonNull = types.subtracting(["null"])
+        if nonNull.contains("number") { nonNull.remove("integer") }
+        // An admitted string or multiple interpretations is not an invitation
+        // to guess which union branch the model meant (for example "001").
+        guard !types.contains("string"), nonNull.count <= 1 else { return nil }
+        return Reading(schema: schema, types: types, nonNull: nonNull)
+    }
+
+    private static let maximumReferenceHops = 8
+
+    /// `schema` with a local `$ref` read for conversion: the node it names in
+    /// `root` (a JSON pointer such as `#/$defs/Point` or `#/definitions/Point`,
+    /// followed through a few chained references), else the node without its
+    /// reference when a sibling `type` says what it holds (the coordinator
+    /// writes its target's type beside a reference it could not inline), else
+    /// nil. Without `root` the schema is returned as written, so a reference
+    /// stays unknown (`declaredTypes`).
+    private static func resolved(
+        _ schema: [String: any Sendable], root: [String: any Sendable]?
+    ) -> [String: any Sendable]? {
+        guard let root, schema["$ref"] != nil else { return schema }
+        var node = schema
+        var hops = 0
+        while let reference = node["$ref"] {
+            guard hops < maximumReferenceHops, let pointer = reference as? String,
+                let target = localTarget(pointer, in: root)
+            else {
+                guard schema["type"] != nil else { return nil }
+                var hinted = schema
+                hinted.removeValue(forKey: "$ref")
+                return hinted
+            }
+            node = target
+            hops += 1
+        }
+        return node
+    }
+
+    /// The schema object a same-document JSON pointer (RFC 6901) names.
+    private static func localTarget(
+        _ pointer: String, in root: [String: any Sendable]
+    ) -> [String: any Sendable]? {
+        guard pointer.hasPrefix("#") else { return nil }
+        let path = pointer.dropFirst()
+        guard path.isEmpty || path.hasPrefix("/") else { return nil }
+        var node: any Sendable = root
+        for raw in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
+            let token = raw.replacingOccurrences(of: "~1", with: "/")
+                .replacingOccurrences(of: "~0", with: "~")
+            guard let object = node as? [String: any Sendable],
+                let next = object[token.removingPercentEncoding ?? token]
+            else { return nil }
+            node = next
+        }
+        return node as? [String: any Sendable]
     }
 
     /// Reads an unquoted scalar the model wrote, such as Gemma's `zip:01000`,
@@ -117,8 +197,9 @@ enum ToolArgumentNormalization {
 
     /// Returns only interpretations every branch describes. Unknown branches
     /// (notably references) prevent coercion rather than being silently ignored.
-    private static func declaredTypes(_ schema: [String: any Sendable], depth: Int) -> Set<String>?
-    {
+    private static func declaredTypes(
+        _ schema: [String: any Sendable], depth: Int, root: [String: any Sendable]? = nil
+    ) -> Set<String>? {
         guard depth < 32,
             ["$ref", "$dynamicRef", "not", "if", "then", "else"].allSatisfy({ schema[$0] == nil })
         else { return nil }
@@ -141,7 +222,11 @@ enum ToolArgumentNormalization {
             guard let branches = schema[key] as? [[String: any Sendable]], !branches.isEmpty else {
                 return nil
             }
-            let types = branches.compactMap { declaredTypes($0, depth: depth + 1) }
+            let types = branches.compactMap { branch in
+                resolved(branch, root: root).flatMap {
+                    declaredTypes($0, depth: depth + 1, root: root)
+                }
+            }
             guard types.count == branches.count else { return nil }
             let combined = types.dropFirst().reduce(types[0]) {
                 key == "allOf" ? $0.intersection($1) : $0.union($1)
