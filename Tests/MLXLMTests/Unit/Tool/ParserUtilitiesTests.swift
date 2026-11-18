@@ -405,6 +405,53 @@ extension UnitTests {
             }
         }
 
+        /// The coordinator's `type` beside a reference that names nothing is
+        /// read without copying the node's other keywords, and a long type
+        /// name costs by its length: 100 inner arrays under 51 references to a
+        /// branch with 20,000 extra keywords, or 84 references to a 200,000-byte
+        /// type name, read in bounded time.
+        @Test
+        func qwenXMLReferenceHintsAndTypeNamesCostWhatTheyRead() {
+            func tools(_ target: [String: any Sendable], _ references: Int)
+                -> [[String: any Sendable]]
+            {
+                let reference = ["$ref": "#/$defs/D"] as [String: any Sendable]
+                return Self.referenceTools(
+                    defs: ["D": target],
+                    properties: [
+                        "rows": [
+                            "type": "array",
+                            "items": [
+                                "type": "array",
+                                "items": [
+                                    "anyOf": Array(repeating: reference, count: references)
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable]
+                    ])
+            }
+            var hinted: [String: any Sendable] = ["$ref": "#/nowhere", "type": "integer"]
+            for index in 0 ..< 20_000 { hinted["k\(index)"] = index }
+            let longName = "int" + String(repeating: "x", count: 200_000)
+            let cases: [(String, [[String: any Sendable]], JSONValue)] = [
+                ("hint", tools(["anyOf": [hinted]] as [String: any Sendable], 51), .int(1)),
+                ("type name", tools(["type": longName], 84), .string("1")),
+            ]
+            let text = "[" + Array(repeating: #"["1"]"#, count: 100).joined(separator: ",") + "]"
+            for (label, tools, element) in cases {
+                var value: JSONValue?
+                let elapsed = ContinuousClock().measure {
+                    value = JSONValue.from(
+                        convertParameterValue(
+                            text, paramName: "rows", funcName: "f", tools: tools,
+                            resolvingReferences: true))
+                }
+                #expect(elapsed < .milliseconds(250), "\(label): \(elapsed)")
+                #expect(
+                    value == .array(Array(repeating: .array([element]), count: 100)), "\(label)")
+            }
+        }
+
         /// A union written out without references is read in full, however
         /// wide: only a reading that has followed a reference is budgeted.
         @Test
