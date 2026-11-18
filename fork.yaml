@@ -303,7 +303,10 @@ def:
         whole batch; this does not register a GLM5 model or qualify grammar decoding.
         `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
         is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
-        argument JSON that the complete-frame parse must agree with when the frame closes.
+        argument JSON that the complete-frame parse must agree with when the frame closes. A Qwen 3.5
+        XML parameter streams as text only when the complete parse keeps all of its text
+        (`ToolArgumentNormalization.keepsText`), and Qwen XML values read a local `$ref` as the schema it
+        names, or by the `type` beside an unresolved one.
         `ToolCallPolicy.returnsFailedCallsAsText` defaults to true (David, 2026-10-23): the fork's frame state
         machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
         recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
@@ -319,6 +322,7 @@ def:
         string exposure. `GemmaQuotedNumberConformanceTests` runs with the flag off and on.
       globs:
         - "changelog.d/glm5-tool-grammar-only.md"
+        - "changelog.d/qwen35-stream-schema-reading.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"

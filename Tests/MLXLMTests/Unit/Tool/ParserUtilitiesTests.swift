@@ -171,6 +171,370 @@ extension UnitTests {
                     == "v")
         }
 
+        /// A Qwen XML value whose parameter names a local `$ref` reads as the
+        /// referenced schema says, on the complete-call path too; a reference
+        /// that names nothing keeps today's text unless the coordinator's type
+        /// stands beside it. Other dialects keep reading references as text.
+        @Test
+        func qwenXMLParametersReadLocalReferences() throws {
+            let tools: [[String: any Sendable]] = [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "plot",
+                        "parameters": [
+                            "type": "object",
+                            "definitions": [
+                                "Point": [
+                                    "type": "object",
+                                    "properties": [
+                                        "x": ["type": "integer"] as [String: any Sendable]
+                                    ] as [String: any Sendable],
+                                ] as [String: any Sendable],
+                                "Loop": ["$ref": "#/definitions/Loop"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "properties": [
+                                "at": ["$ref": "#/definitions/Point"] as [String: any Sendable],
+                                "loop": ["$ref": "#/definitions/Loop"] as [String: any Sendable],
+                                "dangling": ["$ref": "#/definitions/Nowhere"]
+                                    as [String: any Sendable],
+                                "hinted": [
+                                    "$ref": "#/definitions/Nowhere", "type": "integer",
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ]
+            ]
+            let text =
+                "<tool_call>\n<function=plot>\n"
+                + "<parameter=at>\n{\"x\": \"7\"}\n</parameter>\n"
+                + "<parameter=loop>\n{\"a\": 1}\n</parameter>\n"
+                + "<parameter=dangling>\n{\"a\": 1}\n</parameter>\n"
+                + "<parameter=hinted>\n3\n</parameter>\n"
+                + "</function>\n</tool_call>"
+            let call = try #require(
+                Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+                    .parse(content: text, tools: tools))
+            #expect(call.function.arguments["at"] == .object(["x": .int(7)]))
+            #expect(call.function.arguments["loop"] == .string(#"{"a": 1}"#))
+            #expect(call.function.arguments["dangling"] == .string(#"{"a": 1}"#))
+            #expect(call.function.arguments["hinted"] == .int(3))
+            #expect(
+                convertParameterValue("{\"x\": 1}", paramName: "at", funcName: "plot", tools: tools)
+                    as? String == "{\"x\": 1}")
+        }
+
+        private static func referenceTools(
+            defs: [String: any Sendable], properties: [String: any Sendable]
+        ) -> [[String: any Sendable]] {
+            [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "f",
+                        "parameters": [
+                            "type": "object", "$defs": defs, "properties": properties,
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ]
+            ]
+        }
+
+        /// Union branches that name the same definitions again (here a diamond
+        /// 20 levels deep: 2^20 paths) are read within a fixed budget of
+        /// references; past it the value keeps its text, as for a reference
+        /// that names nothing, instead of costing time exponential in the
+        /// depth. A union of a few references still reads by its targets.
+        @Test
+        func qwenXMLReferenceReadingIsBoundedOnBranchingReferences() {
+            var defs: [String: any Sendable] = [
+                "D20": ["type": "integer"] as [String: any Sendable],
+                "A": ["type": "integer"] as [String: any Sendable],
+                "B": ["type": "integer", "minimum": 0] as [String: any Sendable],
+            ]
+            for level in 0 ..< 20 {
+                let next = ["$ref": "#/$defs/D\(level + 1)"] as [String: any Sendable]
+                defs["D\(level)"] = ["anyOf": [next, next]] as [String: any Sendable]
+            }
+            let tools = Self.referenceTools(
+                defs: defs,
+                properties: [
+                    "deep": ["$ref": "#/$defs/D0"] as [String: any Sendable],
+                    "few": [
+                        "anyOf": [
+                            ["$ref": "#/$defs/A"] as [String: any Sendable],
+                            ["$ref": "#/$defs/B"] as [String: any Sendable],
+                            ["type": "null"] as [String: any Sendable],
+                        ]
+                    ] as [String: any Sendable],
+                ])
+            let elapsed = ContinuousClock().measure {
+                #expect(parameterKeepsText(paramName: "deep", funcName: "f", tools: tools))
+                #expect(
+                    convertParameterValue(
+                        "5", paramName: "deep", funcName: "f", tools: tools,
+                        resolvingReferences: true) as? String == "5")
+            }
+            #expect(elapsed < .milliseconds(250), "\(elapsed)")
+            #expect(!parameterKeepsText(paramName: "few", funcName: "f", tools: tools))
+            #expect(
+                JSONValue.from(
+                    convertParameterValue(
+                        "5", paramName: "few", funcName: "f", tools: tools,
+                        resolvingReferences: true)) == .int(5))
+        }
+
+        /// A union whose branches name their own definition (a cycle the
+        /// coordinator keeps) and a diamond 30 levels deep read within the
+        /// budget and keep their text. Without the budget the cycle alone costs
+        /// 2^32 steps, so this test has no red run.
+        @Test
+        func qwenXMLReferenceCyclesKeepTheirText() {
+            var defs: [String: any Sendable] = [
+                "A": [
+                    "anyOf": [
+                        ["$ref": "#/$defs/A"] as [String: any Sendable],
+                        ["$ref": "#/$defs/A"] as [String: any Sendable],
+                    ]
+                ] as [String: any Sendable],
+                "D30": ["type": "integer"] as [String: any Sendable],
+            ]
+            for level in 0 ..< 30 {
+                let next = ["$ref": "#/$defs/D\(level + 1)"] as [String: any Sendable]
+                defs["D\(level)"] = ["oneOf": [next, next]] as [String: any Sendable]
+            }
+            let tools = Self.referenceTools(
+                defs: defs,
+                properties: [
+                    "cycle": ["$ref": "#/$defs/A"] as [String: any Sendable],
+                    "deep": ["$ref": "#/$defs/D0"] as [String: any Sendable],
+                ])
+            let elapsed = ContinuousClock().measure {
+                for key in ["cycle", "deep"] {
+                    #expect(parameterKeepsText(paramName: key, funcName: "f", tools: tools))
+                    #expect(
+                        convertParameterValue(
+                            "5", paramName: key, funcName: "f", tools: tools,
+                            resolvingReferences: true) as? String == "5")
+                }
+            }
+            #expect(elapsed < .milliseconds(250), "\(elapsed)")
+        }
+
+        /// A small schema whose references fan out (64 references to a
+        /// definition that is itself a union of 100 types) costs a bounded
+        /// reading, taken once for all of an array's items, however many items
+        /// the model writes.
+        @Test
+        func qwenXMLReferenceReadingIsBoundedPerValue() {
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let reference = ["$ref": "#/$defs/X"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [
+                    "X": ["anyOf": Array(repeating: integer, count: 100)] as [String: any Sendable]
+                ],
+                properties: [
+                    "many": [
+                        "type": "array",
+                        "items": ["anyOf": Array(repeating: reference, count: 64)]
+                            as [String: any Sendable],
+                    ] as [String: any Sendable]
+                ])
+            let text = "[" + Array(repeating: #""1""#, count: 1000).joined(separator: ",") + "]"
+            var value: JSONValue?
+            let elapsed = ContinuousClock().measure {
+                value = JSONValue.from(
+                    convertParameterValue(
+                        text, paramName: "many", funcName: "f", tools: tools,
+                        resolvingReferences: true))
+            }
+            #expect(elapsed < .milliseconds(250), "\(elapsed)")
+            #expect(value == .array(Array(repeating: .string("1"), count: 1000)))
+        }
+
+        /// A step costs what it reads: a pointer as long as the coordinator's
+        /// resolver allows at most, a `type` list by its names, a `nullable`
+        /// marker only as a scalar. 100 inner arrays under 84 references to a
+        /// 20,000-character pointer, 127 references to a 5,000-name `type`
+        /// list, or 80 references (within the budget, so it converts) to a node
+        /// whose `nullable` is an array of 5,000 values read in bounded time.
+        @Test
+        func qwenXMLReferenceStepsCostWhatTheyRead() {
+            let key = String(repeating: "k", count: 20_000)
+            func tools(_ target: [String: any Sendable], _ references: Int)
+                -> [[String: any Sendable]]
+            {
+                let reference = ["$ref": "#/$defs/Y"] as [String: any Sendable]
+                return Self.referenceTools(
+                    defs: ["Y": target, key: ["type": "integer"] as [String: any Sendable]],
+                    properties: [
+                        "rows": [
+                            "type": "array",
+                            "items": [
+                                "type": "array",
+                                "items": [
+                                    "anyOf": Array(repeating: reference, count: references)
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable]
+                    ])
+            }
+            let names = (0 ..< 5_000).map { "int\($0)" }
+            let cases: [(String, [[String: any Sendable]], JSONValue)] = [
+                ("pointer", tools(["$ref": "#/$defs/\(key)"], 84), .string("1")),
+                ("type list", tools(["type": names], 127), .string("1")),
+                (
+                    "nullable",
+                    tools(["type": "integer", "nullable": Array(repeating: 0, count: 5_000)], 80),
+                    .int(1)
+                ),
+            ]
+            let text = "[" + Array(repeating: #"["1"]"#, count: 100).joined(separator: ",") + "]"
+            for (label, tools, element) in cases {
+                var value: JSONValue?
+                let elapsed = ContinuousClock().measure {
+                    value = JSONValue.from(
+                        convertParameterValue(
+                            text, paramName: "rows", funcName: "f", tools: tools,
+                            resolvingReferences: true))
+                }
+                #expect(elapsed < .milliseconds(250), "\(label): \(elapsed)")
+                #expect(
+                    value == .array(Array(repeating: .array([element]), count: 100)), "\(label)")
+            }
+        }
+
+        /// The coordinator's `type` beside a reference that names nothing is
+        /// read without copying the node's other keywords, and a long type
+        /// name costs by its length: 100 inner arrays under 51 references to a
+        /// branch with 20,000 extra keywords, or 84 references to a 200,000-byte
+        /// type name, read in bounded time.
+        @Test
+        func qwenXMLReferenceHintsAndTypeNamesCostWhatTheyRead() {
+            func tools(_ target: [String: any Sendable], _ references: Int)
+                -> [[String: any Sendable]]
+            {
+                let reference = ["$ref": "#/$defs/D"] as [String: any Sendable]
+                return Self.referenceTools(
+                    defs: ["D": target],
+                    properties: [
+                        "rows": [
+                            "type": "array",
+                            "items": [
+                                "type": "array",
+                                "items": [
+                                    "anyOf": Array(repeating: reference, count: references)
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable]
+                    ])
+            }
+            var hinted: [String: any Sendable] = ["$ref": "#/nowhere", "type": "integer"]
+            for index in 0 ..< 20_000 { hinted["k\(index)"] = index }
+            let longName = "int" + String(repeating: "x", count: 200_000)
+            let cases: [(String, [[String: any Sendable]], JSONValue)] = [
+                ("hint", tools(["anyOf": [hinted]] as [String: any Sendable], 51), .int(1)),
+                ("type name", tools(["type": longName], 84), .string("1")),
+            ]
+            let text = "[" + Array(repeating: #"["1"]"#, count: 100).joined(separator: ",") + "]"
+            for (label, tools, element) in cases {
+                var value: JSONValue?
+                let elapsed = ContinuousClock().measure {
+                    value = JSONValue.from(
+                        convertParameterValue(
+                            text, paramName: "rows", funcName: "f", tools: tools,
+                            resolvingReferences: true))
+                }
+                #expect(elapsed < .milliseconds(250), "\(label): \(elapsed)")
+                #expect(
+                    value == .array(Array(repeating: .array([element]), count: 100)), "\(label)")
+            }
+        }
+
+        /// A `type` hint beside a reference that names nothing keeps every
+        /// keyword the reader reads: nested `properties`, `items`,
+        /// `additionalProperties` and `nullable` convert as on any node.
+        @Test
+        func qwenXMLReferenceHintsKeepWhatTheReaderReads() {
+            func hinted(_ node: [String: any Sendable]) -> [String: any Sendable] {
+                node.merging(["$ref": "#/nowhere"]) { current, _ in current }
+            }
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [:],
+                properties: [
+                    "object": hinted(
+                        ["type": "object", "properties": ["a": integer] as [String: any Sendable]]),
+                    "array": hinted(["type": "array", "items": integer]),
+                    "map": hinted(["type": "object", "additionalProperties": integer]),
+                    "maybe": hinted(["type": "integer", "nullable": true]),
+                ])
+            func read(_ key: String, _ text: String) -> JSONValue {
+                JSONValue.from(
+                    convertParameterValue(
+                        text, paramName: key, funcName: "f", tools: tools, resolvingReferences: true
+                    ))
+            }
+            #expect(read("object", #"{"a": "3"}"#) == .object(["a": .int(3)]))
+            #expect(read("array", #"["1", "2"]"#) == .array([.int(1), .int(2)]))
+            #expect(read("map", #"{"z": "4"}"#) == .object(["z": .int(4)]))
+            #expect(read("maybe", "null") == .null)
+        }
+
+        /// A union written out without references is read in full, however
+        /// wide: only a reading that has followed a reference is budgeted.
+        @Test
+        func qwenXMLWideUnionsWithoutReferencesStillConvert() {
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [:],
+                properties: [
+                    "v": ["anyOf": Array(repeating: integer, count: 300)] as [String: any Sendable]
+                ])
+            #expect(
+                JSONValue.from(
+                    convertParameterValue(
+                        "7", paramName: "v", funcName: "f", tools: tools, resolvingReferences: true)
+                )
+                    == .int(7))
+        }
+
+        /// Pointers read as the coordinator's `$ref` resolver reads them: array
+        /// members are walked (`#/$defs/U/anyOf/0`, as zod's root strategy
+        /// writes), each token is percent-decoded before `~1`/`~0`, and a
+        /// malformed escape names nothing.
+        @Test
+        func qwenXMLReferencePointersReadAsTheCoordinatorReadsThem() {
+            let tools = Self.referenceTools(
+                defs: [
+                    "U": [
+                        "anyOf": [
+                            ["type": "integer"] as [String: any Sendable],
+                            ["type": "string"] as [String: any Sendable],
+                        ]
+                    ] as [String: any Sendable],
+                    "a/b": ["type": "integer"] as [String: any Sendable],
+                    "50%": ["type": "integer"] as [String: any Sendable],
+                ],
+                properties: [
+                    "member": ["$ref": "#/$defs/U/anyOf/0"] as [String: any Sendable],
+                    "escaped": ["$ref": "#/$defs/a~1b"] as [String: any Sendable],
+                    "encoded": ["$ref": "#/$defs/a%7E1b"] as [String: any Sendable],
+                    "malformed": ["$ref": "#/$defs/50%"] as [String: any Sendable],
+                ])
+            func read(_ key: String) -> JSONValue {
+                JSONValue.from(
+                    convertParameterValue(
+                        "7", paramName: key, funcName: "f", tools: tools, resolvingReferences: true)
+                )
+            }
+            #expect(read("member") == .int(7))
+            #expect(read("escaped") == .int(7))
+            #expect(read("encoded") == .int(7))
+            #expect(read("malformed") == .string("7"))
+        }
+
         @Test
         func extractNameRemovesMatchingQuotes() {
             #expect(extractName("  \"get_weather\" ") == "get_weather")
