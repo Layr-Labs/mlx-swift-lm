@@ -42,3 +42,9 @@ enum Qwen35DecodeCommandBuffers {
         (overrideForTesting ?? enabled) ? limits : nil
     }
 }
+
+extension Qwen35Model: CBv2DecodeCommandBufferLimitsProviding {
+    public var decodeCommandBufferLimits: GPU.CommandBufferLimits? {
+        Qwen35DecodeCommandBuffers.current
+    }
+}
