@@ -221,7 +221,8 @@ struct Gemma4CompiledFeedforwardTests {
                 }
                 #expect(layer.feedforwardTraceIsCompiled == (!scoped && enabled))
             }
-            // An unscoped [8, 1] trace is never reused by a scoped call of that shape.
+            // A scoped [8, 1] call after an unscoped trace of that shape keeps the
+            // scoped eager graph's bytes (compare runs both inside the scope).
             layer.invalidateCompiledTraces()
             let x = input(rows: 8)
             compare(layer, x)
