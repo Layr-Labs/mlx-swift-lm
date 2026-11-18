@@ -414,8 +414,18 @@ def:
             affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
             If Metal rejects one of its kernels, the route logs once and keeps the core path.
             Its report separates exact native-state evidence from two-order cold HTTP timing.
+            Decode-shaped forwards (at most 16 tokens per row) run each layer's norm chains around the
+            feed-forward as two kernels (`Gemma4FusedNorms`): post-attention norm, residual add and the
+            sum's three norms; then the branch post-norms, their sum, the shared post-norm, residual add,
+            layer scalar and the next layer's input norm. Each value is the unfused ops' expression, so
+            outputs keep their bits (`Gemma4FusedNormsTests`). The compiler that built MLX's metallib
+            decides how a norm's mean rounds, so the kernels run only where `RMSNormMeanForm` has measured
+            the form that matches MLX's prebuilt norm for the row width, on GPU family 17 (M5), and once
+            they have written the unfused ops' bytes on the rows that separate the forms (a Metal error or
+            a difference keeps the unfused ops and logs once). `DARKBLOOM_GEMMA4_FUSED_NORMS=0` is the rollback.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
+            - "changelog.d/exact-fused-norms.md"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"

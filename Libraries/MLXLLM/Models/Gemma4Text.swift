@@ -1224,7 +1224,14 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        route(normalized: MLXFast.rmsNorm(x, weight: normWeight, eps: eps))
+    }
+
+    /// The router norm's weight (`scale * rootSize`, the same op each call).
+    var normWeight: MLXArray { scale * rootSize }
+
+    /// The routing of an input already normalized with `normWeight`.
+    func route(normalized normed: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
 
         let kth = expertScores.dim(-1) - topK
@@ -1383,8 +1390,19 @@ public class Gemma4DecoderLayer: Module {
     /// summed across ranks before their separate post-norms.
     var tensorParallel: Gemma4TensorParallelContext?
     private let compiledFeedforward = Gemma4CompiledFeedforwardCache()
+    /// The fused path's feed-forward between its two norm kernels (dense MLP,
+    /// routing, experts), compiled for the shapes the compiled feed-forward
+    /// takes, so those shapes keep its fused element-wise kernels.
+    private let compiledFusedMiddle = CompiledTrace<Gemma4DecoderLayer> { layer, arguments in
+        let (dense, experts) = layer.fusedFeedforwardMiddle(
+            arguments[0], arguments[1], arguments[2], isExpertPrefill: false)
+        return [dense, experts]
+    }
+    private let compiledFusedMiddleLock = NSLock()
+    private var compiledFusedMiddleHostRows: Bool?
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
+    var fusedMiddleTraceIsCompiled: Bool { compiledFusedMiddle.isCompiled }
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -1545,6 +1563,155 @@ public class Gemma4DecoderLayer: Module {
         out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
+    }
+
+    /// Whether `forwardFusedNorms` covers this call: decode-shaped rows (at
+    /// most `fusedNormsMaximumWidth` tokens each: decode steps and MTP
+    /// verification; prompt chunks keep today's ops and their timing), no
+    /// prompt-tail narrowing, tensor parallelism or per-layer input, plain
+    /// RMSNorms with one epsilon, and weights in the activation dtype (so each
+    /// add and multiply stays in it, as the unfused ops do).
+    func supportsFusedNorms(_ x: MLXArray, outputTailRows: Int?) -> Bool {
+        guard outputTailRows == nil, tensorParallel == nil, perLayerInputGate == nil,
+            !training, x.ndim == 3, x.dim(1) <= Self.fusedNormsMaximumWidth,
+            x.dim(-1) == config.hiddenSize,
+            Gemma4FusedNorms.supports(width: x.dim(-1), dtype: x.dtype),
+            layerScalar.size == 1, layerScalar.dtype == x.dtype
+        else { return false }
+        var norms: [RMSNorm] = [
+            inputLayernorm, postAttentionLayernorm, preFeedforwardLayernorm,
+            postFeedforwardLayernorm,
+        ]
+        if isMoE {
+            guard let router, experts != nil, let postFeedforwardLayernorm1,
+                let preFeedforwardLayernorm2, let postFeedforwardLayernorm2,
+                router.scale.dtype == x.dtype, router.eps == config.rmsNormEps
+            else { return false }
+            norms += [
+                postFeedforwardLayernorm1, preFeedforwardLayernorm2, postFeedforwardLayernorm2,
+            ]
+        }
+        return norms.allSatisfy {
+            type(of: $0) == RMSNorm.self && $0.weight.dtype == x.dtype
+                && $0.weight.ndim == 1 && $0.eps == config.rmsNormEps
+        }
+    }
+
+    /// The widest row (tokens per row) the fused norm chains take.
+    static let fusedNormsMaximumWidth = 16
+
+    /// The layer body with its feed-forward's norm chains fused
+    /// (`Gemma4FusedNorms`): the same values as `forward`, bit for bit.
+    /// `normalizedInput` is this layer's input norm when the previous layer's
+    /// tail already wrote it; with `nextNorm` this layer's tail also writes
+    /// `rmsNorm(out, nextNorm)` (the next layer's input norm or the final norm).
+    func forwardFusedNorms(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        nextNorm: MLXArray?,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        cache: KVCache?,
+        sharedKV: Gemma4SharedKVState?,
+        positionOffset: Gemma4.PositionOffset?,
+        v2SharedSource: (any CBv2AttendingLayerCache)?,
+        useLastQueryPrefill: Bool,
+        isExpertPrefill: Bool
+    ) -> (MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset, MLXArray?) {
+        let h = normalizedInput ?? inputLayernorm(x)
+        let (attnOut, kvPair, attnPositionOffset) = selfAttn(
+            h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
+            v2SharedSource: v2SharedSource, outputStart: 0,
+            useLastQueryPrefill: useLastQueryPrefill)
+        let eps = config.rmsNormEps
+        // The kernels read every input in the activation dtype. An output in
+        // another dtype keeps the unfused ops (and their promotion) instead.
+        func unfusedEnd(_ out: MLXArray) -> (
+            MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset, MLXArray?
+        ) {
+            let scaled = out * layerScalar
+            // A promoted output leaves the next layer's dtype; it takes the
+            // unfused ops and its own input norm.
+            return (
+                scaled, kvPair, attnPositionOffset,
+                scaled.dtype == x.dtype
+                    ? nextNorm.map { MLXFast.rmsNorm(scaled, weight: $0, eps: eps) } : nil
+            )
+        }
+        guard attnOut.dtype == x.dtype else {
+            return unfusedEnd(
+                feedforwardWithCompilation(
+                    x + postAttentionLayernorm(attnOut), isExpertPrefill: isExpertPrefill))
+        }
+        if isMoE, let router, let experts, let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2, let postFeedforwardLayernorm2
+        {
+            let (sum, norms) = Gemma4FusedNorms.attentionTail(
+                attnOut, residual: x, postAttention: postAttentionLayernorm.weight,
+                sumNorms: [
+                    preFeedforwardLayernorm.weight, preFeedforwardLayernorm2.weight,
+                    router.normWeight,
+                ], eps: eps)
+            let (dense, expertOutput): (MLXArray, MLXArray)
+            if Gemma4CompiledFeedforwardCache.applies(self, sum, isExpertPrefill: isExpertPrefill) {
+                // A trace reads `suppliesHostRowIndices` once; retrace on a change.
+                let hostRows = experts.switchGLU.suppliesHostRowIndices
+                compiledFusedMiddleLock.withLock {
+                    if compiledFusedMiddleHostRows != hostRows {
+                        compiledFusedMiddle.invalidate()
+                        compiledFusedMiddleHostRows = hostRows
+                    }
+                }
+                let outputs = compiledFusedMiddle(self, [norms[0], norms[1], norms[2]])
+                (dense, expertOutput) = (outputs[0], outputs[1])
+            } else {
+                (dense, expertOutput) = fusedFeedforwardMiddle(
+                    norms[0], norms[1], norms[2], isExpertPrefill: isExpertPrefill)
+            }
+            guard dense.dtype == x.dtype, expertOutput.dtype == x.dtype else {
+                let branches =
+                    postFeedforwardLayernorm1(dense) + postFeedforwardLayernorm2(expertOutput)
+                return unfusedEnd(sum + postFeedforwardLayernorm(branches))
+            }
+            let (out, next) = Gemma4FusedNorms.feedforwardTail(
+                dense: dense,
+                experts: (
+                    expertOutput, postFeedforwardLayernorm1.weight,
+                    postFeedforwardLayernorm2.weight
+                ),
+                residual: sum, post: postFeedforwardLayernorm.weight, layerScalar: layerScalar,
+                next: nextNorm, eps: eps)
+            return (out, kvPair, attnPositionOffset, next)
+        }
+        let (sum, norms) = Gemma4FusedNorms.attentionTail(
+            attnOut, residual: x, postAttention: postAttentionLayernorm.weight,
+            sumNorms: [preFeedforwardLayernorm.weight], eps: eps)
+        let dense = mlp(norms[0])
+        guard dense.dtype == x.dtype else {
+            return unfusedEnd(sum + postFeedforwardLayernorm(dense))
+        }
+        let (out, next) = Gemma4FusedNorms.feedforwardTail(
+            dense: dense, experts: nil, residual: sum,
+            post: postFeedforwardLayernorm.weight, layerScalar: layerScalar, next: nextNorm,
+            eps: eps)
+        return (out, kvPair, attnPositionOffset, next)
+    }
+
+    /// A mixture-of-experts layer's feed-forward between the fused norms:
+    /// the dense MLP of `dense`, and the experts of `experts` routed by
+    /// `router` (the router's own normalized input).
+    func fusedFeedforwardMiddle(
+        _ dense: MLXArray, _ experts: MLXArray, _ router: MLXArray, isExpertPrefill: Bool
+    ) -> (MLXArray, MLXArray) {
+        guard let routerModule = self.router, let expertsModule = self.experts else {
+            preconditionFailure("Gemma4: the fused feed-forward middle needs experts")
+        }
+        let (topKIndices, topKWeights) = routerModule.route(normalized: router)
+        return (
+            mlp(dense),
+            expertsModule(
+                experts, topKIndices: topKIndices, topKWeights: topKWeights,
+                isExpertPrefill: isExpertPrefill)
+        )
     }
 
     func feedforwardWithCompilation(_ input: MLXArray, isExpertPrefill: Bool) -> MLXArray {
@@ -1938,6 +2105,32 @@ public class Gemma4TextModelInner: Module {
             repeating: (nil, nil), count: config.numHiddenLayers)
         let submissionStride = Gemma4LayerSubmission.stride
 
+        // Prompt-path tail narrowing applies to the final layer only.
+        func outputTailRows(_ idx: Int) -> Int? {
+            let isFinalPromptLayer =
+                schedulePrefill && isCBv2 && idx == layers.count - 1
+                && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
+            return isFinalPromptLayer && gemma4PrefillTailRows > 0
+                ? min(gemma4PrefillTailRows, h.dim(1)) : nil
+        }
+        // Fused norm chains (`Gemma4FusedNorms`): a layer's tail also writes
+        // the next layer's input norm (or the final norm) when that consumer
+        // takes it, so it is not a launch of its own.
+        // A caller's compiled step (compilable caches) keeps the unfused ops.
+        let compiledStep = fullCache.contains {
+            $0 is CompilableKVCache || $0 is CompilableRotatingKVCache
+        }
+        let fusedLayers = layers.indices.map {
+            !compiledStep && layers[$0].supportsFusedNorms(h, outputTailRows: outputTailRows($0))
+        }
+        let finalNormFuses =
+            type(of: norm) == RMSNorm.self && norm.weight.dtype == h.dtype
+            && norm.weight.ndim == 1 && norm.eps == config.rmsNormEps
+        // The plan above holds while rows keep this dtype (a layer's unfused
+        // fallback can promote them).
+        let fusedDType = h.dtype
+        var pendingNormalized: MLXArray?
+
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -1955,12 +2148,7 @@ public class Gemma4TextModelInner: Module {
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
-            let isFinalPromptLayer =
-                schedulePrefill && isCBv2 && idx == layers.count - 1
-                && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
-            let outputTailRows: Int? =
-                isFinalPromptLayer && gemma4PrefillTailRows > 0
-                ? min(gemma4PrefillTailRows, h.dim(1)) : nil
+            let outputTailRows = outputTailRows(idx)
             let useLastQueryPrefill = gemma4UseLastQueryPrefill(
                 config,
                 layerIdx: idx,
@@ -1968,23 +2156,42 @@ public class Gemma4TextModelInner: Module {
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
                 hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
-            let (out, kvState, positionOffset) = layer.forward(
-                h,
-                mask: mask,
-                cache: fullCache[idx],
-                perLayerInput: perLayerInputs[idx],
-                sharedKV: sharedKV,
-                positionOffset: sharedPositionOffset,
-                v2SharedSource: v2SharedSource,
-                outputTailRows: outputTailRows,
-                useLastQueryPrefill: useLastQueryPrefill,
-                // The retained pair is a CBv2 production-prefill optimization.
-                // Ordinary direct forwards keep the established reduction;
-                // enabling it there regressed the raw-prefill control without
-                // affecting the serving path selected by the benchmark.
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill)
-            )
+            let isExpertPrefill = gemma4AllowsWeightedExpertUnsort(schedulePrefill: schedulePrefill)
+            let out: MLXArray
+            let kvState: Gemma4SharedKVState
+            let positionOffset: Gemma4.PositionOffset
+            if fusedLayers[idx] && h.dtype == fusedDType {
+                let isLast = idx == layers.count - 1
+                let nextNorm: MLXArray? =
+                    isLast
+                    ? (finalNormFuses ? norm.weight : nil)
+                    : (fusedLayers[idx + 1] ? layers[idx + 1].inputLayernorm.weight : nil)
+                let next: MLXArray?
+                (out, kvState, positionOffset, next) = layer.forwardFusedNorms(
+                    h, normalizedInput: pendingNormalized, nextNorm: nextNorm, mask: mask,
+                    cache: fullCache[idx], sharedKV: sharedKV, positionOffset: sharedPositionOffset,
+                    v2SharedSource: v2SharedSource, useLastQueryPrefill: useLastQueryPrefill,
+                    isExpertPrefill: isExpertPrefill)
+                pendingNormalized = next
+            } else {
+                precondition(pendingNormalized == nil, "Gemma4: a fused input norm has no consumer")
+                (out, kvState, positionOffset) = layer.forward(
+                    h,
+                    mask: mask,
+                    cache: fullCache[idx],
+                    perLayerInput: perLayerInputs[idx],
+                    sharedKV: sharedKV,
+                    positionOffset: sharedPositionOffset,
+                    v2SharedSource: v2SharedSource,
+                    outputTailRows: outputTailRows,
+                    useLastQueryPrefill: useLastQueryPrefill,
+                    // The retained pair is a CBv2 production-prefill optimization.
+                    // Ordinary direct forwards keep the established reduction;
+                    // enabling it there regressed the raw-prefill control without
+                    // affecting the serving path selected by the benchmark.
+                    isExpertPrefill: isExpertPrefill
+                )
+            }
             h = out
             intermediates[idx] = (kvState, positionOffset)
             if let captureHook {
@@ -2008,7 +2215,7 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        let postNorm = norm(h)
+        let postNorm = pendingNormalized ?? norm(h)
         return (postNorm, capturePreNorm ? h : nil)
     }
 }
