@@ -424,6 +424,46 @@ extension KernelTests {
             #expect((pixels.max() - pixels.min()).item(Float.self) > 1)
         }
 
+        /// OpenRouter's 5-second 720p readiness clip with a decoded-frame cap of
+        /// six frames: its official sample (10 frames) passes the cap, so it is
+        /// refused, unless `fitsVideoSampleToDecodedBytes` keeps six frames
+        /// spread over the whole clip (pairs at 0, 2 and 4 s), learning the
+        /// frame size from the first decoded frame.
+        @Test func aClipPastTheDecodedFrameCapIsSampledDownAcrossIt() async throws {
+            let url = try #require(
+                Bundle.module.url(
+                    forResource: "input-video-url.mp4", withExtension: nil,
+                    subdirectory: "MiMoOpenRouter"))
+            let data = try Data(contentsOf: url)
+            // Five RGB8 frames and the sixth's RGBA render.
+            let cap = 5 * 1280 * 720 * 3 + 1280 * 720 * 4
+            func prepare(fits: Bool) async throws -> GLM5NextPreparedInput {
+                let processor = try GLM5NextProcessor(
+                    configuration: .init(
+                        maximumDecodedBytes: cap, fitsVideoSampleToDecodedBytes: fits),
+                    tokenizer: GLM5NextTestTokenizer())
+                return try await processor.prepareDetailed(
+                    input: UserInput(
+                        prompt: "Describe the video.",
+                        videos: [.memoryBacked(try MemoryBackedVideoAsset(videoData: data))]))
+            }
+            await #expect(throws: GLM5NextVisionError.budgetExceeded("decoded image")) {
+                _ = try await prepare(fits: false)
+            }
+            let prepared = try await prepare(fits: true)
+            #expect(prepared.input.video?.frames?.map { [$0.t, $0.h, $0.w] } == [[3, 52, 92]])
+            #expect(prepared.placements.count == 3)
+            let tokens = prepared.input.text.tokens.asArray(Int.self)
+            let rendered = tokens.indices.filter { tokens[$0] == 154831 }.map { end in
+                String(
+                    String.UnicodeScalarView(
+                        tokens[(end + 1)...].prefix { $0 < 154830 }.compactMap {
+                            Unicode.Scalar($0)
+                        }))
+            }
+            #expect(rendered == ["0.0 seconds", "2.0 seconds", "4.0 seconds"])
+        }
+
         /// OpenRouter's provider-readiness clips. The QuickTime clip has a
         /// variable frame rate (211 frames in 10.833 s, 31 distinct sample
         /// durations); as in the reference loader, frame i is timed at
