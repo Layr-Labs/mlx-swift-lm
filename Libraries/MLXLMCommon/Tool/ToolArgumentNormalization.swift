@@ -37,7 +37,20 @@ enum ToolArgumentNormalization {
         case .string, .array, .object: break
         default: return value
         }
-        guard let reading = reading(schema, depth: depth, root: root) else { return value }
+        return normalize(
+            value, reading: reading(schema, depth: depth, root: root), depth: depth, root: root)
+    }
+
+    /// `normalize` under a reading already taken: an array's items, and an
+    /// object's members outside `properties`, share one reading.
+    private static func normalize(
+        _ value: JSONValue, reading: Reading?, depth: Int, root: [String: any Sendable]?
+    ) -> JSONValue {
+        switch value {
+        case .string, .array, .object: break
+        default: return value
+        }
+        guard let reading else { return value }
         let (schema, types, nonNull) = (reading.schema, reading.types, reading.nonNull)
         var result = value
         if case .string(let text) = value {
@@ -73,19 +86,27 @@ enum ToolArgumentNormalization {
             let extra = schema["additionalProperties"] as? [String: any Sendable]
             guard !properties.isEmpty || extra != nil else { return result }
             var normalized = object
+            var extraReading: Reading??
             for (key, value) in object {
-                let converted = normalize(
-                    value, schema: properties[key] as? [String: any Sendable] ?? extra,
-                    depth: depth + 1, root: root)
+                let converted: JSONValue
+                if let property = properties[key] as? [String: any Sendable] {
+                    converted = normalize(value, schema: property, depth: depth + 1, root: root)
+                } else {
+                    let shared =
+                        extraReading ?? Self.reading(extra, depth: depth + 1, root: root)
+                    extraReading = shared
+                    converted = normalize(value, reading: shared, depth: depth + 1, root: root)
+                }
                 if converted != value { normalized[key] = converted }
             }
             return .object(normalized)
         case .array(let array):
             guard let items = schema["items"] as? [String: any Sendable] else { return result }
+            let itemReading = Self.reading(items, depth: depth + 1, root: root)
             var normalized = array
             for index in array.indices {
                 let converted = normalize(
-                    array[index], schema: items, depth: depth + 1, root: root)
+                    array[index], reading: itemReading, depth: depth + 1, root: root)
                 if converted != array[index] { normalized[index] = converted }
             }
             return .array(normalized)
@@ -108,14 +129,29 @@ enum ToolArgumentNormalization {
         let nonNull: Set<String>
     }
 
-    /// The local references one reading may follow: those of `root`, each
-    /// `$ref` hop counted against a fixed budget. Union branches that name the
-    /// same definitions again (a diamond or a cycle) would otherwise cost time
-    /// exponential in their depth; past the budget the reading is unknown, so
-    /// the value keeps its text, as for a reference that names nothing.
+    /// The local references one reading may follow, those of `root`, and a
+    /// budget of steps: every `$ref` hop and every schema node the reading
+    /// enters. Union branches that name the same definitions again (a diamond,
+    /// a cycle, or many references to a wide union) would otherwise cost time
+    /// exponential in their depth, or the schema's width times its references;
+    /// past the budget the reading is unknown, so the value keeps its text, as
+    /// for a reference that names nothing (a sibling `type` hint is not read
+    /// then). Without references nothing can multiply a reading, which then
+    /// costs at most the schema's size.
     private struct References {
         let root: [String: any Sendable]?
-        var remaining = 64
+        var remaining: Int
+
+        init(root: [String: any Sendable]?) {
+            self.root = root
+            self.remaining = root == nil ? .max : 256
+        }
+
+        mutating func spend() -> Bool {
+            guard remaining > 0 else { return false }
+            remaining -= 1
+            return true
+        }
     }
 
     /// The one non-string reading `normalize` gives a value under `schema`, or
@@ -154,8 +190,7 @@ enum ToolArgumentNormalization {
         var node = schema
         var hops = 0
         while let reference = node["$ref"] {
-            guard references.remaining > 0 else { return nil }
-            references.remaining -= 1
+            guard references.spend() else { return nil }
             guard hops < maximumReferenceHops, let pointer = reference as? String,
                 let target = localTarget(pointer, in: root)
             else {
@@ -229,7 +264,7 @@ enum ToolArgumentNormalization {
     private static func declaredTypes(
         _ schema: [String: any Sendable], depth: Int, _ references: inout References
     ) -> Set<String>? {
-        guard depth < 32,
+        guard depth < 32, references.spend(),
             ["$ref", "$dynamicRef", "not", "if", "then", "else"].allSatisfy({ schema[$0] == nil })
         else { return nil }
         var result: Set<String>?
