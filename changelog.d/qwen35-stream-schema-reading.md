@@ -16,3 +16,8 @@
   array or number parameter declared by reference is no longer returned as a
   string. A reference that names nothing and has no `type` keeps its text, as
   before. Other dialects read references as before.
+- A reading follows at most 64 `$ref` hops, so union branches that name the same
+  definitions again (a cycle the coordinator keeps, or a diamond) cost bounded
+  time; past the bound the value keeps its text. Pointers are read as the
+  coordinator's resolver reads them: each token percent-decoded (a malformed
+  escape names nothing), then `~1`/`~0` unescaped, and arrays walked by index.

@@ -108,15 +108,26 @@ enum ToolArgumentNormalization {
         let nonNull: Set<String>
     }
 
+    /// The local references one reading may follow: those of `root`, each
+    /// `$ref` hop counted against a fixed budget. Union branches that name the
+    /// same definitions again (a diamond or a cycle) would otherwise cost time
+    /// exponential in their depth; past the budget the reading is unknown, so
+    /// the value keeps its text, as for a reference that names nothing.
+    private struct References {
+        let root: [String: any Sendable]?
+        var remaining = 64
+    }
+
     /// The one non-string reading `normalize` gives a value under `schema`, or
     /// nil when every value keeps its spelling: no schema, a string schema,
     /// an unknown one, or one that admits a string or several types.
     private static func reading(
         _ schema: [String: any Sendable]?, depth: Int, root: [String: any Sendable]?
     ) -> Reading? {
-        guard depth < 32, let declared = schema, let schema = resolved(declared, root: root),
+        var references = References(root: root)
+        guard depth < 32, let declared = schema, let schema = resolved(declared, &references),
             schema["type"] as? String != "string",
-            let types = declaredTypes(schema, depth: depth, root: root)
+            let types = declaredTypes(schema, depth: depth, &references)
         else { return nil }
         var nonNull = types.subtracting(["null"])
         if nonNull.contains("number") { nonNull.remove("integer") }
@@ -129,19 +140,22 @@ enum ToolArgumentNormalization {
     private static let maximumReferenceHops = 8
 
     /// `schema` with a local `$ref` read for conversion: the node it names in
-    /// `root` (a JSON pointer such as `#/$defs/Point` or `#/definitions/Point`,
-    /// followed through a few chained references), else the node without its
-    /// reference when a sibling `type` says what it holds (the coordinator
-    /// writes its target's type beside a reference it could not inline), else
-    /// nil. Without `root` the schema is returned as written, so a reference
-    /// stays unknown (`declaredTypes`).
+    /// the references' root (a JSON pointer such as `#/$defs/Point` or
+    /// `#/definitions/Point`, followed through a few chained references), else
+    /// the node without its reference when a sibling `type` says what it holds
+    /// (the coordinator writes its target's type beside a reference it could
+    /// not inline), else nil. Without a root the schema is returned as
+    /// written, so a reference stays unknown (`declaredTypes`); past the
+    /// budget it is unknown too.
     private static func resolved(
-        _ schema: [String: any Sendable], root: [String: any Sendable]?
+        _ schema: [String: any Sendable], _ references: inout References
     ) -> [String: any Sendable]? {
-        guard let root, schema["$ref"] != nil else { return schema }
+        guard let root = references.root, schema["$ref"] != nil else { return schema }
         var node = schema
         var hops = 0
         while let reference = node["$ref"] {
+            guard references.remaining > 0 else { return nil }
+            references.remaining -= 1
             guard hops < maximumReferenceHops, let pointer = reference as? String,
                 let target = localTarget(pointer, in: root)
             else {
@@ -156,7 +170,10 @@ enum ToolArgumentNormalization {
         return node
     }
 
-    /// The schema object a same-document JSON pointer (RFC 6901) names.
+    /// The schema object a same-document JSON pointer (RFC 6901) names, read as
+    /// the coordinator's `$ref` resolver reads it: each token percent-decoded
+    /// (a malformed escape names nothing), then `~1` and `~0` unescaped, and
+    /// arrays walked by index (`#/$defs/U/anyOf/0`).
     private static func localTarget(
         _ pointer: String, in root: [String: any Sendable]
     ) -> [String: any Sendable]? {
@@ -165,12 +182,18 @@ enum ToolArgumentNormalization {
         guard path.isEmpty || path.hasPrefix("/") else { return nil }
         var node: any Sendable = root
         for raw in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
-            let token = raw.replacingOccurrences(of: "~1", with: "/")
+            guard let decoded = String(raw).removingPercentEncoding else { return nil }
+            let token = decoded.replacingOccurrences(of: "~1", with: "/")
                 .replacingOccurrences(of: "~0", with: "~")
-            guard let object = node as? [String: any Sendable],
-                let next = object[token.removingPercentEncoding ?? token]
-            else { return nil }
-            node = next
+            if let object = node as? [String: any Sendable], let next = object[token] {
+                node = next
+            } else if let array = node as? [any Sendable], let index = Int(token),
+                String(index) == token, array.indices.contains(index)
+            {
+                node = array[index]
+            } else {
+                return nil
+            }
         }
         return node as? [String: any Sendable]
     }
@@ -195,10 +218,16 @@ enum ToolArgumentNormalization {
         return types.contains(type) ? reading : .string(text)
     }
 
+    private static func declaredTypes(_ schema: [String: any Sendable], depth: Int) -> Set<String>?
+    {
+        var references = References(root: nil)
+        return declaredTypes(schema, depth: depth, &references)
+    }
+
     /// Returns only interpretations every branch describes. Unknown branches
     /// (notably references) prevent coercion rather than being silently ignored.
     private static func declaredTypes(
-        _ schema: [String: any Sendable], depth: Int, root: [String: any Sendable]? = nil
+        _ schema: [String: any Sendable], depth: Int, _ references: inout References
     ) -> Set<String>? {
         guard depth < 32,
             ["$ref", "$dynamicRef", "not", "if", "then", "else"].allSatisfy({ schema[$0] == nil })
@@ -222,12 +251,13 @@ enum ToolArgumentNormalization {
             guard let branches = schema[key] as? [[String: any Sendable]], !branches.isEmpty else {
                 return nil
             }
-            let types = branches.compactMap { branch in
-                resolved(branch, root: root).flatMap {
-                    declaredTypes($0, depth: depth + 1, root: root)
-                }
+            var types: [Set<String>] = []
+            for branch in branches {
+                guard let target = resolved(branch, &references),
+                    let branchTypes = declaredTypes(target, depth: depth + 1, &references)
+                else { return nil }
+                types.append(branchTypes)
             }
-            guard types.count == branches.count else { return nil }
             let combined = types.dropFirst().reduce(types[0]) {
                 key == "allOf" ? $0.intersection($1) : $0.union($1)
             }

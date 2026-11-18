@@ -285,6 +285,43 @@ extension UnitTests {
                         resolvingReferences: true)) == .int(5))
         }
 
+        /// A union whose branches name their own definition (a cycle the
+        /// coordinator keeps) and a diamond 30 levels deep read within the
+        /// budget and keep their text. Without the budget the cycle alone costs
+        /// 2^32 steps, so this test has no red run.
+        @Test
+        func qwenXMLReferenceCyclesKeepTheirText() {
+            var defs: [String: any Sendable] = [
+                "A": [
+                    "anyOf": [
+                        ["$ref": "#/$defs/A"] as [String: any Sendable],
+                        ["$ref": "#/$defs/A"] as [String: any Sendable],
+                    ]
+                ] as [String: any Sendable],
+                "D30": ["type": "integer"] as [String: any Sendable],
+            ]
+            for level in 0 ..< 30 {
+                let next = ["$ref": "#/$defs/D\(level + 1)"] as [String: any Sendable]
+                defs["D\(level)"] = ["oneOf": [next, next]] as [String: any Sendable]
+            }
+            let tools = Self.referenceTools(
+                defs: defs,
+                properties: [
+                    "cycle": ["$ref": "#/$defs/A"] as [String: any Sendable],
+                    "deep": ["$ref": "#/$defs/D0"] as [String: any Sendable],
+                ])
+            let elapsed = ContinuousClock().measure {
+                for key in ["cycle", "deep"] {
+                    #expect(parameterKeepsText(paramName: key, funcName: "f", tools: tools))
+                    #expect(
+                        convertParameterValue(
+                            "5", paramName: key, funcName: "f", tools: tools,
+                            resolvingReferences: true) as? String == "5")
+                }
+            }
+            #expect(elapsed < .milliseconds(250), "\(elapsed)")
+        }
+
         /// Pointers read as the coordinator's `$ref` resolver reads them: array
         /// members are walked (`#/$defs/U/anyOf/0`, as zod's root strategy
         /// writes), each token is percent-decoded before `~1`/`~0`, and a
