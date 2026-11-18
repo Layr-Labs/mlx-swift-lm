@@ -994,7 +994,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
     /// `draftHidden`/`recordDraft` are available (not the legacy double-forward oracle).
     public var splitsDrafts: Bool { !Self.forceDoubleForward }
-    public var maximumSpeculativeBatch: Int? { 1 }
+    public var maximumSpeculativeBatch: Int? { speculativeBatchLimit }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
     /// batch-gated rows may chain and a final prompt row may seed the carry.
