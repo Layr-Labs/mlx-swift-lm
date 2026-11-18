@@ -47,6 +47,17 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
+    /// Test seam only (red control): today's behaviour, sorted rows never compile.
+    static let sortedEnabled = sortedEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED"])
+
+    static func sortedEnabled(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+
+    @TaskLocal static var sortedOverrideForTesting: Bool?
+
     var isCompiled: Bool { lock.withLock { entry != nil } }
 
     func invalidate() {
