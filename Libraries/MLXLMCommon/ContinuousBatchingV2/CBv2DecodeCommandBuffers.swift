@@ -8,9 +8,10 @@ import MLX
 /// unless the model also declares `speculativeCommandBufferLimits`.
 public protocol CBv2DecodeCommandBufferLimitsProviding: AnyObject {
     var decodeCommandBufferLimits: GPU.CommandBufferLimits? { get }
-    /// Limits for speculative (MTP) rounds whose rows are all decode or
-    /// verification rows (at most `EngineLoopV2.speculativeCommandBufferRowTokens`
-    /// tokens); rounds that carry a prompt chunk keep MLX's defaults.
+    /// Limits for speculative (MTP) rounds whose rows each carry at most
+    /// `EngineLoopV2.speculativeCommandBufferRowTokens` tokens (decode and
+    /// verification rows, or a prompt chunk that short); rounds with a longer
+    /// row keep MLX's defaults.
     var speculativeCommandBufferLimits: GPU.CommandBufferLimits? { get }
 }
 
@@ -24,8 +25,8 @@ extension EngineLoopV2 {
 
     /// Runs one step's graph construction and evaluation with the model's
     /// decode command-buffer limits when `plan` is a plain decode step, or its
-    /// speculative limits when `plan` is a speculative round of decode and
-    /// verification rows.
+    /// speculative limits when `plan` is a speculative round whose rows each
+    /// carry at most `speculativeCommandBufferRowTokens` tokens.
     func withDecodeCommandBuffers<R>(
         _ plan: CBv2StepPlan, speculative: Bool = false, _ body: () throws -> R
     ) rethrows -> R {
