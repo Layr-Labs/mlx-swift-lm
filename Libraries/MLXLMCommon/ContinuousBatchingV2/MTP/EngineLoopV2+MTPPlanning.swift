@@ -45,8 +45,7 @@ extension EngineLoopV2 {
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
             sampling.repetitionPenalty == 1,
-            sampling.frequencyPenalty == 0,
-            sampling.presencePenalty == 0,
+            mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
         else { return false }
         // The current multimodal seam does not return trusted pre-norm
@@ -62,6 +61,30 @@ extension EngineLoopV2 {
             return false
         }
         return true
+    }
+
+    /// Presence/frequency penalties live in the sampler's incremental row
+    /// state. A penalty row may draft only when the engine opted in and the
+    /// kill switch is not set (`CBv2MTPConfig.effectivePenaltySpeculation`), the drafter opted into
+    /// target-prefix acceptance and the sampler re-derives the penalties per
+    /// verify position (`supportsMTPPenaltyVerification`; such rows always
+    /// accept exactly). Constrained rows keep the historical exclusion.
+    func mtpPenaltiesEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard CBv2MTPVerifyPenalties.applies(sampling) else { return true }
+        return Self.mtpPenaltyRowEligible(
+            switchOn: mtp?.config.effectivePenaltySpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            penaltyVerification: sampler.supportsMTPPenaltyVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.presencePenalty.isFinite && sampling.frequencyPenalty.isFinite)
+    }
+
+    static func mtpPenaltyRowEligible(
+        switchOn: Bool, targetPrefix: Bool, penaltyVerification: Bool,
+        constrained: Bool, finite: Bool
+    ) -> Bool {
+        switchOn && targetPrefix && penaltyVerification && !constrained && finite
     }
 
     static func mtpMultimodalHistoryEligible(
