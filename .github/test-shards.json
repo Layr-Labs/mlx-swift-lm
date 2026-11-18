@@ -978,6 +978,8 @@
             "MLXLMTests.CBv2MTPCommittedGoodputTests",
             "MLXLMTests.CBv2MTPKVStagingEquivalenceTests",
             "MLXLMTests.CBv2MTPOutputBudgetTests",
+            "MLXLMTests.CBv2MTPPenaltyEngineTests",
+            "MLXLMTests.CBv2MTPPenaltyVerifyTests",
             "MLXLMTests.CBv2MTPTargetSamplingMatrixTests",
             "MLXLMTests.CBv2MTPTypicalEngineTests",
             "MLXLMTests.CBv2MTPWorkloadLifecycleTests",
