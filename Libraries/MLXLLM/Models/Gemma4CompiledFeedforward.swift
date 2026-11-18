@@ -56,7 +56,7 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }
 
-    nonisolated(unsafe) static var sortedOverrideForTesting: Bool?
+    @TaskLocal static var sortedOverrideForTesting: Bool?
 
     var isCompiled: Bool { lock.withLock { entry != nil } }
 
