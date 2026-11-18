@@ -183,7 +183,8 @@ struct Gemma4CompiledFeedforwardTests {
         for raw in ["0", "false", "no", "off", ""] {
             #expect(!Gemma4CompiledFeedforwardCache.sortedEnabled(raw))
         }
-        let enabled = MLXHardwareInfo.isCompiledDecodeSupported
+        let enabled =
+            MLXHardwareInfo.isCompiledDecodeSupported
             && (ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD"]
                 .map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
         for sorted in [false, true] {
