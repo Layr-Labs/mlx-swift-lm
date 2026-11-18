@@ -68,4 +68,8 @@ extension Qwen35Model: CBv2DecodeCommandBufferLimitsProviding {
         // The Prism Hadamard pack (Bonsai) wasn't measured with these limits.
         self is PrismHadamardQwen35TextModel ? nil : Qwen35DecodeCommandBuffers.current
     }
+
+    public var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+        self is PrismHadamardQwen35TextModel ? nil : Qwen35DecodeCommandBuffers.speculativeCurrent
+    }
 }
