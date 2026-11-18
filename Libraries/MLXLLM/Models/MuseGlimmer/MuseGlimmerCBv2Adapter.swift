@@ -77,3 +77,29 @@ public final class MuseGlimmerCBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppa
         return (result.logits, result.hidden)
     }
 }
+
+// MARK: Image spans
+
+/// Image features replace the `<|patch|>` rows of the prompt at their own
+/// positions. The text model attends to them causally, like text, so a
+/// request needs no positions of its own and no span masks. The engine
+/// splices into `embed_norm(embed_tokens(ids))`; the features arrive already
+/// normalized and are not normalized again.
+extension MuseGlimmerCBv2Adapter: CBv2MultimodalSteppableModel {
+    public var causalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
+
+    public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
+        attention == .causal
+    }
+
+    public func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        target.scaledTokenEmbeddings(tokens)
+    }
+
+    /// The prompt forward with spliced embeddings, at every row.
+    public func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        target.numerics.prompt { target(inputEmbeddings: inputEmbeddings, cache: kvCaches(caches)) }
+    }
+}

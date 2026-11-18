@@ -2,11 +2,11 @@
 
 `MuseGlimmerTextModel` (MLXLLM) is a fork-only text tower for Muse Glimmer 30B. It serves
 NVIDIA's ModelOpt checkpoint `nvidia/Muse-Glimmer-30B-NVFP4` through ContinuousBatchingV2 on
-paged KV. Upstream's `MuseGlimmer` in MLXVLM is unchanged and still loads the MLX 4-bit
-checkpoint through the generic factory. The native tower is not registered in a factory: a host
-stages it with `MuseGlimmerInstallation`.
+paged KV. Upstream's `MuseGlimmer` in MLXVLM gains one additive class for image features and
+still loads the MLX 4-bit checkpoint through the generic factory. The native tower is not
+registered in a factory: a host stages it with `MuseGlimmerInstallation`.
 
-Status: text only; vision is not wired. The DFlash block drafter and exact verify windows are
+Status: text and images; video is refused. The DFlash block drafter and exact verify windows are
 part of it (sections below).
 
 ## Architecture
@@ -44,8 +44,8 @@ from the verified shard headers:
 
 `hf_quant_config.json` is compared with that reading and never drives it. A missing, extra or
 misshapen tensor throws a `MuseGlimmerInstallation.Failure` that names the key. The 809 vision
-tensors are verified and listed in the receipt but not loaded; `Installed.visionSources` hands
-them to a later vision loader.
+tensors are verified and listed in the receipt but not loaded with the text tower;
+`Installed.visionSources` hands them to `MuseGlimmerImageEncoder` (see Images).
 
 Numerics decisions that enter a checkpoint's numerics fingerprint:
 
@@ -163,6 +163,32 @@ anything if one has no row-exact product. The installer does not set it: call it
 and before serving, and add `numericsProfile` to the checkpoint numerics fingerprint, because
 decode bytes change with it.
 
+## Images
+
+Upstream's `MuseGlimmerVisionFeatures` (the one addition to `MLXVLM/Models/MuseGlimmer.swift`)
+holds upstream's vision tower, adapter and projection and the parameterless
+`perception_emb_norm`, so features are upstream's arithmetic. The fork-only
+`MuseGlimmerImageEncoder` (MLXVLM):
+
+- loads the 809 BF16 tensors from `Installed.visionSources` with a strict key, dtype, shape and
+  source-name set. config.json is read as a bounded regular file and only cross-checked against
+  the pinned configuration;
+- preprocesses like upstream's processor: sRGB tone curve, LANCZOS to the `smart_resize` grid
+  (unit 28, at most 4,096 merged tokens), mean and std 0.5, patchify;
+- expands each image's `<|patch|>` placeholder into one causal span
+  (`MuseGlimmerImagePrompt.expand`) and returns features under `MLX.withError`.
+
+`MuseGlimmerCBv2Adapter` conforms to `CBv2MultimodalSteppableModel` for causal spans only.
+Requests go through plain `submit` (the deadline submit refuses media). Image requests run on the
+target alone and never read or write the prefix cache. A speculation step that holds an image row
+takes no drafts, so text rows beside it decode at depth 0 until it finishes. Images have no
+switch: they are served whenever the encoder has loaded from the verified stack. A grid over
+4,096 merged tokens, a video placeholder or a span mismatch is refused.
+
+The tower stays bf16, as stored. Against a float32 CPU reference its features drift by a relative
+L2 of up to 0.053 at 720 merged tokens; the same reference run with bf16 storage emulated drifts
+by the same amount. The same weights in float32 match the reference within 1e-4.
+
 ## Tests
 
 Tiny synthetic models, no weights:
@@ -210,7 +236,6 @@ require the oracle's greedy tokens wherever its top-1 margin is not a near-tie.
 
 ## Not done
 
-- Vision: upstream's vision classes are private, so loading into them needs a small addition to
-  the upstream file.
+- Video: `<|video|>` is refused; frame sampling, timestamps and per-group spans come next.
 - Exact windows set by the installer, and the numerics profile in the checkpoint fingerprint.
 - A measured prefill activation bound, load residency accounting and factory registration.

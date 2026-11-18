@@ -1113,6 +1113,35 @@ private final class MuseGlimmerVision: Module {
     }
 }
 
+/// The vision stack alone, with the parameter paths it has in ``MuseGlimmer``,
+/// for a host that runs the text model elsewhere. Its call is the image
+/// encoding of ``MuseGlimmer``: text-width features after `perception_emb_norm`.
+public final class MuseGlimmerVisionFeatures: Module {
+    @ModuleInfo(key: "vision_tower") private var tower: MuseGlimmerVisionModel
+    @ModuleInfo(key: "vision_adapter") private var adapter: MuseGlimmerVisionAdapter
+    @ModuleInfo(key: "vision_projection") private var projection: Linear
+    @ModuleInfo(key: "perception_emb_norm") private var perceptionEmbNorm: MuseRMSNormNoScale
+
+    public init(_ config: MuseGlimmerConfiguration) {
+        let vision = MuseGlimmerVision(config)
+        _tower.wrappedValue = vision.tower
+        _adapter.wrappedValue = vision.adapter
+        _projection.wrappedValue = vision.projection
+        _perceptionEmbNorm.wrappedValue = MuseRMSNormNoScale(
+            eps: config.textConfiguration.rmsNormEps)
+        super.init()
+    }
+
+    /// `[gh * gw / 4, text hidden]` features for patchified `pixelValues`.
+    public func callAsFunction(_ pixelValues: MLXArray, grid: [THW]) -> MLXArray {
+        let dtype = tower.patchEmbedder.patchEmbedding.weight.dtype
+        var features = tower(pixelValues.asType(dtype), grid: grid)
+        features = adapter(features)
+        features = projection(features)
+        return perceptionEmbNorm(features)
+    }
+}
+
 public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerLanguageModel
     @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
