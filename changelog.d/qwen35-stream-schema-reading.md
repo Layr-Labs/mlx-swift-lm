@@ -17,7 +17,9 @@
   string. A reference that names nothing and has no `type` keeps its text, as
   before. Other dialects read references as before.
 - Once a reading follows a reference it has 256 steps: a hop costs by its
-  pointer's length, a schema node one step, a `type` list one step per name.
+  pointer's length, a schema node one step, a `type` list one step per name
+  and per 64 bytes of names, and a `type` hint beside a reference that names
+  nothing is read without copying the node's other keywords.
   An array's items, or an object's members outside `properties`, share one
   reading. So union branches that name the same definitions again (a cycle the
   coordinator keeps, a diamond, or many references to a wide or costly node)

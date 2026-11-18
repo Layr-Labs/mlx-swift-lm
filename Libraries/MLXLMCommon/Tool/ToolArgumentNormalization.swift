@@ -183,14 +183,21 @@ enum ToolArgumentNormalization {
 
     private static let maximumReferenceHops = 8
 
+    /// The keywords a reading and `normalize` look at: a hinted node keeps
+    /// only these, so its other keywords are never copied.
+    private static let readKeywords = [
+        "type", "nullable", "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "$dynamicRef",
+        "properties", "additionalProperties", "items",
+    ]
+
     /// `schema` with a local `$ref` read for conversion: the node it names in
     /// the references' root (a JSON pointer such as `#/$defs/Point` or
     /// `#/definitions/Point`, followed through a few chained references), else
-    /// the node without its reference when a sibling `type` says what it holds
-    /// (the coordinator writes its target's type beside a reference it could
-    /// not inline), else nil. Without a root the schema is returned as
-    /// written, so a reference stays unknown (`declaredTypes`); past the
-    /// budget it is unknown too.
+    /// the node's `readKeywords` without its reference when a sibling `type`
+    /// says what it holds (the coordinator writes its target's type beside a
+    /// reference it could not inline), else nil. Without a root the schema is
+    /// returned as written, so a reference stays unknown (`declaredTypes`);
+    /// past the budget it is unknown too.
     private static func resolved(
         _ schema: [String: any Sendable], _ references: inout References
     ) -> [String: any Sendable]? {
@@ -204,9 +211,7 @@ enum ToolArgumentNormalization {
                 let target = localTarget(pointer, in: root)
             else {
                 guard schema["type"] != nil else { return nil }
-                var hinted = schema
-                hinted.removeValue(forKey: "$ref")
-                return hinted
+                return schema.filter(keys: readKeywords)
             }
             node = target
             hops += 1
@@ -282,7 +287,8 @@ enum ToolArgumentNormalization {
         var result: Set<String>?
         if let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
-            guard references.spend(names.count) else { return nil }
+            let bytes = names.reduce(0) { $0 + $1.utf8.count }
+            guard references.spend(names.count + bytes / 64) else { return nil }
             let mapped = names.compactMap(canonicalType)
             guard !names.isEmpty, mapped.count == names.count else { return nil }
             result = Set(mapped)
@@ -382,5 +388,14 @@ enum ToolArgumentNormalization {
             digits.removeLast(-scale)
         }
         return Int((negative ? "-" : "") + digits)
+    }
+}
+
+extension Dictionary where Key == String {
+    /// The entries whose keys are in `keys`, read one key at a time.
+    fileprivate func filter(keys: [String]) -> [String: Value] {
+        var kept: [String: Value] = [:]
+        for key in keys { if let value = self[key] { kept[key] = value } }
+        return kept
     }
 }
