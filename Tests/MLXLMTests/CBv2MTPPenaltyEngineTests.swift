@@ -238,9 +238,10 @@ struct CBv2MTPPenaltyEngineTests {
         }
     }
 
-    /// (c) The kill switch keeps penalty rows target-only (no rounds) and
-    /// their output unchanged; rows without penalties still speculate.
-    @Test func killSwitchKeepsPenaltyRowsTargetOnly() async throws {
+    /// (c) Without the per-engine opt-in (what `DARKBLOOM_MTP_PENALTY_ROWS=0`
+    /// forces through `effectivePenaltySpeculation`) penalty rows stay
+    /// target-only and unchanged; rows without penalties still speculate.
+    @Test func optOutKeepsPenaltyRowsTargetOnly() async throws {
         let target = try makeTarget()
         let prompt = [3, 7, 11, 9, 13]
         let maxTokens = 20

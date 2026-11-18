@@ -65,6 +65,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// divergence check). Engine queue only; dropped on `requestDidFinish`.
     private var mtpPenaltyCounts: [CBv2RequestID: (folded: Int, last: Int, counts: MLXArray)] =
         [:]
+    /// `arange(vocab)` `[1, 1, vocab]` int32 for the draft one-hot, per vocab.
+    private var mtpVocabIDs: MLXArray?
     /// Test hooks for the constrained-chaining device-mask cache.
     var constraintMaskBuildCount: Int { constraintSampler.maskBuildCount }
     var constraintMaskCacheHitCount: Int { constraintSampler.maskCacheHitCount }
@@ -220,7 +222,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// Pure re-derivation of the ordinary per-token draw for every verify
     /// window position. Eligibility gating guarantees the admitted rows use
     /// only the STATELESS transforms (temperature → top-k/top-p/min-p; no
-    /// bias, penalties, constraints, or logprob capture), so this mirrors
+    /// bias, constraints, or logprob capture; presence/frequency penalties
+    /// only through the `penalties:` overload), so this mirrors
     /// `LogitsPipelineV2.process` + `SamplerV2.sample` per (row, position)
     /// without touching the incremental pipeline state. RNG keys use the
     /// per-request output index (`stepBases[r] + j`), i.e. exactly the key
@@ -290,7 +293,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// the row instead of `mtpVerifySample`'s sort and scatter. Greedy rows
     /// take the argmax. A verifier that commits only its own draws stays
     /// exact whatever it is proposed; this only raises how often it agrees.
-    /// Same eligibility as `mtpVerifySample` (stateless transforms). `[B, 1]`.
+    /// Stateless transforms only: it ignores presence/frequency penalties (a
+    /// penalty row's proposal is then less likely to be accepted, never
+    /// inexact). `[B, 1]`.
     public func mtpCoupledProposal(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
@@ -496,6 +501,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         precondition(
             penalties.outputTokens.count == b, "MTP verify penalty row metadata mismatch")
         let zeroRow = MLXArray.zeros([vocab], type: Float.self)
+        // Bound the count cache to the rows of this call plus a small slack:
+        // entries of requests that left without `requestDidFinish` (none
+        // today) cannot accumulate past it.
+        if mtpPenaltyCounts.count > 64 {
+            let live = Set(requestIDs)
+            mtpPenaltyCounts = mtpPenaltyCounts.filter { live.contains($0.key) }
+        }
         let confirmed = stacked(
             (0 ..< b).map { r in
                 penaltyRows[r]
@@ -514,7 +526,10 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
                 drafts.ndim == 2 && drafts.dim(0) == b && drafts.dim(1) >= draftsNeeded,
                 "CBv2 MTP: penalty drafts must be [B, >= \(draftsNeeded)]")
             let used = drafts[0..., ..<draftsNeeded].asType(.int32)
-            let vocabIDs = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, 1, vocab])
+            if mtpVocabIDs?.dim(2) != vocab {
+                mtpVocabIDs = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, 1, vocab])
+            }
+            let vocabIDs = mtpVocabIDs!
             let oneHot = (used.expandedDimensions(axis: 2) .== vocabIDs).asType(.float32)
             // prefix[g] = drafts before global position g, g = 0 ... draftsNeeded.
             let prefix = concatenated(
@@ -543,7 +558,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// Confirmed output counts `[vocab]` float32 for one row, folded
     /// incrementally (scatter-add of the tokens confirmed since the last
     /// call; integer-valued, so exact in any order). Rebuilt from scratch
-    /// when the confirmed output no longer extends what was folded.
+    /// when the confirmed output no longer extends what was folded. The
+    /// last-token check suffices because confirmed output only grows while a
+    /// request lives and `requestDidFinish` drops an id before any reuse.
     private func confirmedOutputCounts(
         id: CBv2RequestID, tokens: ArraySlice<Int>, vocab: Int
     ) -> MLXArray {
@@ -565,7 +582,6 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
                 counts = counts.at[MLXArray(fresh)].add(Float(1))
             }
         }
-        if mtpPenaltyCounts.count > 256, entry == nil { mtpPenaltyCounts.removeAll() }
         mtpPenaltyCounts[id] = (tokens.count, tokens.last ?? -1, counts)
         return counts
     }

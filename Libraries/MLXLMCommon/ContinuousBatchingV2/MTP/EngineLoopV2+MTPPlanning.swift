@@ -15,8 +15,9 @@ extension EngineLoopV2 {
     /// any temperature/top-p/top-k/min-p. Opted-in constrained rows instead
     /// use the ordinary sampler on their committed prefix at finalization
     /// (grammar verification), and opted-in free spans accept only pure
-    /// same-state previews. Logprob capture, bias, penalties and stop strings
-    /// keep their gates.
+    /// same-state previews. Presence/frequency penalties pass only under the
+    /// penalty opt-in (`mtpPenaltiesEligible`). Logprob capture, bias,
+    /// repetition penalty and stop strings keep their gates.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         mtpHistoryEligible(rec)
             && (rec.request.tokenConstraint == nil || grammarMTPEnabled
@@ -96,7 +97,7 @@ extension EngineLoopV2 {
     /// Only the explicit native fallback may remove media/ineligible rows from
     /// the head batch count, and only in a cohort actually containing media, a
     /// logprob row or, on a row-exact recurrent fallback target, any other
-    /// ineligible row (stop strings, penalties, logit bias). Such a row never
+    /// ineligible row (stop strings, penalties without the opt-in, logit bias). Such a row never
     /// drafts; its one-token decode beside verifying rows is exact (row-exact
     /// decode, ordinary sampler), so the other rows keep speculating.
     /// All-row target costs, token/KV headroom and reservations stay unchanged.
