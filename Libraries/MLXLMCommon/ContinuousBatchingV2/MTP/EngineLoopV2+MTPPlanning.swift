@@ -64,6 +64,14 @@ extension EngineLoopV2 {
         return true
     }
 
+    /// Red-control seam: today's behaviour (penalty rows never draft).
+    static func mtpPenaltyRowEligible(
+        switchOn: Bool, targetPrefix: Bool, penaltyVerification: Bool,
+        constrained: Bool, finite: Bool
+    ) -> Bool {
+        false
+    }
+
     static func mtpMultimodalHistoryEligible(
         hasSpans: Bool, tracksPersistentHistory: Bool
     ) -> Bool {
