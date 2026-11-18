@@ -15,8 +15,9 @@ import Tokenizers
 @testable import MLXLMCommon
 @testable import MLXVLM
 
-/// The image proofs (zebra, receipt, multi-image) for one arm, written as
-/// JSON lines to `MUSE_GLIMMER_PROOF_OUT`; a script compares the arms.
+/// The image proofs (zebra, receipt, multi-image) and the video proof (a
+/// rendered clip of numbers) for one arm, written as JSON lines to
+/// `MUSE_GLIMMER_PROOF_OUT`; a script compares the arms.
 /// `MUSE_GLIMMER_PROOF_ARM` is `nvfp4` (the pinned NVIDIA checkpoint through
 /// EngineV2, `MUSE_GLIMMER_NVFP4_DIR`) or `bf16` (upstream `MuseGlimmer` on
 /// the pinned original checkpoint, `MUSE_GLIMMER_BF16_DIR`). A photo for the
@@ -43,6 +44,8 @@ struct MuseGlimmerImageProofTests {
         let name: String
         let images: [(label: String, image: CIImage)]
         let question: String
+        /// Decoded frames of one video after the images, or none.
+        var video: [CIImage] = []
     }
 
     static func cases() throws -> [Case] {
@@ -78,15 +81,29 @@ struct MuseGlimmerImageProofTests {
             + "what colour is swatch 3?"
         cases.append(Case(name: "multi-a", images: [third, receipt, swatches], question: multi))
         cases.append(Case(name: "multi-b", images: [receipt, swatches, third], question: multi))
+        // A 2 fps source, so vLLM's timestamps are the true times.
+        let clip = MuseGlimmerProofImages.numberClip()
+        let indices = try MuseGlimmerVideoGeometry.sampledFrameIndices(
+            totalFrames: clip.count, sourceFPS: MuseGlimmerProofImages.clipFPS)
+        cases.append(
+            Case(
+                name: "video-numbers", images: [],
+                question:
+                    "Answer in two lines. 1. The video shows one large number at a time. List the "
+                    + "numbers in the order they appear, separated by spaces. 2. At what time, in "
+                    + "seconds, does the number 9 first appear? Give the number only.",
+                video: indices.map { clip[$0] }))
         return cases
     }
 
     static func renderedPrompt(
-        _ question: String, images: Int, tokenizer: any MLXLMCommon.Tokenizer
+        _ question: String, images: Int, video: Bool = false,
+        tokenizer: any MLXLMCommon.Tokenizer
     ) throws
         -> [Int]
     {
         var content: [[String: any Sendable]] = (0 ..< images).map { _ in ["type": "image"] }
+        if video { content.append(["type": "video"]) }
         content.append(["type": "text", "text": question])
         return try tokenizer.applyChatTemplate(
             messages: [
@@ -121,10 +138,30 @@ struct MuseGlimmerImageProofTests {
     }
 
     typealias Geometry = MuseGlimmerImageGeometry
-    /// Greedy continuation of the expanded prompt with the images' features.
+
+    /// One preprocessed image or video, in prompt order.
+    enum Media {
+        case image(pixels: MLXArray, grid: Geometry.Grid)
+        case video(groups: [MLXArray], grid: MuseGlimmerVideoGeometry.Grid)
+
+        /// Pixel rows and grid as upstream's `LMInput` takes them.
+        var pixels: [MLXArray] {
+            switch self {
+            case .image(let pixels, _): [pixels]
+            case .video(let groups, _): groups
+            }
+        }
+        var thw: THW {
+            switch self {
+            case .image(_, let grid): grid.thw
+            case .video(_, let grid): grid.thw
+            }
+        }
+    }
+
+    /// Greedy continuation of the expanded prompt with the media's features.
     typealias Generate = (
-        _ prompt: MuseGlimmerImagePrompt.Expanded,
-        _ prepared: [(pixels: MLXArray, grid: Geometry.Grid)]
+        _ prompt: MuseGlimmerImagePrompt.Expanded, _ media: [Media]
     ) async throws -> [Int]
 
     @Test(.enabled(if: enabled), .timeLimit(.minutes(90)))
@@ -146,16 +183,34 @@ struct MuseGlimmerImageProofTests {
         ])
         for item in try Self.cases() {
             let rendered = try Self.renderedPrompt(
-                item.question, images: item.images.count, tokenizer: tokenizer)
+                item.question, images: item.images.count, video: !item.video.isEmpty,
+                tokenizer: tokenizer)
             let prepared = try item.images.map {
                 try MuseGlimmerImageEncoder.preprocess(image: $0.image)
             }
-            let expanded = try MuseGlimmerImagePrompt.expand(
-                promptTokens: rendered, grids: prepared.map(\.grid))
+            var media = prepared.map { Media.image(pixels: $0.pixels, grid: $0.grid) }
+            let expanded: MuseGlimmerImagePrompt.Expanded
+            var record: [String: Any] = [:]
+            if item.video.isEmpty {
+                expanded = try MuseGlimmerImagePrompt.expand(
+                    promptTokens: rendered, grids: prepared.map(\.grid))
+            } else {
+                let video = try MuseGlimmerImageEncoder.preprocessVideo(frames: item.video)
+                media.append(.video(groups: video.groups, grid: video.grid))
+                expanded = try MuseGlimmerMediaPrompt.expand(
+                    promptTokens: rendered,
+                    media: prepared.map { MuseGlimmerMediaPrompt.Item.image($0.grid) }
+                        + [MuseGlimmerMediaPrompt.Item.video(video.grid)]
+                ) { tokenizer.encode(text: $0, addSpecialTokens: false) }
+                record["video_grid"] = [
+                    video.grid.groups, video.grid.frame.patchRows, video.grid.frame.patchColumns,
+                ]
+                record["video_frames_sha256"] = item.video.map(Self.pixelDigest)
+            }
             let caseStart = Date()
-            let tokens = try await generate(expanded, prepared)
+            let tokens = try await generate(expanded, media)
             let seconds = Date().timeIntervalSince(caseStart)
-            try Self.write([
+            record.merge([
                 "kind": "case", "arm": Self.arm ?? "", "name": item.name,
                 "images": item.images.map(\.label),
                 "image_pixels_sha256": item.images.map { Self.pixelDigest($0.image) },
@@ -166,7 +221,8 @@ struct MuseGlimmerImageProofTests {
                 ).map { String(format: "%02x", $0) }.joined(),
                 "tokens": tokens, "seconds": seconds,
                 "text": tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false),
-            ])
+            ]) { _, new in new }
+            try Self.write(record)
         }
     }
 
@@ -184,9 +240,14 @@ struct MuseGlimmerImageProofTests {
             checkpointConfiguration: try ModelOptIndexedCheckpoint.readRegularFile(
                 at: directory.appendingPathComponent("config.json"), maximumBytes: 1 << 20))
         var next: UInt64 = 1
-        let generate: Generate = { prompt, prepared in
-            let features = try prepared.map {
-                try encoder.features(pixels: $0.pixels, grid: $0.grid)
+        let generate: Generate = { prompt, media in
+            let features = try media.flatMap { item -> [MLXArray] in
+                switch item {
+                case .image(let pixels, let grid):
+                    try [encoder.features(pixels: pixels, grid: grid)]
+                case .video(let groups, let grid):
+                    try encoder.videoFeatures(groups: groups, grid: grid)
+                }
             }
             let backend = try PagedKVBackend(
                 layerKinds: model.cbv2LayerKinds,
@@ -226,13 +287,14 @@ struct MuseGlimmerImageProofTests {
             fileURLWithPath: try #require(Self.environment["MUSE_GLIMMER_BF16_DIR"]),
             isDirectory: true)
         let model = try MuseGlimmerBF16Reference.load(directory: directory)
-        let generate: Generate = { prompt, prepared in
+        let generate: Generate = { prompt, media in
             let cache = try model.newCache(parameters: nil)
             let tokens = MLXArray(prompt.tokens.map(Int32.init)).expandedDimensions(axis: 0)
+            // A video goes to upstream's tower whole, as THW(groups, h, w).
             let input = LMInput(
                 text: .init(tokens: tokens),
                 image: .init(
-                    pixels: concatenated(prepared.map(\.pixels)), frames: prepared.map(\.grid.thw)))
+                    pixels: concatenated(media.flatMap(\.pixels)), frames: media.map(\.thw)))
             var generated = [Int]()
             var logits: MLXArray
             switch try model.prepare(
@@ -308,5 +370,24 @@ enum MuseGlimmerBF16Reference {
             try errors.check()
         }
         return model
+    }
+}
+
+extension MuseGlimmerProofImages {
+    /// The clip's numbers, one per second.
+    static let clipNumbers = [3, 7, 1, 9, 4, 6, 2, 8]
+    static let clipFPS = 2.0
+
+    /// 640 × 360 frames at 2 fps: each number held for one second (two
+    /// frames), drawn large and shifted between its two frames.
+    static func numberClip() -> [CIImage] {
+        clipNumbers.flatMap { number in
+            (0 ..< 2).map { half in
+                canvas(width: 640, height: 360) { context in
+                    text(
+                        "\(number)", x: 250 + 24 * CGFloat(half), y: 70, size: 220, in: context)
+                }
+            }
+        }
     }
 }

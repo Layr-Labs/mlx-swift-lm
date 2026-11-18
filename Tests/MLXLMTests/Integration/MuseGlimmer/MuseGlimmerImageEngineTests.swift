@@ -246,6 +246,27 @@ struct MuseGlimmerImageEngineTests {
         #expect(!backend.pool.writeValidation.isFaulted && backend.bytesReserved == 0)
     }
 
+    /// A video's temporal groups arrive as many short spans with text between
+    /// them (timestamps and separators), some crossing a chunk boundary; the
+    /// engine matches the eager splice.
+    @Test(.timeLimit(.minutes(4)))
+    func videoGroupSpansEqualTheEagerSplice() async throws {
+        let m = try model(.float32)
+        let spans = (0 ..< 12).map { CBv2ImageSpan(tokenOffset: 24 + 41 * $0, length: 36) }
+        let prompt = ImagePrompt(
+            length: spans[11].end + 30, spans: spans, hidden: 64, salt: 8, seed: 19)
+        let expected = try Self.eagerGreedy(m, prompt, chunk: 256, steps: 24)
+        let textOnly = try Self.eagerGreedy(m, prompt, images: false, chunk: 256, steps: 24)
+        #expect(expected != textOnly, "the spans must change the continuation")
+        let (engine, backend) = try engine(m, chunk: 256)
+        let result = try await run(engine, prompt.request(1, maxTokens: 24))
+        await engine.shutdown()
+        #expect(result.finishReason == .length)
+        #expect(result.tokens == expected)
+        #expect(result.usage?.promptTokens == prompt.tokens.count)
+        #expect(!backend.pool.writeValidation.isFaulted && backend.bytesReserved == 0)
+    }
+
     /// Image and text requests share steps; each gets its solo output. The
     /// tower runs exact windows, the numerics the provider serves, so a decode
     /// row's bytes do not depend on how many rows share the step. With MLX's

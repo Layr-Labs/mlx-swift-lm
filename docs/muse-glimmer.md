@@ -6,8 +6,8 @@ paged KV. Upstream's `MuseGlimmer` in MLXVLM gains one additive class for image 
 still loads the MLX 4-bit checkpoint through the generic factory. The native tower is not
 registered in a factory: a host stages it with `MuseGlimmerInstallation`.
 
-Status: text and images; video is refused. The DFlash block drafter and exact verify windows are
-part of it (sections below).
+Status: text, images and video. The DFlash block drafter and exact verify windows are part of it
+(sections below).
 
 ## Architecture
 
@@ -183,11 +183,35 @@ Requests go through plain `submit` (the deadline submit refuses media). Image re
 target alone and never read or write the prefix cache. A speculation step that holds an image row
 takes no drafts, so text rows beside it decode at depth 0 until it finishes. Images have no
 switch: they are served whenever the encoder has loaded from the verified stack. A grid over
-4,096 merged tokens, a video placeholder or a span mismatch is refused.
+4,096 merged tokens or a span mismatch is refused, and so is a video placeholder in the
+image-only expansion (`MuseGlimmerMediaPrompt.expand` takes images and videos).
 
 The tower stays bf16, as stored. Against a float32 CPU reference its features drift by a relative
 L2 of up to 0.053 at 720 merged tokens; the same reference run with bf16 storage emulated drifts
 by the same amount. The same weights in float32 match the reference within 1e-4.
+
+## Video
+
+`MuseGlimmerVideo.swift` (MLXVLM, fork-only) follows the reference video processor with the
+checkpoint's processor config:
+
+- **Frames.** `MuseGlimmerVideoGeometry.sampledFrameIndices` picks the source frames as
+  `sample_frames` does: 2 per second of video, at most 96, an even count, at torch's float32
+  `linspace` positions. The host decodes those frames; every frame gets one `smart_resize` grid
+  of at most 144 merged tokens.
+- **Groups.** Frames are paired into temporal groups (the last frame repeats for an odd count)
+  and patchified like images, with the second frame in the second half of each patch row.
+  `videoFeatures` encodes each group on its own, as vLLM does.
+- **Prompt.** `MuseGlimmerMediaPrompt.expand` turns `<|video|>` into `<|vid_start|>`, then per
+  group the tokens of `Time: {:.1f}s` and the group's `<|video|>` run, separated by
+  `<|vid_frame_separator|>` and closed by `<|vid_end|>`. Each group is one causal span, so a
+  video of 48 groups is 48 spans with text between them. Timestamps are vLLM's
+  (group × 2 / 2 fps); HF's (`timestamps[::2]`) differ when the source rate is not 2 fps, and a
+  test pins that difference.
+
+At most 96 frames, 48 groups and 6,912 `<|video|>` tokens. A frame grid over 144 tokens is
+refused. Video requests are served the way image requests are: target only, no prefix cache,
+plain `submit`.
 
 ## Tests
 
@@ -236,6 +260,9 @@ require the oracle's greedy tokens wherever its top-1 margin is not a near-tie.
 
 ## Not done
 
-- Video: `<|video|>` is refused; frame sampling, timestamps and per-group spans come next.
+- Video frame choice on vLLM hosts: vLLM samples frames in its own video loader, which the local
+  reference copy does not include, so a vLLM host may pick other frames than `sample_frames`.
+- Resize: the reference's fast processor maps LANCZOS to a torchvision mode on tensors, and which
+  mode is unconfirmed, so images and frames may resize slightly differently from HF.
 - Exact windows set by the installer, and the numerics profile in the checkpoint fingerprint.
 - A measured prefill activation bound, load residency accounting and factory registration.
