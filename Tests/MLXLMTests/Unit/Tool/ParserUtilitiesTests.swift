@@ -171,6 +171,60 @@ extension UnitTests {
                     == "v")
         }
 
+        /// A Qwen XML value whose parameter names a local `$ref` reads as the
+        /// referenced schema says, on the complete-call path too; a reference
+        /// that names nothing keeps today's text unless the coordinator's type
+        /// stands beside it. Other dialects keep reading references as text.
+        @Test
+        func qwenXMLParametersReadLocalReferences() throws {
+            let tools: [[String: any Sendable]] = [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "plot",
+                        "parameters": [
+                            "type": "object",
+                            "definitions": [
+                                "Point": [
+                                    "type": "object",
+                                    "properties": [
+                                        "x": ["type": "integer"] as [String: any Sendable]
+                                    ] as [String: any Sendable],
+                                ] as [String: any Sendable],
+                                "Loop": ["$ref": "#/definitions/Loop"] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "properties": [
+                                "at": ["$ref": "#/definitions/Point"] as [String: any Sendable],
+                                "loop": ["$ref": "#/definitions/Loop"] as [String: any Sendable],
+                                "dangling": ["$ref": "#/definitions/Nowhere"]
+                                    as [String: any Sendable],
+                                "hinted": [
+                                    "$ref": "#/definitions/Nowhere", "type": "integer",
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ]
+            ]
+            let text =
+                "<tool_call>\n<function=plot>\n"
+                + "<parameter=at>\n{\"x\": \"7\"}\n</parameter>\n"
+                + "<parameter=loop>\n{\"a\": 1}\n</parameter>\n"
+                + "<parameter=dangling>\n{\"a\": 1}\n</parameter>\n"
+                + "<parameter=hinted>\n3\n</parameter>\n"
+                + "</function>\n</tool_call>"
+            let call = try #require(
+                Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+                    .parse(content: text, tools: tools))
+            #expect(call.function.arguments["at"] == .object(["x": .int(7)]))
+            #expect(call.function.arguments["loop"] == .string(#"{"a": 1}"#))
+            #expect(call.function.arguments["dangling"] == .string(#"{"a": 1}"#))
+            #expect(call.function.arguments["hinted"] == .int(3))
+            #expect(
+                convertParameterValue("{\"x\": 1}", paramName: "at", funcName: "plot", tools: tools)
+                    as? String == "{\"x\": 1}")
+        }
+
         @Test
         func extractNameRemovesMatchingQuotes() {
             #expect(extractName("  \"get_weather\" ") == "get_weather")

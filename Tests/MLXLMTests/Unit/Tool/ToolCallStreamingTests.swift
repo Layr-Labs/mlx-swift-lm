@@ -348,6 +348,124 @@ extension UnitTests {
             }
         }
 
+        /// Parameters whose type the schema states only through a union, a
+        /// type list, `nullable` or a local `$ref`, as Pydantic, FastMCP and zod
+        /// write optional and nested arguments. The complete parse reads them
+        /// as numbers, Booleans, arrays and objects, so they stream only once
+        /// their value closes; a string member never has to be taken back.
+        private static let typedThroughTheSchemaTools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "$defs": [
+                            "Point": [
+                                "type": "object",
+                                "properties": [
+                                    "x": ["type": "integer"] as [String: any Sendable],
+                                    "y": ["type": "integer"] as [String: any Sendable],
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "Node": [
+                                "type": "object",
+                                "properties": [
+                                    "child": ["$ref": "#/$defs/Node"] as [String: any Sendable]
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "properties": [
+                            "query": ["type": "string"] as [String: any Sendable],
+                            "limit": [
+                                "anyOf": [
+                                    ["type": "integer"] as [String: any Sendable],
+                                    ["type": "null"] as [String: any Sendable],
+                                ],
+                                "default": NSNull(),
+                            ] as [String: any Sendable],
+                            "offset": ["type": ["integer", "null"]] as [String: any Sendable],
+                            "exact": [
+                                "anyOf": [
+                                    ["type": "boolean"] as [String: any Sendable],
+                                    ["type": "null"] as [String: any Sendable],
+                                ]
+                            ] as [String: any Sendable],
+                            "tags": [
+                                "anyOf": [
+                                    [
+                                        "type": "array",
+                                        "items": ["type": "string"] as [String: any Sendable],
+                                    ] as [String: any Sendable],
+                                    ["type": "null"] as [String: any Sendable],
+                                ]
+                            ] as [String: any Sendable],
+                            "near": ["$ref": "#/$defs/Point"] as [String: any Sendable],
+                            "area": [
+                                "anyOf": [
+                                    ["$ref": "#/$defs/Point"] as [String: any Sendable],
+                                    ["type": "null"] as [String: any Sendable],
+                                ]
+                            ] as [String: any Sendable],
+                            "tree": ["$ref": "#/$defs/Node"] as [String: any Sendable],
+                            // What the coordinator forwards for a reference it could
+                            // not inline: the reference beside its target's type.
+                            "kept": [
+                                "$ref": "#/$defs/Unresolved", "type": "object",
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+
+        private static func qwenCall(_ parameters: [(String, String)]) -> String {
+            "<tool_call>\n<function=search>\n"
+                + parameters.map { "<parameter=\($0.0)>\n\($0.1)\n</parameter>\n" }.joined()
+                + "</function>\n</tool_call>"
+        }
+
+        @Test(arguments: [
+            ("limit", "5", JSONValue.int(5)),
+            ("limit", "null", JSONValue.null),
+            ("offset", "20", .int(20)),
+            ("exact", "true", .bool(true)),
+            ("tags", #"["a.py", "b.py"]"#, .array([.string("a.py"), .string("b.py")])),
+            ("near", #"{"x": 1, "y": 2}"#, .object(["x": .int(1), "y": .int(2)])),
+            ("area", #"{"x": 3, "y": 4}"#, .object(["x": .int(3), "y": .int(4)])),
+            (
+                "tree", #"{"child": {"child": {}}}"#,
+                .object(["child": .object(["child": .object([:])])])
+            ),
+            ("kept", #"{"a": 1}"#, .object(["a": .int(1)])),
+        ])
+        func qwenXMLParametersTypedThroughTheSchemaNeverDiverge(
+            key: String, value: String, expected: JSONValue
+        ) {
+            let text = Self.qwenCall([("query", "weather"), (key, value)])
+            for width in Self.widths {
+                let run = Self.run(
+                    .qwen35, text, width: width, tools: Self.typedThroughTheSchemaTools)
+                #expect(run.failures.isEmpty, "width \(width)")
+                Self.expectFaithful(run.calls.first, name: "search")
+                let arguments = Self.decoded(run.calls.first?.arguments ?? "")
+                #expect(arguments?[key] == expected, "width \(width)")
+                #expect(arguments?["query"] == .string("weather"))
+            }
+        }
+
+        /// A string the schema admits still streams as it is generated.
+        @Test func qwenXMLStringUnionMembersStillStreamEarly() throws {
+            let text = Self.qwenCall([("query", "weather in Paris and Rome")])
+            let run = Self.run(.qwen35, text, width: 1, tools: Self.typedThroughTheSchemaTools)
+            let completed = try #require(
+                run.segments.firstIndex { if case .callCompleted = $0 { true } else { false } })
+            let fragments = run.segments[..<completed].compactMap {
+                if case .callArguments(let fragment) = $0 { fragment } else { nil }
+            }.joined()
+            #expect(fragments.hasPrefix(#"{"query":"weather in Paris"#))
+        }
+
         /// The Qwen parser rejects undeclared names, so such a frame keeps the
         /// historical visible-text fallback.
         @Test func qwenUndeclaredFunctionKeepsTextFallback() {
