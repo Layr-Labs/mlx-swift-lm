@@ -50,12 +50,18 @@ enum Qwen35DecodeCommandBuffers {
     /// `EngineLoopV2.speculativeCommandBufferRowTokens` tokens (the assistant's draft
     /// steps and the target's verification windows, or a prompt chunk that short)
     /// take the same `limits` unless `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS` is `0`,
-    /// `off`, `false` or `no`, as Gemma 4's and GLM's rounds do. Read once.
+    /// `off`, `false` or `no`, as Gemma 4's and GLM's rounds do. Read once. One-token
+    /// rounds that go through the MTP path without speculating (rows that keep the
+    /// assistant's history) follow this switch, not `environmentKey`. A round's first
+    /// draft step also moves the assistant's queued history (up to the whole prompt on
+    /// a request's first round) through the head inside the round.
     static let speculativeEnvironmentKey = "DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS"
     static let speculativeEnabled = enabled(
         ProcessInfo.processInfo.environment[speculativeEnvironmentKey])
 
-    /// Tests only, as `overrideForTesting`, for MTP rounds.
+    /// Tests only: replaces the environment's choice for MTP rounds (nil: the
+    /// environment's). Set it only from a `.serialized` suite while no engine runs;
+    /// the engine reads it on its own queue at each step.
     nonisolated(unsafe) static var speculativeOverrideForTesting: Bool?
 
     static var speculativeCurrent: GPU.CommandBufferLimits? {
