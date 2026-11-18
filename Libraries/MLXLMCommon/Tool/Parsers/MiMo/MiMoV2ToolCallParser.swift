@@ -91,7 +91,9 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
         return result
     }
 
-    private static func value(
+    /// One parameter's value from its raw text (`MiMoV2ArgumentStreamer`
+    /// converts a buffered parameter with it too).
+    static func value(
         _ raw: String, function: String, parameter: String,
         tools: [[String: any Sendable]]?, grammarOnly: Bool
     ) -> JSONValue? {
@@ -157,7 +159,7 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
         }
     }
 
-    private static func declared(_ name: String, tools: [[String: any Sendable]]?) -> Bool {
+    static func declared(_ name: String, tools: [[String: any Sendable]]?) -> Bool {
         guard let tools else { return true }
         let matches = tools.filter {
             ($0["function"] as? [String: any Sendable])?["name"] as? String == name
@@ -182,7 +184,7 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
         body = body[body.unicodeScalars.index(after: angle)...]
         return name
     }
-    private static func validFunctionName(_ name: String) -> Bool {
+    static func validFunctionName(_ name: String) -> Bool {
         let bytes = name.utf8
         return (1 ... 64).contains(bytes.count)
             && bytes.allSatisfy {
@@ -190,7 +192,7 @@ public struct MiMoV2ToolCallParser: ToolCallParser, Sendable {
                     || $0 == 45 || $0 == 95
             }
     }
-    private static func isFramingWhitespace(_ value: Unicode.Scalar) -> Bool {
+    static func isFramingWhitespace(_ value: Unicode.Scalar) -> Bool {
         [UInt32(0x20), 0x09, 0x0A, 0x0D].contains(value.value)
     }
     private static func dropFramingWhitespace(_ value: Substring) -> Substring {
