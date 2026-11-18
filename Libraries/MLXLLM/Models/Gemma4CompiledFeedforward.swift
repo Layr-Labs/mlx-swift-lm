@@ -60,19 +60,20 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
     }
 
     /// Tests only: replaces the environment's choice for sorted rows (nil: the
-    /// environment's). Set only while no other test compiles a Gemma layer.
-    nonisolated(unsafe) static var sortedOverrideForTesting: Bool?
+    /// environment's) in the calling task.
+    @TaskLocal static var sortedOverrideForTesting: Bool?
 
     /// Whether `[rows, width]` decode or verification input may take the trace.
-    /// Up to 7 rows keep the unsorted expert path; 8 to 16 rows sort their
-    /// assignments inside the trace exactly as the eager graph does. Scoped
-    /// batch-decode or prompt projections keep the eager graph at those sizes.
+    /// Up to 7 rows below 64 assignments keep the unsorted expert path. Up to 16
+    /// tokens at 64 or more assignments sort them inside the trace exactly as
+    /// the eager graph does (16 covers c = 8 verification and c = 16 decode).
+    /// A scoped batch-decode or prompt projection keeps those sorted sizes eager.
     static func admitsShape(rows: Int, width: Int, topK: Int) -> Bool {
         guard topK > 0, (1 ... 2).contains(width), rows >= 1 else { return false }
         let assignments = rows * width * topK
         if rows <= 7 && assignments < 64 { return true }
         return (sortedOverrideForTesting ?? sortedEnabled)
-            && rows <= 16 && rows * width <= 16
+            && assignments >= 64 && rows * width <= 16
             && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
     }
 

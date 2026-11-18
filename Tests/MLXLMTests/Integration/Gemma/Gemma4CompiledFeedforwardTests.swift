@@ -69,6 +69,19 @@ struct Gemma4CompiledFeedforwardTests {
         #expect(actual.asData(access: .copy).data == expected.asData(access: .copy).data)
     }
 
+    /// Whether the trace is on, and whether it covers sorted sizes, in this process.
+    private var compiledEnabled: Bool {
+        MLXHardwareInfo.isCompiledDecodeSupported
+            && (ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD"]
+                .map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
+    }
+
+    private func expectedCompiled(rows: Int, width: Int, eligible: Bool) -> Bool {
+        let sorted = rows * width * 8 >= 64
+        return eligible && compiledEnabled
+            && (!sorted || Gemma4CompiledFeedforwardCache.sortedEnabled)
+    }
+
     private func compare(_ layer: Gemma4DecoderLayer, _ x: MLXArray, prefill: Bool = false) {
         expectExact(
             layer.feedforwardWithCompilation(x, isExpertPrefill: prefill),
@@ -123,7 +136,9 @@ struct Gemma4CompiledFeedforwardTests {
             layer.invalidateCompiledTraces()
             let x = input(rows: rows, sequenceWidth: width)
             compare(layer, x)
-            #expect(layer.feedforwardTraceIsCompiled == (eligible && enabled))
+            #expect(
+                layer.feedforwardTraceIsCompiled
+                    == expectedCompiled(rows: rows, width: width, eligible: eligible))
             let changed = x + Float(0.125)
             eval(changed)
             compare(layer, changed)
@@ -161,7 +176,9 @@ struct Gemma4CompiledFeedforwardTests {
             layer.invalidateCompiledTraces()
             let x = input(rows: rows, sequenceWidth: width)
             compare(layer, x)
-            #expect(layer.feedforwardTraceIsCompiled == (eligible && enabled))
+            #expect(
+                layer.feedforwardTraceIsCompiled
+                    == expectedCompiled(rows: rows, width: width, eligible: eligible))
             let changed = x + Float(0.125)
             eval(changed)
             compare(layer, changed)
@@ -175,7 +192,6 @@ struct Gemma4CompiledFeedforwardTests {
     /// batch-decode frame, keeps those rows on the eager graph with the same bytes.
     @Test func sortedRowsFollowTheirSwitchAndScopes() throws {
         let layer = try layer(expertGroupSize: 32)
-        defer { Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = nil }
         #expect(Gemma4CompiledFeedforwardCache.sortedEnabled(nil))
         for raw in ["1", "true", "YES", "on"] {
             #expect(Gemma4CompiledFeedforwardCache.sortedEnabled(raw))
@@ -183,29 +199,36 @@ struct Gemma4CompiledFeedforwardTests {
         for raw in ["0", "false", "no", "off", ""] {
             #expect(!Gemma4CompiledFeedforwardCache.sortedEnabled(raw))
         }
-        let enabled =
-            MLXHardwareInfo.isCompiledDecodeSupported
-            && (ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD"]
-                .map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
+        let enabled = compiledEnabled
         for sorted in [false, true] {
-            Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = sorted
-            for (rows, width) in [(8, 1), (4, 2), (16, 1)] {
+            Gemma4CompiledFeedforwardCache.$sortedOverrideForTesting.withValue(sorted) {
+                for (rows, width) in [(8, 1), (4, 2), (16, 1)] {
+                    layer.invalidateCompiledTraces()
+                    compare(layer, input(rows: rows, sequenceWidth: width))
+                    #expect(layer.feedforwardTraceIsCompiled == (sorted && enabled))
+                }
                 layer.invalidateCompiledTraces()
-                compare(layer, input(rows: rows, sequenceWidth: width))
-                #expect(layer.feedforwardTraceIsCompiled == (sorted && enabled))
+                compare(layer, input(rows: 7))
+                #expect(layer.feedforwardTraceIsCompiled == enabled)
             }
-            layer.invalidateCompiledTraces()
-            compare(layer, input(rows: 7))
-            #expect(layer.feedforwardTraceIsCompiled == enabled)
         }
-        Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = true
-        for scoped in [false, true] {
+        Gemma4CompiledFeedforwardCache.$sortedOverrideForTesting.withValue(true) {
+            for scoped in [false, true] {
+                layer.invalidateCompiledTraces()
+                let x = input(rows: 8)
+                Gemma4BatchDecodeProjection.$active.withValue(scoped) {
+                    compare(layer, x)
+                }
+                #expect(layer.feedforwardTraceIsCompiled == (!scoped && enabled))
+            }
+            // An unscoped [8, 1] trace is never reused by a scoped call of that shape.
             layer.invalidateCompiledTraces()
             let x = input(rows: 8)
-            Gemma4BatchDecodeProjection.$active.withValue(scoped) {
+            compare(layer, x)
+            #expect(layer.feedforwardTraceIsCompiled == enabled)
+            Gemma4BatchDecodeProjection.$active.withValue(true) {
                 compare(layer, x)
             }
-            #expect(layer.feedforwardTraceIsCompiled == (!scoped && enabled))
         }
     }
 
