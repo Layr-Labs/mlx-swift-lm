@@ -47,10 +47,10 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
-    /// Rows whose top-K assignments reach 64 (8 to 16 rows of one or two
-    /// tokens at top-8) take the sorted expert path; they compile unless
-    /// `DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED` is set to something other
-    /// than 1, true, yes or on.
+    /// Steps whose top-K assignments reach 64 (at top-8: 8 to 16 decode rows,
+    /// or 4 to 8 verification rows of two tokens) take the sorted expert path;
+    /// they compile unless `DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED` is set
+    /// to something other than 1, true, yes or on.
     static let sortedEnabled = sortedEnabled(
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED"])
 

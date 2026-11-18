@@ -15,6 +15,18 @@ import Testing
     .enabled(if: ProcessInfo.processInfo.environment["GEMMA4_FFN_CHECKPOINT_DIR"] != nil))
 struct Gemma4CheckpointFeedforwardTests {
     private static let environment = ProcessInfo.processInfo.environment
+
+    /// The checkpoint's expert-bank group sizes, for the run's receipt line.
+    private static func expertGroupSizes(_ quantization: [String: Any]) -> [Int] {
+        let perPath = quantization.compactMap { key, value -> Int? in
+            guard key.contains(".experts."), let policy = value as? [String: Any] else {
+                return nil
+            }
+            return policy["group_size"] as? Int
+        }
+        let sizes = perPath.isEmpty ? [quantization["group_size"] as? Int ?? 0] : perPath
+        return Set(sizes).sorted()
+    }
     private static let projections = [
         "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "router.proj",
         "experts.switch_glu.gate_proj", "experts.switch_glu.up_proj",
@@ -56,7 +68,7 @@ struct Gemma4CheckpointFeedforwardTests {
             let policy = quantization[prefix + path] as? [String: Any] ?? quantization
             try #require(policy["bits"] as? Int == bits)
             let groupSize = try #require(policy["group_size"] as? Int)
-            // Expert banks: 64, or the QAT lattice's 32 (the production "C" build).
+            // Expert banks: 64, or the QAT lattice's 32 (the QAT-lattice build).
             try #require(groupSize == 64 || (expert && groupSize == 32))
             try #require((policy["mode"] as? String ?? "affine") == "affine")
             let weight = try #require(weights[path + ".weight"])
@@ -172,7 +184,7 @@ struct Gemma4CheckpointFeedforwardTests {
             SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         }
         print(
-            "GEMMA4_FFN_CHECKPOINT config=\(hash(configData)) index=\(hash(indexData)) layers=\(layers) compiled=\(flag)"
+            "GEMMA4_FFN_CHECKPOINT config=\(hash(configData)) index=\(hash(indexData)) layers=\(layers) compiled=\(flag) sorted=\(Gemma4CompiledFeedforwardCache.sortedEnabled) expertGroups=\(Self.expertGroupSizes(quantization))"
         )
         for index in layers {
             let layer = try loadLayer(
