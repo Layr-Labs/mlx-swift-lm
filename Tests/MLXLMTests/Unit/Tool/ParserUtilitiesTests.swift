@@ -452,6 +452,36 @@ extension UnitTests {
             }
         }
 
+        /// A `type` hint beside a reference that names nothing keeps every
+        /// keyword the reader reads: nested `properties`, `items`,
+        /// `additionalProperties` and `nullable` convert as on any node.
+        @Test
+        func qwenXMLReferenceHintsKeepWhatTheReaderReads() {
+            func hinted(_ node: [String: any Sendable]) -> [String: any Sendable] {
+                node.merging(["$ref": "#/nowhere"]) { current, _ in current }
+            }
+            let integer = ["type": "integer"] as [String: any Sendable]
+            let tools = Self.referenceTools(
+                defs: [:],
+                properties: [
+                    "object": hinted(
+                        ["type": "object", "properties": ["a": integer] as [String: any Sendable]]),
+                    "array": hinted(["type": "array", "items": integer]),
+                    "map": hinted(["type": "object", "additionalProperties": integer]),
+                    "maybe": hinted(["type": "integer", "nullable": true]),
+                ])
+            func read(_ key: String, _ text: String) -> JSONValue {
+                JSONValue.from(
+                    convertParameterValue(
+                        text, paramName: key, funcName: "f", tools: tools, resolvingReferences: true
+                    ))
+            }
+            #expect(read("object", #"{"a": "3"}"#) == .object(["a": .int(3)]))
+            #expect(read("array", #"["1", "2"]"#) == .array([.int(1), .int(2)]))
+            #expect(read("map", #"{"z": "4"}"#) == .object(["z": .int(4)]))
+            #expect(read("maybe", "null") == .null)
+        }
+
         /// A union written out without references is read in full, however
         /// wide: only a reading that has followed a reference is budgeted.
         @Test

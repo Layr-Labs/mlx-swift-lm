@@ -132,7 +132,8 @@ enum ToolArgumentNormalization {
     /// The local references one reading may follow, those of `root`, and a
     /// budget of steps spent once the reading has followed one: each hop costs
     /// by its pointer's length, each schema node entered one step, a `type`
-    /// list one step per name. Union branches that name the same definitions
+    /// list one step per name and per 64 bytes of names. Union branches that
+    /// name the same definitions
     /// again (a diamond, a cycle, or many references to a wide or costly node)
     /// would otherwise cost time exponential in their depth, or the node's
     /// size times its references; past the budget the reading is unknown, so
@@ -184,7 +185,8 @@ enum ToolArgumentNormalization {
     private static let maximumReferenceHops = 8
 
     /// The keywords a reading and `normalize` look at: a hinted node keeps
-    /// only these, so its other keywords are never copied.
+    /// only these, so its other keywords are never copied. A keyword either
+    /// starts to read belongs here (`qwenXMLReferenceHintsKeepWhatTheReaderReads`).
     private static let readKeywords = [
         "type", "nullable", "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "$dynamicRef",
         "properties", "additionalProperties", "items",
