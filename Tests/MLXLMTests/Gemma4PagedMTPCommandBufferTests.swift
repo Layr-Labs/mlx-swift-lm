@@ -178,13 +178,16 @@ struct Gemma4PagedMTPCommandBufferTests {
             for (index, prompt) in prompts.enumerated() {
                 let engine = try makeEngine(
                     target: target, drafter: drafter, verification: .rectangular,
-                    segmentBytes: 2 * 16 * 64 * 4 * 2)
+                    // 2 pages × 16 tokens × (K + V) × head dim 64 × float32, one KV head.
+                    segmentBytes: 2 * 16 * 2 * 64 * 4)
                 let out = await cbv2SchedCollect(
                     try engine.submit(
                         greedy(id: UInt64(index + 1), prompt: prompt, maxTokens: 48)))
                 let metrics = try #require(engine.mtpMetricsSnapshot())
                 await engine.shutdown()
                 #expect(metrics.rounds >= 1, "no MTP round ran")
+                #expect(
+                    metrics.rectangularVerificationRounds > 0, "rectangular verification fell back")
                 #expect(out.tokens.count == 48)
                 tokens.append(out.tokens)
             }

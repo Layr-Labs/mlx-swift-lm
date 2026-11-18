@@ -31,7 +31,10 @@ enum Gemma4DecodeCommandBuffers {
     }
 
     /// Tests only: replaces the environment's choice for MTP rounds (nil: the
-    /// environment's). The engine reads it on its own queue at each round.
+    /// environment's). The engine reads it on its own queue at each round; a
+    /// test sets it only while no engine runs, and test runs that read the
+    /// environment's value must not run in parallel with it (CI runs shards
+    /// with `--no-parallel`).
     nonisolated(unsafe) static var speculativeOverrideForTesting: Bool?
 }
 
