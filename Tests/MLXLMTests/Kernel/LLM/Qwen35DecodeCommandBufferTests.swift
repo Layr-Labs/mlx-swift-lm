@@ -46,11 +46,48 @@ extension KernelTests {
             for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
                 let adapter = CBv2SteppableLanguageModelAdapter(model)
                 #expect(adapter.decodeCommandBufferLimits == Qwen35DecodeCommandBuffers.limits)
-                // MTP rounds and prefill chunks keep MLX's defaults.
-                #expect(adapter.speculativeCommandBufferLimits == nil)
             }
             #expect(Qwen35DecodeCommandBuffers.limits.operations == 100)
             #expect(Qwen35DecodeCommandBuffers.limits.megabytes == 1 << 20)
+        }
+
+        @Test func declaresMTPRoundLimitsThroughTheSteppableAdapter() throws {
+            defer { Qwen35DecodeCommandBuffers.speculativeOverrideForTesting = nil }
+            Qwen35DecodeCommandBuffers.speculativeOverrideForTesting = true
+            #expect(EngineLoopV2.speculativeCommandBufferRowTokens == 8)
+            for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
+                let adapter = CBv2SteppableLanguageModelAdapter(model)
+                #expect(adapter.speculativeCommandBufferLimits == Qwen35DecodeCommandBuffers.limits)
+            }
+            Qwen35DecodeCommandBuffers.speculativeOverrideForTesting = false
+            let adapter = CBv2SteppableLanguageModelAdapter(try Self.dense())
+            #expect(adapter.speculativeCommandBufferLimits == nil)
+            #expect(
+                Qwen35DecodeCommandBuffers.speculativeEnvironmentKey
+                    == "DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS")
+        }
+
+        /// MTP verification rows (a few rows of 2 to 8 tokens, the shapes the round's
+        /// target forward takes) under the limits against a commit every two kernel
+        /// dispatches: the same bytes.
+        @Test func verificationRowLimitsKeepExactBytes() throws {
+            let everyOperation = GPU.CommandBufferLimits(operations: 1, megabytes: 1)
+            for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
+                for (rows, width) in [(1, 2), (1, 4), (2, 4), (1, 8)] {
+                    let tokens = MLXArray((0 ..< rows * width).map { Int32(($0 * 7 + 3) % 64) })
+                        .reshaped(rows, width)
+                    func logits(_ limits: GPU.CommandBufferLimits) -> Data {
+                        GPU.withCommandBufferLimits(limits) {
+                            let out = model(tokens, cache: nil)
+                            eval(out)
+                            return out.asData(access: .copy).data
+                        }
+                    }
+                    #expect(
+                        logits(everyOperation) == logits(Qwen35DecodeCommandBuffers.limits),
+                        "rows \(rows) width \(width)")
+                }
+            }
         }
 
         @Test func theSwitchRestoresMLXDefaults() throws {
