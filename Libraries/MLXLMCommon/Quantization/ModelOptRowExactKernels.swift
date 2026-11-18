@@ -1,4 +1,27 @@
+import Foundation
 import MLX
+
+/// The row-exact kernel pipelines a task dispatches, for tests. MLX compiles a
+/// custom kernel once for each set of template values, at its first dispatch;
+/// each recorded key is one such set (kernel name and template values).
+/// Nothing is recorded unless the task binds `log`.
+enum ModelOptRowExactPipelines {
+    final class Log: @unchecked Sendable {
+        private let lock = NSLock()
+        private var keys = Set<String>()
+
+        var recorded: Set<String> { lock.withLock { keys } }
+
+        fileprivate func insert(_ key: String) { _ = lock.withLock { keys.insert(key) } }
+    }
+
+    @TaskLocal static var log: Log?
+
+    static func record(_ kernel: String, _ template: [(String, any KernelTemplateArg)]) {
+        guard let log else { return }
+        log.insert(kernel + template.map { " \($0.0)=\($0.1)" }.joined())
+    }
+}
 
 /// Row-exact matrix-vector products for 1 to 16 rows. Every row of the result
 /// is bit-identical to MLX's single-vector product (`GEMVKernel::run`,
@@ -247,16 +270,18 @@ public enum ModelOptRowExact {
         }
         let groups = (outputs + bm * tm - 1) / (bm * tm)
         let unit = MLXArray([Float(1)])
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("TM", tm), ("K", inputs),
+            ("N", outputs), ("V", count), ("FP8", mat.dtype == .uint8),
+            ("ACT", activation != nil),
+        ]
+        ModelOptRowExactPipelines.record("modelopt_row_exact_gemv", template)
         return kernel(
             [
                 mat, scale ?? unit, vectors, activation?.multipliers ?? unit,
                 activation?.overflowBound ?? unit,
             ],
-            template: [
-                ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("TM", tm), ("K", inputs),
-                ("N", outputs), ("V", count), ("FP8", mat.dtype == .uint8),
-                ("ACT", activation != nil),
-            ],
+            template: template,
             grid: (groups * 32, bn, bm), threadGroup: (32, bn, bm),
             outputShapes: [[count, outputs]], outputDTypes: [vectors.dtype])[0]
     }

@@ -278,6 +278,48 @@ extension KernelTests {
                     == weightOnlyNVFP4RowWords(fixture.product(x)))
         }
 
+        @Test func gpuGenerationIsParsedFromTheArchitectureName() {
+            let parse = ModelOptWeightOnlyNVFP4RowExact.gpuGeneration
+            #expect(parse("applegpu_g15d") == 15)
+            #expect(parse("applegpu_g17s") == 17)
+            #expect(parse("applegpu_g13p") == 13)
+            #expect(parse("applegpu_g15") == nil)
+            #expect(parse("applegpu_g1x5d") == nil)
+            #expect(parse("applegpu_gd") == nil)
+            #expect(parse("Apple M3 Ultra") == nil)
+            #expect(parse("Unknown") == nil)
+            #expect(parse("") == nil)
+        }
+
+        /// The kernel choice follows the Metal device's own architecture name,
+        /// whatever `MLX_METAL_GPU_ARCH` says.
+        @Test func kernelChoiceFollowsTheMetalDeviceOnly() {
+            let device = ModelOptWeightOnlyNVFP4RowExact.gpuGeneration(
+                architecture: GPU.deviceInfo().architecture)
+            #expect(ModelOptWeightOnlyNVFP4RowExact.deviceGeneration == device)
+            #expect(
+                ModelOptWeightOnlyNVFP4RowExact.scalarKernelMeasured
+                    == (device.map {
+                        ModelOptWeightOnlyNVFP4RowExact.scalarKernelGenerations.contains($0)
+                    } ?? false))
+            // The scalar kernel takes one row by default only where it is
+            // equal and faster: generation 15, not the M5's 17.
+            #expect(
+                ModelOptWeightOnlyNVFP4RowExact.defaultScalarRows == (device == 15 ? 1 : 0))
+            #expect(
+                ModelOptWeightOnlyNVFP4RowExact.scalarKernelDefaultGenerations.isSubset(
+                    of: ModelOptWeightOnlyNVFP4RowExact.scalarKernelGenerations))
+            if let forced = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"],
+                let generation = ModelOptWeightOnlyNVFP4RowExact.gpuGeneration(
+                    architecture: forced),
+                generation != device
+            {
+                print(
+                    "ROWEXACT device generation \(device.map(String.init) ?? "-"), ignored \(forced)"
+                )
+            }
+        }
+
         @Test func supportedCalls() {
             let supports = ModelOptWeightOnlyNVFP4RowExact.supports
             #expect(supports(1, 6656, .bfloat16))
