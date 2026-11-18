@@ -158,6 +158,42 @@ public final class MuseGlimmerDFlashDraftModel: Module {
         return (concatenated(keys, axis: 0), concatenated(values, axis: 0))
     }
 
+    /// `contextKeyValues` for several runs of projected rows at once: one
+    /// key and one value projection per layer over all of `context`, then
+    /// `k_norm` and RoPE per segment at its own first position. Segment `i`
+    /// covers `context` rows `segments[i].rows`; the result is in segment
+    /// order.
+    public func contextKeyValues(
+        _ context: MLXArray, segments: [(rows: Range<Int>, position: Int)]
+    ) -> [(keys: MLXArray, values: MLXArray)] {
+        let c = configuration
+        precondition(
+            context.ndim == 2 && context.dim(1) == c.hiddenSize && !segments.isEmpty
+                && segments.allSatisfy { !$0.rows.isEmpty && $0.rows.upperBound <= context.dim(0) },
+            "DFlash projected context segments must be rows of [rows, hiddenSize]")
+        if segments.count == 1, segments[0].rows == 0 ..< context.dim(0) {
+            return [contextKeyValues(context, at: segments[0].position)]
+        }
+        var keys = [[MLXArray]](repeating: [], count: segments.count)
+        var values = [[MLXArray]](repeating: [], count: segments.count)
+        for layer in layers {
+            let attention = layer.attention
+            let projectedKeys = attention.kProj(context)
+            let projectedValues = attention.vProj(context)
+            for (index, segment) in segments.enumerated() {
+                let shape = [1, segment.rows.count, c.kvHeads, c.headDimensions]
+                let key = attention.kNorm(
+                    projectedKeys[segment.rows, 0...].reshaped(shape).transposed(0, 2, 1, 3))
+                keys[index].append(rope(key, at: segment.position))
+                values[index].append(
+                    projectedValues[segment.rows, 0...].reshaped(shape).transposed(0, 2, 1, 3))
+            }
+        }
+        return (0 ..< segments.count).map {
+            (concatenated(keys[$0], axis: 0), concatenated(values[$0], axis: 0))
+        }
+    }
+
     /// One block forward.
     /// - Parameters:
     ///   - embeddings: `[blockSize, hiddenSize]`, the target's raw embeddings
@@ -207,6 +243,70 @@ public final class MuseGlimmerDFlashDraftModel: Module {
             hidden = hidden + layer.mlp(layer.postAttentionNorm(hidden))
         }
         return norm(hidden).reshaped([block, c.hiddenSize])
+    }
+
+    /// `blockForward` for several blocks in one pass. Every projection, norm
+    /// and MLP runs over all blocks' rows, so each weight is read once per
+    /// layer; RoPE and attention stay per block, at its own anchor over its
+    /// own context and mask. Block `i` of the result is
+    /// `blockForward(embeddings[i], at: positions[i], context: contexts[i],
+    /// mask: masks[i])` up to the projections' accumulation order. One block
+    /// is exactly `blockForward`.
+    public func blockForwards(
+        embeddings: [MLXArray], at positions: [Int],
+        contexts: [(keys: MLXArray, values: MLXArray)?], masks: [MLXArray?]
+    ) -> [MLXArray] {
+        let c = configuration
+        let n = embeddings.count
+        precondition(
+            n > 0 && positions.count == n && contexts.count == n && masks.count == n
+                && embeddings.allSatisfy { $0.shape == [c.blockSize, c.hiddenSize] },
+            "DFlash blocks must be [blockSize, hiddenSize] with one anchor, context and mask each")
+        if n == 1 {
+            return [
+                blockForward(
+                    embeddings: embeddings[0], at: positions[0], context: contexts[0],
+                    mask: masks[0])
+            ]
+        }
+        let block = c.blockSize
+        var hidden = activation(
+            concatenated(embeddings.map { $0.reshaped([1, block, c.hiddenSize]) }, axis: 0))
+        for (index, layer) in layers.enumerated() {
+            let attention = layer.attention
+            let x = layer.inputNorm(hidden)
+            let queries = attention.qNorm(
+                attention.qProj(x).reshaped([n, block, c.attentionHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3))
+            let blockKeys = attention.kNorm(
+                attention.kProj(x).reshaped([n, block, c.kvHeads, c.headDimensions])
+                    .transposed(0, 2, 1, 3))
+            let blockValues = attention.vProj(x).reshaped([n, block, c.kvHeads, c.headDimensions])
+                .transposed(0, 2, 1, 3)
+            var attended: [MLXArray] = []
+            attended.reserveCapacity(n)
+            for row in 0 ..< n {
+                let rows = row ..< (row + 1)
+                var keys = rope(blockKeys[rows], at: positions[row])
+                var values = blockValues[rows]
+                if let context = contexts[row] {
+                    keys = concatenated([context.keys[index ..< index + 1], keys], axis: 2)
+                    values = concatenated([context.values[index ..< index + 1], values], axis: 2)
+                }
+                attended.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: rope(queries[rows], at: positions[row]), keys: keys,
+                        values: values, scale: scale, mask: masks[row]))
+            }
+            hidden =
+                hidden
+                + attention.oProj(
+                    concatenated(attended, axis: 0).transposed(0, 2, 1, 3).reshaped(
+                        [n, block, c.attentionHeads * c.headDimensions]))
+            hidden = hidden + layer.mlp(layer.postAttentionNorm(hidden))
+        }
+        let normed = norm(hidden)
+        return (0 ..< n).map { normed[$0].reshaped([block, c.hiddenSize]) }
     }
 
     /// Block embeddings `[blockSize, hiddenSize]` from the anchor row and the

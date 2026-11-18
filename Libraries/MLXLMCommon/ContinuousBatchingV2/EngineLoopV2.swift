@@ -189,6 +189,16 @@ public protocol CBv2StepSampler: AnyObject {
         params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> (tokens: MLXArray, accept: MLXArray)?
 
+    /// Coupled draft proposals for draft logits `[B, 1, vocab]`, row r for
+    /// output index `stepBases[r]`: the keyed race `mtpVerifySample` runs at
+    /// that index (same transforms, same noise) over the draft's row. Same
+    /// eligibility and purity as `mtpVerifySample`. Lazy `[B, 1]` int32, or
+    /// nil when unsupported (the drafter then keeps its own proposals).
+    func mtpCoupledDraftProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray?
+
     /// An MTP round confirmed tokens for `requestIDs` OUTSIDE `sample`
     /// (verify rows never pass through it). Stateful samplers must drop the
     /// affected row configuration so the next `sample` reconfigures from
@@ -219,6 +229,10 @@ extension CBv2StepSampler {
         logits: MLXArray, draftIDs: MLXArray, delta: Float,
         params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> (tokens: MLXArray, accept: MLXArray)? { nil }
+    public func mtpCoupledDraftProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? { nil }
     public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
 }
 

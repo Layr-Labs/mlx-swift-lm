@@ -14,5 +14,13 @@ extension MuseGlimmerTextModel: MuseGlimmerDFlashTarget {
         rawTokenEmbeddings(tokens)
     }
     public func dflashHeadProduct(_ hidden: MLXArray) -> MLXArray { headProduct(hidden) }
+    /// `output_multiplier`, then the tanh softcap: the two steps
+    /// `outputLogits` applies after the head product.
+    public func dflashReadout(_ headProduct: MLXArray) -> MLXArray {
+        var logits = headProduct * configuration.outputMultiplier
+        let cap = configuration.finalLogitSoftcapping
+        if cap > 0 { logits = tanh(logits / cap) * cap }
+        return logits
+    }
     public var dflashVerifiesWindowsExactly: Bool { verifiesWindowsExactly }
 }

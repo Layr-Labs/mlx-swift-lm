@@ -198,4 +198,91 @@ extension MuseGlimmerDFlashDraftModel {
             embeddings: embeddings, at: state.nextPosition,
             context: visible.map { ($0.keys, $0.values) }, mask: visible?.mask)
     }
+
+    /// `draftBlock` for several states in one forward (`blockForwards`): one
+    /// block per state, each anchored at that state's `nextPosition`. No
+    /// state is changed.
+    public func draftBlocks(
+        embeddings: [MLXArray], states: [MuseGlimmerDFlashContextState]
+    ) -> [MLXArray] {
+        precondition(
+            embeddings.count == states.count, "DFlash blocks need one state per block")
+        let visible = states.map { $0.visibleContext() }
+        return blockForwards(
+            embeddings: embeddings, at: states.map(\.nextPosition),
+            contexts: visible.map { $0.map { ($0.keys, $0.values) } },
+            masks: visible.map { $0?.mask })
+    }
+
+    /// One commit's rows for one state: features `[rows, contextWidth]` for
+    /// the positions from `position`, or from the state's next position
+    /// (after the earlier entries for that state) when nil.
+    public struct ContextCommit {
+        public let features: MLXArray
+        public let position: Int?
+        public let state: MuseGlimmerDFlashContextState
+
+        public init(features: MLXArray, at position: Int?, to state: MuseGlimmerDFlashContextState)
+        {
+            self.features = features
+            self.position = position
+            self.state = state
+        }
+    }
+
+    /// `commit(features:at:to:)` for each entry in order, with one context
+    /// projection and one key / value projection per layer for all of them.
+    ///
+    /// Each state ends with the rows, positions and restarts the calls one
+    /// by one give; only the projections' accumulation order may differ.
+    /// Norms and rotations run per entry at its own positions. Nothing is
+    /// evaluated here.
+    public func commit(_ commits: [ContextCommit]) {
+        // Plan against each state's next position as the earlier entries
+        // leave it; nothing is written until the projections exist.
+        struct Planned {
+            let state: MuseGlimmerDFlashContextState
+            let rows: Range<Int>
+            let keyPosition: Int
+            let restart: Int?
+            let skipping: Int
+        }
+        var next: [ObjectIdentifier: Int] = [:]
+        var planned: [Planned] = []
+        var used: [MLXArray] = []
+        var total = 0
+        for entry in commits {
+            let features = entry.features
+            precondition(
+                features.ndim == 2 && features.dim(1) == configuration.contextWidth,
+                "DFlash context features must be [rows, contextWidth]")
+            let id = ObjectIdentifier(entry.state)
+            let held = next[id] ?? entry.state.nextPosition
+            let position = entry.position ?? held
+            precondition(position >= 0, "DFlash context position must not be negative")
+            let rows = features.dim(0)
+            let duplicates = max(0, held - position)
+            guard rows > duplicates else { continue }
+            let restart = position > held ? position : nil
+            let start = restart ?? held
+            let fresh = rows - duplicates
+            let unread = max(0, fresh - entry.state.window)
+            used.append(features[(duplicates + unread)..., 0...])
+            planned.append(
+                Planned(
+                    state: entry.state, rows: total ..< (total + fresh - unread),
+                    keyPosition: start + unread, restart: restart, skipping: unread))
+            total += fresh - unread
+            next[id] = start + fresh
+        }
+        guard !planned.isEmpty else { return }
+        let context = projectContext(used.count == 1 ? used[0] : concatenated(used, axis: 0))
+        let projected = contextKeyValues(
+            context, segments: planned.map { ($0.rows, $0.keyPosition) })
+        for (entry, keyValues) in zip(planned, projected) {
+            if let restart = entry.restart { entry.state.restart(at: restart) }
+            entry.state.append(
+                keys: keyValues.keys, values: keyValues.values, skipping: entry.skipping)
+        }
+    }
 }
