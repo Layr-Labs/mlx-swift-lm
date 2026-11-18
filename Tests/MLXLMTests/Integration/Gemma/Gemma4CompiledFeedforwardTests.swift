@@ -79,7 +79,7 @@ struct Gemma4CompiledFeedforwardTests {
         let layer = try layer()
         #expect(layer.feedforwardCompilationState() != nil)
         let names = layer.parameters().flattened().map(\.0).sorted()
-        for rows in [1, 2, 4, 7, 8, 4, 2, 1] {
+        for rows in [1, 2, 4, 7, 8, 12, 16, 8, 4, 2, 1] {
             compare(layer, input(rows: rows))
         }
         let experts = try #require(layer.modules().compactMap { $0 as? SwitchGLU }.first)
@@ -103,8 +103,8 @@ struct Gemma4CompiledFeedforwardTests {
             ]))
         // All expert scores tie. Keep argPartition's selected order and
         // the subsequent weighted reduction exactly as the eager graph.
-        for rows in [1, 2, 4, 7] { compare(layer, input(rows: rows)) }
-        for rows in [1, 2, 3] { compare(layer, input(rows: rows, sequenceWidth: 2)) }
+        for rows in [1, 2, 4, 7, 8, 16] { compare(layer, input(rows: rows)) }
+        for rows in [1, 2, 3, 4, 8] { compare(layer, input(rows: rows, sequenceWidth: 2)) }
         #expect(layer.parameters().flattened().map(\.0).sorted() == names)
     }
 
@@ -117,7 +117,8 @@ struct Gemma4CompiledFeedforwardTests {
         print("[Gemma4 FFN sequence2] requested=\(requested ?? "unset") enabled=\(enabled)")
         for (rows, width, eligible) in [
             (1, 1, true), (1, 2, true), (2, 2, true), (3, 2, true),
-            (4, 2, false), (1, 3, false), (8, 1, false),
+            (4, 2, true), (8, 2, true), (8, 1, true), (16, 1, true),
+            (1, 3, false), (9, 2, false), (17, 1, false),
         ] {
             layer.invalidateCompiledTraces()
             let x = input(rows: rows, sequenceWidth: width)
@@ -129,7 +130,7 @@ struct Gemma4CompiledFeedforwardTests {
         }
         // Reuse shape-specialized traces across ordinary decode and the
         // original two-column verification layout, without flattening/padding.
-        for (rows, width) in [(1, 2), (2, 2), (3, 2), (1, 1), (1, 2)] {
+        for (rows, width) in [(1, 2), (2, 2), (4, 2), (8, 1), (3, 2), (1, 1), (16, 1), (1, 2)] {
             compare(layer, input(rows: rows, sequenceWidth: width))
         }
         layer.invalidateCompiledTraces()
@@ -154,7 +155,8 @@ struct Gemma4CompiledFeedforwardTests {
         print("[Gemma4 FFN lattice] requested=\(requested ?? "unset") enabled=\(enabled)")
         for (rows, width, eligible) in [
             (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
-            (8, 1, false), (4, 2, false),
+            (8, 1, true), (4, 2, true), (12, 1, true), (16, 1, true), (8, 2, true),
+            (17, 1, false), (9, 2, false),
         ] {
             layer.invalidateCompiledTraces()
             let x = input(rows: rows, sequenceWidth: width)
@@ -167,6 +169,43 @@ struct Gemma4CompiledFeedforwardTests {
         layer.invalidateCompiledTraces()
         compare(layer, input(rows: 2, sequenceWidth: 2), prefill: true)
         #expect(!layer.feedforwardTraceIsCompiled)
+    }
+
+    /// 8 to 16 rows sort their expert assignments. The switch off, or a scoped
+    /// batch-decode frame, keeps those rows on the eager graph with the same bytes.
+    @Test func sortedRowsFollowTheirSwitchAndScopes() throws {
+        let layer = try layer(expertGroupSize: 32)
+        defer { Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = nil }
+        #expect(Gemma4CompiledFeedforwardCache.sortedEnabled(nil))
+        for raw in ["1", "true", "YES", "on"] {
+            #expect(Gemma4CompiledFeedforwardCache.sortedEnabled(raw))
+        }
+        for raw in ["0", "false", "no", "off", ""] {
+            #expect(!Gemma4CompiledFeedforwardCache.sortedEnabled(raw))
+        }
+        let enabled = MLXHardwareInfo.isCompiledDecodeSupported
+            && (ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD"]
+                .map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
+        for sorted in [false, true] {
+            Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = sorted
+            for (rows, width) in [(8, 1), (4, 2), (16, 1)] {
+                layer.invalidateCompiledTraces()
+                compare(layer, input(rows: rows, sequenceWidth: width))
+                #expect(layer.feedforwardTraceIsCompiled == (sorted && enabled))
+            }
+            layer.invalidateCompiledTraces()
+            compare(layer, input(rows: 7))
+            #expect(layer.feedforwardTraceIsCompiled == enabled)
+        }
+        Gemma4CompiledFeedforwardCache.sortedOverrideForTesting = true
+        for scoped in [false, true] {
+            layer.invalidateCompiledTraces()
+            let x = input(rows: 8)
+            Gemma4BatchDecodeProjection.$active.withValue(scoped) {
+                compare(layer, x)
+            }
+            #expect(layer.feedforwardTraceIsCompiled == (!scoped && enabled))
+        }
     }
 
     @Test func parameterUpdatesAndModuleReplacementsRemainLive() throws {
@@ -212,7 +251,8 @@ struct Gemma4CompiledFeedforwardTests {
 
     @Test func unsupportedInputsAndTrainingKeepEagerExecution() throws {
         let layer = try layer()
-        compare(layer, input(rows: 8))
+        compare(layer, input(rows: 17))
+        compare(layer, input(rows: 8, dtype: .float32))
         compare(layer, input(rows: 2, dtype: .float32))
         compare(layer, input(rows: 2, dtype: .float16))
         compare(layer, input(rows: 2), prefill: true)

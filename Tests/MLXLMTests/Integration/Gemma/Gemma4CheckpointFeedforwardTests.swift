@@ -172,10 +172,12 @@ struct Gemma4CheckpointFeedforwardTests {
             let layer = try loadLayer(
                 directory: directory, configuration: configuration, index: index,
                 weightMap: weightMap, quantization: quantization)
-            // Include actual concurrent ordinary-decode widths below the routing sort boundary.
+            // Ordinary-decode and verification widths on both sides of the routing sort
+            // boundary (64 assignments), up to the 16-row limit.
             for (batch, width, compiled) in [
-                (1, 1, true), (2, 1, true), (4, 1, true), (7, 1, true),
-                (1, 2, true), (3, 2, true), (4, 2, false),
+                (1, 1, true), (2, 1, true), (4, 1, true), (7, 1, true), (8, 1, true),
+                (16, 1, true), (1, 2, true), (3, 2, true), (4, 2, true), (8, 2, true),
+                (9, 2, false),
             ] {
                 for amplitude: Float in [0, 0.25, 4] {
                     let input =
@@ -208,7 +210,7 @@ struct Gemma4CheckpointFeedforwardTests {
             }
             // Discard this local perturbed layer; checkpoint files are unchanged.
             print(
-                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=23 native-byte checks completed")
+                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=35 native-byte checks completed")
         }
     }
 }
