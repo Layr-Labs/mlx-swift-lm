@@ -41,16 +41,11 @@ extension KernelTests {
         }
 
         @Test func declaresDecodeLimitsThroughTheSteppableAdapter() throws {
-            Qwen35DecodeCommandBuffers.overrideForTesting = nil
-            let expected =
-                Qwen35DecodeCommandBuffers.enabled(
-                    ProcessInfo.processInfo.environment[Qwen35DecodeCommandBuffers.environmentKey])
-                ? Qwen35DecodeCommandBuffers.limits : nil
+            defer { Qwen35DecodeCommandBuffers.overrideForTesting = nil }
+            Qwen35DecodeCommandBuffers.overrideForTesting = true
             for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
                 let adapter = CBv2SteppableLanguageModelAdapter(model)
-                #expect(
-                    expected != nil, "run without \(Qwen35DecodeCommandBuffers.environmentKey)=0")
-                #expect(adapter.decodeCommandBufferLimits == expected)
+                #expect(adapter.decodeCommandBufferLimits == Qwen35DecodeCommandBuffers.limits)
                 // MTP rounds and prefill chunks keep MLX's defaults.
                 #expect(adapter.speculativeCommandBufferLimits == nil)
             }
@@ -100,8 +95,9 @@ extension KernelTests {
             return steps
         }
 
-        /// The decode limits against a commit after every operation (the most a
-        /// partitioning can split a step): the same bytes at every step.
+        /// The decode limits against a commit every two kernel dispatches (the finest
+        /// split MLX allows: it commits once a buffer holds more than `operations`
+        /// dispatches): the same bytes at every step.
         @Test func decodeLimitsKeepExactBytes() throws {
             let everyOperation = GPU.CommandBufferLimits(operations: 1, megabytes: 1)
             for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
