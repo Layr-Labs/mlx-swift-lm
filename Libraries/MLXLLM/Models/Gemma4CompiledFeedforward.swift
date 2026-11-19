@@ -47,6 +47,36 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
+    /// Steps whose top-K assignments reach 64 (at top-8: 8 to 16 decode rows,
+    /// or 4 to 8 verification rows of two tokens) take the sorted expert path;
+    /// they compile unless `DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED` is set
+    /// to something other than 1, true, yes or on.
+    static let sortedEnabled = sortedEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED"])
+
+    static func sortedEnabled(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+
+    /// Tests only: replaces the environment's choice for sorted rows (nil: the
+    /// environment's) in the calling task.
+    @TaskLocal static var sortedOverrideForTesting: Bool?
+
+    /// Whether `[rows, width]` decode or verification input may take the trace.
+    /// Up to 7 rows below 64 assignments keep the unsorted expert path. Up to 16
+    /// tokens at 64 or more assignments sort them inside the trace exactly as
+    /// the eager graph does (16 covers c = 8 verification and c = 16 decode).
+    /// A scoped batch-decode or prompt projection keeps those sorted sizes eager.
+    static func admitsShape(rows: Int, width: Int, topK: Int) -> Bool {
+        guard topK > 0, (1 ... 2).contains(width), rows >= 1 else { return false }
+        let assignments = rows * width * topK
+        if rows <= 7 && assignments < 64 { return true }
+        return (sortedOverrideForTesting ?? sortedEnabled)
+            && assignments >= 64 && rows * width <= 16
+            && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
+    }
+
     var isCompiled: Bool { lock.withLock { entry != nil } }
 
     func invalidate() {
@@ -72,10 +102,9 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
         }
         let canCompile =
             Device.defaultDevice().deviceType == .gpu
-            && !isExpertPrefill && input.ndim == 3 && (1 ... 2).contains(input.dim(1))
-            && (1 ... 7).contains(input.dim(0)) && input.dtype == .bfloat16
+            && !isExpertPrefill && input.ndim == 3 && input.dtype == .bfloat16
             && input.dim(2) == owner.config.hiddenSize
-            && state.topK > 0 && input.dim(0) * input.dim(1) * state.topK < 64
+            && Self.admitsShape(rows: input.dim(0), width: input.dim(1), topK: state.topK)
             // Preserve existing per-invocation component receipts.
             && !CBv2ForwardShapeObservation.isActive
 

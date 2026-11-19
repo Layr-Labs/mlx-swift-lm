@@ -15,6 +15,18 @@ import Testing
     .enabled(if: ProcessInfo.processInfo.environment["GEMMA4_FFN_CHECKPOINT_DIR"] != nil))
 struct Gemma4CheckpointFeedforwardTests {
     private static let environment = ProcessInfo.processInfo.environment
+
+    /// The checkpoint's expert-bank group sizes, for the run's receipt line.
+    private static func expertGroupSizes(_ quantization: [String: Any]) -> [Int] {
+        let perPath = quantization.compactMap { key, value -> Int? in
+            guard key.contains(".experts."), let policy = value as? [String: Any] else {
+                return nil
+            }
+            return policy["group_size"] as? Int
+        }
+        let sizes = perPath.isEmpty ? [quantization["group_size"] as? Int ?? 0] : perPath
+        return Set(sizes).sorted()
+    }
     private static let projections = [
         "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "router.proj",
         "experts.switch_glu.gate_proj", "experts.switch_glu.up_proj",
@@ -55,7 +67,9 @@ struct Gemma4CheckpointFeedforwardTests {
             let bits = expert ? 4 : 8
             let policy = quantization[prefix + path] as? [String: Any] ?? quantization
             try #require(policy["bits"] as? Int == bits)
-            try #require(policy["group_size"] as? Int == 64)
+            let groupSize = try #require(policy["group_size"] as? Int)
+            // Expert banks: 64, or the QAT lattice's 32 (the QAT-lattice build).
+            try #require(groupSize == 64 || (expert && groupSize == 32))
             try #require((policy["mode"] as? String ?? "affine") == "affine")
             let weight = try #require(weights[path + ".weight"])
             let scales = try #require(weights[path + ".scales"])
@@ -69,7 +83,9 @@ struct Gemma4CheckpointFeedforwardTests {
             let expected = expert ? [128, output, input * bits / 32] : [output, input * bits / 32]
             try #require(weight.shape == expected)
             try #require(
-                scales.shape == (expert ? [128, output, input / 64] : [output, input / 64]))
+                scales.shape
+                    == (expert
+                        ? [128, output, input / groupSize] : [output, input / groupSize]))
             try #require(biases.shape == scales.shape)
             if expert {
                 children.append(
@@ -77,14 +93,16 @@ struct Gemma4CheckpointFeedforwardTests {
                         path,
                         try QuantizedSwitchLinear(
                             inputDims: input, outputDims: output, numExperts: 128,
-                            weight: weight, scales: scales, biases: biases, groupSize: 64, bits: 4)
+                            weight: weight, scales: scales, biases: biases, groupSize: groupSize,
+                            bits: 4)
                     ))
             } else {
                 children.append(
                     (
                         path,
                         QuantizedLinear(
-                            weight: weight, scales: scales, biases: biases, groupSize: 64, bits: 8)
+                            weight: weight, scales: scales, biases: biases, groupSize: groupSize,
+                            bits: 8)
                     ))
             }
         }
@@ -166,16 +184,18 @@ struct Gemma4CheckpointFeedforwardTests {
             SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         }
         print(
-            "GEMMA4_FFN_CHECKPOINT config=\(hash(configData)) index=\(hash(indexData)) layers=\(layers) compiled=\(flag)"
+            "GEMMA4_FFN_CHECKPOINT config=\(hash(configData)) index=\(hash(indexData)) layers=\(layers) compiled=\(flag) sorted=\(Gemma4CompiledFeedforwardCache.sortedEnabled) expertGroups=\(Self.expertGroupSizes(quantization))"
         )
         for index in layers {
             let layer = try loadLayer(
                 directory: directory, configuration: configuration, index: index,
                 weightMap: weightMap, quantization: quantization)
-            // Include actual concurrent ordinary-decode widths below the routing sort boundary.
+            // Ordinary-decode and verification widths on both sides of the routing sort
+            // boundary (64 assignments), up to the 16-row limit.
             for (batch, width, compiled) in [
-                (1, 1, true), (2, 1, true), (4, 1, true), (7, 1, true),
-                (1, 2, true), (3, 2, true), (4, 2, false),
+                (1, 1, true), (2, 1, true), (4, 1, true), (7, 1, true), (8, 1, true),
+                (16, 1, true), (1, 2, true), (3, 2, true), (4, 2, true), (8, 2, true),
+                (9, 2, false),
             ] {
                 for amplitude: Float in [0, 0.25, 4] {
                     let input =
@@ -184,7 +204,9 @@ struct Gemma4CheckpointFeedforwardTests {
                         * amplitude).asType(
                             .bfloat16)
                     compare(
-                        layer, input: input, shouldCompile: compiled,
+                        layer, input: input,
+                        shouldCompile: compiled
+                            && (batch * width < 8 || Gemma4CompiledFeedforwardCache.sortedEnabled),
                         label: "layer\(index) B\(batch) S\(width) amplitude\(amplitude)")
                 }
             }
@@ -195,20 +217,21 @@ struct Gemma4CheckpointFeedforwardTests {
             )
             let projection = try #require(
                 layer.namedModules().first { $0.0 == "router.proj" }?.1 as? QuantizedLinear)
-            for batch in [1, 3] {
-                let input = MLXRandom.normal([batch, 2, 2816], key: MLXRandom.key(12400)).asType(
-                    .bfloat16)
+            for (batch, width) in [(1, 2), (3, 2), (4, 2), (8, 1)] {
+                let input = MLXRandom.normal([batch, width, 2816], key: MLXRandom.key(12400))
+                    .asType(.bfloat16)
                 #expect(
-                    abs(projection(MLXArray.zeros([batch, 2, 2816], dtype: .bfloat16))).max().item(
-                        Float.self)
-                        == 0)
+                    abs(projection(MLXArray.zeros([batch, width, 2816], dtype: .bfloat16))).max()
+                        .item(Float.self) == 0)
                 compare(
-                    layer, input: input, shouldCompile: true,
-                    label: "layer\(index) tied router B\(batch) S2")
+                    layer, input: input,
+                    shouldCompile: batch * width < 8
+                        || Gemma4CompiledFeedforwardCache.sortedEnabled,
+                    label: "layer\(index) tied router B\(batch) S\(width)")
             }
             // Discard this local perturbed layer; checkpoint files are unchanged.
             print(
-                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=23 native-byte checks completed")
+                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=37 native-byte checks completed")
         }
     }
 }
