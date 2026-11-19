@@ -68,9 +68,15 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
     /// tokens at 64 or more assignments sort them inside the trace exactly as
     /// the eager graph does (16 covers c = 8 verification and c = 16 decode).
     /// A scoped batch-decode or prompt projection keeps those sorted sizes eager.
+    /// Width 3 (two-draft MTP verification) takes the trace only below 64
+    /// assignments, outside those scopes.
     static func admitsShape(rows: Int, width: Int, topK: Int) -> Bool {
-        guard topK > 0, (1 ... 2).contains(width), rows >= 1 else { return false }
+        guard topK > 0, (1 ... 3).contains(width), rows >= 1 else { return false }
         let assignments = rows * width * topK
+        if width == 3 {
+            return assignments < 64
+                && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
+        }
         if rows <= 7 && assignments < 64 { return true }
         return (sortedOverrideForTesting ?? sortedEnabled)
             && assignments >= 64 && rows * width <= 16
