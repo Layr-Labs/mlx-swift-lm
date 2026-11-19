@@ -254,13 +254,16 @@ struct CBv2NonSpeculatingRowCheckpointTests {
             let (on, onBackend) = try make(true)
             let served = try await cbv2ServeControlled(on, request)
             let drafted = on.mtpMetricsSnapshot()?.draftedTokens ?? 0
-            let accepted = on.mtpMetricsSnapshot()?.acceptedTokens ?? 0
             Self.released(on, onBackend)
             await on.shutdown()
             #expect(expected.tokens.count == 24)
             #expect(drafted > 0, "\(target) \(control) T=\(sampling.temperature): speculates")
-            // Committed draft positions exercise the draft-prefix counts.
-            #expect(accepted > 0, "\(target) \(control) T=\(sampling.temperature): accepts")
+            // The synthetic assistants' drafts are never accepted (measured on
+            // Mac A, all twelve cases): every committed token is a target draw at
+            // window column 0 after a rejection, so this pins the opt-in's gate,
+            // round plumbing and column-0 penalties on the production drafters.
+            // Accepted draft prefixes are covered by CBv2MTPPenaltyEngineTests
+            // (oracle drafts, accepted == drafted) and CBv2MTPPenaltyVerifyTests.
             #expect(
                 served.tokens == expected.tokens,
                 "\(target) \(control) T=\(sampling.temperature): on=\(served.tokens) off=\(expected.tokens)"
