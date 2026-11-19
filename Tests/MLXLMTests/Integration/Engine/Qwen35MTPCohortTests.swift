@@ -14,7 +14,8 @@ import Testing
 /// tokens it commits alone, with MTP off. That oracle relies on this tiny
 /// dense fixture's batched target arithmetic being row-invariant at two rows
 /// (the module promises distribution-exactness, not bit parity across batch
-/// shapes), so four rows pin only the gate, lengths and state release.
+/// shapes), so four rows pin the gate, a multi-row verify step, lengths and state
+/// release, not tokens.
 @Suite("Qwen3.5 inline MTP cohorts", .serialized, .tags(.integration))
 struct Qwen35MTPCohortTests {
     private func fixture() throws -> (Qwen35TextModel, Qwen35InlineMTPAssistant) {
@@ -195,8 +196,8 @@ struct Qwen35MTPCohortTests {
         #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
     }
 
-    @Test("the default limit of one keeps cohorts target-only with exact tokens")
-    func defaultLimitKeepsBatchGate() async throws {
+    @Test("a limit of one keeps cohorts target-only with exact tokens")
+    func limitOfOneKeepsBatchGate() async throws {
         let target = try fixture()
         // Independent of the runner's DARKBLOOM_QWEN_MTP_MAX_BATCH.
         target.1.speculativeBatchLimit = 1
@@ -212,6 +213,21 @@ struct Qwen35MTPCohortTests {
         #expect((metrics.skippedRows["batch_gate"] ?? 0) > 0)
     }
 
+    @Test(
+        "only plain rectangular verification of a standard assistant takes cohorts",
+        arguments: [
+            (.rectangular, true, 4),
+            (.rectangular, false, 1), (.rectangularExact, true, 1), (.serialTarget, true, 1),
+            (.automatic, true, 1),
+        ] as [(CBv2MTPVerificationMode, Bool, Int)])
+    func cohortScope(mode: CBv2MTPVerificationMode, allowsCohorts: Bool, expected: Int) {
+        #expect(
+            Qwen35InlineMTPAssistant.speculativeBatch(
+                mode: mode, allowsCohorts: allowsCohorts, limit: 4) == expected)
+    }
+
+    /// The `maximumSpeculativeBatch == 8` check (like the cohort tests) assumes
+    /// `DARKBLOOM_QWEN_MTP_SERIAL` is unset in the runner.
     @Test("the limit is clamped to 1...8")
     func limitIsClamped() throws {
         let target = try fixture()

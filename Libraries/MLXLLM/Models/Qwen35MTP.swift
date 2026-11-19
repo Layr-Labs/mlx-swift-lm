@@ -285,12 +285,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
     /// Decode rows that may speculate together in one round: each row drafts
     /// on its own history and one captured `[B, 1 + k]` verification scores
-    /// every row's window; the rows commit one common width (the shortest
-    /// accepted prefix, `commitsAcceptedPrefixPerRow` is false). The engine
-    /// reads it once, when it binds the assistant. Defaults to
-    /// `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8), else 1; values outside 1...8
-    /// are clamped. Only plain rectangular verification of a standard inline
-    /// assistant uses it (`maximumSpeculativeBatch`).
+    /// every row's window; the rows commit one common width (the smallest
+    /// accepted prefix plus its correction token across the rows,
+    /// `commitsAcceptedPrefixPerRow` is false). The engine reads it once, when
+    /// it binds the assistant. Defaults to `DARKBLOOM_QWEN_MTP_MAX_BATCH`
+    /// (1...8; an out-of-range environment value keeps 1); assigned values
+    /// outside 1...8 are clamped. Only plain rectangular verification of a
+    /// standard inline assistant uses it (`maximumSpeculativeBatch`).
     public var speculativeBatchLimit: Int = Qwen35InlineMTPAssistant
         .environmentSpeculativeBatchLimit
     {
@@ -1002,7 +1003,15 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// assistant: `rectangularExact` (canonical single-row columns) and the
     /// Prism 9B sidecar have no multi-row evidence and keep one row.
     public var maximumSpeculativeBatch: Int? {
-        installedVerificationMode == .rectangular && allowsCohorts ? speculativeBatchLimit : 1
+        Self.speculativeBatch(
+            mode: installedVerificationMode, allowsCohorts: allowsCohorts,
+            limit: speculativeBatchLimit)
+    }
+
+    static func speculativeBatch(
+        mode: CBv2MTPVerificationMode, allowsCohorts: Bool, limit: Int
+    ) -> Int {
+        mode == .rectangular && allowsCohorts ? limit : 1
     }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
