@@ -254,10 +254,13 @@ struct CBv2NonSpeculatingRowCheckpointTests {
             let (on, onBackend) = try make(true)
             let served = try await cbv2ServeControlled(on, request)
             let drafted = on.mtpMetricsSnapshot()?.draftedTokens ?? 0
+            let accepted = on.mtpMetricsSnapshot()?.acceptedTokens ?? 0
             Self.released(on, onBackend)
             await on.shutdown()
             #expect(expected.tokens.count == 24)
             #expect(drafted > 0, "\(target) \(control) T=\(sampling.temperature): speculates")
+            // Committed draft positions exercise the draft-prefix counts.
+            #expect(accepted > 0, "\(target) \(control) T=\(sampling.temperature): accepts")
             #expect(
                 served.tokens == expected.tokens,
                 "\(target) \(control) T=\(sampling.temperature): on=\(served.tokens) off=\(expected.tokens)"
