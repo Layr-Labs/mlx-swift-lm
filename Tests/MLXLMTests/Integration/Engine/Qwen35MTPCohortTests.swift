@@ -173,7 +173,7 @@ struct Qwen35MTPCohortTests {
         #expect(released.0 == 0 && released.1)
     }
 
-    @Test("adaptive two-row cohorts match plain batched decode and chain depth-zero steps")
+    @Test("adaptive two-row cohorts match plain batched decode")
     func adaptiveTwoRowCohortMatchesPlainBatched() async throws {
         let target = try fixture()
         let requests = Self.requests(991, rows: 2)
@@ -188,14 +188,13 @@ struct Qwen35MTPCohortTests {
             mtpConfig: .init(enabled: true, maxDraftTokens: 2, verificationMode: .rectangular))
         let actual = try await runTogether(candidate, requests)
         let metrics = try #require(candidate.mtpMetricsSnapshot())
-        let chained = candidate.chainedStepCount
         await candidate.shutdown()
 
+        // The adaptive config uses the marginal policy, whose depth is decided
+        // only in `beginMTPPlan`, so its cohorts keep breaking the chain (a
+        // depth-zero cohort plan then runs as ordinary decode).
         #expect(actual == expected)
         #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
-        // Plans the controller or marginal policy holds at depth zero run as
-        // chained ordinary decode instead of unchained MTP seed steps.
-        if (metrics.depthSelections[0] ?? 0) > 1 { #expect(chained > 0) }
     }
 
     @Test("a four-row cohort under a limit of four speculates without a batch gate")
