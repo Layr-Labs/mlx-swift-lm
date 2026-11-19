@@ -18,7 +18,7 @@ import Testing
 /// release, not tokens.
 @Suite("Qwen3.5 inline MTP cohorts", .serialized, .tags(.integration))
 struct Qwen35MTPCohortTests {
-    private func fixture() throws -> (Qwen35TextModel, Qwen35InlineMTPAssistant) {
+    private func fixture(experts: Int = 0) throws -> (Qwen35TextModel, Qwen35InlineMTPAssistant) {
         let json = Data(
             """
             {
@@ -32,7 +32,7 @@ struct Qwen35MTPCohortTests {
                 "linear_num_value_heads": 1, "linear_num_key_heads": 1,
                 "linear_key_head_dim": 64, "linear_value_head_dim": 64,
                 "linear_conv_kernel_dim": 4, "full_attention_interval": 2,
-                "vocab_size": 64, "num_experts": 0, "num_experts_per_tok": 0,
+                "vocab_size": 64, "num_experts": \(experts), "num_experts_per_tok": \(min(experts, 2)),
                 "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
                 "norm_topk_prob": true, "mtp_num_hidden_layers": 1
               }
@@ -269,31 +269,63 @@ struct Qwen35MTPCohortTests {
     }
 
     @Test(
-        "DARKBLOOM_QWEN_MTP_MAX_BATCH 1...8 wins, anything else keeps the default",
+        "DARKBLOOM_QWEN_MTP_MAX_BATCH 1...8 wins, unset keeps the default, anything else is one",
         arguments: [
-            (nil, 1), (nil, 2), ("", 2), ("1", 1), ("1", 2), ("2", 2), (" 4 ", 4), ("8", 8),
-            ("9", 2), ("0", 2), ("-2", 1), ("four", 2), ("2.5", 1),
-        ] as [(String?, Int)])
-    func environmentLimit(raw: String?, defaultLimit: Int) {
+            (nil, 1, 1), (nil, 2, 2), ("", 2, 2), ("1", 2, 1), ("1", 1, 1), ("2", 1, 2),
+            (" 4 ", 2, 4), ("8", 1, 8), ("9", 2, 1), ("0", 2, 1), ("off", 2, 1), ("-2", 2, 1),
+            ("four", 2, 1), ("2.5", 2, 1),
+        ] as [(String?, Int, Int)])
+    func environmentLimit(raw: String?, defaultLimit: Int, expected: Int) {
         let environment =
             raw.map { [Qwen35InlineMTPAssistant.speculativeBatchEnvironmentKey: $0] } ?? [:]
-        let parsed = raw.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-        let expected = parsed.map { (1 ... 8).contains($0) ? $0 : defaultLimit } ?? defaultLimit
         #expect(
             Qwen35InlineMTPAssistant.speculativeBatchLimit(
                 environment: environment, defaultLimit: defaultLimit) == expected)
     }
 
-    @Test("sparse targets default to cohorts of two, dense targets to one row")
+    @Test("the 35B-A3B MoE geometry defaults to cohorts of two, dense targets to one row")
     func defaultsBySparsity() throws {
         #expect(Qwen35InlineMTPAssistant.defaultSpeculativeBatchLimit(sparseTarget: true) == 2)
         #expect(Qwen35InlineMTPAssistant.defaultSpeculativeBatchLimit(sparseTarget: false) == 1)
-        // The tiny fixture is dense (no experts): one row unless the runner
-        // sets DARKBLOOM_QWEN_MTP_MAX_BATCH.
-        if ProcessInfo.processInfo.environment[
-            Qwen35InlineMTPAssistant.speculativeBatchEnvironmentKey] == nil
-        {
-            #expect(try fixture().1.speculativeBatchLimit == 1)
-        }
+        let dense = try fixture()
+        let sparse = try fixture(experts: 4)
+        #expect(!Qwen35InlineMTPAssistant.takesSparseDefault(dense.0.configuration))
+        #expect(Qwen35InlineMTPAssistant.takesSparseDefault(sparse.0.configuration))
+        // The loaded limits follow the runner's DARKBLOOM_QWEN_MTP_MAX_BATCH.
+        let environment = ProcessInfo.processInfo.environment
+        #expect(
+            dense.1.speculativeBatchLimit
+                == Qwen35InlineMTPAssistant.speculativeBatchLimit(
+                    environment: environment, defaultLimit: 1))
+        #expect(
+            sparse.1.speculativeBatchLimit
+                == Qwen35InlineMTPAssistant.speculativeBatchLimit(
+                    environment: environment, defaultLimit: 2))
+    }
+
+    /// A single decode row keeps the MTP seed path at depth zero even when a
+    /// non-speculating prompt row (stop strings) shares the plan.
+    @Test("one decode row beside a non-speculating prompt keeps the seed path")
+    func singleDecodeRowKeepsSeedPath() async throws {
+        let target = try fixture()
+        target.1.speculativeBatchLimit = 2
+        defer { target.1.speculativeBatchLimit = 1 }
+        let requests = [
+            CBv2Request(
+                id: .init(995), promptTokens: (1 ... 17).map { $0 },
+                sampling: .init(temperature: 0), maxTokens: 24),
+            CBv2Request(
+                id: .init(996), promptTokens: (3 ... 60).map { $0 % 60 + 1 },
+                sampling: .init(temperature: 0), maxTokens: 4, stopStrings: ["\u{1}"]),
+        ]
+        let plain = try engine(target, mtpConfig: .init(enabled: false))
+        let expected = try await runTogether(plain, requests)
+        await plain.shutdown()
+        let candidate = try engine(
+            target,
+            mtpConfig: .init(enabled: true, maxDraftTokens: 2, verificationMode: .rectangular))
+        let actual = try await runTogether(candidate, requests)
+        await candidate.shutdown()
+        #expect(actual == expected)
     }
 }

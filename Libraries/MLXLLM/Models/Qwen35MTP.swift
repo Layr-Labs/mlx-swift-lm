@@ -289,10 +289,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// accepted prefix plus its correction token across the rows,
     /// `commitsAcceptedPrefixPerRow` is false). The engine reads it once, when
     /// it binds the assistant. `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8; `1` is the
-    /// kill switch) wins; otherwise sparse (MoE) targets take
-    /// `sparseDefaultSpeculativeBatch` and dense targets one row, where the
-    /// measured cohort rounds did not beat plain batched decode. Assigned values
-    /// outside 1...8 are clamped. Only plain rectangular verification of a
+    /// kill switch, and any other set value also keeps one row) wins; unset,
+    /// the 35B-A3B geometry (experts, hidden 2,048) takes
+    /// `sparseDefaultSpeculativeBatch` and every other target one row.
+    /// Assigned values outside 1...8 are clamped. Only plain rectangular verification of a
     /// standard inline assistant uses it (`maximumSpeculativeBatch`).
     public var speculativeBatchLimit: Int = 1 {
         didSet { speculativeBatchLimit = min(max(speculativeBatchLimit, 1), 8) }
@@ -305,16 +305,23 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         sparseTarget ? sparseDefaultSpeculativeBatch : 1
     }
 
+    /// The measured MoE geometry (Qwen 3.5 / 3.6 35B-A3B): experts and a
+    /// 2,048-wide residual. Larger MoE targets keep one row until measured.
+    static func takesSparseDefault(_ configuration: Qwen35TextConfiguration) -> Bool {
+        configuration.numExperts > 0 && configuration.hiddenSize <= 2048
+    }
+
     /// `DARKBLOOM_QWEN_MTP_MAX_BATCH`: an integer 1...8 (trimmed) wins; unset
-    /// or any other value keeps `defaultLimit`.
+    /// (or empty) keeps `defaultLimit`; any other set value (`0`, `off`, a
+    /// typo) is one row, so a mistyped kill switch still turns cohorts off.
     static func speculativeBatchLimit(
         environment: [String: String], defaultLimit: Int
     ) -> Int {
         guard
             let raw = environment[speculativeBatchEnvironmentKey]?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            let value = Int(raw), (1 ... 8).contains(value)
+                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
         else { return defaultLimit }
+        guard let value = Int(raw), (1 ... 8).contains(value) else { return 1 }
         return value
     }
 
@@ -350,7 +357,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         speculativeBatchLimit = Self.speculativeBatchLimit(
             environment: ProcessInfo.processInfo.environment,
             defaultLimit: Self.defaultSpeculativeBatchLimit(
-                sparseTarget: target.model.layers.contains { $0.mlp is Qwen35SparseMoeBlock }))
+                sparseTarget: Self.takesSparseDefault(target.configuration)))
     }
 
     static func resolvedVerificationMode(

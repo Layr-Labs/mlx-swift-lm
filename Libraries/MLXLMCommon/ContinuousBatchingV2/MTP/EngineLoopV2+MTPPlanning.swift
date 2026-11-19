@@ -192,13 +192,15 @@ extension EngineLoopV2 {
         // takes ordinary-decode history keeps chaining while no row can
         // speculate; the chained launch captures hidden for finalize.
         if mtp.tracksPersistentHistory {
-            // A plan the controller sends to depth zero drafts nothing: keep
-            // it on chained ordinary decode (finalize feeds the history) unless
-            // the controller needs an unchained depth-zero cost probe.
-            // Single rows keep today's path (MTP seed steps at depth zero).
+            // A cohort the controller holds at depth zero drafts nothing: keep
+            // it on chained ordinary decode (finalize feeds the history). Not
+            // for single rows (today's seed path), the controller's unchained
+            // depth-zero cost probe, or a marginal-policy plan, whose depth is
+            // decided only in `beginMTPPlan` (a depth-zero plan there still
+            // runs as ordinary decode, `mtpPlanFeedsHistoryFromOrdinaryDecode`).
             let drafts =
                 canSpeculate
-                && (ids.count < 2 || decision.depth > 0
+                && (ids.count < 2 || decision.depth > 0 || mtp.usesMarginalPolicy
                     || mtp.requiresNonChainedDepthZeroProbe(decision))
             return drafts || !mtpFeedsHistoryFromOrdinaryDecode
         }
@@ -360,11 +362,12 @@ extension EngineLoopV2 {
     /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
     /// so persistent history starts at prompt position 0.
     private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
-        // A speculation-capable plan clamped to depth zero (controller,
-        // marginal policy, tail, budget or headroom) has no round either.
+        // A speculation-capable cohort plan (two or more decode rows) clamped to
+        // depth zero (controller, marginal policy, tail, budget or headroom)
+        // has no round either. Single decode rows keep the seed path.
         guard mtpFeedsHistoryFromOrdinaryDecode, let mtp,
             !mtp.planCanSpeculate
-                || (mtp.planDepth == 0 && plan.assignments.count > 1
+                || (mtp.planDepth == 0 && mtp.planDecision.decodeRowBucket >= 2
                     && !mtp.requiresNonChainedDepthZeroProbe(mtp.planDecision))
         else {
             return false
