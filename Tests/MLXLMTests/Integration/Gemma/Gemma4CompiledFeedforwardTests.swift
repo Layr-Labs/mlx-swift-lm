@@ -131,7 +131,8 @@ struct Gemma4CompiledFeedforwardTests {
         for (rows, width, eligible) in [
             (1, 1, true), (1, 2, true), (2, 2, true), (3, 2, true),
             (4, 2, true), (8, 2, true), (8, 1, true), (16, 1, true),
-            (1, 3, false), (9, 2, false), (17, 1, false),
+            (1, 3, true), (2, 3, true), (3, 3, false), (1, 4, false),
+            (9, 2, false), (17, 1, false),
         ] {
             layer.invalidateCompiledTraces()
             let x = input(rows: rows, sequenceWidth: width)
@@ -145,7 +146,9 @@ struct Gemma4CompiledFeedforwardTests {
         }
         // Reuse shape-specialized traces across ordinary decode and the
         // original two-column verification layout, without flattening/padding.
-        for (rows, width) in [(1, 2), (2, 2), (4, 2), (8, 1), (3, 2), (1, 1), (16, 1), (1, 2)] {
+        for (rows, width) in [
+            (1, 2), (2, 2), (1, 3), (4, 2), (8, 1), (2, 3), (3, 2), (1, 1), (16, 1), (1, 3), (1, 2),
+        ] {
             compare(layer, input(rows: rows, sequenceWidth: width))
         }
         layer.invalidateCompiledTraces()
@@ -171,6 +174,7 @@ struct Gemma4CompiledFeedforwardTests {
         for (rows, width, eligible) in [
             (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
             (8, 1, true), (4, 2, true), (12, 1, true), (16, 1, true), (8, 2, true),
+            (1, 3, true), (2, 3, true), (3, 3, false),
             (17, 1, false), (9, 2, false),
         ] {
             layer.invalidateCompiledTraces()
@@ -231,6 +235,40 @@ struct Gemma4CompiledFeedforwardTests {
                 compare(layer, x)
             }
         }
+    }
+
+    /// Two-draft verification rows ([1, 3], [2, 3]) take the trace with the eager
+    /// bytes, also with tied routing; a scoped prompt or batch-decode projection,
+    /// or the trace's switch, keeps them eager.
+    @Test func widthThreeVerificationCompilesWithTheSameBytes() throws {
+        let layer = try layer(expertGroupSize: 32)
+        let enabled = compiledEnabled
+        for rows in [1, 2] {
+            layer.invalidateCompiledTraces()
+            compare(layer, input(rows: rows, sequenceWidth: 3))
+            #expect(layer.feedforwardTraceIsCompiled == enabled)
+        }
+        for scope in [0, 1] {
+            layer.invalidateCompiledTraces()
+            let x = input(rows: 1, sequenceWidth: 3)
+            if scope == 0 {
+                Gemma4PrefillProjection.$active.withValue(true) { compare(layer, x) }
+            } else {
+                Gemma4BatchDecodeProjection.$active.withValue(true) { compare(layer, x) }
+            }
+            #expect(!layer.feedforwardTraceIsCompiled)
+        }
+        #expect(!Gemma4CompiledFeedforwardCache.admitsShape(rows: 3, width: 3, topK: 8))
+        #expect(Gemma4CompiledFeedforwardCache.admitsShape(rows: 2, width: 3, topK: 8))
+        let parameters = Dictionary(uniqueKeysWithValues: layer.parameters().flattened())
+        let scales = try #require(parameters["router.proj.scales"])
+        let biases = try #require(parameters["router.proj.biases"])
+        layer.update(
+            parameters: .unflattened([
+                "router.proj.scales": MLXArray.zeros(scales.shape, dtype: .bfloat16),
+                "router.proj.biases": MLXArray.zeros(biases.shape, dtype: .bfloat16),
+            ]))
+        for rows in [1, 2] { compare(layer, input(rows: rows, sequenceWidth: 3)) }
     }
 
     @Test func parameterUpdatesAndModuleReplacementsRemainLive() throws {

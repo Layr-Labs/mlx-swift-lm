@@ -424,10 +424,12 @@ def:
             Decode steps of 8 to 16 rows and verification of 4 to 8 rows of two tokens (sorted expert
             assignments) take the same trace outside scoped batch-decode frames
             (`DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED=0` keeps them eager); outputs keep their bits.
+            Two-draft verification rows of three tokens below 64 assignments take the trace too.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "changelog.d/gemma4-lattice-decode.md"
             - "changelog.d/gemma4-sorted-feedforward.md"
+            - "changelog.d/gemma4-width3-feedforward.md"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "Tests/MLXLMTests/Integration/Gemma/**"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
