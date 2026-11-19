@@ -265,6 +265,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let allowsShortlist: Bool
     private let maximumDraftDepth: Int
     private let minimumStateElementBytes: Int
+    private let allowsCohorts: Bool
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -282,18 +283,18 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         }
     }
 
-    /// Decode rows that may speculate together in one round (each row drafts
-    /// with its own history; one captured `[B, 1 + k]` verification scores
-    /// every row's window). Read by the engine once, when it binds the
-    /// assistant. Defaults to `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8), else 1.
+    /// Decode rows that may speculate together in one round: each row drafts
+    /// on its own history and one captured `[B, 1 + k]` verification scores
+    /// every row's window; the rows commit one common width (the shortest
+    /// accepted prefix, `commitsAcceptedPrefixPerRow` is false). The engine
+    /// reads it once, when it binds the assistant. Defaults to
+    /// `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8), else 1; values outside 1...8
+    /// are clamped. Only plain rectangular verification of a standard inline
+    /// assistant uses it (`maximumSpeculativeBatch`).
     public var speculativeBatchLimit: Int = Qwen35InlineMTPAssistant
         .environmentSpeculativeBatchLimit
     {
-        didSet {
-            precondition(
-                (1 ... 8).contains(speculativeBatchLimit),
-                "inline Qwen MTP speculative batch must be 1...8")
-        }
+        didSet { speculativeBatchLimit = min(max(speculativeBatchLimit, 1), 8) }
     }
 
     static let speculativeBatchEnvironmentKey = "DARKBLOOM_QWEN_MTP_MAX_BATCH"
@@ -326,7 +327,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         verificationMode: CBv2MTPVerificationMode?,
         allowsShortlist: Bool = true,
         maximumDraftDepth: Int = 4,
-        minimumStateElementBytes: Int = 0
+        minimumStateElementBytes: Int = 0,
+        allowsCohorts: Bool = true
     ) {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
@@ -334,6 +336,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         self.allowsShortlist = allowsShortlist
         self.maximumDraftDepth = maximumDraftDepth
         self.minimumStateElementBytes = minimumStateElementBytes
+        self.allowsCohorts = allowsCohorts
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -598,7 +601,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration, blockSize: metadata.blockSize,
             target: target, verificationMode: verificationMode, allowsShortlist: false,
-            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size)
+            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size,
+            allowsCohorts: false)
         if let quantization = metadata.quantization?.quantization {
             let matrixPaths = Set(
                 prism9BWeightShapes.compactMap { key, shape in
