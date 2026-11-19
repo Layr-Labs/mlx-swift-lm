@@ -258,6 +258,13 @@ struct Gemma4CompiledFeedforwardTests {
             }
             #expect(!layer.feedforwardTraceIsCompiled)
         }
+        // A scoped [1, 3] call after an unscoped trace of that shape keeps the
+        // scoped eager graph's bytes (compare runs both inside the scope).
+        layer.invalidateCompiledTraces()
+        let traced = input(rows: 1, sequenceWidth: 3)
+        compare(layer, traced)
+        #expect(layer.feedforwardTraceIsCompiled == enabled)
+        Gemma4PrefillProjection.$active.withValue(true) { compare(layer, traced) }
         #expect(!Gemma4CompiledFeedforwardCache.admitsShape(rows: 3, width: 3, topK: 8))
         #expect(Gemma4CompiledFeedforwardCache.admitsShape(rows: 2, width: 3, topK: 8))
         let parameters = Dictionary(uniqueKeysWithValues: layer.parameters().flattened())
