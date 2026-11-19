@@ -11,7 +11,10 @@ import Testing
 /// to `speculativeBatchLimit` rows speculate together. Each row drafts against
 /// its own assistant history and the cohort's rows are verified in one
 /// `[B, 1 + k]` window, so at temperature 0 every row must commit exactly the
-/// tokens it commits alone, with MTP off.
+/// tokens it commits alone, with MTP off. That oracle relies on this tiny
+/// dense fixture's batched target arithmetic being row-invariant at two rows
+/// (the module promises distribution-exactness, not bit parity across batch
+/// shapes), so four rows pin only the gate, lengths and state release.
 @Suite("Qwen3.5 inline MTP cohorts", .serialized, .tags(.integration))
 struct Qwen35MTPCohortTests {
     private func fixture() throws -> (Qwen35TextModel, Qwen35InlineMTPAssistant) {
@@ -157,6 +160,9 @@ struct Qwen35MTPCohortTests {
 
         #expect(actual == expected)
         #expect(metrics.rounds > 0 && metrics.draftedTokens > 0)
+        // `rounds` counts verified rows, `rectangularVerificationRounds` steps:
+        // more rows than steps means some step verified both rows.
+        #expect(metrics.rounds > metrics.rectangularVerificationRounds)
         #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
         #expect(released.0 == 0 && released.1)
     }
@@ -172,20 +178,28 @@ struct Qwen35MTPCohortTests {
         let candidate = try engine(target, mtpConfig: Self.mtpConfig)
         let actual = try await runTogether(candidate, requests)
         let metrics = try #require(candidate.mtpMetricsSnapshot())
+        let released = candidate.loopForTesting.onEngineQueueSync {
+            (
+                candidate.loopForTesting.mtp?.requestStateCountForTesting,
+                candidate.loopForTesting.recurrentStates.isEmpty
+            )
+        }
         await candidate.shutdown()
 
         // Four-row target arithmetic need not be row-invariant (plain B = 4
         // decode already differs from a row alone on the 27B), so only the
         // lengths and the gate are pinned here; B = 2 pins the tokens.
         #expect(actual.map(\.count) == expected.map(\.count))
-        #expect(metrics.rounds > 0)
+        #expect(metrics.rounds > metrics.rectangularVerificationRounds)
+        #expect(released.0 == 0 && released.1)
         #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
     }
 
     @Test("the default limit of one keeps cohorts target-only with exact tokens")
     func defaultLimitKeepsBatchGate() async throws {
         let target = try fixture()
-        #expect(target.1.speculativeBatchLimit == 1)
+        // Independent of the runner's DARKBLOOM_QWEN_MTP_MAX_BATCH.
+        target.1.speculativeBatchLimit = 1
         #expect(target.1.maximumSpeculativeBatch == 1)
         let requests = Self.requests(981, rows: 2)
         let expected = try await aloneReference(target, requests)
@@ -196,6 +210,16 @@ struct Qwen35MTPCohortTests {
 
         #expect(actual == expected)
         #expect((metrics.skippedRows["batch_gate"] ?? 0) > 0)
+    }
+
+    @Test("the limit is clamped to 1...8")
+    func limitIsClamped() throws {
+        let target = try fixture()
+        target.1.speculativeBatchLimit = 0
+        #expect(target.1.speculativeBatchLimit == 1)
+        target.1.speculativeBatchLimit = 12
+        #expect(target.1.speculativeBatchLimit == 8)
+        #expect(target.1.maximumSpeculativeBatch == 8)
     }
 
     @Test(
