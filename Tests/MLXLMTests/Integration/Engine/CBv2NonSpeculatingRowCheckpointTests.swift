@@ -27,7 +27,7 @@ struct CBv2NonSpeculatingRowCheckpointTests {
     private static func engine(
         _ adapter: any CBv2SteppableModel, kinds: [CBv2LayerKind], backend: PagedKVBackend,
         caches: [any CBv2AttendingLayerCache], store: Store?, drafter: any CBv2MTPDrafter,
-        verification: CBv2MTPVerificationMode
+        verification: CBv2MTPVerificationMode, mtp: Bool = true, penaltySpeculation: Bool = false
     ) -> (EngineV2, PagedKVBackend) {
         let engine = EngineV2(
             model: adapter, layerKinds: kinds, backend: backend,
@@ -36,16 +36,18 @@ struct CBv2NonSpeculatingRowCheckpointTests {
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                 prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: store != nil),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
-            mtpDrafter: drafter,
+            mtpDrafter: mtp ? drafter : nil,
             mtpConfig: .init(
-                enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
-                verificationMode: verification))
+                enabled: mtp, maxDraftTokens: 2, fixedDraftTokens: 2,
+                verificationMode: verification, penaltySpeculation: penaltySpeculation))
         #expect(engine.hybridPrefixCache == nil)
         #expect((engine.completeCheckpointCodec != nil) == (store != nil))
         return (engine, backend)
     }
 
-    private static func qwen35Engine(_ store: Store?) throws -> (EngineV2, PagedKVBackend) {
+    private static func qwen35Engine(
+        _ store: Store?, mtp: Bool = true, penaltySpeculation: Bool = false
+    ) throws -> (EngineV2, PagedKVBackend) {
         let json = Data(
             """
             {
@@ -111,10 +113,14 @@ struct CBv2NonSpeculatingRowCheckpointTests {
         return engine(
             adapter, kinds: kinds, backend: backend,
             caches: model.newCacheV2 { index, _ in storage[indices[index]!] }, store: store,
-            drafter: assistant, verification: .serialTarget)
+            drafter: assistant, verification: .serialTarget, mtp: mtp,
+            penaltySpeculation: penaltySpeculation)
     }
 
-    private static func qwen4Engine(_ store: Store?, verification: CBv2MTPVerificationMode) throws
+    private static func qwen4Engine(
+        _ store: Store?, verification: CBv2MTPVerificationMode, mtp: Bool = true,
+        penaltySpeculation: Bool = false
+    ) throws
         -> (EngineV2, PagedKVBackend)
     {
         var c = Qwen4ExpTextConfiguration()
@@ -168,7 +174,8 @@ struct CBv2NonSpeculatingRowCheckpointTests {
         eval(assistant)
         return engine(
             adapter, kinds: kinds, backend: backend, caches: backend.makeLayerCaches(),
-            store: store, drafter: assistant, verification: verification)
+            store: store, drafter: assistant, verification: verification, mtp: mtp,
+            penaltySpeculation: penaltySpeculation)
     }
 
     /// Every charge and every assistant request state is back.
@@ -202,5 +209,65 @@ struct CBv2NonSpeculatingRowCheckpointTests {
             control, chunk: Self.chunk, maxTokens: 8, segmentBytes: 1024,
             make: { try Self.qwen4Engine($0, verification: verification) },
             released: Self.released)
+    }
+
+    enum PenaltyTarget: String, CaseIterable, CustomTestStringConvertible {
+        case qwen35Serial, qwen4Serial, qwen4RectangularExact
+        var testDescription: String { rawValue }
+    }
+
+    /// Opted-in penalty rows on the request-stateful Qwen assistants (the
+    /// production drafters): presence/frequency rows speculate, and their
+    /// tokens equal those of the same MTP engine without the opt-in, where the
+    /// row decodes target-only (greedy and seeded sampled).
+    @Test(
+        .timeLimit(.minutes(5)),
+        arguments: PenaltyTarget.allCases, [Control.presencePenalty, .frequencyPenalty])
+    func optedInPenaltyRowsSpeculateExactly(_ target: PenaltyTarget, _ control: Control)
+        async throws
+    {
+        func make(_ optIn: Bool) throws -> (EngineV2, PagedKVBackend) {
+            switch target {
+            case .qwen35Serial:
+                try Self.qwen35Engine(nil, penaltySpeculation: optIn)
+            case .qwen4Serial:
+                try Self.qwen4Engine(nil, verification: .serialTarget, penaltySpeculation: optIn)
+            case .qwen4RectangularExact:
+                try Self.qwen4Engine(
+                    nil, verification: .rectangularExact, penaltySpeculation: optIn)
+            }
+        }
+        let prompt = (0 ..< Self.chunk + 7).map { 1 + ($0 * 7) % 61 }
+        for (i, sampling) in [
+            CBv2SamplingParams(temperature: 0),
+            CBv2SamplingParams(temperature: 1, topP: 0.95, topK: 20, seed: 4242),
+        ].enumerated() {
+            var request = CBv2Request(
+                id: .init(UInt64(40 + i)), promptTokens: prompt, sampling: sampling,
+                maxTokens: 24)
+            control.apply(to: &request)
+            let (off, offBackend) = try make(false)
+            let expected = try await cbv2ServeControlled(off, request)
+            #expect((off.mtpMetricsSnapshot()?.draftedTokens ?? 0) == 0, "opt-out: target-only")
+            Self.released(off, offBackend)
+            await off.shutdown()
+            let (on, onBackend) = try make(true)
+            let served = try await cbv2ServeControlled(on, request)
+            let drafted = on.mtpMetricsSnapshot()?.draftedTokens ?? 0
+            Self.released(on, onBackend)
+            await on.shutdown()
+            #expect(expected.tokens.count == 24)
+            #expect(drafted > 0, "\(target) \(control) T=\(sampling.temperature): speculates")
+            // The synthetic assistants' drafts are never accepted (measured on
+            // Mac A, all twelve cases): every committed token is a target draw at
+            // window column 0 after a rejection, so this pins the opt-in's gate,
+            // round plumbing and column-0 penalties on the production drafters.
+            // Accepted draft prefixes are covered by CBv2MTPPenaltyEngineTests
+            // (oracle drafts, accepted == drafted) and CBv2MTPPenaltyVerifyTests.
+            #expect(
+                served.tokens == expected.tokens,
+                "\(target) \(control) T=\(sampling.temperature): on=\(served.tokens) off=\(expected.tokens)"
+            )
+        }
     }
 }

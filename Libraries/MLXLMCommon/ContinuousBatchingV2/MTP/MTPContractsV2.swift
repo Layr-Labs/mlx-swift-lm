@@ -588,6 +588,19 @@ public struct CBv2MTPConfig: Sendable {
 
     /// Draft only through opted-in grammar spans. Off preserves request-wide exclusion.
     public var freeSpanSpeculation: Bool
+    /// Opt-in: admit rows with presence/frequency penalties to target-prefix
+    /// MTP when the sampler re-derives the penalties at every verify position
+    /// (`CBv2StepSampler.supportsMTPPenaltyVerification`). Such rows always
+    /// use exact acceptance. Off by default; the process kill switch
+    /// `DARKBLOOM_MTP_PENALTY_ROWS=0` overrides an opt-in
+    /// (`effectivePenaltySpeculation`).
+    public var penaltySpeculation: Bool
+    /// False for `DARKBLOOM_MTP_PENALTY_ROWS=0/false/no/off`; read once.
+    public static let envPenaltySpeculation = envSwitch("DARKBLOOM_MTP_PENALTY_ROWS")
+    /// The opt-in AND the process kill switch.
+    public var effectivePenaltySpeculation: Bool {
+        penaltySpeculation && Self.envPenaltySpeculation
+    }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
         ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
@@ -621,7 +634,8 @@ public struct CBv2MTPConfig: Sendable {
         ordinaryDecodeHistory: Bool = Self.envOrdinaryDecodeHistory,
         prefillCarry: Bool = Self.envPrefillCarry,
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
-        freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation
+        freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
+        penaltySpeculation: Bool = false
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
@@ -630,6 +644,7 @@ public struct CBv2MTPConfig: Sendable {
         self.prefillCarry = prefillCarry
         self.constrainedSpeculation = constrainedSpeculation
         self.freeSpanSpeculation = freeSpanSpeculation
+        self.penaltySpeculation = penaltySpeculation
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(

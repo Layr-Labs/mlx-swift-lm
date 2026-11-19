@@ -15,8 +15,9 @@ extension EngineLoopV2 {
     /// any temperature/top-p/top-k/min-p. Opted-in constrained rows instead
     /// use the ordinary sampler on their committed prefix at finalization
     /// (grammar verification), and opted-in free spans accept only pure
-    /// same-state previews. Logprob capture, bias, penalties and stop strings
-    /// keep their gates.
+    /// same-state previews. Presence/frequency penalties pass only under the
+    /// penalty opt-in (`mtpPenaltiesEligible`). Logprob capture, bias,
+    /// repetition penalty and stop strings keep their gates.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         mtpHistoryEligible(rec)
             && (rec.request.tokenConstraint == nil || grammarMTPEnabled
@@ -45,8 +46,7 @@ extension EngineLoopV2 {
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
             sampling.repetitionPenalty == 1,
-            sampling.frequencyPenalty == 0,
-            sampling.presencePenalty == 0,
+            mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
         else { return false }
         // The current multimodal seam does not return trusted pre-norm
@@ -64,6 +64,30 @@ extension EngineLoopV2 {
         return true
     }
 
+    /// Presence/frequency penalties live in the sampler's incremental row
+    /// state. A penalty row may draft only when the engine opted in and the
+    /// kill switch is not set (`CBv2MTPConfig.effectivePenaltySpeculation`), the drafter opted into
+    /// target-prefix acceptance and the sampler re-derives the penalties per
+    /// verify position (`supportsMTPPenaltyVerification`; such rows always
+    /// accept exactly). Constrained rows keep the historical exclusion.
+    func mtpPenaltiesEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard CBv2MTPVerifyPenalties.applies(sampling) else { return true }
+        return Self.mtpPenaltyRowEligible(
+            switchOn: mtp?.config.effectivePenaltySpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            penaltyVerification: sampler.supportsMTPPenaltyVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.presencePenalty.isFinite && sampling.frequencyPenalty.isFinite)
+    }
+
+    static func mtpPenaltyRowEligible(
+        switchOn: Bool, targetPrefix: Bool, penaltyVerification: Bool,
+        constrained: Bool, finite: Bool
+    ) -> Bool {
+        switchOn && targetPrefix && penaltyVerification && !constrained && finite
+    }
+
     static func mtpMultimodalHistoryEligible(
         hasSpans: Bool, tracksPersistentHistory: Bool
     ) -> Bool {
@@ -73,7 +97,7 @@ extension EngineLoopV2 {
     /// Only the explicit native fallback may remove media/ineligible rows from
     /// the head batch count, and only in a cohort actually containing media, a
     /// logprob row or, on a row-exact recurrent fallback target, any other
-    /// ineligible row (stop strings, penalties, logit bias). Such a row never
+    /// ineligible row (stop strings, penalties without the opt-in, logit bias). Such a row never
     /// drafts; its one-token decode beside verifying rows is exact (row-exact
     /// decode, ordinary sampler), so the other rows keep speculating.
     /// All-row target costs, token/KV headroom and reservations stay unchanged.
