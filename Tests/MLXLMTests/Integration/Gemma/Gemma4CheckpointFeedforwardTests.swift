@@ -195,7 +195,7 @@ struct Gemma4CheckpointFeedforwardTests {
             for (batch, width, compiled) in [
                 (1, 1, true), (2, 1, true), (4, 1, true), (7, 1, true), (8, 1, true),
                 (16, 1, true), (1, 2, true), (3, 2, true), (4, 2, true), (8, 2, true),
-                (9, 2, false),
+                (1, 3, true), (2, 3, true), (3, 3, false), (9, 2, false),
             ] {
                 for amplitude: Float in [0, 0.25, 4] {
                     let input =
@@ -231,7 +231,7 @@ struct Gemma4CheckpointFeedforwardTests {
             }
             // Discard this local perturbed layer; checkpoint files are unchanged.
             print(
-                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=37 native-byte checks completed")
+                "GEMMA4_FFN_CHECKPOINT layer=\(index) comparisons=46 native-byte checks completed")
         }
     }
 }
