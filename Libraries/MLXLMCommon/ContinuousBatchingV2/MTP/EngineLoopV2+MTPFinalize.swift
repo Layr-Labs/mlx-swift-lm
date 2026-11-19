@@ -572,8 +572,11 @@ extension EngineLoopV2 {
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
+                // A grammar-failing token is never emitted (ordinary decode
+                // finishes with the error before emitting it).
+                let visibleTokens = outcome.constraintFailure == nil ? kept : Array(kept.dropLast())
                 stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
+                    .delta(text: textPieces.joined(), tokens: visibleTokens, logprobs: nil))
             } else {
                 let stream = stream(for: id)
                 stream?.reserveEmission()

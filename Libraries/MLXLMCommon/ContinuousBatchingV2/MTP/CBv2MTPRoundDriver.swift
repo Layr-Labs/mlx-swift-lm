@@ -289,7 +289,8 @@ final class CBv2MTPRoundDriver {
     /// Media requests run target-only beside speculating text. Fixed by the
     /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
     let supportsRequestScopedMediaFallback: Bool
-    /// Any MTP-ineligible row (stop strings, penalties, logit bias, logprobs)
+    /// Any MTP-ineligible row (stop strings or penalties without their
+    /// opt-ins, logit bias, logprobs)
     /// decodes one ordinary target token per step beside speculating rows
     /// instead of keeping every row target-only. Only the recurrent fallback
     /// qualifies: its decode is row-exact, so the mixed step changes no row.

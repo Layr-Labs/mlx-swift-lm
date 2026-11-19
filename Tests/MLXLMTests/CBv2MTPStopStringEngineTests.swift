@@ -80,6 +80,7 @@ struct CBv2MTPStopStringEngineTests {
         var tokens: [Int] = []
         var text = ""
         var finish: CBv2FinishReason?
+        var completionTokens: Int?
         var metrics: CBv2MTPMetrics?
     }
 
@@ -116,7 +117,7 @@ struct CBv2MTPStopStringEngineTests {
         await engine.shutdown()
         return Served(
             tokens: collected.tokens, text: collected.text, finish: collected.finishReason,
-            metrics: metrics)
+            completionTokens: collected.usage?.completionTokens, metrics: metrics)
     }
 
     private func request(
@@ -152,11 +153,21 @@ struct CBv2MTPStopStringEngineTests {
                 target: target, script: nil, prompt: prompt,
                 request: request(1, prompt, maxTokens, sampling, stops: []))
             try #require(plain.tokens.count == maxTokens, "\(name)")
-            let cases: [(String, [String], Int?)] = [
-                ("one-token", [rendered([plain.tokens[9]])], 9),
-                ("two-token", [rendered(Array(plain.tokens[12 ... 13]))], 12),
-                ("never", ["<never>"], nil),
-            ]
+            // One-token matches at three consecutive indices hit every slot of
+            // a depth-2 round; two-token matches at consecutive starts span a
+            // round and cross a round boundary; the last token coincides with
+            // max_tokens (.stop must win over .length).
+            var cases: [(String, [String], Int?)] = []
+            for at in 8 ... 10 {
+                cases.append(("one-token@\(at)", [rendered([plain.tokens[at]])], at))
+            }
+            for at in 11 ... 13 {
+                cases.append(
+                    ("two-token@\(at)", [rendered(Array(plain.tokens[at ... at + 1]))], at))
+            }
+            cases.append(
+                ("at-max-tokens", [rendered([plain.tokens[maxTokens - 1]])], maxTokens - 1))
+            cases.append(("never", ["<never>"], nil))
             // The same request id everywhere: keyed sampling is (seed, id, step).
             for (label, stops, matchAt) in cases {
                 let req = request(1, prompt, maxTokens, sampling, stops: stops)
@@ -181,11 +192,73 @@ struct CBv2MTPStopStringEngineTests {
                         #expect(on.text == off.text, "\(tag) text")
                         #expect(on.tokens == off.tokens, "\(tag) tokens")
                         #expect(on.finish == off.finish, "\(tag) finish")
+                        #expect(on.completionTokens == off.completionTokens, "\(tag) usage")
                         #expect((on.metrics?.rounds ?? 0) > 0, "\(tag): the row speculates")
                     }
                 }
             }
         }
+    }
+
+    /// Two rows decoding together under rectangular verification: a row with
+    /// a stop string beside a row without one. Each row's text, tokens,
+    /// finish and usage equal the same rows on the MTP-off engine.
+    @Test func stopStringRowBesideAPlainRowMatchesTheMTPOffEngine() async throws {
+        let target = try makeTarget()
+        let prompt = [3, 7, 11, 19, 23]
+        let maxTokens = 24
+        let plain = try await serve(
+            target: target, script: nil, prompt: prompt,
+            request: request(1, prompt, maxTokens, .init(temperature: 0), stops: []))
+        let stopped = request(
+            1, prompt, maxTokens, .init(temperature: 0), stops: [rendered([plain.tokens[9]])])
+        let other = request(2, prompt, maxTokens, .init(temperature: 0), stops: [])
+        func both(script: [Int]?) async throws -> [Served] {
+            let kinds = target.cbv2LayerKinds
+            let drafter = script.map {
+                CBv2TypicalScriptedDrafter(
+                    script: $0, promptLength: prompt.count, offset: 0, vocabSize: vocabSize,
+                    target: target)
+            }
+            let engine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(target),
+                layerKinds: kinds,
+                backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 41),
+                detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2MTPStopTokenizer()),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                    prefillChunkSize: 16, maxWaiting: 16),
+                mtpDrafter: drafter,
+                mtpConfig: CBv2MTPConfig(
+                    enabled: drafter != nil, maxDraftTokens: k, maxSpeculativeBatch: 4,
+                    fixedDraftTokens: k, verificationMode: .rectangular,
+                    maxAutomaticRectangularTokens: 8, acceptance: .exact,
+                    stopStringSpeculation: true))
+            let a = try engine.submit(stopped)
+            let b = try engine.submit(other)
+            async let ca = cbv2SchedCollect(a)
+            async let cb = cbv2SchedCollect(b)
+            let (ra, rb) = await (ca, cb)
+            let metrics = engine.mtpMetricsSnapshot()
+            await engine.shutdown()
+            return [ra, rb].map {
+                Served(
+                    tokens: $0.tokens, text: $0.text, finish: $0.finishReason,
+                    completionTokens: $0.usage?.completionTokens, metrics: metrics)
+            }
+        }
+        let off = try await both(script: nil)
+        let on = try await both(script: plain.tokens + [0, 0, 0, 0])
+        #expect(off[0].finish == .stop && off[0].text == rendered(Array(plain.tokens[..<9])))
+        for row in 0 ..< 2 {
+            #expect(on[row].text == off[row].text, "row \(row) text")
+            #expect(on[row].tokens == off[row].tokens, "row \(row) tokens")
+            #expect(on[row].finish == off[row].finish, "row \(row) finish")
+            #expect(on[row].completionTokens == off[row].completionTokens, "row \(row) usage")
+        }
+        #expect((on[0].metrics?.rounds ?? 0) > 0)
     }
 
     /// Without the opt-in (what `DARKBLOOM_MTP_STOP_STRING_ROWS=0` forces)
