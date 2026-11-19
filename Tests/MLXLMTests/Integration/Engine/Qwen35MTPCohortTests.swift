@@ -160,12 +160,42 @@ struct Qwen35MTPCohortTests {
         await candidate.shutdown()
 
         #expect(actual == expected)
+        // Plain batched decode of the same two rows commits the same tokens.
+        let plain = try engine(target, mtpConfig: .init(enabled: false))
+        let plainTogether = try await runTogether(plain, requests)
+        await plain.shutdown()
+        #expect(actual == plainTogether)
         #expect(metrics.rounds > 0 && metrics.draftedTokens > 0)
         // `rounds` counts verified rows, `rectangularVerificationRounds` steps:
         // more rows than steps means some step verified both rows.
         #expect(metrics.rounds > metrics.rectangularVerificationRounds)
         #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
         #expect(released.0 == 0 && released.1)
+    }
+
+    @Test("adaptive two-row cohorts match plain batched decode and chain depth-zero steps")
+    func adaptiveTwoRowCohortMatchesPlainBatched() async throws {
+        let target = try fixture()
+        let requests = Self.requests(991, rows: 2)
+        let plain = try engine(target, mtpConfig: .init(enabled: false))
+        let expected = try await runTogether(plain, requests)
+        await plain.shutdown()
+
+        target.1.speculativeBatchLimit = 2
+        defer { target.1.speculativeBatchLimit = 1 }
+        let candidate = try engine(
+            target,
+            mtpConfig: .init(enabled: true, maxDraftTokens: 2, verificationMode: .rectangular))
+        let actual = try await runTogether(candidate, requests)
+        let metrics = try #require(candidate.mtpMetricsSnapshot())
+        let chained = candidate.chainedStepCount
+        await candidate.shutdown()
+
+        #expect(actual == expected)
+        #expect((metrics.skippedRows["batch_gate"] ?? 0) == 0, "\(metrics.skippedRows)")
+        // Plans the controller or marginal policy holds at depth zero run as
+        // chained ordinary decode instead of unchained MTP seed steps.
+        if (metrics.depthSelections[0] ?? 0) > 1 { #expect(chained > 0) }
     }
 
     @Test("a four-row cohort under a limit of four speculates without a batch gate")
@@ -239,15 +269,31 @@ struct Qwen35MTPCohortTests {
     }
 
     @Test(
-        "DARKBLOOM_QWEN_MTP_MAX_BATCH parses 1...8, anything else is one",
+        "DARKBLOOM_QWEN_MTP_MAX_BATCH 1...8 wins, anything else keeps the default",
         arguments: [
-            (nil, 1), ("", 1), ("1", 1), ("2", 2), (" 4 ", 4), ("8", 8), ("9", 1), ("0", 1),
-            ("-2", 1), ("four", 1), ("2.5", 1),
+            (nil, 1), (nil, 2), ("", 2), ("1", 1), ("1", 2), ("2", 2), (" 4 ", 4), ("8", 8),
+            ("9", 2), ("0", 2), ("-2", 1), ("four", 2), ("2.5", 1),
         ] as [(String?, Int)])
-    func environmentLimit(raw: String?, expected: Int) {
+    func environmentLimit(raw: String?, defaultLimit: Int) {
         let environment =
             raw.map { [Qwen35InlineMTPAssistant.speculativeBatchEnvironmentKey: $0] } ?? [:]
+        let parsed = raw.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let expected = parsed.map { (1 ... 8).contains($0) ? $0 : defaultLimit } ?? defaultLimit
         #expect(
-            Qwen35InlineMTPAssistant.speculativeBatchLimit(environment: environment) == expected)
+            Qwen35InlineMTPAssistant.speculativeBatchLimit(
+                environment: environment, defaultLimit: defaultLimit) == expected)
+    }
+
+    @Test("sparse targets default to cohorts of two, dense targets to one row")
+    func defaultsBySparsity() throws {
+        #expect(Qwen35InlineMTPAssistant.defaultSpeculativeBatchLimit(sparseTarget: true) == 2)
+        #expect(Qwen35InlineMTPAssistant.defaultSpeculativeBatchLimit(sparseTarget: false) == 1)
+        // The tiny fixture is dense (no experts): one row unless the runner
+        // sets DARKBLOOM_QWEN_MTP_MAX_BATCH.
+        if ProcessInfo.processInfo.environment[
+            Qwen35InlineMTPAssistant.speculativeBatchEnvironmentKey] == nil
+        {
+            #expect(try fixture().1.speculativeBatchLimit == 1)
+        }
     }
 }

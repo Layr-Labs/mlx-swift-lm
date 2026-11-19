@@ -192,7 +192,15 @@ extension EngineLoopV2 {
         // takes ordinary-decode history keeps chaining while no row can
         // speculate; the chained launch captures hidden for finalize.
         if mtp.tracksPersistentHistory {
-            return canSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+            // A plan the controller sends to depth zero drafts nothing: keep
+            // it on chained ordinary decode (finalize feeds the history) unless
+            // the controller needs an unchained depth-zero cost probe.
+            // Single rows keep today's path (MTP seed steps at depth zero).
+            let drafts =
+                canSpeculate
+                && (ids.count < 2 || decision.depth > 0
+                    || mtp.requiresNonChainedDepthZeroProbe(decision))
+            return drafts || !mtpFeedsHistoryFromOrdinaryDecode
         }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
@@ -352,7 +360,13 @@ extension EngineLoopV2 {
     /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
     /// so persistent history starts at prompt position 0.
     private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
-        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp, !mtp.planCanSpeculate else {
+        // A speculation-capable plan clamped to depth zero (controller,
+        // marginal policy, tail, budget or headroom) has no round either.
+        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp,
+            !mtp.planCanSpeculate
+                || (mtp.planDepth == 0 && plan.assignments.count > 1
+                    && !mtp.requiresNonChainedDepthZeroProbe(mtp.planDecision))
+        else {
             return false
         }
         return plan.assignments.allSatisfy { assignment in
