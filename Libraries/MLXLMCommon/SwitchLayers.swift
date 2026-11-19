@@ -241,6 +241,17 @@ package let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+/// A scope that moves `SwitchGLU`'s sort threshold for the graph built inside
+/// it (for example an MTP verify window, whose few tokens gain nothing from
+/// sorting by expert). nil keeps the process threshold.
+public enum SwitchGLUSortScope {
+    @TaskLocal public static var minimumAssignments: Int?
+}
+
+/// Expert assignments from which `SwitchGLU` sorts rows by expert (MLX's
+/// threshold), unless a `SwitchGLUSortScope` moves it.
+let switchSortMinimumAssignments = 64
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -841,7 +852,9 @@ open class SwitchGLU: Module {
 
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         x = transformInput(x)
-        let doSort = indices.size >= 64
+        let doSort =
+            indices.size
+            >= (SwitchGLUSortScope.minimumAssignments ?? switchSortMinimumAssignments)
         let hint = doSort && hintsSorted
 
         var idx = indices
