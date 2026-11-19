@@ -49,15 +49,23 @@ enum Qwen35DecodeCommandBuffers {
     /// MTP rounds whose rows each carry at most
     /// `EngineLoopV2.speculativeCommandBufferRowTokens` tokens (the assistant's draft
     /// steps and the target's verification windows, or a prompt chunk that short)
-    /// take the same `limits` unless `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS` is `0`,
-    /// `off`, `false` or `no`, as Gemma 4's and GLM's rounds do. Read once. One-token
+    /// take the same `limits` when `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS` is `1`, `on`,
+    /// `true` or `yes` (off by default until its long-context memory is measured), as
+    /// Gemma 4's and GLM's rounds do. Read once. One-token
     /// rounds that go through the MTP path without speculating (rows that keep the
     /// assistant's history) follow this switch, not `environmentKey`. A round's first
     /// draft step also moves the assistant's queued history (up to the whole prompt on
     /// a request's first round) through the head inside the round.
     static let speculativeEnvironmentKey = "DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS"
-    static let speculativeEnabled = enabled(
+    static let speculativeEnabled = speculativeEnabled(
         ProcessInfo.processInfo.environment[speculativeEnvironmentKey])
+
+    /// Opt-in: only `1`, `on`, `true` or `yes` (trimmed, case-insensitive) enables.
+    static func speculativeEnabled(_ raw: String?) -> Bool {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "on", "true", "yes"].contains(value)
+    }
 
     /// Tests only: replaces the environment's choice for MTP rounds (nil: the
     /// environment's). Set it only from a `.serialized` suite while no engine runs;

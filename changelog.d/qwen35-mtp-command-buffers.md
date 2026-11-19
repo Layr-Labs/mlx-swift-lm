@@ -7,5 +7,5 @@
   already do. Outputs keep their bits by construction (only the partitioning
   changes); `Qwen35DecodeCommandBufferTests.verificationRowLimitsKeepExactBytes`
   checks verify-shaped rows through the target.
-  `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS=0` (or `off`, `false`, `no`) restores
-  MLX's defaults for those rounds.
+  Off by default: `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS=1` (or `on`, `true`,
+  `yes`) enables it.

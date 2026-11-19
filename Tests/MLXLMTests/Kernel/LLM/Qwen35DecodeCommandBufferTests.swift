@@ -70,6 +70,16 @@ extension KernelTests {
         /// MTP verification rows (a few rows of 2 to 8 tokens, the shapes the round's
         /// target forward takes) under the limits against a commit every two kernel
         /// dispatches: the same bytes.
+        @Test func mtpRoundSwitchIsOptIn() {
+            #expect(!Qwen35DecodeCommandBuffers.speculativeEnabled(nil))
+            #expect(!Qwen35DecodeCommandBuffers.speculativeEnabled(""))
+            #expect(!Qwen35DecodeCommandBuffers.speculativeEnabled("0"))
+            #expect(!Qwen35DecodeCommandBuffers.speculativeEnabled("off"))
+            #expect(Qwen35DecodeCommandBuffers.speculativeEnabled("1"))
+            #expect(Qwen35DecodeCommandBuffers.speculativeEnabled(" On "))
+            #expect(Qwen35DecodeCommandBuffers.speculativeEnabled("YES"))
+        }
+
         @Test func verificationRowLimitsKeepExactBytes() throws {
             let everyOperation = GPU.CommandBufferLimits(operations: 1, megabytes: 1)
             for model in [try Self.dense() as Qwen35Model, try Self.quantizedMoE()] {
