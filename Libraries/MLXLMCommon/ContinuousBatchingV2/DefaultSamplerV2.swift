@@ -59,6 +59,14 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         let steps: [UInt64]
     }
     private var speculation: SpeculativeSample?
+    /// Confirmed output-token counts `[vocab]` per penalty row for MTP
+    /// verification, folded incrementally from the row's confirmed output
+    /// (`folded` tokens so far; `last` = the last folded token, a cheap
+    /// divergence check). Engine queue only; dropped on `requestDidFinish`.
+    private var mtpPenaltyCounts: [CBv2RequestID: (folded: Int, last: Int, counts: MLXArray)] =
+        [:]
+    /// `arange(vocab)` `[1, 1, vocab]` int32 for the draft one-hot, per vocab.
+    private var mtpVocabIDs: MLXArray?
     /// Test hooks for the constrained-chaining device-mask cache.
     var constraintMaskBuildCount: Int { constraintSampler.maskBuildCount }
     var constraintMaskCacheHitCount: Int { constraintSampler.maskCacheHitCount }
@@ -200,6 +208,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     public func requestDidFinish(_ id: CBv2RequestID) {
         constraintSampler.requestDidFinish(id)
         budgetSampler.requestDidFinish(id)
+        mtpPenaltyCounts[id] = nil
         if configuredIDs.contains(id) {
             configuredIDs = []
         }
@@ -208,11 +217,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     // MARK: - MTP target-prefix verify sampling
 
     public var supportsMTPTargetPrefix: Bool { true }
+    public var supportsMTPPenaltyVerification: Bool { true }
 
     /// Pure re-derivation of the ordinary per-token draw for every verify
     /// window position. Eligibility gating guarantees the admitted rows use
     /// only the STATELESS transforms (temperature → top-k/top-p/min-p; no
-    /// bias, penalties, constraints, or logprob capture), so this mirrors
+    /// bias, constraints, or logprob capture; presence/frequency penalties
+    /// only through the `penalties:` overload), so this mirrors
     /// `LogitsPipelineV2.process` + `SamplerV2.sample` per (row, position)
     /// without touching the incremental pipeline state. RNG keys use the
     /// per-request output index (`stepBases[r] + j`), i.e. exactly the key
@@ -223,8 +234,37 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     ) -> MLXArray? {
         verifyWindow(
             logits: logits, params: params, requestIDs: requestIDs,
-            stepBases: stepBases, typical: nil
+            stepBases: stepBases, typical: nil, penalties: nil
         ).tokens
+    }
+
+    /// Penalty-aware `mtpVerifySample`: window position `j` of row `r` is
+    /// penalized with the row's confirmed output counts plus the drafts
+    /// before it, using `LogitsPipelineV2.process`'s ops in its order and
+    /// dtype (bias → penalties → temperature → top-k/top-p/min-p), so on
+    /// the accepted prefix every draw is the one sequential sampling makes
+    /// from the same logits.
+    public func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?
+    ) -> MLXArray? {
+        verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: nil, penalties: penalties
+        ).tokens
+    }
+
+    /// Penalty-aware `mtpVerifyTypical`; penalty rows accept exactly.
+    public func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int],
+        penalties: CBv2MTPVerifyPenalties?
+    ) -> (tokens: MLXArray, accept: MLXArray)? {
+        let window = verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: (draftIDs: draftIDs, delta: delta),
+            penalties: penalties)
+        return (window.tokens, window.accept!)
     }
 
     /// Typical acceptance on the same filtered rows `mtpVerifySample` draws
@@ -238,7 +278,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     ) -> (tokens: MLXArray, accept: MLXArray)? {
         let window = verifyWindow(
             logits: logits, params: params, requestIDs: requestIDs,
-            stepBases: stepBases, typical: (draftIDs: draftIDs, delta: delta))
+            stepBases: stepBases, typical: (draftIDs: draftIDs, delta: delta), penalties: nil)
         return (window.tokens, window.accept!)
     }
 
@@ -253,7 +293,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// the row instead of `mtpVerifySample`'s sort and scatter. Greedy rows
     /// take the argmax. A verifier that commits only its own draws stays
     /// exact whatever it is proposed; this only raises how often it agrees.
-    /// Same eligibility as `mtpVerifySample` (stateless transforms). `[B, 1]`.
+    /// Stateless transforms only: it ignores presence/frequency penalties (a
+    /// penalty row's proposal is then less likely to be accepted, never
+    /// inexact). `[B, 1]`.
     public func mtpCoupledProposal(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
@@ -329,7 +371,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     private func verifyWindow(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int],
-        typical: (draftIDs: MLXArray, delta: Float)?
+        typical: (draftIDs: MLXArray, delta: Float)?,
+        penalties: CBv2MTPVerifyPenalties?
     ) -> (tokens: MLXArray, accept: MLXArray?) {
         precondition(logits.ndim == 3, "MTP verify logits must be [B, W, vocab]")
         let b = logits.dim(0)
@@ -345,7 +388,16 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
                 "MTP typical draft ids must be [B, D] with 1 <= D <= W")
             precondition(typical.delta > 0, "MTP typical delta must be positive")
         }
-        let flat = logits.reshaped([b * w, vocab]).asType(.float32)
+        var flat = logits.reshaped([b * w, vocab]).asType(.float32)
+        // Penalty rows: stage (2) of `LogitsPipelineV2.process` per window
+        // position. Rows without a penalty are left untouched (the ordinary
+        // path's `x - 0 * counts` is the identity on them as well).
+        let penaltyRows = params.map(CBv2MTPVerifyPenalties.applies)
+        if let penalties, penaltyRows.contains(true) {
+            flat = applyWindowPenalties(
+                flat, penalties: penalties, params: params, requestIDs: requestIDs,
+                penaltyRows: penaltyRows, b: b, w: w, vocab: vocab)
+        }
         let greedyTokens = argMax(flat, axis: -1).asType(.int32)
         let anyStochastic = params.contains {
             $0.temperature >= LogitsPipelineV2.greedyEpsilon
@@ -430,8 +482,108 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         let floor = minimum(exp(-entropy) * typical.delta, MLXArray(Float(1)))
         let typicalAccept = pDraft .> floor
         let exact = Self.exactAccept(tokens: tokens, draftIDs: typical.draftIDs)
-        let greedyPerPosition = greedyRows.reshaped([b, w])[0..., ..<d]
-        return (tokens, which(greedyPerPosition, exact, typicalAccept))
+        // Greedy rows, and penalty rows when penalties are applied, accept
+        // exactly (target prefix).
+        let exactRows = (0 ..< b * w).map { i in
+            greedyFlags[i] || (penalties != nil && penaltyRows[i / w])
+        }
+        let exactPerPosition = MLXArray(exactRows).reshaped([b, w])[0..., ..<d]
+        return (tokens, which(exactPerPosition, exact, typicalAccept))
+    }
+
+    /// `x - α·counts - β·(counts > 0)` per window position, in
+    /// `LogitsPipelineV2.process` order and float32, with counts = confirmed
+    /// output counts + one-hot of the drafts preceding the position.
+    private func applyWindowPenalties(
+        _ flat: MLXArray, penalties: CBv2MTPVerifyPenalties, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], penaltyRows: [Bool], b: Int, w: Int, vocab: Int
+    ) -> MLXArray {
+        precondition(
+            penalties.outputTokens.count == b, "MTP verify penalty row metadata mismatch")
+        let zeroRow = MLXArray.zeros([vocab], type: Float.self)
+        // Bound the count cache to the rows of this call plus a small slack:
+        // entries of requests that left without `requestDidFinish` (none
+        // today) cannot accumulate past it.
+        if mtpPenaltyCounts.count > 64 {
+            let live = Set(requestIDs)
+            mtpPenaltyCounts = mtpPenaltyCounts.filter { live.contains($0.key) }
+        }
+        let confirmed = stacked(
+            (0 ..< b).map { r in
+                penaltyRows[r]
+                    ? confirmedOutputCounts(
+                        id: requestIDs[r], tokens: penalties.outputTokens[r], vocab: vocab)
+                    : zeroRow
+            }, axis: 0)  // [B, vocab]
+        var counts = broadcast(
+            confirmed.expandedDimensions(axis: 1), to: [b, w, vocab])
+        let draftsNeeded = penalties.columnOffset + w - 1
+        if draftsNeeded > 0 {
+            guard let drafts = penalties.drafts else {
+                preconditionFailure("CBv2 MTP: penalty verification needs the round's drafts")
+            }
+            precondition(
+                drafts.ndim == 2 && drafts.dim(0) == b && drafts.dim(1) >= draftsNeeded,
+                "CBv2 MTP: penalty drafts must be [B, >= \(draftsNeeded)]")
+            let used = drafts[0..., ..<draftsNeeded].asType(.int32)
+            if mtpVocabIDs?.dim(2) != vocab {
+                mtpVocabIDs = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, 1, vocab])
+            }
+            let vocabIDs = mtpVocabIDs!
+            let oneHot = (used.expandedDimensions(axis: 2) .== vocabIDs).asType(.float32)
+            // prefix[g] = drafts before global position g, g = 0 ... draftsNeeded.
+            let prefix = concatenated(
+                [
+                    MLXArray.zeros([b, 1, vocab], type: Float.self),
+                    cumsum(oneHot, axis: 1),
+                ], axis: 1)
+            let window = prefix[0..., penalties.columnOffset ..< (penalties.columnOffset + w), 0...]
+            counts = counts + window
+        }
+        let flatCounts = counts.reshaped([b * w, vocab])
+        var freqs = [Float](repeating: 0, count: b * w)
+        var press = [Float](repeating: 0, count: b * w)
+        for r in 0 ..< b where penaltyRows[r] {
+            for j in 0 ..< w {
+                freqs[r * w + j] = params[r].frequencyPenalty
+                press[r * w + j] = params[r].presencePenalty
+            }
+        }
+        var x = flat
+        x = x - MLXArray(freqs).reshaped([b * w, 1]) * flatCounts
+        x = x - MLXArray(press).reshaped([b * w, 1]) * (flatCounts .> 0).asType(.float32)
+        return x
+    }
+
+    /// Confirmed output counts `[vocab]` float32 for one row, folded
+    /// incrementally (scatter-add of the tokens confirmed since the last
+    /// call; integer-valued, so exact in any order). Rebuilt from scratch
+    /// when the confirmed output no longer extends what was folded. The
+    /// last-token check suffices because confirmed output only grows while a
+    /// request lives and `requestDidFinish` drops an id before any reuse.
+    private func confirmedOutputCounts(
+        id: CBv2RequestID, tokens: ArraySlice<Int>, vocab: Int
+    ) -> MLXArray {
+        var entry = mtpPenaltyCounts[id]
+        if let current = entry,
+            current.counts.dim(0) != vocab || current.folded > tokens.count
+                || (current.folded > 0
+                    && tokens[tokens.startIndex + current.folded - 1] != current.last)
+        {
+            entry = nil
+        }
+        var counts = entry?.counts ?? MLXArray.zeros([vocab], type: Float.self)
+        let folded = entry?.folded ?? 0
+        if folded < tokens.count {
+            let fresh = tokens[(tokens.startIndex + folded)...].compactMap { token in
+                token >= 0 && token < vocab ? Int32(token) : nil
+            }
+            if !fresh.isEmpty {
+                counts = counts.at[MLXArray(fresh)].add(Float(1))
+            }
+        }
+        mtpPenaltyCounts[id] = (tokens.count, tokens.last ?? -1, counts)
+        return counts
     }
 
     /// Verify rows never pass through `sample`, so their pipeline/RNG row

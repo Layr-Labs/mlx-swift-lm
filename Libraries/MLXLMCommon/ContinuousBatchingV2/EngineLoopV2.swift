@@ -195,6 +195,52 @@ public protocol CBv2StepSampler: AnyObject {
     /// confirmed history — penalty counts and RNG step indices stay a pure
     /// function of each request's history. Default: no-op.
     func mtpRoundDidCommit(requestIDs: [CBv2RequestID])
+
+    /// True when the penalty-aware verify entry points below re-derive
+    /// presence/frequency penalties at every window position exactly as the
+    /// ordinary pipeline would apply them after the window's preceding
+    /// drafts were sampled. Gates MTP for penalty rows. Default false.
+    var supportsMTPPenaltyVerification: Bool { get }
+
+    /// `mtpVerifySample` with presence/frequency penalties. nil `penalties`
+    /// is exactly `mtpVerifySample`.
+    func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?
+    ) -> MLXArray?
+
+    /// `mtpVerifyTypical` with presence/frequency penalties. Rows with a
+    /// penalty use exact acceptance (keep iff the draft equals the target
+    /// draw). nil `penalties` is exactly `mtpVerifyTypical`.
+    func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int],
+        penalties: CBv2MTPVerifyPenalties?
+    ) -> (tokens: MLXArray, accept: MLXArray)?
+}
+
+/// Penalty context of one MTP verify call. Window position `j` of row `r`
+/// (output index `stepBases[r] + j`) is penalized with the row's confirmed
+/// output tokens plus the drafts that precede it in the round:
+/// `drafts[r, 0 ..< columnOffset + j]`.
+public struct CBv2MTPVerifyPenalties {
+    /// Confirmed output tokens per row (the round's seed included).
+    public let outputTokens: [ArraySlice<Int>]
+    /// The round's whole draft chain `[B, D]` int32, or nil when it has none.
+    public let drafts: MLXArray?
+    /// Global window position of this call's first logits column.
+    public let columnOffset: Int
+
+    public init(outputTokens: [ArraySlice<Int>], drafts: MLXArray?, columnOffset: Int = 0) {
+        self.outputTokens = outputTokens
+        self.drafts = drafts
+        self.columnOffset = columnOffset
+    }
+
+    /// Rows whose sampling applies presence or frequency penalties.
+    public static func applies(_ params: CBv2SamplingParams) -> Bool {
+        params.presencePenalty != 0 || params.frequencyPenalty != 0
+    }
 }
 
 extension CBv2StepSampler {
@@ -220,6 +266,25 @@ extension CBv2StepSampler {
         params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> (tokens: MLXArray, accept: MLXArray)? { nil }
     public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
+    public var supportsMTPPenaltyVerification: Bool { false }
+    public func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?
+    ) -> MLXArray? {
+        guard penalties == nil else { return nil }
+        return mtpVerifySample(
+            logits: logits, params: params, requestIDs: requestIDs, stepBases: stepBases)
+    }
+    public func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int],
+        penalties: CBv2MTPVerifyPenalties?
+    ) -> (tokens: MLXArray, accept: MLXArray)? {
+        guard penalties == nil else { return nil }
+        return mtpVerifyTypical(
+            logits: logits, draftIDs: draftIDs, delta: delta, params: params,
+            requestIDs: requestIDs, stepBases: stepBases)
+    }
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by

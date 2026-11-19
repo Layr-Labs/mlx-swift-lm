@@ -79,11 +79,25 @@ extension EngineLoopV2 {
         // Target-prefix pre-sampling activates only for batches containing a
         // stochastic row; all-greedy batches keep the historical argmax
         // packet bit for bit.
+        // Presence/frequency penalty rows (greedy or not) are scored with
+        // the penalties re-derived per window position, which needs the
+        // target-prefix path as well.
+        let penaltyVerification =
+            sampler.supportsMTPPenaltyVerification
+            && rows.contains { CBv2MTPVerifyPenalties.applies($0.rec.request.sampling) }
         let useTargetPrefix =
             mtp.targetPrefixAcceptance && sampler.supportsMTPTargetPrefix
             && rows.contains {
                 $0.rec.request.sampling.temperature >= LogitsPipelineV2.greedyEpsilon
+                    || (penaltyVerification
+                        && CBv2MTPVerifyPenalties.applies($0.rec.request.sampling))
             }
+        let penaltyOutputs: [ArraySlice<Int>]? =
+            useTargetPrefix && penaltyVerification
+            ? rows.map { $0.rec.tokens[$0.rec.request.promptTokens.count...] } : nil
+        let penaltyDrafts: MLXArray? =
+            penaltyOutputs != nil && columns.count > 1
+            ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
         let verifyParams = rows.map(\.rec.request.sampling)
         let verifyIDs = rows.map(\.rec.id)
         let spanSampler =
@@ -117,10 +131,15 @@ extension EngineLoopV2 {
                 return (argMax(logits, axis: -1).asType(.int32), nil)
             }
             let stepBases = verifyStepBases.map { $0 + columnOffset }
+            let penalties = penaltyOutputs.map {
+                CBv2MTPVerifyPenalties(
+                    outputTokens: $0, drafts: penaltyDrafts, columnOffset: columnOffset)
+            }
             if let typicalDelta, let drafts {
                 if let scored = sampler.mtpVerifyTypical(
                     logits: logits, draftIDs: drafts, delta: typicalDelta,
-                    params: verifyParams, requestIDs: verifyIDs, stepBases: stepBases)
+                    params: verifyParams, requestIDs: verifyIDs, stepBases: stepBases,
+                    penalties: penalties)
                 {
                     return (scored.tokens, scored.accept)
                 }
@@ -129,7 +148,7 @@ extension EngineLoopV2 {
             guard
                 let sampled = sampler.mtpVerifySample(
                     logits: logits, params: verifyParams, requestIDs: verifyIDs,
-                    stepBases: stepBases)
+                    stepBases: stepBases, penalties: penalties)
             else {
                 preconditionFailure(
                     "CBv2 MTP: sampler advertised target-prefix support but returned nil")
