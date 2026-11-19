@@ -13,9 +13,9 @@
 // per row). Attention runs per row against that row's own history (its cache,
 // rotary offset and mask), and every norm and element-wise step treats each
 // row independently, so the step is the rows' own steps side by side: a row's
-// result does not depend on how many rows share the call. Nothing here is
-// reached through `draftStep`, `draftHidden` or the engine's own drafter, so
-// the single-Mac drafting path keeps its arithmetic.
+// result does not depend on how many rows share the call. `draftStep` and
+// `draftHidden` never reach this path; the engine's single-Mac cohorts use the
+// `cohortDraftStepRows` variant at the end of this file (shared products).
 
 import Foundation
 import MLX
@@ -111,5 +111,49 @@ extension Qwen35MTPModule {
             return createAttentionMask(h: fused[row ..< (row + 1)], cache: rowCache)
         }
         return norm(layers[0].draftStepRows(fused, caches: caches, masks: masks, project: project))
+    }
+}
+
+// Cohort drafting on one Mac (the engine's `draftRowsStep`): the same per-row
+// attention against each row's own cache as `draftStepRows`, but every
+// projection and the MLP (dense or routed experts) run as one product over the
+// rows. A row's bits may then depend on its cohort. That only changes which
+// drafts a round proposes; the target still decides every committed token.
+
+extension Qwen35MTPDecoderLayer {
+    func cohortDraftStepRows(
+        _ x: MLXArray, caches: [any KVCache],
+        masks: [MLXFast.ScaledDotProductAttentionMaskMode]
+    ) -> MLXArray {
+        let r = selfAttn.draftStepRows(
+            inputLayerNorm(x), caches: caches, masks: masks, project: { $0($1) })
+        let h = x + r
+        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+}
+
+extension Qwen35MTPModule {
+    /// Whether `cohortDraftStepRows` covers this head: one decoder layer.
+    var draftsCohortRows: Bool { layers.count == 1 }
+
+    /// One column per row (`hidden [B, 1, H]`, `nextTokenIds [B, 1]`), row `b`
+    /// against `caches[b]`, with shared projections and MLP.
+    func cohortDraftStepRows(
+        hidden: MLXArray, nextTokenIds: MLXArray, embedTokens: Embedding,
+        caches: [any KVCache]
+    ) -> MLXArray {
+        let rows = hidden.dim(0)
+        precondition(
+            draftsCohortRows && hidden.ndim == 3 && hidden.dim(1) == 1
+                && nextTokenIds.shape == [rows, 1] && caches.count == rows,
+            "inline Qwen MTP cohort draft rows differ from one column per row")
+        let e = preFcNormEmbedding(embedTokens(nextTokenIds))
+        let h = preFcNormHidden(hidden)
+        let fused = fc(concatenated([e, h], axis: -1))
+        let masks = (0 ..< rows).map { row -> MLXFast.ScaledDotProductAttentionMaskMode in
+            let rowCache: (any KVCache)? = caches[row]
+            return createAttentionMask(h: fused[row ..< (row + 1)], cache: rowCache)
+        }
+        return norm(layers[0].cohortDraftStepRows(fused, caches: caches, masks: masks))
     }
 }

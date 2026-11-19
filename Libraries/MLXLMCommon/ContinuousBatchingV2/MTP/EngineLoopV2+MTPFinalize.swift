@@ -422,6 +422,15 @@ extension EngineLoopV2 {
                 measurement: step.mtpMeasurement)
         }
 
+        var keptCounts: [Int] = []
+        keptCounts.reserveCapacity(outcomes.count)
+        defer {
+            // Rows of this step committed different widths (a common width
+            // would have cut every row to the shortest).
+            if perRowWidth, keptCounts.count > 1, Set(keptCounts).count > 1 {
+                mtp.recordRowWidthSplitStep()
+            }
+        }
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
             let metadata = outcome.metadata
@@ -495,6 +504,7 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
+            keptCounts.append(confirmed)
             round.committedVerifyTokenCount +=
                 kept.filter {
                     !rec.request.stopTokens.contains($0)

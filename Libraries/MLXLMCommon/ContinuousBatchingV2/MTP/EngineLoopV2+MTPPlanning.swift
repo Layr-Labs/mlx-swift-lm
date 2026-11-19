@@ -219,7 +219,21 @@ extension EngineLoopV2 {
         // takes ordinary-decode history keeps chaining while no row can
         // speculate; the chained launch captures hidden for finalize.
         if mtp.tracksPersistentHistory {
-            return canSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+            // A cohort the controller holds at depth zero drafts nothing: keep
+            // it on chained ordinary decode (finalize feeds the history). Not
+            // for single rows (today's seed path) or the controller's unchained
+            // depth-zero cost probe. A marginal-policy plan's depth is the one
+            // `beginMTPPlan` will select (`mtpPreviewPlanDepth`), so a
+            // cohort that policy clamps to zero keeps the chain too.
+            var previewDepth = decision.depth
+            if canSpeculate, ids.count >= 2 {
+                previewDepth = mtpPreviewPlanDepth(rows: rows, plannedDecodeRows: ids.count)
+            }
+            let drafts =
+                canSpeculate
+                && (ids.count < 2 || previewDepth > 0
+                    || mtp.requiresNonChainedDepthZeroProbe(decision))
+            return drafts || !mtpFeedsHistoryFromOrdinaryDecode
         }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
@@ -236,6 +250,42 @@ extension EngineLoopV2 {
                 ? remaining >= 1
                 : remaining >= 2
         }
+    }
+
+    /// The depth `beginMTPPlan` would select for these decode rows, without
+    /// touching controller state: the driver's previewed plan decision (with
+    /// the marginal offer where `beginPlan` makes it), then the marginal
+    /// policy's per-row minimum and the output-budget tail clamp, as
+    /// `beginMTPPlan` applies them. (Step-budget and KV-headroom clamps are
+    /// left to the plan; they only lower the depth.)
+    func mtpPreviewPlanDepth(rows: [CBv2ScheduledRequest], plannedDecodeRows: Int) -> Int {
+        guard let mtp else { return 0 }
+        let decision = mtp.previewPlanDecision(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: true)
+        var depth = decision.depth
+        guard depth > 0 else { return 0 }
+        let eligibleRows = rows.filter { rec in
+            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+            return Self.mtpStorageEligible(state)
+        }
+        guard !eligibleRows.isEmpty else { return depth }
+        if mtp.usesMarginalPolicy, !decision.isExploration {
+            let verificationLimit = mtp.maximumAutomaticDepth(
+                plannedDecodeRows: plannedDecodeRows)
+            depth =
+                eligibleRows.map { rec in
+                    mtp.marginalDepth(
+                        for: rec.id,
+                        offeredDepth: depth,
+                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                        verificationLimit: verificationLimit,
+                        decodeRowBucket: decision.decodeRowBucket)
+                }.min() ?? 0
+        }
+        guard depth > 0 else { return 0 }
+        return Self.mtpDepthWithinOutputBudget(
+            offeredDepth: depth,
+            remainingTokens: eligibleRows.map { $0.request.maxTokens - $0.generatedTokenCount })
     }
 
     /// A depth-k round verifies and can emit k+1 target tokens. Reserve one
@@ -379,7 +429,14 @@ extension EngineLoopV2 {
     /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
     /// so persistent history starts at prompt position 0.
     private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
-        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp, !mtp.planCanSpeculate else {
+        // A speculation-capable cohort plan (two or more decode rows) clamped to
+        // depth zero (controller, marginal policy, tail, budget or headroom)
+        // has no round either. Single decode rows keep the seed path.
+        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp,
+            !mtp.planCanSpeculate
+                || (mtp.planDepth == 0 && mtp.planDecision.decodeRowBucket >= 2
+                    && !mtp.requiresNonChainedDepthZeroProbe(mtp.planDecision))
+        else {
             return false
         }
         return plan.assignments.allSatisfy { assignment in

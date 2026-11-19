@@ -265,6 +265,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let allowsShortlist: Bool
     private let maximumDraftDepth: Int
     private let minimumStateElementBytes: Int
+    private let allowsCohorts: Bool
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -282,6 +283,47 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         }
     }
 
+    /// Decode rows that may speculate together in one round: each row drafts
+    /// on its own history and one captured `[B, 1 + k]` verification scores
+    /// every row's window; each row commits its own accepted prefix
+    /// (`commitsAcceptedPrefixPerRow`, switch `DARKBLOOM_QWEN_MTP_ROW_WIDTHS`). The engine reads it once, when
+    /// it binds the assistant. `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8; `1` is the
+    /// kill switch, and any other set value also keeps one row) wins; unset,
+    /// the 35B-A3B geometry (experts, hidden 2,048) takes
+    /// `sparseDefaultSpeculativeBatch` and every other target one row.
+    /// Assigned values outside 1...8 are clamped. Only plain rectangular verification of a
+    /// standard inline assistant uses it (`maximumSpeculativeBatch`).
+    public var speculativeBatchLimit: Int = 1 {
+        didSet { speculativeBatchLimit = min(max(speculativeBatchLimit, 1), 8) }
+    }
+
+    static let speculativeBatchEnvironmentKey = "DARKBLOOM_QWEN_MTP_MAX_BATCH"
+    static let sparseDefaultSpeculativeBatch = 2
+
+    static func defaultSpeculativeBatchLimit(sparseTarget: Bool) -> Int {
+        sparseTarget ? sparseDefaultSpeculativeBatch : 1
+    }
+
+    /// The measured MoE geometry (Qwen 3.5 / 3.6 35B-A3B): experts and a
+    /// 2,048-wide residual. Larger MoE targets keep one row until measured.
+    static func takesSparseDefault(_ configuration: Qwen35TextConfiguration) -> Bool {
+        configuration.numExperts > 0 && configuration.hiddenSize <= 2048
+    }
+
+    /// `DARKBLOOM_QWEN_MTP_MAX_BATCH`: an integer 1...8 (trimmed) wins; unset
+    /// (or empty) keeps `defaultLimit`; any other set value (`0`, `off`, a
+    /// typo) is one row, so a mistyped kill switch still turns cohorts off.
+    static func speculativeBatchLimit(
+        environment: [String: String], defaultLimit: Int
+    ) -> Int {
+        guard
+            let raw = environment[speculativeBatchEnvironmentKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+        else { return defaultLimit }
+        guard let value = Int(raw), (1 ... 8).contains(value) else { return 1 }
+        return value
+    }
+
     var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
     {
         (
@@ -297,7 +339,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         verificationMode: CBv2MTPVerificationMode?,
         allowsShortlist: Bool = true,
         maximumDraftDepth: Int = 4,
-        minimumStateElementBytes: Int = 0
+        minimumStateElementBytes: Int = 0,
+        allowsCohorts: Bool = true
     ) {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
@@ -305,10 +348,15 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         self.allowsShortlist = allowsShortlist
         self.maximumDraftDepth = maximumDraftDepth
         self.minimumStateElementBytes = minimumStateElementBytes
+        self.allowsCohorts = allowsCohorts
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
         super.init()
+        speculativeBatchLimit = Self.speculativeBatchLimit(
+            environment: ProcessInfo.processInfo.environment,
+            defaultLimit: Self.defaultSpeculativeBatchLimit(
+                sparseTarget: Self.takesSparseDefault(target.configuration)))
     }
 
     static func resolvedVerificationMode(
@@ -569,7 +617,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration, blockSize: metadata.blockSize,
             target: target, verificationMode: verificationMode, allowsShortlist: false,
-            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size)
+            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size,
+            allowsCohorts: false)
         if let quantization = metadata.quantization?.quantization {
             let matrixPaths = Set(
                 prism9BWeightShapes.compactMap { key, shape in
@@ -965,7 +1014,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
     /// `draftHidden`/`recordDraft` are available (not the legacy double-forward oracle).
     public var splitsDrafts: Bool { !Self.forceDoubleForward }
-    public var maximumSpeculativeBatch: Int? { 1 }
+    /// Cohorts only under plain rectangular verification of a standard inline
+    /// assistant: `rectangularExact` (canonical single-row columns) and the
+    /// Prism 9B sidecar have no multi-row evidence and keep one row.
+    public var maximumSpeculativeBatch: Int? {
+        Self.speculativeBatch(
+            mode: installedVerificationMode, allowsCohorts: allowsCohorts,
+            limit: speculativeBatchLimit)
+    }
+
+    static func speculativeBatch(
+        mode: CBv2MTPVerificationMode, allowsCohorts: Bool, limit: Int
+    ) -> Int {
+        mode == .rectangular && allowsCohorts ? limit : 1
+    }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
     /// batch-gated rows may chain and a final prompt row may seed the carry.
@@ -1270,6 +1332,138 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             !state.isReleased && state.roundInFlight && draft.shape == [1] && draft.dtype == .int32,
             "inline Qwen MTP recorded a draft outside its round")
         recordProposal(lastHidden: lastHidden, draft: draft, state: state)
+    }
+
+    /// `DARKBLOOM_QWEN_MTP_COHORT_DRAFTS=0/false/no/off` drafts a cohort's
+    /// rows one by one (`draftStep` per row) instead of `draftRowsStep`.
+    static let cohortDrafts: Bool = enabledUnlessOff("DARKBLOOM_QWEN_MTP_COHORT_DRAFTS")
+    /// `DARKBLOOM_QWEN_MTP_ROW_WIDTHS=0/false/no/off` makes a cohort commit one
+    /// common width (the shortest accepted prefix plus its correction) instead
+    /// of each row's own accepted prefix.
+    static let rowWidths: Bool = enabledUnlessOff("DARKBLOOM_QWEN_MTP_ROW_WIDTHS")
+    /// Measurement switch (default off): `DARKBLOOM_QWEN_MTP_EARLY_DRAFTS=1`
+    /// submits every draft step's graph as soon as it is built
+    /// (`submitsEveryDraftStepEarly`), not only the first.
+    static let earlyDrafts: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_EARLY_DRAFTS"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+    public var submitsEveryDraftStepEarly: Bool { Self.earlyDrafts }
+    /// Measurement switch (default off): `DARKBLOOM_QWEN_MTP_BATCHED_ATTENTION=1`
+    /// verifies each row's window on paged full-attention layers with one
+    /// multi-query pass (`PagedMTPBatchedColumns`) instead of one decode
+    /// dispatch per column.
+    static let batchedAttention: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_BATCHED_ATTENTION"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+    public var prefersBatchedRectangularAttention: Bool { Self.batchedAttention }
+    /// A verify window of a few rows' 1 + k tokens keeps the target's unsorted
+    /// expert route (no argsort, gather and unsort per routed layer):
+    /// `DARKBLOOM_QWEN_MTP_VERIFY_SORT_MIN=<n>` (n >= 1), default 256
+    /// assignments (32 tokens at top-8); `0` keeps the target's threshold.
+    static let verifySortMinimum: Int? = {
+        guard
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_VERIFY_SORT_MIN"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return 256 }
+        guard let value = Int(raw), value >= 0 else { return 256 }
+        return value == 0 ? nil : value
+    }()
+    public var verifySortMinimumAssignments: Int? { Self.verifySortMinimum }
+
+    static func enabledUnlessOff(_ key: String, environment: [String: String] = ProcessInfo
+        .processInfo.environment) -> Bool
+    {
+        guard let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+
+    /// Each cohort row commits its own accepted prefix. Every committed token
+    /// is still the target's own token at that position of the row's verify
+    /// window, and the captured verification keeps a replay tape per row, so a
+    /// row's commit never depends on how much another row accepted.
+    public var commitsAcceptedPrefixPerRow: Bool {
+        Self.rowWidths && (maximumSpeculativeBatch ?? 1) > 1
+    }
+
+    /// A cohort draft step: the rows' first steps run per row (each flushes its
+    /// own history backlog), later steps run the head's decoder layer once for
+    /// all rows, and every row without a shortlist takes its proposal from one
+    /// shared output-head product. Each row's history advances exactly as its
+    /// own `draftStep` would advance it.
+    public func draftRowsStep(
+        tokens: [MLXArray], hiddens: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> (tokens: [MLXArray], hiddens: [MLXArray])? {
+        let rows = tokens.count
+        guard Self.cohortDrafts, !Self.forceDoubleForward, mtp.draftsCohortRows, rows > 1,
+            hiddens.count == rows, shortlists.count == rows, requestStates.count == rows
+        else { return nil }
+        var states: [RequestState] = []
+        states.reserveCapacity(rows)
+        for requestState in requestStates {
+            guard let state = requestState as? RequestState else {
+                preconditionFailure("inline Qwen MTP received foreign request state")
+            }
+            precondition(!state.isReleased, "inline Qwen MTP drafted with released request state")
+            states.append(state)
+        }
+        guard Set(states.map { ObjectIdentifier($0) }).count == rows else { return nil }
+        for (token, hidden) in zip(tokens, hiddens) {
+            precondition(
+                token.shape == [1, 1] && hidden.ndim == 3 && hidden.dim(0) == 1
+                    && hidden.dim(1) == 1,
+                "inline Qwen MTP draft input shape mismatch")
+        }
+        let firstSteps = states.map { !$0.roundInFlight }
+        guard firstSteps.allSatisfy({ $0 == firstSteps[0] }) else { return nil }
+
+        let lastHiddens: [MLXArray]
+        if firstSteps[0] {
+            lastHiddens = (0 ..< rows).map {
+                proposalHidden(tokens: tokens[$0], hidden: hiddens[$0], state: states[$0])
+            }
+        } else {
+            guard states.allSatisfy({ $0.caches.count == 1 && $0.roundDraftSteps < 4 }) else {
+                return nil
+            }
+            let output = mtp.cohortDraftStepRows(
+                hidden: concatenated(hiddens, axis: 0),
+                nextTokenIds: concatenated(tokens, axis: 0),
+                embedTokens: target.model.embedTokens,
+                caches: states.map { $0.caches[0] })
+            lastHiddens = (0 ..< rows).map { output[$0 ..< ($0 + 1)] }
+        }
+
+        var drafts = [MLXArray?](repeating: nil, count: rows)
+        var headRows: [Int] = []
+        for row in 0 ..< rows {
+            if allowsShortlist, let shortlist = shortlists[row] {
+                drafts[row] = draftToken(hidden: lastHiddens[row], shortlist: shortlist)
+            } else {
+                headRows.append(row)
+            }
+        }
+        if !headRows.isEmpty {
+            let shared =
+                headRows.count == 1
+                ? lastHiddens[headRows[0]]
+                : concatenated(headRows.map { lastHiddens[$0] }, axis: 0)
+            let ids = argMax(headLogits(shared)[0..., -1, 0...], axis: -1).asType(.int32)
+            for (index, row) in headRows.enumerated() {
+                drafts[row] = ids[index ..< (index + 1)]
+            }
+        }
+        let proposals = drafts.map { $0! }
+        for row in 0 ..< rows {
+            recordProposal(lastHidden: lastHiddens[row], draft: proposals[row], state: states[row])
+        }
+        return (proposals, lastHiddens)
     }
 
     private func proposalHidden(tokens: MLXArray, hidden: MLXArray, state: RequestState) -> MLXArray
