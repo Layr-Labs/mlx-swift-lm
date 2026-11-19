@@ -980,6 +980,7 @@
             "MLXLMTests.CBv2MTPOutputBudgetTests",
             "MLXLMTests.CBv2MTPPenaltyEngineTests",
             "MLXLMTests.CBv2MTPPenaltyVerifyTests",
+            "MLXLMTests.CBv2MTPStopStringEngineTests",
             "MLXLMTests.CBv2MTPTargetSamplingMatrixTests",
             "MLXLMTests.CBv2MTPTypicalEngineTests",
             "MLXLMTests.CBv2MTPWorkloadLifecycleTests",
