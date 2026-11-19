@@ -438,6 +438,8 @@ extension EngineLoopV2 {
             var kept: [Int] = []
             var textPieces: [String] = []
             var finishReason: CBv2FinishReason?
+            // True only when the loop reached the grammar-failing token.
+            var keptFailingToken = false
             for (index, token) in emitted.enumerated() {
                 if metadata.freeSpan != nil {
                     sampler.confirmSampledTokens([token], requestIDs: [id])
@@ -450,6 +452,7 @@ extension EngineLoopV2 {
                 kept.append(token)
                 if index == emitted.count - 1, let failure = outcome.constraintFailure {
                     finishReason = .error(failure)
+                    keptFailingToken = true
                     break
                 }
                 if rec.request.stopTokens.contains(token) {
@@ -572,8 +575,11 @@ extension EngineLoopV2 {
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
+                // A grammar-failing token is never emitted (ordinary decode
+                // finishes with the error before emitting it).
+                let visibleTokens = keptFailingToken ? Array(kept.dropLast()) : kept
                 stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: kept, logprobs: nil))
+                    .delta(text: textPieces.joined(), tokens: visibleTokens, logprobs: nil))
             } else {
                 let stream = stream(for: id)
                 stream?.reserveEmission()

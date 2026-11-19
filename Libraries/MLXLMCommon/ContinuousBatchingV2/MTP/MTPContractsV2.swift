@@ -601,6 +601,18 @@ public struct CBv2MTPConfig: Sendable {
     public var effectivePenaltySpeculation: Bool {
         penaltySpeculation && Self.envPenaltySpeculation
     }
+    /// Opt-in: rows with stop strings may draft. The round's finalize
+    /// confirms committed tokens one at a time through the row's
+    /// detokenizer and ends the row at the first stop-string match, the
+    /// ordinary decode semantics (tokens past the match are rolled back).
+    /// Off by default; `DARKBLOOM_MTP_STOP_STRING_ROWS=0` overrides an opt-in.
+    public var stopStringSpeculation: Bool
+    /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
+    public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")
+    /// The opt-in AND the process kill switch.
+    public var effectiveStopStringSpeculation: Bool {
+        stopStringSpeculation && Self.envStopStringSpeculation
+    }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
         ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
@@ -635,7 +647,8 @@ public struct CBv2MTPConfig: Sendable {
         prefillCarry: Bool = Self.envPrefillCarry,
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
-        penaltySpeculation: Bool = false
+        penaltySpeculation: Bool = false,
+        stopStringSpeculation: Bool = false
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
@@ -645,6 +658,7 @@ public struct CBv2MTPConfig: Sendable {
         self.constrainedSpeculation = constrainedSpeculation
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
+        self.stopStringSpeculation = stopStringSpeculation
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(

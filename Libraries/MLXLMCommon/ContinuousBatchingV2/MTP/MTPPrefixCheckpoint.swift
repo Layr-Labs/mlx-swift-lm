@@ -11,8 +11,8 @@ public protocol CBv2MTPPrefixCheckpoint: AnyObject {
 /// Optional capability for assistants that can restore the same prompt history
 /// and first-draft geometry as cold execution. Checkpoints stay model-owned.
 public protocol CBv2MTPPrefixCheckpointDrafter: CBv2MTPRequestStatefulDrafter {
-    /// True when a cached text request that cannot speculate (a stop string,
-    /// logprobs, a logit bias, a penalty, a token constraint) still records
+    /// True when a cached text request that cannot speculate (a stop string or
+    /// penalty without its opt-in, logprobs, a logit bias, a token constraint) still records
     /// this drafter's prompt history, so its prefix checkpoints carry the
     /// assistant state a speculating request restores. Its prompt then runs
     /// the hidden-returning prefill forward, whose logits must be the
