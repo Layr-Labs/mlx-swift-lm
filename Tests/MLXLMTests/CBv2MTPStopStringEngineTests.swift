@@ -212,7 +212,8 @@ struct CBv2MTPStopStringEngineTests {
             request: request(1, prompt, maxTokens, .init(temperature: 0), stops: []))
         let stopped = request(
             1, prompt, maxTokens, .init(temperature: 0), stops: [rendered([plain.tokens[9]])])
-        let other = request(2, prompt, maxTokens, .init(temperature: 0), stops: [])
+        // A different prompt: the two rows' streams differ, so a row mix-up shows.
+        let other = request(2, [5, 9, 13, 17, 29], maxTokens, .init(temperature: 0), stops: [])
         func both(script: [Int]?) async throws -> [Served] {
             let kinds = target.cbv2LayerKinds
             let drafter = script.map {
@@ -259,6 +260,31 @@ struct CBv2MTPStopStringEngineTests {
             #expect(on[row].completionTokens == off[row].completionTokens, "row \(row) usage")
         }
         #expect((on[0].metrics?.rounds ?? 0) > 0)
+    }
+
+    /// A match on the max_tokens-th token ends `.stop`, for three consecutive
+    /// max_tokens values, so one of them puts that token in a round's slot.
+    @Test func matchOnTheLastTokenEndsStop() async throws {
+        let target = try makeTarget()
+        let prompt = [3, 7, 11, 19, 23]
+        let plain = try await serve(
+            target: target, script: nil, prompt: prompt,
+            request: request(1, prompt, 32, .init(temperature: 0), stops: []))
+        for maxTokens in 23 ... 25 {
+            let req = request(
+                1, prompt, maxTokens, .init(temperature: 0),
+                stops: [rendered([plain.tokens[maxTokens - 1]])])
+            let off = try await serve(target: target, script: nil, prompt: prompt, request: req)
+            #expect(off.finish == .stop, "max \(maxTokens)")
+            for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
+                let on = try await serve(
+                    target: target, script: plain.tokens + [0, 0, 0, 0], prompt: prompt,
+                    request: req, verificationMode: mode)
+                #expect(on.finish == .stop, "max \(maxTokens) \(mode)")
+                #expect(on.text == off.text && on.tokens == off.tokens, "max \(maxTokens) \(mode)")
+                #expect(on.completionTokens == off.completionTokens, "max \(maxTokens) \(mode)")
+            }
+        }
     }
 
     /// Without the opt-in (what `DARKBLOOM_MTP_STOP_STRING_ROWS=0` forces)
