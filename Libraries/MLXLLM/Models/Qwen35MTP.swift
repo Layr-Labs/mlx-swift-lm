@@ -285,12 +285,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
     /// Decode rows that may speculate together in one round: each row drafts
     /// on its own history and one captured `[B, 1 + k]` verification scores
-    /// every row's window; the rows commit one common width (the shortest
-    /// accepted prefix, `commitsAcceptedPrefixPerRow` is false). The engine
-    /// reads it once, when it binds the assistant. Defaults to
-    /// `DARKBLOOM_QWEN_MTP_MAX_BATCH` (1...8), else 1; values outside 1...8
-    /// are clamped. Only plain rectangular verification of a standard inline
-    /// assistant uses it (`maximumSpeculativeBatch`).
+    /// every row's window; the rows commit one common width (the smallest
+    /// accepted prefix plus its correction token across the rows,
+    /// `commitsAcceptedPrefixPerRow` is false). The engine reads it once, when
+    /// it binds the assistant. Defaults to `DARKBLOOM_QWEN_MTP_MAX_BATCH`
+    /// (1...8; an out-of-range environment value keeps 1); assigned values
+    /// outside 1...8 are clamped. Only plain rectangular verification of a
+    /// standard inline assistant uses it (`maximumSpeculativeBatch`).
     public var speculativeBatchLimit: Int = Qwen35InlineMTPAssistant
         .environmentSpeculativeBatchLimit
     {
@@ -999,6 +1000,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// `draftHidden`/`recordDraft` are available (not the legacy double-forward oracle).
     public var splitsDrafts: Bool { !Self.forceDoubleForward }
     public var maximumSpeculativeBatch: Int? { 1 }
+
+    static func speculativeBatch(
+        mode: CBv2MTPVerificationMode, allowsCohorts: Bool, limit: Int
+    ) -> Int { 1 }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
     /// batch-gated rows may chain and a final prompt row may seed the carry.
