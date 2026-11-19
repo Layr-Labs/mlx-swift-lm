@@ -1369,14 +1369,15 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return value == 0 ? nil : value
     }()
 
-    static func enabledUnlessOff(_ key: String, environment: [String: String] = ProcessInfo
-        .processInfo.environment) -> Bool
-    {
+    static func enabledUnlessOff(
+        _ key: String,
+        environment: [String: String] = ProcessInfo
+            .processInfo.environment
+    ) -> Bool {
         guard let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }
-
 
     private func proposalHidden(tokens: MLXArray, hidden: MLXArray, state: RequestState) -> MLXArray
     {
