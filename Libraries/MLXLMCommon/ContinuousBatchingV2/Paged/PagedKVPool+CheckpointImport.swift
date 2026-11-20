@@ -107,7 +107,7 @@ extension PagedKVPool {
                         item.group,
                         try item.group.prepareImport(
                             item.plan, source: storage.groups[item.group.key]!, evaluate: slabEval,
-                            admission: memoryAdmission)
+                            admission: memoryAdmission, hostZeroed: config.hostZeroedSegments)
                     ))
             }
             let pageMaps = Dictionary(
