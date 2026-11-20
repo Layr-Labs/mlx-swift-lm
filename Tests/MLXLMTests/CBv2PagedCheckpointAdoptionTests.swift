@@ -173,8 +173,9 @@ struct CBv2PagedCheckpointAdoptionTests {
             .reshaped([2, count, 64]).asType(.bfloat16)
         var readBack: [Bool: [Data]] = [:]
         for hostZeroed in [false, true] {
-            // 4 pages of 8 KiB per segment: 32 KiB, page-granular for host zeros.
-            let (backend, admission, kinds) = try fixture(segmentPages: 3, hostZeroed: hostZeroed)
+            // Four 8 KiB pages per segment: 32 KiB, a whole number of 16 KiB VM
+            // pages, so host zeros apply and each buffer is exactly its length.
+            let (backend, admission, kinds) = try fixture(segmentPages: 4, hostZeroed: hostZeroed)
             var weakOwners: [WeakImportedArray] = []
             let staged = try frame(
                 backend: backend, admission: admission, kinds: kinds, weakOwners: &weakOwners)
