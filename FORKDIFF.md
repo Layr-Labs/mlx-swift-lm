@@ -61,15 +61,15 @@ The peak of a job is the larger of two sampler figures: used memory (app +
 wired + compressed) and the sum of the lifetime peak footprints of the
 runner user's processes. The second matters where memory is compressed:
 used memory counts compressed pages at their compressed size. The idle VM
-uses about 6 GiB. Pull request runs 44750661761 and 44754337456 measured
-every job.
+uses about 6 GiB. Pull request runs 44750661761, 44754337456 and 44764725460
+measured every job.
 
 | Job | Size | Data before the sampler | Measured (size: wall time, peak) |
 |---|---|---|---|
 | Build | 8x16 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16: 361 and 457 s, 10.04 GiB. The sampler scales 339 sampled seconds to about 547 s on 4 vCPUs (+61%); the slower builds (583 s) would then take more than 10 minutes on 4x16. |
 | Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. | 4x16: 231 and 306 s, 10.04 GiB (`air-lld` 6.52) |
-| Test shard 1 to 8 and 10 to 12 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 222 to 446 s; shard 8 17.84 GiB of footprints, the others at most 11.41 GiB. |
-| Test shard 9 (`test-shard-9`) | 12x32 | Same runs. Shard 9 holds `HistoricalWindowCheckpointEngineTests`. | 4x16 and 4x24: 276 and 299 s, 7.88 GiB, but three of its assertions fail on 4 vCPUs (issue #469). It keeps 12x32, the size it ran on before, and moves to 4x24 in `test` when #469 is fixed. |
+| Test shards 1 to 6, 8 and 10 to 12 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB. |
+| Test shards 7 and 9 (`test-12x32`, the plan's `SHARDS_12X32`) | 12x32 | Same runs. | On 4 vCPUs (4x16 and 4x24) tests in them find admission bytes still reserved after a request's final event (issue #469): `HistoricalWindowCheckpointEngineTests` in shard 9 failed in both runs, `Qwen35CardDefaultCheckpointTests` in shard 7 in one of three. Memory is not the cause: shard 7 peaked at 10.25 GiB, shard 9 at 7.88 GiB. They keep 12x32, the size they ran on before, and move to 4x24 in `test` when #469 is fixed. |
 | Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. | not run on pull requests |
 | PR lint | 4x16 | 35 s on 12 vCPUs. | 4x16: 31 s, 6.04 GiB |
 
