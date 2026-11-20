@@ -953,13 +953,30 @@ extension KernelTests {
             let (consumer, _) = try nativeMTPEngine(
                 store: consumerStore, process: gate, verification: .serialTarget)
             let loop = consumer.loopForTesting
+            func clearHooks() {
+                hold.release()
+                loop.onEngineQueueSync {
+                    loop.suspendStepExecutionAtCountForTesting = nil
+                    loop.nativePagedPrefixPreparedForTesting = nil
+                    loop.nativePagedPrefixAdoptedForTesting = nil
+                    loop.nativeShutdownState?.beforeFenceForTesting = nil
+                    loop.nativeShutdownState?.afterAssistantFenceForTesting = nil
+                }
+            }
             // Only the staged import's native work captures the hold; the hook is
             // cleared before any other native work exists.
             let suspendAt = loop.onEngineQueueSync {
                 loop.nativeShutdownState?.beforeFenceForTesting = { _ in hold.fence() }
-                return loop.stepCount + 5
+                return loop.stepCount + 6
             }
-            #expect(try consumerStore.base.stage(engine: consumer, request: request))
+            let staged: Bool
+            do {
+                staged = try consumerStore.base.stage(engine: consumer, request: request)
+            } catch {
+                clearHooks()
+                await consumer.shutdown()
+                throw error
+            }
             var prepared = 0
             var adopted = 0
             loop.onEngineQueueSync {
@@ -978,30 +995,45 @@ extension KernelTests {
                 }
                 loop.suspendStepExecutionAtCountForTesting = suspendAt
             }
-            let stream = try consumer.submit(request)
+            guard staged else {
+                Issue.record("the producer's checkpoint was not staged")
+                clearHooks()
+                await consumer.shutdown()
+                return
+            }
+            let stream: AsyncStream<CBv2Event>
+            do {
+                stream = try consumer.submit(request)
+            } catch {
+                clearHooks()
+                await consumer.shutdown()
+                throw error
+            }
             let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 120) }
             // The refused restore's retirement waits at its fence while the cold
             // request prefills, runs its assistant and pauses mid-decode.
             let paused = await cbv2SchedWait(timeoutSeconds: 30) {
                 hold.isHolding && loop.onEngineQueueSync { loop.stepCount >= suspendAt }
             }
-            let live = loop.onEngineQueueSync { loop.scheduler.record(for: request.id) != nil }
-            #expect(paused && live && assistantFences.value > 0)
+            let row = loop.onEngineQueueSync { () -> (running: Bool, generated: Int) in
+                guard let record = loop.scheduler.record(for: request.id) else { return (false, 0) }
+                return (record.status == .running, record.generatedTokenCount)
+            }
+            #expect(paused, "the cold request reached the pause while the restore's fence was held")
+            #expect(row.running && row.generated > 0, "the cold request is decoding at the pause")
+            #expect(assistantFences.value > 0, "the cold request's assistant ran before the pause")
             #expect(
                 consumerStore.base.releaseCount == 0, "the refused restore's stage is still held")
-            hold.release()
-            let retired = await cbv2SchedWait(timeoutSeconds: 30) {
-                consumer.nativeCompletionFault != nil || consumerStore.base.releaseCount > 0
+            if paused, row.running, row.generated > 0 {
+                hold.release()
+                let retired = await cbv2SchedWait(timeoutSeconds: 30) {
+                    consumer.nativeCompletionFault != nil || consumerStore.base.releaseCount > 0
+                }
+                #expect(retired, "the refused restore retired while the cold request was live")
+                #expect(consumer.nativeCompletionFault == nil)
+                #expect(consumerStore.base.releaseCount == 1)
             }
-            #expect(retired, "the refused restore retired while the cold request was live")
-            #expect(consumer.nativeCompletionFault == nil)
-            #expect(consumerStore.base.releaseCount == 1)
-            loop.onEngineQueueSync {
-                loop.suspendStepExecutionAtCountForTesting = nil
-                loop.nativePagedPrefixPreparedForTesting = nil
-                loop.nativePagedPrefixAdoptedForTesting = nil
-                loop.nativeShutdownState?.afterAssistantFenceForTesting = nil
-            }
+            clearHooks()
             let cold = await collector.value
             #expect(prepared == 1 && adopted == 0 && gate.refusals == 1)
             #expect(cold.finishReason == .length && cold.tokens == produced.tokens)
