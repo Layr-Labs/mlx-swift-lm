@@ -54,6 +54,12 @@ jobs:
       - name: Test the shard tool
         run: python3 .github/scripts/test_shards_test.py
 
+      - name: Test the runner sizes and the resource sampler
+        # Fails when a macOS job names no signed VM size (FORKDIFF.md, Job sizes).
+        run: |
+          python3 .github/scripts/test-runner-sizes.py
+          python3 .github/scripts/test-ci-resource-sampler.py
+
       - name: Read the shard numbers
         id: matrix
         # The seven-test audio exception uses its separate hosted shard.
@@ -66,7 +72,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-8x16]
     permissions:
       contents: read
     timeout-minutes: 90
@@ -97,6 +103,11 @@ jobs:
           fi
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the resource sampler
+        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
+        # samples memory and busy vCPUs. It never fails the job.
+        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
 
       - name: Test the suite runner scripts
         # Checks that scripts/run-nested-suite.sh, which developers use to
@@ -264,9 +275,14 @@ jobs:
           path: /Users/runner/Library/Caches/ccache-fork-tests
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
+      - name: Report the resource samples
+        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
+        if: ${{ always() }}
+        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true
+
   metallib:
     name: Metal library
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
     permissions:
       contents: read
     timeout-minutes: 30
@@ -286,6 +302,11 @@ jobs:
           fi
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the resource sampler
+        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
+        # samples memory and busy vCPUs. It never fails the job.
+        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
 
       - name: Select Xcode
         id: xcode
@@ -346,6 +367,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Report the resource samples
+        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
+        if: ${{ always() }}
+        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true
+
   list:
     name: Check the shard map
     needs: build
@@ -369,7 +395,7 @@ jobs:
   test:
     name: Test shard ${{ matrix.shard }}
     needs: [plan, build, metallib]
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
     permissions:
       contents: read
     timeout-minutes: 45
@@ -379,6 +405,11 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the resource sampler
+        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
+        # samples memory and busy vCPUs. It never fails the job.
+        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
 
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
@@ -432,6 +463,11 @@ jobs:
           path: ~/Library/Logs/DiagnosticReports/*
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Report the resource samples
+        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
+        if: ${{ always() }}
+        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true
 
   # Temporary decoder exception: the same seven strict tests, products and
   # coverage reports run on hosted macOS until the native audio issue is fixed.
@@ -648,12 +684,17 @@ jobs:
     # requests skip it: it starts after the last shard and adds a new
     # sandbox's start to their wait. Pushes to main report it.
     if: ${{ !cancelled() && needs.build.result == 'success' && github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
     permissions:
       contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the resource sampler
+        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
+        # samples memory and busy vCPUs. It never fails the job.
+        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
 
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
@@ -762,3 +803,8 @@ jobs:
         with:
           name: coverage-report
           path: ${{ runner.temp }}/coverage-report.txt
+
+      - name: Report the resource samples
+        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
+        if: ${{ always() }}
+        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true

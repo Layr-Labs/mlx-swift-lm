@@ -26,7 +26,8 @@ Fork Tests, PR lint, the fork-diff check and page rendering use Darkbloom
 macOS or Linux ARM64 runners. Each compute job queues independently with
 the full native runner labels; these jobs have no hosted fallback and do
 not reserve all seven Mac jobs before the build starts. The repository's
-approval still determines its resources, image and network policy.
+approval still determines the image and the network policy. Each macOS job
+names its VM size ([Job sizes](#job-sizes)).
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
@@ -46,6 +47,32 @@ artifact through the `github-pages` environment. The disabled native
 CodeQL workflow has separate activation and rollback gates in
 [`docs/ci-codeql-native.md`](docs/ci-codeql-native.md); merging it does not
 switch off GitHub's current default setup.
+
+### Job sizes
+
+Each Darkbloom macOS job names its VM size in its runner label, for example
+`darkbloom-macos-arm64-4x16` (4 vCPUs, 16 GiB). A job without a size gets the
+size that the approval pins (12 vCPUs, 32 GiB). The image pipeline signs
+4x16, 4x24, 8x16 and 12x32. A job gets the smallest signed size that has 30%
+headroom over its measured memory peak (used memory: app + wired +
+compressed). A job that took less than 10 minutes must stay under 10 minutes.
+
+| Job | Size | Data |
+|---|---|---|
+| Build | 8x16 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). On 4 vCPUs the job would take more than 10 minutes. |
+| Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. |
+| Test shard 1 to 12 | 4x16 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. All ten shards of the earlier map passed on the hosted 3-vCPU, 7 GiB Mac (runs 43365935094, 43408681875). |
+| Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. |
+| PR lint | 4x16 | 35 s on 12 vCPUs. |
+
+Every macOS job runs `.github/scripts/ci-resource-sampler.py`, a copy of the
+sampler of Layr-Labs/d-inference, from its checkout on. Its last step,
+"Report the resource samples", prints the memory peak of each class, the
+three largest processes, the busy vCPUs and the sampled time scaled to 4 and
+8 vCPUs. Use these numbers to change a size. The Shard map job runs
+`.github/scripts/test-runner-sizes.py`. It fails when a macOS job names no
+size, a size that is not signed, or a size other than the one its table
+gives.
 
 ## The gate
 
