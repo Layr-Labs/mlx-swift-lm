@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -15,6 +15,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 2 # the merge commit and the tip of the base branch
+
+      - name: Start the resource sampler
+        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
+        # samples memory and busy vCPUs. It never fails the job.
+        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
 
       - name: Select Xcode
         # The formatter is the swift-format of the Xcode that this action
@@ -35,3 +40,8 @@ jobs:
           git diff -z --name-only --diff-filter=ACMR HEAD^1...HEAD -- '*.swift' \
             | xargs -0 swift format format --in-place --configuration .swift-format
           git diff --exit-code
+
+      - name: Report the resource samples
+        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
+        if: ${{ always() }}
+        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true
