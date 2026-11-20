@@ -923,6 +923,111 @@ extension KernelTests {
             #expect(gate.growthAfterRefusal.isEmpty)
         }
 
+        /// An ordinary request whose prefix adoption is refused prefills cold. Its
+        /// assistant must get its own binding, not the refused restore's
+        /// stage-funded one, which that restore's retirement later abandons.
+        @Test func refusedNativeMTPPrefixAdoptionColdFallbackUsesItsOwnBinding() async throws {
+            let request = CBv2Request(
+                id: .init(806), promptTokens: (0 ..< 73).map { 4 + $0 % 20 },
+                sampling: .init(temperature: 0), maxTokens: 24,
+                cacheSalt: "tenant-mtp", prefixCacheReceiptID: .init(1806))
+            let producerStore = NativeStore(.init(segmentBytes: 28))
+            let (producer, _) = try nativeMTPEngine(
+                store: producerStore, verification: .serialTarget)
+            let produced = await cbv2SchedCollect(try producer.submit(request))
+            switch await producer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
+                Issue.record("producer did not shut down cleanly")
+                return
+            }
+            #expect(produced.finishReason == .length && !producerStore.base.saved.isEmpty)
+
+            let consumerStore = NativeStore(
+                .init(archives: producerStore.base.saved, segmentBytes: 28))
+            let gate = GrowthGate()
+            let hold = FenceHold()
+            defer { hold.release() }
+            let (consumer, _) = try nativeMTPEngine(
+                store: consumerStore, process: gate, verification: .serialTarget)
+            let loop = consumer.loopForTesting
+            let baseline = gate.charge
+            // The import's native work captures this hook when it is staged.
+            let suspendAt = loop.onEngineQueueSync {
+                loop.nativeShutdownState?.beforeFenceForTesting = { _ in hold.fence() }
+                return loop.stepCount + 5
+            }
+            #expect(try consumerStore.base.stage(engine: consumer, request: request))
+            var prepared = 0
+            var adopted = 0
+            loop.onEngineQueueSync {
+                loop.nativePagedPrefixPreparedForTesting = { id, _ in
+                    guard id == request.id else { return }
+                    prepared += 1
+                    gate.refuseNextGrowth()
+                    hold.arm()
+                }
+                loop.nativePagedPrefixAdoptedForTesting = { id, _, _ in
+                    if id == request.id { adopted += 1 }
+                }
+                loop.suspendStepExecutionAtCountForTesting = suspendAt
+            }
+            let stream = try consumer.submit(request)
+            let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 60) }
+            // The refused restore's retirement waits at its fence while the cold
+            // request prefills, configures its assistant and pauses mid-decode.
+            let paused = await cbv2SchedWait(timeoutSeconds: 30) {
+                hold.isHolding && loop.onEngineQueueSync { loop.stepCount >= suspendAt }
+            }
+            #expect(paused)
+            let charged = gate.charge
+            hold.release()
+            let retired = await cbv2SchedWait(timeoutSeconds: 30) {
+                consumer.nativeCompletionFault != nil || gate.charge < charged
+            }
+            #expect(retired, "the refused restore retired while the cold request was live")
+            #expect(consumer.nativeCompletionFault == nil)
+            loop.onEngineQueueSync {
+                loop.suspendStepExecutionAtCountForTesting = nil
+                loop.nativePagedPrefixPreparedForTesting = nil
+                loop.nativePagedPrefixAdoptedForTesting = nil
+                loop.nativeShutdownState?.beforeFenceForTesting = nil
+            }
+            let cold = await collector.value
+            #expect(prepared == 1 && adopted == 0 && gate.refusals == 1)
+            #expect(cold.finishReason == .length && cold.tokens == produced.tokens)
+            let drained = await cbv2SchedWait { gate.charge == baseline }
+            #expect(drained, "the stage and both assistants retire to the baseline charge")
+            #expect(consumer.nativeCompletionFault == nil)
+            switch await consumer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
+                Issue.record("consumer did not shut down cleanly")
+            }
+        }
+
+        /// Holds the first native fence after `arm()` until `release()`.
+        private final class FenceHold: @unchecked Sendable {
+            private let lock = NSLock()
+            private let resume = DispatchSemaphore(value: 0)
+            private var armed = false
+            private var holding = false
+            var isHolding: Bool { lock.withLock { holding } }
+            func arm() { lock.withLock { armed = true } }
+            func fence() {
+                let hold = lock.withLock { () -> Bool in
+                    guard armed else { return false }
+                    armed = false
+                    holding = true
+                    return true
+                }
+                if hold { resume.wait() }
+            }
+            func release() { resume.signal() }
+        }
+
         private func nativeMTPEngine(
             store: NativeStore, process: any CBv2ProcessMemoryOwner = ProcessBudget(),
             verification: GLM5NextMTPVerification
