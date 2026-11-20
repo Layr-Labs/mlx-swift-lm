@@ -57,13 +57,17 @@ size that the approval pins (12 vCPUs, 32 GiB). The image pipeline signs
 headroom over its measured memory peak (used memory: app + wired +
 compressed). A job that took less than 10 minutes must stay under 10 minutes.
 
-| Job | Size | Data |
-|---|---|---|
-| Build | 8x16 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). On 4 vCPUs the job would take more than 10 minutes. |
-| Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. |
-| Test shard 1 to 12 | 4x16 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. All ten shards of the earlier map passed on the hosted 3-vCPU, 7 GiB Mac (runs 43365935094, 43408681875). |
-| Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. |
-| PR lint | 4x16 | 35 s on 12 vCPUs. |
+The last column is from pull request run 44750661761, where the sampler
+measured each job: its size there, its wall time, and its peak of used memory.
+The idle VM uses about 6 GiB.
+
+| Job | Size | Data before the sampler | Run 44750661761 |
+|---|---|---|---|
+| Build | 8x16 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16, 361 s, 10.04 GiB. The sampler scales its 339 sampled seconds to about 547 s on 4 vCPUs (+61%); with the slower builds (583 s) the job would take more than 10 minutes on 4x16. |
+| Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. | 4x16, 231 s, 9.94 GiB (`air-lld` 6.52) |
+| Test shard 1 to 12 | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16, 206 to 512 s, 7.52 to 13.26 GiB. Shard 8 peaked at 13.26 GiB with 6.4 GiB compressed, memory pressure at warning and 0.06 GiB swapped (`swiftpm-testing-helper` 10.28 GiB). 16 GiB is less than 1.3 times that, so every shard gets 24 GiB. |
+| Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. | not run on pull requests |
+| PR lint | 4x16 | 35 s on 12 vCPUs. | 4x16, 31 s, 6.04 GiB |
 
 Every macOS job runs `.github/scripts/ci-resource-sampler.py`, a copy of the
 sampler of Layr-Labs/d-inference, from its checkout on. Its last step,

@@ -395,7 +395,7 @@ jobs:
   test:
     name: Test shard ${{ matrix.shard }}
     needs: [plan, build, metallib]
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x24]
     permissions:
       contents: read
     timeout-minutes: 45
