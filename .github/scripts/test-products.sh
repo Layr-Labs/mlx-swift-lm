@@ -11,7 +11,10 @@
 # clones (repositories), each target's <Target>.build directory (object
 # files), ModuleCache, index, Modules, the host tools (-tool) and the .dSYM
 # bundles. It keeps the test bundle, the build database, the checkouts and
-# workspace-state.json. SwiftPM's products hold absolute paths and were built
+# workspace-state.json. zstd level 9 with a 2 GiB window: every test shard
+# downloads the archive, so its size beats the build job's few seconds of
+# packing (d-inference measured 400 to 265 MiB for about 7 s).
+# SwiftPM's products hold absolute paths and were built
 # with one Xcode, so unpack fails when the workspace path or the developer
 # directory is not the build job's.
 set -euo pipefail
@@ -41,7 +44,7 @@ if [[ $1 == pack ]]; then
         -o -path '.build/*-apple-*/*/*-tool.product' \
         -o -name '*.dSYM' \) -prune -o \( -type f -o -type l \) -print0 \
         | tar --null -T - -cf - \
-        | zstd -T0 -3 --long=31 -q -f -o "$archive"
+        | zstd -T0 -9 --long=31 -q -f -o "$archive"
     echo "Packed $(du -sh "$archive" | cut -f1) in $(( $(date +%s) - start )) s"
 else
     start=$(date +%s)
