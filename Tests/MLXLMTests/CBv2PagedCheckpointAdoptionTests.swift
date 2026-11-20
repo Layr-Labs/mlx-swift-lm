@@ -177,8 +177,8 @@ struct CBv2PagedCheckpointAdoptionTests {
         var readBack: [Bool: [Data]] = [:]
         for hostZeroed in [false, true] {
             // 16 KiB pages (2 KV heads x 16 tokens x 128 x K+V x bf16): every
-            // segment is a whole number of VM pages, so host zeros apply and each
-            // grown buffer is exactly its length.
+            // backing (usable pages + poison) is a whole number of VM pages, so
+            // host zeros apply to all of it.
             let (backend, admission, kinds) = try fixture(
                 segmentPages: 3, hostZeroed: hostZeroed, headDim: dim)
             var weakOwners: [WeakImportedArray] = []
@@ -196,19 +196,23 @@ struct CBv2PagedCheckpointAdoptionTests {
                 maximumTokens: 513)
             let row = try #require(adopted.rows.first)
             let group = backend.pool.group(row.groupKey)
-            #expect(row.reservedPages == 33 && group.committedUsablePages >= 33)
+            #expect(row.reservedPages == 33 && row.table.count == 2)
+            // The empty pool held nothing: the two staged pages are imported and
+            // exactly the other 31 promised pages are new backing.
+            let grown = group.segments.values.filter {
+                !stageIDs.contains(ObjectIdentifier($0.storage))
+            }
+            #expect(grown.reduce(0) { $0 + $1.pages.count - 1 } == 31)
+            #expect(grown.allSatisfy { $0.storage.nbytes % Int(getpagesize()) == 0 })
+            let grownPages = Set(grown.flatMap { $0.pages.dropFirst().map(Int32.init) })
             if hostZeroed {
                 #expect(allocations == 0, "suffix backing must be host-zeroed, not device-filled")
-                let grown = group.segments.values.filter {
-                    !stageIDs.contains(ObjectIdentifier($0.storage))
-                }
-                #expect(!grown.isEmpty)
                 for segment in grown {
                     let info = try #require(try segment.storage.evaluatedBufferInfo())
                     #expect(info.allocatedBytes == segment.storage.nbytes)
                 }
             } else {
-                #expect(allocations > 0, "the reference keeps the device zero fill")
+                #expect(allocations == grown.count, "the reference device-fills each new backing")
             }
             for isValues in [false, true] {
                 #expect(
@@ -221,7 +225,8 @@ struct CBv2PagedCheckpointAdoptionTests {
                     keys: keys[0..., start ..< start + 60],
                     values: values[0..., start ..< start + 60])
             }
-            #expect(row.absoluteOffset == 17 + count)
+            #expect(row.absoluteOffset == 17 + count && row.table.count == 20)
+            #expect(row.table.dropFirst(2).allSatisfy(grownPages.contains))
             readBack[hostZeroed] = try [false, true].map {
                 try read(row, position: 17 + count, values: $0, admission: admission)
             }
