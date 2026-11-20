@@ -899,7 +899,10 @@ extension KernelTests {
                 let result = try await consumer.submit(request, firstTokenDeadline: policy)
                 Issue.record("the refused restore must reject the request, got \(result)")
             } catch let error as CBv2KVError {
-                if case .capacityExhausted = error {} else {
+                switch error {
+                case .capacityExhausted:
+                    break
+                default:
                     Issue.record("unexpected rejection \(error)")
                 }
             }
@@ -911,7 +914,10 @@ extension KernelTests {
             let drained = await cbv2SchedWait { gate.charge == baseline }
             #expect(drained, "the stage and its imported assistant retire to the baseline charge")
             #expect(consumer.nativeCompletionFault == nil)
-            if case .quiescent = await consumer.shutdownReportingNativeCompletion() {} else {
+            switch await consumer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
                 Issue.record("consumer did not shut down cleanly")
             }
             #expect(gate.growthAfterRefusal.isEmpty)
