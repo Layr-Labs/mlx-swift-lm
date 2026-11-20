@@ -1125,8 +1125,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             auxiliaryBytesPerToken >= resolved.auxiliaryBytesPerToken,
             contiguousCheckpointOwners[id] == nil, checkpointRequestOwners[id] == nil
         else { throw CBv2MTPBindingError.missingAdmission }
-        // A reserved request can no longer commit an import, so a stage-funded
-        // binding here belongs to a refused restore. It keeps its leases and
+        // No import commits while this reservation is live, so a stage-funded
+        // binding here is from an unpublished restore. It keeps its leases and
         // stage charge; this request gets its own binding.
         if let record = mtpBindings[id], record.isStageFunded {
             record.context?.retireStageFunded()
