@@ -6,7 +6,9 @@ import Testing
 
 @Suite("Page-native checkpoint adoption", .serialized)
 struct CBv2PagedCheckpointAdoptionTests {
-    private func fixture(types: [DType] = [.bfloat16], segmentPages: Int = 2)
+    private func fixture(
+        types: [DType] = [.bfloat16], segmentPages: Int = 2, hostZeroed: Bool = false
+    )
         throws -> (PagedKVBackend, AdmissionV2, [CBv2LayerKind])
     {
         let kinds = types.map { _ in CBv2LayerKind(
@@ -14,7 +16,8 @@ struct CBv2PagedCheckpointAdoptionTests {
         let largestPage = 2 * 2 * 16 * 64 * types.map(\.size).max()!
         let config = PagedKVPoolConfig(
             capacityBytes: 32 << 20, maxPrefillChunk: 64, maxBufferLength: 32 << 20,
-            segmentSizeBytes: largestPage * (segmentPages + 1), layerDTypes: types)
+            segmentSizeBytes: largestPage * (segmentPages + 1), layerDTypes: types,
+            hostZeroedSegments: hostZeroed)
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
         let admission = AdmissionV2(layerKinds: kinds, bytesCapacity: 32 << 20, config: .init(
             watermarkFraction: 0, elementBytes: 2, layerElementBytes: types.map(\.size),
@@ -129,6 +132,72 @@ struct CBv2PagedCheckpointAdoptionTests {
         backend.pool.unreserve([key: 4])
         admission.releaseAll(id: .init(1))
         #expect(backend.bytesWired == 0 && admission.bytesReserved == 0)
+    }
+
+    /// Admission growth on a host-zeroed pool wraps zero-fill-on-demand pages
+    /// (`PagedKVPoolConfig.hostZeroedSegments`). A checkpoint import that must
+    /// grow backing for its full-N suffix promise takes the same path: no device
+    /// zero fill, evaluator call or stream fence for a long `maximumTokens`.
+    /// The imported prefix and a suffix written into the grown pages read back
+    /// byte-identical to the device-filled reference.
+    @Test func hostZeroedPoolGrowsImportedSuffixPromiseWithoutDeviceFill() throws {
+        let count = 300
+        let keys = MLXArray((0 ..< 2 * count * 64).map { Float(($0 * 37) % 251) / 64 })
+            .reshaped([2, count, 64]).asType(.bfloat16)
+        let values = MLXArray((0 ..< 2 * count * 64).map { Float(($0 * 53) % 241) / 32 })
+            .reshaped([2, count, 64]).asType(.bfloat16)
+        var readBack: [Bool: [Data]] = [:]
+        for hostZeroed in [false, true] {
+            // 4 pages of 8 KiB per segment: 32 KiB, page-granular for host zeros.
+            let (backend, admission, kinds) = try fixture(segmentPages: 3, hostZeroed: hostZeroed)
+            var weakOwners: [WeakImportedArray] = []
+            let staged = try frame(
+                backend: backend, admission: admission, kinds: kinds, weakOwners: &weakOwners)
+            let stageIDs = Set(weakOwners.dropLast().compactMap { $0.array.map(ObjectIdentifier.init) })
+            var allocations = 0
+            backend.pool.slabEval = { array in
+                allocations += 1
+                try withError { eval(array) }
+            }
+            let adopted = try backend.pool.importCheckpoint(
+                staged, admission: admission, requestID: .init(1), layerKinds: kinds,
+                maximumTokens: 513)
+            let row = try #require(adopted.rows.first)
+            let group = backend.pool.group(row.groupKey)
+            #expect(row.reservedPages == 33 && group.committedUsablePages >= 33)
+            if hostZeroed {
+                #expect(allocations == 0, "suffix backing must be host-zeroed, not device-filled")
+                let grown = group.segments.values.filter {
+                    !stageIDs.contains(ObjectIdentifier($0.storage))
+                }
+                #expect(!grown.isEmpty)
+                for segment in grown {
+                    let info = try #require(try segment.storage.evaluatedBufferInfo())
+                    #expect(info.allocatedBytes == segment.storage.nbytes)
+                }
+            } else {
+                #expect(allocations > 0, "the reference keeps the device zero fill")
+            }
+            for isValues in [false, true] {
+                #expect(try read(row, position: 17, values: isValues, admission: admission)
+                    == rawBytes(count: 2 * 17 * 64 * 2, salt: isValues ? 7 : 3))
+            }
+            // Through the imported frontier into grown pages, one chunk at a time.
+            for start in stride(from: 0, to: count, by: 60) {
+                row.write(
+                    keys: keys[0..., start ..< start + 60], values: values[0..., start ..< start + 60])
+            }
+            #expect(row.absoluteOffset == 17 + count)
+            readBack[hostZeroed] = try [false, true].map {
+                try read(row, position: 17 + count, values: $0, admission: admission)
+            }
+            adopted.release()
+            #expect(backend.bytesReserved == 0 && backend.bytesWired == 0)
+            #expect(admission.bytesReserved == 0 && weakOwners.allSatisfy { $0.array == nil })
+        }
+        let reference = try #require(readBack[false])
+        #expect(reference.allSatisfy { $0.count == 2 * (17 + count) * 64 * 2 })
+        #expect(readBack[true] == reference)
     }
 
     @Test("allocation and grant-epoch failures discard every private alias before floor refund",
