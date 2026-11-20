@@ -33,6 +33,7 @@ SIZES = {
     ("fork-tests.yml", "build"): "8x16",
     ("fork-tests.yml", "metallib"): "4x16",
     ("fork-tests.yml", "test"): "4x24",
+    ("fork-tests.yml", "test-shard-9"): "12x32",
     ("fork-tests.yml", "coverage"): "4x16",
     ("pull_request.yml", "lint"): "4x16",
 }
