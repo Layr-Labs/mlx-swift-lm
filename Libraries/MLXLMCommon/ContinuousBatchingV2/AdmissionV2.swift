@@ -1113,11 +1113,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission,
         policy: AllocationFootprintPolicy
     ) throws -> CBv2AdmittedMTPContext {
-        var refusedImport: CBv2MTPAdmissionRecord?
+        var unpublishedImport: CBv2MTPAdmissionRecord?
         lock.lock()
         defer {
             lock.unlock()
-            withExtendedLifetime(refusedImport) {}
+            withExtendedLifetime(unpublishedImport) {}
         }
         guard processMemoryOwner != nil, (reservedTokens[id] ?? 0) > 0, maximumInputs > 0,
             resolved.fixedBytesPerRequest > 0,
@@ -1125,12 +1125,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             auxiliaryBytesPerToken >= resolved.auxiliaryBytesPerToken,
             contiguousCheckpointOwners[id] == nil, checkpointRequestOwners[id] == nil
         else { throw CBv2MTPBindingError.missingAdmission }
-        // No import commits while this reservation is live, so a stage-funded
-        // binding here is from an unpublished restore. It keeps its leases and
-        // stage charge; this request gets its own binding.
-        if let record = mtpBindings[id], record.isStageFunded {
-            record.context?.retireStageFunded()
-            refusedImport = mtpBindings.removeValue(forKey: id)
+        // No import commits while this reservation is live, so a stage-funded binding
+        // is an unpublished restore's. Unlink it; its charge stays on the stage.
+        if mtpBindings[id]?.isStageFunded == true {
+            unpublishedImport = retireMTPBindingLocked(id, reservedTokens: 0).record
         }
         if let record = mtpBindings[id] {
             guard record.target == target, record.drafter == drafter else {
