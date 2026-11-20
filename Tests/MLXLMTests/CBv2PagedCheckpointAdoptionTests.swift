@@ -7,15 +7,16 @@ import Testing
 @Suite("Page-native checkpoint adoption", .serialized)
 struct CBv2PagedCheckpointAdoptionTests {
     private func fixture(
-        types: [DType] = [.bfloat16], segmentPages: Int = 2, hostZeroed: Bool = false
+        types: [DType] = [.bfloat16], segmentPages: Int = 2, hostZeroed: Bool = false,
+        headDim: Int = 64
     )
         throws -> (PagedKVBackend, AdmissionV2, [CBv2LayerKind])
     {
         let kinds = types.map { _ in
             CBv2LayerKind(
-                attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
+                attention: .full, headDim: headDim, kvHeads: 2, queryHeads: 4)
         }
-        let largestPage = 2 * 2 * 16 * 64 * types.map(\.size).max()!
+        let largestPage = 2 * 2 * 16 * headDim * types.map(\.size).max()!
         let config = PagedKVPoolConfig(
             capacityBytes: 32 << 20, maxPrefillChunk: 64, maxBufferLength: 32 << 20,
             segmentSizeBytes: largestPage * (segmentPages + 1), layerDTypes: types,
@@ -54,7 +55,8 @@ struct CBv2PagedCheckpointAdoptionTests {
             for (index, layer) in plan.layers.enumerated() {
                 for values in [false, true] {
                     let data = rawBytes(
-                        count: 2 * position * 64 * layer.key.dtype.size,
+                        count: layer.key.kvHeads * position * layer.key.headDim
+                            * layer.key.dtype.size,
                         salt: index * 19 + (values ? 7 : 3))
                     try storage.append(layerIndex: index, values: values, byteOffset: 0, data: data)
                 }
@@ -167,15 +169,18 @@ struct CBv2PagedCheckpointAdoptionTests {
     /// byte-identical to the device-filled reference.
     @Test func hostZeroedPoolGrowsImportedSuffixPromiseWithoutDeviceFill() throws {
         let count = 300
-        let keys = MLXArray((0 ..< 2 * count * 64).map { Float(($0 * 37) % 251) / 64 })
-            .reshaped([2, count, 64]).asType(.bfloat16)
-        let values = MLXArray((0 ..< 2 * count * 64).map { Float(($0 * 53) % 241) / 32 })
-            .reshaped([2, count, 64]).asType(.bfloat16)
+        let dim = 128
+        let keys = MLXArray((0 ..< 2 * count * dim).map { Float(($0 * 37) % 251) / 64 })
+            .reshaped([2, count, dim]).asType(.bfloat16)
+        let values = MLXArray((0 ..< 2 * count * dim).map { Float(($0 * 53) % 241) / 32 })
+            .reshaped([2, count, dim]).asType(.bfloat16)
         var readBack: [Bool: [Data]] = [:]
         for hostZeroed in [false, true] {
-            // Four 8 KiB pages per segment: 32 KiB, a whole number of 16 KiB VM
-            // pages, so host zeros apply and each buffer is exactly its length.
-            let (backend, admission, kinds) = try fixture(segmentPages: 4, hostZeroed: hostZeroed)
+            // 16 KiB pages (2 KV heads x 16 tokens x 128 x K+V x bf16): every
+            // segment is a whole number of VM pages, so host zeros apply and each
+            // grown buffer is exactly its length.
+            let (backend, admission, kinds) = try fixture(
+                segmentPages: 3, hostZeroed: hostZeroed, headDim: dim)
             var weakOwners: [WeakImportedArray] = []
             let staged = try frame(
                 backend: backend, admission: admission, kinds: kinds, weakOwners: &weakOwners)
@@ -208,7 +213,7 @@ struct CBv2PagedCheckpointAdoptionTests {
             for isValues in [false, true] {
                 #expect(
                     try read(row, position: 17, values: isValues, admission: admission)
-                        == rawBytes(count: 2 * 17 * 64 * 2, salt: isValues ? 7 : 3))
+                        == rawBytes(count: 2 * 17 * dim * 2, salt: isValues ? 7 : 3))
             }
             // Through the imported frontier into grown pages, one chunk at a time.
             for start in stride(from: 0, to: count, by: 60) {
@@ -225,7 +230,7 @@ struct CBv2PagedCheckpointAdoptionTests {
             #expect(admission.bytesReserved == 0 && weakOwners.allSatisfy { $0.array == nil })
         }
         let reference = try #require(readBack[false])
-        #expect(reference.allSatisfy { $0.count == 2 * (17 + count) * 64 * 2 })
+        #expect(reference.allSatisfy { $0.count == 2 * (17 + count) * dim * 2 })
         #expect(readBack[true] == reference)
     }
 
