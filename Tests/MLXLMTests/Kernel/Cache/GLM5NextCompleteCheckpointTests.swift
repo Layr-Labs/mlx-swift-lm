@@ -816,58 +816,6 @@ extension KernelTests {
 
             let verification: GLM5NextMTPVerification =
                 depth == 0 ? .serialTarget : .rectangular(depth: depth)
-            let profile =
-                depth == 0
-                ? "glm5_next_native_paged_full_state_serial_mtp_v1"
-                : "glm5_next_native_paged_full_state_rectangular_mtp_v1"
-            func engine(_ store: NativeStore) throws -> (EngineV2, PagedKVBackend) {
-                let target = try model()
-                let predictor = try GLM5NextMTP(target: target) { name in
-                    try Self.tensor(name, inventory: target.inventory)
-                }
-                let factory = try GLM5NextMTPExecution(
-                    target: target, predictor: predictor, maximumInputs: 128,
-                    storage: .contiguous, verification: verification)
-                let assistant = try GLM5NextMTPAdapter(
-                    target: target, predictor: predictor, factory: factory)
-                let limits = try CBv2PagedGatheredAttentionLimits(
-                    maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 128,
-                    maximumInFlightGraphs: 2, maximumScratchBytes: 512 << 20,
-                    admissionMode: .stepOwned(.pinnedMetal))
-                let process = ProcessBudget()
-                let resources = try factory.makeNativeResources(
-                    assistant: assistant,
-                    config: .init(
-                        capacityBytes: 512 << 20, dtype: .float32,
-                        maxPrefillChunk: 32, nominalMaxSequenceLength: 128,
-                        maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
-                        layerDTypes: target.cbv2CompleteCheckpointKVDTypes,
-                        gatheredAttention: limits),
-                    processMemoryOwner: process, construction: NativeConstructionScope(),
-                    completePrefixCache: store)
-                #expect(resources.contract.profile == profile)
-                #expect(resources.contract.supportsNativeCompletePrefix)
-                #expect(resources.contract.supportsNativePagedRectangularMTP == (depth > 0))
-                let engine = EngineV2(
-                    model: resources.model, layerKinds: target.cbv2LayerKinds,
-                    backend: resources.backend, cacheProvider: resources.cacheProvider,
-                    sampler: CBv2GreedySampler(),
-                    schedulerConfig: .init(
-                        maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
-                        prefillChunkSize: 32, maxConcurrentPartialPrefills: 1, maxWaiting: 4,
-                        enablePrefixCache: true),
-                    admissionConfig: target.cbv2NativeAdmissionConfig,
-                    completePrefixCache: store, mtpDrafter: assistant,
-                    mtpConfig: .init(
-                        enabled: true, maxDraftTokens: verification.depth,
-                        maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
-                        verificationMode: verification.engineMode),
-                    processMemoryOwner: process, nativeCompletionTracking: true,
-                    nativeExecutionContract: resources.contract)
-                #expect(engine.mtpInactiveReason == nil)
-                #expect(engine.loopForTesting.nativeShutdownState?.isIncomplete == false)
-                return (engine, resources.backend)
-            }
             func expectQuiescent(_ engine: EngineV2) async -> CBv2MTPMetrics? {
                 let metrics = engine.mtpMetricsSnapshot()
                 guard case .quiescent = await engine.shutdownReportingNativeCompletion() else {
@@ -878,7 +826,8 @@ extension KernelTests {
             }
 
             let producerStore = NativeStore(.init(segmentBytes: 28))
-            let (producer, producerBackend) = try engine(producerStore)
+            let (producer, producerBackend) = try nativeMTPEngine(
+                store: producerStore, verification: verification)
             let produced = await cbv2SchedCollect(try producer.submit(request))
             let producerMetrics = await expectQuiescent(producer)
             #expect(produced.tokens == expected.tokens)
@@ -888,7 +837,8 @@ extension KernelTests {
 
             let consumerStore = NativeStore(
                 .init(archives: producerStore.base.saved, segmentBytes: 28))
-            let (consumer, consumerBackend) = try engine(consumerStore)
+            let (consumer, consumerBackend) = try nativeMTPEngine(
+                store: consumerStore, verification: verification)
             #expect(try consumerStore.base.stage(engine: consumer, request: request))
             let resumed = await cbv2SchedCollect(try consumer.submit(request))
             let consumerMetrics = await expectQuiescent(consumer)
@@ -902,6 +852,174 @@ extension KernelTests {
                 #expect((consumerMetrics?.serialVerificationRounds ?? 0) > 0)
             }
             #expect(consumerBackend.bytesReserved == 0 && consumerBackend.bytesInUse == 0)
+        }
+
+        /// A refused prefix adoption under a first-token deadline discards the request.
+        /// Releasing its stage-charged assistant must not grow the process charge.
+        @Test func refusedNativeMTPPrefixAdoptionReleasesWithoutChargeGrowth() async throws {
+            let request = CBv2Request(
+                id: .init(805), promptTokens: (0 ..< 73).map { 4 + $0 % 20 },
+                sampling: .init(temperature: 0), maxTokens: 6,
+                cacheSalt: "tenant-mtp", prefixCacheReceiptID: .init(1805))
+            let producerStore = NativeStore(.init(segmentBytes: 28))
+            let (producer, _) = try nativeMTPEngine(
+                store: producerStore, verification: .serialTarget)
+            _ = await cbv2SchedCollect(try producer.submit(request))
+            guard case .quiescent = await producer.shutdownReportingNativeCompletion() else {
+                Issue.record("producer did not shut down cleanly")
+                return
+            }
+            #expect(!producerStore.base.saved.isEmpty)
+
+            let consumerStore = NativeStore(
+                .init(archives: producerStore.base.saved, segmentBytes: 28))
+            let gate = GrowthGate()
+            let (consumer, _) = try nativeMTPEngine(
+                store: consumerStore, process: gate, verification: .serialTarget)
+            let loop = consumer.loopForTesting
+            let baseline = gate.charge
+            #expect(try consumerStore.base.stage(engine: consumer, request: request))
+            var prepared = 0
+            var adopted = 0
+            loop.onEngineQueueSync {
+                loop.nativePagedPrefixPreparedForTesting = { id, _ in
+                    guard id == request.id else { return }
+                    prepared += 1
+                    gate.refuseNextGrowth()
+                }
+                loop.nativePagedPrefixAdoptedForTesting = { id, _, _ in
+                    if id == request.id { adopted += 1 }
+                }
+            }
+            let policy = CBv2FirstTokenDeadlineAdmission(
+                deadline: .now.advanced(by: .seconds(60)),
+                conservativePrefillTokensPerSecond: 1000,
+                conservativeDecodeTokensPerSecond: 1000)
+            do {
+                let result = try await consumer.submit(request, firstTokenDeadline: policy)
+                Issue.record("the refused restore must reject the request, got \(result)")
+            } catch let error as CBv2KVError {
+                switch error {
+                case .capacityExhausted:
+                    break
+                default:
+                    Issue.record("unexpected rejection \(error)")
+                }
+            }
+            loop.onEngineQueueSync {
+                loop.nativePagedPrefixPreparedForTesting = nil
+                loop.nativePagedPrefixAdoptedForTesting = nil
+            }
+            #expect(prepared == 1 && adopted == 0 && gate.refusals == 1)
+            let drained = await cbv2SchedWait { gate.charge == baseline }
+            #expect(drained, "the stage and its imported assistant retire to the baseline charge")
+            #expect(consumer.nativeCompletionFault == nil)
+            switch await consumer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
+                Issue.record("consumer did not shut down cleanly")
+            }
+            #expect(gate.growthAfterRefusal.isEmpty)
+        }
+
+        private func nativeMTPEngine(
+            store: NativeStore, process: any CBv2ProcessMemoryOwner = ProcessBudget(),
+            verification: GLM5NextMTPVerification
+        ) throws -> (EngineV2, PagedKVBackend) {
+            let rectangular = verification != .serialTarget
+            let profile =
+                rectangular
+                ? "glm5_next_native_paged_full_state_rectangular_mtp_v1"
+                : "glm5_next_native_paged_full_state_serial_mtp_v1"
+            let target = try model()
+            let predictor = try GLM5NextMTP(target: target) { name in
+                try Self.tensor(name, inventory: target.inventory)
+            }
+            let factory = try GLM5NextMTPExecution(
+                target: target, predictor: predictor, maximumInputs: 128,
+                storage: .contiguous, verification: verification)
+            let assistant = try GLM5NextMTPAdapter(
+                target: target, predictor: predictor, factory: factory)
+            let limits = try CBv2PagedGatheredAttentionLimits(
+                maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 128,
+                maximumInFlightGraphs: 2, maximumScratchBytes: 512 << 20,
+                admissionMode: .stepOwned(.pinnedMetal))
+            let resources = try factory.makeNativeResources(
+                assistant: assistant,
+                config: .init(
+                    capacityBytes: 512 << 20, dtype: .float32,
+                    maxPrefillChunk: 32, nominalMaxSequenceLength: 128,
+                    maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
+                    layerDTypes: target.cbv2CompleteCheckpointKVDTypes,
+                    gatheredAttention: limits),
+                processMemoryOwner: process, construction: NativeConstructionScope(),
+                completePrefixCache: store)
+            #expect(resources.contract.profile == profile)
+            #expect(resources.contract.supportsNativeCompletePrefix)
+            #expect(resources.contract.supportsNativePagedRectangularMTP == rectangular)
+            let engine = EngineV2(
+                model: resources.model, layerKinds: target.cbv2LayerKinds,
+                backend: resources.backend, cacheProvider: resources.cacheProvider,
+                sampler: CBv2GreedySampler(),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                    prefillChunkSize: 32, maxConcurrentPartialPrefills: 1, maxWaiting: 4,
+                    enablePrefixCache: true),
+                admissionConfig: target.cbv2NativeAdmissionConfig,
+                completePrefixCache: store, mtpDrafter: assistant,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: verification.depth,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
+                    verificationMode: verification.engineMode),
+                processMemoryOwner: process, nativeCompletionTracking: true,
+                nativeExecutionContract: resources.contract)
+            #expect(engine.mtpInactiveReason == nil)
+            #expect(engine.loopForTesting.nativeShutdownState?.isIncomplete == false)
+            return (engine, resources.backend)
+        }
+
+        /// Accepts charge changes until armed, then refuses the next growth like a
+        /// ledger out of headroom and records any growth after that refusal.
+        private final class GrowthGate: CBv2ProcessMemoryOwner, @unchecked Sendable {
+            enum Failure: Error { case refused, invalid }
+            private let lock = NSLock()
+            private var charged: UInt64 = 0
+            private var coverage: UInt64 = 0
+            private var armed = false
+            private var refused = 0
+            private var laterGrowth: [UInt64] = []
+            var charge: UInt64 { lock.withLock { charged } }
+            var refusals: Int { lock.withLock { refused } }
+            var growthAfterRefusal: [UInt64] { lock.withLock { laterGrowth } }
+            func refuseNextGrowth() { lock.withLock { armed = true } }
+            func replaceCharge(_ bytes: UInt64) throws {
+                try lock.withLock {
+                    guard bytes >= coverage else { throw Failure.invalid }
+                    if bytes > charged {
+                        if armed {
+                            armed = false
+                            refused += 1
+                            throw Failure.refused
+                        }
+                        if refused > 0 { laterGrowth.append(bytes - charged) }
+                    }
+                    charged = bytes
+                }
+            }
+            func recordMaterialization(_ bytes: UInt64) throws {
+                try lock.withLock {
+                    guard bytes >= coverage, bytes <= charged else { throw Failure.invalid }
+                    coverage = bytes
+                }
+            }
+            func withdrawCoverage(_ bytes: UInt64) throws {
+                try lock.withLock {
+                    guard bytes <= coverage else { throw Failure.invalid }
+                    coverage -= bytes
+                }
+            }
+            func retire() {}
         }
 
         /// Native store adapter over the shared fixture store.

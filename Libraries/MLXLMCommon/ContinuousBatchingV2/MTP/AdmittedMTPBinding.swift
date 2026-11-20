@@ -152,6 +152,14 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
         return detachedBytes
     }
 
+    // Called with Admission's lock held. The checkpoint stage keeps this
+    // charge, so outstanding leases refund nothing to Admission.
+    func retireStageFunded() {
+        lock.lock()
+        defer { lock.unlock() }
+        active = false
+    }
+
     fileprivate func release(_ pool: Pool, bytes: Int) {
         lock.lock()
         switch pool {
