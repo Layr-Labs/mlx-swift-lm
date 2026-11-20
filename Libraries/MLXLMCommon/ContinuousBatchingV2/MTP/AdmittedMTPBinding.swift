@@ -26,6 +26,8 @@ final class CBv2MTPAdmissionRecord {
     /// Admission mutates this only with the matching real stage transfer or
     /// rollback; callers cannot use a phase flag in place of the proof owner.
     var checkpointImportCommitted = false
+    /// An uncommitted import's charge is still held by its checkpoint stage.
+    var isStageFunded: Bool { checkpointImport != nil && !checkpointImportCommitted }
     init(
         id: CBv2RequestID, target: ObjectIdentifier, drafter: ObjectIdentifier,
         maximumInputs: Int, resolved: CBv2ResolvedMTPAdmission
