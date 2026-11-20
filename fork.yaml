@@ -379,9 +379,11 @@ def:
             `DARKBLOOM_CBV2_MTP_GRAMMAR` they draft under grammar-aware verification.
             A clip past the decoded-frame cap can be sampled down across it
             (`fitsVideoSampleToDecodedBytes`, off by default).
+            A refused prefix restore's release leaves its imported assistant charge on the stage.
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"
+            - "changelog.d/glm-refused-prefix-restore-release.md"
             - "changelog.d/glm5-video-decode-budget-sampling.md"
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
             - "Libraries/MLXVLM/Models/GLM5Next*.swift"
