@@ -1113,14 +1113,23 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission,
         policy: AllocationFootprintPolicy
     ) throws -> CBv2AdmittedMTPContext {
+        var unpublishedImport: CBv2MTPAdmissionRecord?
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            withExtendedLifetime(unpublishedImport) {}
+        }
         guard processMemoryOwner != nil, (reservedTokens[id] ?? 0) > 0, maximumInputs > 0,
             resolved.fixedBytesPerRequest > 0,
             fixedBytesPerRequest >= resolved.fixedBytesPerRequest,
             auxiliaryBytesPerToken >= resolved.auxiliaryBytesPerToken,
             contiguousCheckpointOwners[id] == nil, checkpointRequestOwners[id] == nil
         else { throw CBv2MTPBindingError.missingAdmission }
+        // No import commits while this reservation is live, so a stage-funded binding
+        // is an unpublished restore's. Unlink it; its charge stays on the stage.
+        if mtpBindings[id]?.isStageFunded == true {
+            unpublishedImport = retireMTPBindingLocked(id, reservedTokens: 0).record
+        }
         if let record = mtpBindings[id] {
             guard record.target == target, record.drafter == drafter else {
                 throw CBv2MTPBindingError.identityMismatch
@@ -1250,7 +1259,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let record = mtpBindings.removeValue(forKey: id)
         // An uncommitted import's charge stays on its checkpoint stage, so
         // retiring the binding retains no bytes for Admission.
-        if let record, record.checkpointImport != nil, !record.checkpointImportCommitted {
+        if let record, record.isStageFunded {
             record.context?.retireStageFunded()
             return (0, record)
         }

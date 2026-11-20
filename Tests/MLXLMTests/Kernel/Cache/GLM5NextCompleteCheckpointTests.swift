@@ -923,6 +923,154 @@ extension KernelTests {
             #expect(gate.growthAfterRefusal.isEmpty)
         }
 
+        /// An ordinary request whose prefix adoption is refused prefills cold. Its
+        /// assistant must get its own binding, not the refused restore's
+        /// stage-funded one, which that restore's retirement later abandons.
+        @Test func refusedNativeMTPPrefixAdoptionColdFallbackUsesItsOwnBinding() async throws {
+            let request = CBv2Request(
+                id: .init(806), promptTokens: (0 ..< 73).map { 4 + $0 % 20 },
+                sampling: .init(temperature: 0), maxTokens: 24,
+                cacheSalt: "tenant-mtp", prefixCacheReceiptID: .init(1806))
+            let producerStore = NativeStore(.init(segmentBytes: 28))
+            let (producer, _) = try nativeMTPEngine(
+                store: producerStore, verification: .serialTarget)
+            let produced = await cbv2SchedCollect(try producer.submit(request))
+            switch await producer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
+                Issue.record("producer did not shut down cleanly")
+                return
+            }
+            #expect(produced.finishReason == .length && !producerStore.base.saved.isEmpty)
+
+            let consumerStore = NativeStore(
+                .init(archives: producerStore.base.saved, segmentBytes: 28))
+            let gate = GrowthGate()
+            let hold = FenceHold()
+            defer { hold.release() }
+            let assistantFences = Counter()
+            let (consumer, _) = try nativeMTPEngine(
+                store: consumerStore, process: gate, verification: .serialTarget)
+            let loop = consumer.loopForTesting
+            func clearHooks() {
+                hold.release()
+                loop.onEngineQueueSync {
+                    loop.suspendStepExecutionAtCountForTesting = nil
+                    loop.nativePagedPrefixPreparedForTesting = nil
+                    loop.nativePagedPrefixAdoptedForTesting = nil
+                    loop.nativeShutdownState?.beforeFenceForTesting = nil
+                    loop.nativeShutdownState?.afterAssistantFenceForTesting = nil
+                }
+            }
+            func abandon() async {
+                clearHooks()
+                await consumer.shutdown()
+            }
+            // Only the staged import's native work captures the hold; the hook is
+            // cleared before any other native work exists.
+            let suspendAt = loop.onEngineQueueSync {
+                loop.nativeShutdownState?.beforeFenceForTesting = { _ in hold.fence() }
+                return loop.stepCount + 6
+            }
+            let staged: Bool
+            do {
+                staged = try consumerStore.base.stage(engine: consumer, request: request)
+            } catch {
+                await abandon()
+                throw error
+            }
+            var prepared = 0
+            var adopted = 0
+            loop.onEngineQueueSync {
+                loop.nativeShutdownState?.beforeFenceForTesting = nil
+                loop.nativeShutdownState?.afterAssistantFenceForTesting = { _ in
+                    assistantFences.increment()
+                }
+                loop.nativePagedPrefixPreparedForTesting = { id, _ in
+                    guard id == request.id else { return }
+                    prepared += 1
+                    gate.refuseNextGrowth()
+                    hold.arm()
+                }
+                loop.nativePagedPrefixAdoptedForTesting = { id, _, _ in
+                    if id == request.id { adopted += 1 }
+                }
+                loop.suspendStepExecutionAtCountForTesting = suspendAt
+            }
+            guard staged else {
+                Issue.record("the producer's checkpoint was not staged")
+                await abandon()
+                return
+            }
+            let stream: AsyncStream<CBv2Event>
+            do {
+                stream = try consumer.submit(request)
+            } catch {
+                await abandon()
+                throw error
+            }
+            let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 120) }
+            // The refused restore's retirement waits at its fence while the cold
+            // request prefills, runs its assistant and pauses mid-decode.
+            let paused = await cbv2SchedWait(timeoutSeconds: 30) {
+                hold.isHolding && loop.onEngineQueueSync { loop.stepCount >= suspendAt }
+            }
+            let row = loop.onEngineQueueSync { () -> (running: Bool, generated: Int) in
+                guard let record = loop.scheduler.record(for: request.id) else { return (false, 0) }
+                return (record.status == .running, record.generatedTokenCount)
+            }
+            #expect(paused, "the cold request reached the pause while the restore's fence was held")
+            #expect(row.running && row.generated > 0, "the cold request is decoding at the pause")
+            #expect(assistantFences.value > 0, "the cold request's assistant ran before the pause")
+            #expect(
+                consumerStore.base.releaseCount == 0, "the refused restore's stage is still held")
+            if paused, row.running, row.generated > 0 {
+                hold.release()
+                let retired = await cbv2SchedWait(timeoutSeconds: 30) {
+                    consumer.nativeCompletionFault != nil || consumerStore.base.releaseCount > 0
+                }
+                #expect(retired, "the refused restore retired while the cold request was live")
+                #expect(consumer.nativeCompletionFault == nil)
+                #expect(consumerStore.base.releaseCount == 1)
+            }
+            clearHooks()
+            let cold = await collector.value
+            #expect(prepared == 1 && adopted == 0 && gate.refusals == 1)
+            #expect(cold.finishReason == .length && cold.tokens == produced.tokens)
+            #expect(consumer.nativeCompletionFault == nil)
+            switch await consumer.shutdownReportingNativeCompletion() {
+            case .quiescent:
+                break
+            default:
+                Issue.record("consumer did not shut down cleanly")
+            }
+            #expect(!hold.timedOut)
+        }
+
+        /// Holds the first native fence after `arm()` until `release()`, or 120 s.
+        private final class FenceHold: @unchecked Sendable {
+            private let lock = NSLock()
+            private let resume = DispatchSemaphore(value: 0)
+            private var armed = false
+            private var holding = false
+            private var expired = false
+            var isHolding: Bool { lock.withLock { holding } }
+            var timedOut: Bool { lock.withLock { expired } }
+            func arm() { lock.withLock { armed = true } }
+            func fence() {
+                let shouldHold = lock.withLock { () -> Bool in
+                    guard armed else { return false }
+                    armed = false
+                    holding = true
+                    return true
+                }
+                guard shouldHold, resume.wait(timeout: .now() + 120) == .timedOut else { return }
+                lock.withLock { expired = true }
+            }
+            func release() { resume.signal() }
+        }
+
         private func nativeMTPEngine(
             store: NativeStore, process: any CBv2ProcessMemoryOwner = ProcessBudget(),
             verification: GLM5NextMTPVerification
