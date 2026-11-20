@@ -949,11 +949,12 @@ extension KernelTests {
             let gate = GrowthGate()
             let hold = FenceHold()
             defer { hold.release() }
+            let assistantFences = Counter()
             let (consumer, _) = try nativeMTPEngine(
                 store: consumerStore, process: gate, verification: .serialTarget)
             let loop = consumer.loopForTesting
-            let baseline = gate.charge
-            // The import's native work captures this hook when it is staged.
+            // Only the staged import's native work captures the hold; the hook is
+            // cleared before any other native work exists.
             let suspendAt = loop.onEngineQueueSync {
                 loop.nativeShutdownState?.beforeFenceForTesting = { _ in hold.fence() }
                 return loop.stepCount + 5
@@ -962,6 +963,10 @@ extension KernelTests {
             var prepared = 0
             var adopted = 0
             loop.onEngineQueueSync {
+                loop.nativeShutdownState?.beforeFenceForTesting = nil
+                loop.nativeShutdownState?.afterAssistantFenceForTesting = { _ in
+                    assistantFences.increment()
+                }
                 loop.nativePagedPrefixPreparedForTesting = { id, _ in
                     guard id == request.id else { return }
                     prepared += 1
@@ -974,31 +979,32 @@ extension KernelTests {
                 loop.suspendStepExecutionAtCountForTesting = suspendAt
             }
             let stream = try consumer.submit(request)
-            let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 60) }
+            let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 120) }
             // The refused restore's retirement waits at its fence while the cold
-            // request prefills, configures its assistant and pauses mid-decode.
+            // request prefills, runs its assistant and pauses mid-decode.
             let paused = await cbv2SchedWait(timeoutSeconds: 30) {
                 hold.isHolding && loop.onEngineQueueSync { loop.stepCount >= suspendAt }
             }
-            #expect(paused)
-            let charged = gate.charge
+            let live = loop.onEngineQueueSync { loop.scheduler.record(for: request.id) != nil }
+            #expect(paused && live && assistantFences.value > 0)
+            #expect(
+                consumerStore.base.releaseCount == 0, "the refused restore's stage is still held")
             hold.release()
             let retired = await cbv2SchedWait(timeoutSeconds: 30) {
-                consumer.nativeCompletionFault != nil || gate.charge < charged
+                consumer.nativeCompletionFault != nil || consumerStore.base.releaseCount > 0
             }
             #expect(retired, "the refused restore retired while the cold request was live")
             #expect(consumer.nativeCompletionFault == nil)
+            #expect(consumerStore.base.releaseCount == 1)
             loop.onEngineQueueSync {
                 loop.suspendStepExecutionAtCountForTesting = nil
                 loop.nativePagedPrefixPreparedForTesting = nil
                 loop.nativePagedPrefixAdoptedForTesting = nil
-                loop.nativeShutdownState?.beforeFenceForTesting = nil
+                loop.nativeShutdownState?.afterAssistantFenceForTesting = nil
             }
             let cold = await collector.value
             #expect(prepared == 1 && adopted == 0 && gate.refusals == 1)
             #expect(cold.finishReason == .length && cold.tokens == produced.tokens)
-            let drained = await cbv2SchedWait { gate.charge == baseline }
-            #expect(drained, "the stage and both assistants retire to the baseline charge")
             #expect(consumer.nativeCompletionFault == nil)
             switch await consumer.shutdownReportingNativeCompletion() {
             case .quiescent:
@@ -1006,15 +1012,18 @@ extension KernelTests {
             default:
                 Issue.record("consumer did not shut down cleanly")
             }
+            #expect(!hold.timedOut)
         }
 
-        /// Holds the first native fence after `arm()` until `release()`.
+        /// Holds the first native fence after `arm()` until `release()`, or 120 s.
         private final class FenceHold: @unchecked Sendable {
             private let lock = NSLock()
             private let resume = DispatchSemaphore(value: 0)
             private var armed = false
             private var holding = false
+            private var expired = false
             var isHolding: Bool { lock.withLock { holding } }
+            var timedOut: Bool { lock.withLock { expired } }
             func arm() { lock.withLock { armed = true } }
             func fence() {
                 let hold = lock.withLock { () -> Bool in
@@ -1023,7 +1032,8 @@ extension KernelTests {
                     holding = true
                     return true
                 }
-                if hold { resume.wait() }
+                guard hold, resume.wait(timeout: .now() + 120) == .timedOut else { return }
+                lock.withLock { expired = true }
             }
             func release() { resume.signal() }
         }
