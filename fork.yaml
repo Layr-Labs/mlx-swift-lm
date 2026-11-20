@@ -133,9 +133,11 @@ def:
             (`PagedKVQuantizationPolicy`), the segmented serving pool builder and the kernel preflight
             core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
             them through `PagedKVBackend` as the engine does.
+            A non-native checkpoint import grows its suffix backing as admission does (host-zeroed eligible segments when configured).
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
+            - "changelog.d/paged-import-host-zeroed-growth.md"
             - "docs/runtime-kv-quantization.md"
         - title: "Prefix checkpoints"
           description: |

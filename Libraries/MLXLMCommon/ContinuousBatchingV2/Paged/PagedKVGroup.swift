@@ -400,10 +400,14 @@ final class PagedKVGroup {
 
     /// All replacement dictionaries, tables and free queues are prepared
     /// before grant publication. Only missing suffix buffers allocate/evaluate.
+    /// `hostZeroed` grows those suffix buffers like admission growth does
+    /// (`PagedKVPoolConfig.hostZeroedSegments`): a VM-page-granular new
+    /// segment wraps zero-fill-on-demand pages with no device fill, evaluator
+    /// call or stream fence; any other keeps the device fill.
     func prepareImport(
         _ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
         evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil
+        admission: AdmissionV2? = nil, hostZeroed: Bool = false
     ) throws -> PreparedImport {
         var replacement = segments
         var counts = refCounts
@@ -430,7 +434,8 @@ final class PagedKVGroup {
         }
         for id in plan.growthIDs {
             let segment = try growthSegment(
-                index: id, layout: plan.layout, evaluate: evaluate, admission: admission)
+                index: id, layout: plan.layout, evaluate: evaluate, admission: admission,
+                hostZeroed: hostZeroed)
             replacement[id] = segment
             counts[segment.pages.lowerBound] = 1
             free.addFresh(segment.pages.dropFirst().lazy.map { Int32($0) })
