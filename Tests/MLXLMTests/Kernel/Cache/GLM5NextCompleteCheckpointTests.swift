@@ -963,6 +963,10 @@ extension KernelTests {
                     loop.nativeShutdownState?.afterAssistantFenceForTesting = nil
                 }
             }
+            func abandon() async {
+                clearHooks()
+                await consumer.shutdown()
+            }
             // Only the staged import's native work captures the hold; the hook is
             // cleared before any other native work exists.
             let suspendAt = loop.onEngineQueueSync {
@@ -973,8 +977,7 @@ extension KernelTests {
             do {
                 staged = try consumerStore.base.stage(engine: consumer, request: request)
             } catch {
-                clearHooks()
-                await consumer.shutdown()
+                await abandon()
                 throw error
             }
             var prepared = 0
@@ -997,16 +1000,14 @@ extension KernelTests {
             }
             guard staged else {
                 Issue.record("the producer's checkpoint was not staged")
-                clearHooks()
-                await consumer.shutdown()
+                await abandon()
                 return
             }
             let stream: AsyncStream<CBv2Event>
             do {
                 stream = try consumer.submit(request)
             } catch {
-                clearHooks()
-                await consumer.shutdown()
+                await abandon()
                 throw error
             }
             let collector = Task { await cbv2SchedCollect(stream, timeoutSeconds: 120) }
@@ -1058,13 +1059,13 @@ extension KernelTests {
             var timedOut: Bool { lock.withLock { expired } }
             func arm() { lock.withLock { armed = true } }
             func fence() {
-                let hold = lock.withLock { () -> Bool in
+                let shouldHold = lock.withLock { () -> Bool in
                     guard armed else { return false }
                     armed = false
                     holding = true
                     return true
                 }
-                guard hold, resume.wait(timeout: .now() + 120) == .timedOut else { return }
+                guard shouldHold, resume.wait(timeout: .now() + 120) == .timedOut else { return }
                 lock.withLock { expired = true }
             }
             func release() { resume.signal() }
