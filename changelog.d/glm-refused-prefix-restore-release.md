@@ -1,6 +1,6 @@
 ### Keep a refused GLM prefix restore's assistant charge on its stage
 
-- A GLM-5.3-Flash request admitted under a first-token deadline prepares its
+- A GLM-5.3-Flash request submitted with a first-token deadline prepares its
   complete-prefix restore, including the MTP assistant state, before the
   restore is published. When publication was refused, releasing the request
   moved that assistant's charge, which the checkpoint stage still held, into

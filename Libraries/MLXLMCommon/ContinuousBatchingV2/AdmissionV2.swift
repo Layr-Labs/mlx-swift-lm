@@ -1248,8 +1248,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         -> (retainedBytes: Int, record: CBv2MTPAdmissionRecord?)
     {
         let record = mtpBindings.removeValue(forKey: id)
-        // Until its import commits, the checkpoint stage holds this binding's
-        // charge. The request never held it, so its retirement keeps none.
+        // An uncommitted import's charge stays on its checkpoint stage, so
+        // retiring the binding retains no bytes for Admission.
         if let record, record.checkpointImport != nil, !record.checkpointImportCommitted {
             record.context?.retireStageFunded()
             return (0, record)
