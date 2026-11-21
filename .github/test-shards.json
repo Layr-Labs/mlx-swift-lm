@@ -317,7 +317,7 @@
   ],
   "shards": [
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -330,6 +330,7 @@
             "MLXLMServerTests.ModelContainerEngineFinishReasonTests",
             "MLXLMServerTests.OpenAIToolHistoryDecodingTests",
             "MLXLMServerTests.ServerSurfaceTests",
+            "MLXLMTests.AfMoESlidingMaskTests",
             "MLXLMTests.BidirectionalAttentionMaskTests",
             "MLXLMTests.CBv2AsymmetricCompleteCheckpointTests",
             "MLXLMTests.CBv2AsymmetricContiguousTests",
@@ -357,7 +358,6 @@
             "MLXLMTests.KVCachePlanBenchmark",
             "MLXLMTests.KernelTests/DeepseekV3ForwardPassTests",
             "MLXLMTests.KernelTests/GLM5NextDSACacheTests",
-            "MLXLMTests.KernelTests/GLM5NextMoEFusionTests",
             "MLXLMTests.KernelTests/GLM5NextProcessorMediaTests",
             "MLXLMTests.KernelTests/GLM5NextSparseDecodeKernelTests",
             "MLXLMTests.KernelTests/GLM5NextThreadgroupContractTests",
@@ -368,7 +368,6 @@
             "MLXLMTests.KernelTests/ModelOptActivationOverflowTests",
             "MLXLMTests.KernelTests/ModelOptQQMMTests",
             "MLXLMTests.KernelTests/NemotronH35MTPRuntimeTests",
-            "MLXLMTests.KernelTests/Qwen3MoEForwardPassTests",
             "MLXLMTests.KernelTests/SmolVLM2ProcessorTests",
             "MLXLMTests.LFM2MoECausalMaskTests",
             "MLXLMTests.LoadWeightsTests",
@@ -378,11 +377,11 @@
             "MLXLMTests.MiMoV26MTPPrefixCheckpointTests",
             "MLXLMTests.MiMoV26MediaGeometryTests",
             "MLXLMTests.MiMoV26RectangularVerifyTests",
+            "MLXLMTests.MiMoV26TinyMultimodalTests",
             "MLXLMTests.ModelComponentTests",
             "MLXLMTests.MuseGlimmerForwardTests",
             "MLXLMTests.MuseGlimmerOnDemandVisionTests",
             "MLXLMTests.NamedJSONToolCallTests",
-            "MLXLMTests.Nemotron35BatchDecodeModelTests",
             "MLXLMTests.NemotronSuperEVSTests",
             "MLXLMTests.Qwen35BatchDecodeProjectionTests",
             "MLXLMTests.Qwen35ContinuationTests",
@@ -412,7 +411,7 @@
       ]
     },
     {
-      "estimated_seconds": 191,
+      "estimated_seconds": 170,
       "runs": [
         {
           "groups": [
@@ -473,6 +472,7 @@
             "MLXLMTests.KernelTests/GLM5NextParallelSparseSelectionTests",
             "MLXLMTests.KernelTests/GLM5NextPreparedLoadTests",
             "MLXLMTests.KernelTests/GLM5NextSelectionPinningTests",
+            "MLXLMTests.KernelTests/GLM5NextSequenceParallelTests",
             "MLXLMTests.KernelTests/GLM5NextSparseStateTests",
             "MLXLMTests.KernelTests/GLM5NextStageEntryTests",
             "MLXLMTests.KernelTests/GPTOSSActivationDTypeTests",
@@ -480,6 +480,7 @@
             "MLXLMTests.KernelTests/NemotronSuperFP8KVCodecTests",
             "MLXLMTests.KernelTests/Qwen3VLForwardPassTests",
             "MLXLMTests.KernelTests/QwenDenseForwardPassTests",
+            "MLXLMTests.KernelTests/VisionModelExtraPathTests",
             "MLXLMTests.KernelTests/WiredMemoryTuneTests",
             "MLXLMTests.LFM2BidirectionalTests",
             "MLXLMTests.LFM2VLImagePlaceholderAndTileTests",
@@ -493,14 +494,12 @@
             "MLXLMTests.NemotronCalibratedProjectionTests",
             "MLXLMTests.NemotronH35MTPHistoryEventTests",
             "MLXLMTests.NemotronSuperGraphExecutionTests",
-            "MLXLMTests.NemotronSuperMTPRequestControlsTests",
             "MLXLMTests.NemotronSuperMTPTextTargetTests",
             "MLXLMTests.PenaltyLongPromptTests",
             "MLXLMTests.Qwen35LLMMRoPEParityTests",
             "MLXLMTests.Qwen35MTPTopTwoTests",
             "MLXLMTests.Qwen35PagedCompleteCheckpointTests",
             "MLXLMTests.Qwen35ProcessorFallbackTests",
-            "MLXLMTests.Qwen35VLMCompiledDecodeTests",
             "MLXLMTests.Qwen3VLMoEModelTests",
             "MLXLMTests.Qwen4ExpConfigurationTests",
             "MLXLMTests.Qwen4ExpPLEDeferredTests",
@@ -523,7 +522,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -564,7 +563,6 @@
             "MLXLMTests.CBv2PagedSeamContractWindowSnapshotTests",
             "MLXLMTests.CBv2SamplingDetokenizerTests",
             "MLXLMTests.CBv2SamplingPipelineTests",
-            "MLXLMTests.CBv2TeacherForcedScoreDiagnosticTests",
             "MLXLMTests.CBv2TokenRadixIndexTests",
             "MLXLMTests.CancellationTests",
             "MLXLMTests.ChatMLTemplateTests",
@@ -592,7 +590,6 @@
             "MLXLMTests.KernelTests/GLM5NextRouterKernelTests",
             "MLXLMTests.KernelTests/GLM5NextVisionLinearTests",
             "MLXLMTests.KernelTests/GenerateTokenIteratorTests",
-            "MLXLMTests.KernelTests/ModelOptFP8ProductPlanParityTests",
             "MLXLMTests.KernelTests/ModelOptNAXDenseLinearTests",
             "MLXLMTests.KernelTests/NemotronHRuntimeTests",
             "MLXLMTests.KernelTests/NemotronSuperFP8KVHistoryTests",
@@ -608,6 +605,7 @@
             "MLXLMTests.MoERouterFusedIntegrationTests",
             "MLXLMTests.ModelCheckpointTests",
             "MLXLMTests.MuseGlimmerOnyxCacheTests",
+            "MLXLMTests.NemotronSuperMTPCaptureTests",
             "MLXLMTests.NemotronSuperPagedEngineTests",
             "MLXLMTests.NemotronSuperPrefixBankLifecycleTests",
             "MLXLMTests.OpenELMUntiedHeadTests",
@@ -641,7 +639,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -655,10 +653,8 @@
             "MLXFoundationModelsTests.TemperaturePlumbingTests",
             "MLXGuidedGenerationTests.WhitespaceRunTrackerTests",
             "MLXLMServerTests.GemmaFunctionConstraintParserTests",
-            "MLXLMTests.AfMoESlidingMaskTests",
             "MLXLMTests.CBv2AttentionOwnerIdentityTests",
             "MLXLMTests.CBv2CoreReferenceTests",
-            "MLXLMTests.CBv2OrdinaryAttentionMetadataTests",
             "MLXLMTests.CBv2PackedPrefillTests",
             "MLXLMTests.CBv2PagedPlacementTests",
             "MLXLMTests.CBv2PagedPrefixReuseBoundNarrowingTests",
@@ -680,8 +676,6 @@
             "MLXLMTests.KernelTests/CBv2MTPCoupledProposalTests",
             "MLXLMTests.KernelTests/GLM5NextAllTrueValidityTests",
             "MLXLMTests.KernelTests/GLM5NextHyperConnectionKernelTests",
-            "MLXLMTests.KernelTests/GLM5NextSequenceParallelTests",
-            "MLXLMTests.KernelTests/GLM5NextTextModelTests",
             "MLXLMTests.KernelTests/GenerateSpeculativeTests",
             "MLXLMTests.KernelTests/MediaProcessingVideoTests",
             "MLXLMTests.KernelTests/ModelOptLazyFP8ProjectionTests",
@@ -689,17 +683,13 @@
             "MLXLMTests.KernelTests/ModelOptWeightTests",
             "MLXLMTests.KernelTests/Qwen35DecodeCommandBufferTests",
             "MLXLMTests.KernelTests/Qwen35MoEVLMSanitizeKernelTests",
-            "MLXLMTests.KernelTests/VisionModelExtraPathTests",
             "MLXLMTests.KernelTests/VisionProcessorTests",
             "MLXLMTests.MellumTests",
             "MLXLMTests.MiMoV26AudioTokenizerEncoderTests",
             "MLXLMTests.MiMoV26EncodedAudiovisualDecoderTests",
             "MLXLMTests.MiMoV26NAXGateUpTests",
             "MLXLMTests.MiMoV26NAXGatherQMMTests",
-            "MLXLMTests.MiMoV26TextTests",
-            "MLXLMTests.MiMoV26TinyMultimodalTests",
             "MLXLMTests.ModelConversionTests",
-            "MLXLMTests.NemotronSuperMTPCaptureTests",
             "MLXLMTests.NemotronSuperMambaStepTests",
             "MLXLMTests.NemotronSuperMoEKernelTests",
             "MLXLMTests.NemotronSuperVisionProjectorTests",
@@ -731,7 +721,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -749,7 +739,6 @@
             "MLXLMTests.CBv2HybridPublicationDecisionTests",
             "MLXLMTests.CBv2LegacyAttentionGuardTests",
             "MLXLMTests.CBv2MTPCaptureVerifyTests",
-            "MLXLMTests.CBv2MTPEngineMixedTests",
             "MLXLMTests.CBv2MTPKVStagingFullRoundTests",
             "MLXLMTests.CBv2MTPKVStagingMidFlightTests",
             "MLXLMTests.CBv2MTPKVStagingSpeculativeLifecycleTests",
@@ -790,6 +779,7 @@
             "MLXLMTests.KernelTests/Gemma3nTextForwardPassTests",
             "MLXLMTests.KernelTests/ModelOptFP8CalibratedMatmulTests",
             "MLXLMTests.KernelTests/ModelOptNVFP4LazyDecodeTests",
+            "MLXLMTests.KernelTests/Qwen3MoEForwardPassTests",
             "MLXLMTests.KernelTests/Qwen3VLVideoReferenceLayoutTests",
             "MLXLMTests.KernelTests/Qwen4ExpVideoPreparationKernelTests",
             "MLXLMTests.KernelTests/TextModelForwardPassTests",
@@ -797,6 +787,7 @@
             "MLXLMTests.MiMoV26FullVisionQualificationTests",
             "MLXLMTests.MiMoV26MediaMTPFallbackTests",
             "MLXLMTests.MiMoV26PrefillMediaStripeTests",
+            "MLXLMTests.MiMoV26TextTests",
             "MLXLMTests.MuseGlimmerConfigurationTests",
             "MLXLMTests.MuseGlimmerImageBudgetTests",
             "MLXLMTests.NativeBlockEngineTests",
@@ -816,7 +807,6 @@
             "MLXLMTests.Qwen3VLBatchedDecodeTests",
             "MLXLMTests.Qwen4BatchPolicyTests",
             "MLXLMTests.Qwen4BatchedPLETests",
-            "MLXLMTests.Qwen4RectangularStateParityTests",
             "MLXLMTests.Qwen4VisionActivationTests",
             "MLXLMTests.QwenReasoningHistoryTests",
             "MLXLMTests.ReasoningTokenCollectorTests",
@@ -843,7 +833,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -914,7 +904,6 @@
             "MLXLMTests.NemotronSuperMTPPrefixReuseTests",
             "MLXLMTests.NemotronSuperMTPSequenceChargeTests",
             "MLXLMTests.NemotronSuperMambaPrefillTests",
-            "MLXLMTests.NemotronSuperPrefixReuseTests",
             "MLXLMTests.OrdinaryRequestRetirementTests",
             "MLXLMTests.PrismHadamardCheckpointTests",
             "MLXLMTests.PromptCacheChunkedMambaTests",
@@ -953,7 +942,7 @@
       ]
     },
     {
-      "estimated_seconds": 191,
+      "estimated_seconds": 170,
       "runs": [
         {
           "groups": [
@@ -1045,7 +1034,6 @@
             "MLXLMTests.ReasoningConfigTests",
             "MLXLMTests.TokenLoopHandlerTests",
             "MLXLMTests.ToolCallRecoveryRegressionTests",
-            "MLXLMTests.TurboQuantMSECodecTests",
             "MLXLMTests.UserInputAudioTests",
             "MLXLMTests.UserInputVideoTests",
             "MLXLMTests.cacheStatusCapacityUnsupportedForPureSSM()",
@@ -1071,7 +1059,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 170,
       "runs": [
         {
           "groups": [
@@ -1127,6 +1115,7 @@
             "MLXLMTests.KernelTests/CBv2FusedCausalPrefillTests",
             "MLXLMTests.KernelTests/GLM5NextExecutionPolicyTests",
             "MLXLMTests.KernelTests/GLM5NextKDAStepGraphTests",
+            "MLXLMTests.KernelTests/GLM5NextMoEFusionTests",
             "MLXLMTests.KernelTests/GLM5NextMultiVectorQMVTests",
             "MLXLMTests.KernelTests/GPTOSSDecodeCommandBufferTests",
             "MLXLMTests.KernelTests/Gemma4GeluProductTests",
@@ -1147,7 +1136,6 @@
             "MLXLMTests.NemotronSuperMTPBatchedEngineTests",
             "MLXLMTests.NemotronSuperMTPEngineTests",
             "MLXLMTests.NemotronSuperPagedAttentionTests",
-            "MLXLMTests.NemotronSuperPagedParityTests",
             "MLXLMTests.NemotronSuperRecurrentAdapterTests",
             "MLXLMTests.PrefillParametersTests",
             "MLXLMTests.ProcessorConfigLoadingTests",
@@ -1192,7 +1180,7 @@
       ]
     },
     {
-      "estimated_seconds": 191,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -1228,7 +1216,6 @@
             "MLXLMTests.DiffusionGemmaResidentPrefixTests",
             "MLXLMTests.FalconH1CausalMaskTests",
             "MLXLMTests.FlintPrefixTests",
-            "MLXLMTests.FlintTests",
             "MLXLMTests.Gemma4ForwardForMTPTests",
             "MLXLMTests.Gemma4SharedTowerContractTests",
             "MLXLMTests.Gemma4UnifiedTests",
@@ -1239,7 +1226,6 @@
             "MLXLMTests.KernelTests/EmbedderModelFactoryLoadTests",
             "MLXLMTests.KernelTests/GLM5NextAbsorbedAttentionTests",
             "MLXLMTests.KernelTests/GLM5NextCompleteCheckpointTests",
-            "MLXLMTests.KernelTests/GLM5NextHyperConnectionOneLaunchTests",
             "MLXLMTests.KernelTests/GLM5NextHyperConnectionTests",
             "MLXLMTests.KernelTests/GLM5NextKDALongConvolutionTests",
             "MLXLMTests.KernelTests/GLM5NextNativeKernelPolicyTests",
@@ -1298,7 +1284,7 @@
       ]
     },
     {
-      "estimated_seconds": 191,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -1338,7 +1324,6 @@
             "MLXLMTests.DeepseekV3Tests",
             "MLXLMTests.DiffusionGemmaExpertReductionTests",
             "MLXLMTests.DiffusionGemmaVisionOracleTests",
-            "MLXLMTests.FlintPrefillExactnessTests",
             "MLXLMTests.GatedDeltaFusedInputProjectionTests",
             "MLXLMTests.Gemma3nCheckpointTests",
             "MLXLMTests.Gemma3nTextSlidingMaskTests",
@@ -1377,6 +1362,7 @@
             "MLXLMTests.NemotronSuperMTPAssistantTests",
             "MLXLMTests.NemotronSuperMTPGraphTests",
             "MLXLMTests.NemotronSuperNonFiniteLogitsTests",
+            "MLXLMTests.NemotronSuperPrefixReuseTests",
             "MLXLMTests.NemotronSuperSSDTests",
             "MLXLMTests.PromptCacheReusePolicyTests",
             "MLXLMTests.QuantizedSDPATests",
@@ -1418,7 +1404,7 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "groups": [
@@ -1449,13 +1435,13 @@
             "MLXLMTests.CBv2CompleteCheckpointTests",
             "MLXLMTests.CBv2CoreFullSequenceKVTests",
             "MLXLMTests.CBv2DeadlineLeaseTests",
-            "MLXLMTests.CBv2FrozenReplayCounterexampleTests",
             "MLXLMTests.CBv2FrozenReplayFullRowTests",
             "MLXLMTests.CBv2Gemma4ScheduledPrefillTests",
             "MLXLMTests.CBv2HistoricalCheckpointGeometryTests",
             "MLXLMTests.CBv2InvarianceTests",
             "MLXLMTests.CBv2KVResizeTests",
             "MLXLMTests.CBv2LastQueryPrefillCacheTests",
+            "MLXLMTests.CBv2MTPEngineMixedTests",
             "MLXLMTests.CBv2MTPKVStagingEquivalenceTests",
             "MLXLMTests.CBv2MTPTargetSamplingMatrixTests",
             "MLXLMTests.CBv2NativeCompletePrefixOwnerTests",
@@ -1657,11 +1643,16 @@
       ]
     },
     {
-      "estimated_seconds": 195,
+      "estimated_seconds": 169,
       "runs": [
         {
           "units": [
-            "MLXLMTests.CBv2MTPPenaltyLongRunTests"
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T07Holdback",
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T0LateStopString",
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T0PresenceFrequency",
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T1LateStopToken",
+            "MLXLMTests.CBv2OrdinaryAttentionMetadataTests",
+            "MLXLMTests.FlintTests"
           ]
         },
         {
@@ -1670,13 +1661,14 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
       "runs": [
         {
           "units": [
             "MLXLMTests.KernelTests/GLM5NextHyperConnectionSiteRevisionTests",
+            "MLXLMTests.KernelTests/GLM5NextTextModelTests",
             "MLXLMTests.KernelTests/GLM5NextTextStageTests",
-            "MLXLMTests.KernelTests/GatedDeltaPrefillTests",
+            "MLXLMTests.NemotronSuperPagedParityTests",
             "MLXLMTests.Qwen4ExpLightningMTPTests",
             "OnboardingQualificationTests.CBv2PagedSegmentReadbackBoundaryTests"
           ]
@@ -1684,14 +1676,45 @@
       ]
     },
     {
-      "estimated_seconds": 192,
+      "estimated_seconds": 169,
+      "runs": [
+        {
+          "units": [
+            "MLXLMTests.CBv2MTPEngineParityTests",
+            "MLXLMTests.CBv2PagedSegmentDispatchCacheEngineTests",
+            "MLXLMTests.KernelTests/GLM5NextMTPTests",
+            "MLXLMTests.Nemotron35BatchDecodeModelTests",
+            "MLXLMTests.Qwen4RectangularStateParityTests"
+          ]
+        }
+      ]
+    },
+    {
+      "estimated_seconds": 170,
+      "runs": [
+        {
+          "units": [
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T1Card",
+            "MLXLMTests.KernelTests/GLM5NextHyperConnectionOneLaunchTests",
+            "MLXLMTests.KernelTests/ModelOptFP8ProductPlanParityTests",
+            "MLXLMTests.NemotronSuperMTPRequestControlsTests",
+            "MLXLMTests.Qwen35VLMCompiledDecodeTests",
+            "MLXLMTests.TurboQuantMSECodecTests"
+          ]
+        }
+      ]
+    },
+    {
+      "estimated_seconds": 169,
       "runs": [
         {
           "units": [
             "MLXGuidedGenerationTests.MaskBuildBenchmark",
-            "MLXLMTests.CBv2MTPEngineParityTests",
-            "MLXLMTests.CBv2PagedSegmentDispatchCacheEngineTests",
-            "MLXLMTests.KernelTests/GLM5NextMTPTests"
+            "MLXLMTests.CBv2FrozenReplayCounterexampleTests",
+            "MLXLMTests.CBv2MTPPenaltyLongRunTests/T0RectangularK3",
+            "MLXLMTests.CBv2TeacherForcedScoreDiagnosticTests",
+            "MLXLMTests.FlintPrefillExactnessTests",
+            "MLXLMTests.KernelTests/GatedDeltaPrefillTests"
           ]
         }
       ]
