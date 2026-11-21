@@ -989,8 +989,9 @@ def:
 
         The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a Mac with Xcode 27.2.
         Its compute jobs, PR lint, fork-diff checking and page rendering queue independently
-        on Darkbloom macOS or Linux ARM64 runners, without a hosted fallback or a seven-Mac
-        reservation before the build. Seven strict audio tests remain hosted on `xcode-27`
+        on Darkbloom macOS or Linux ARM64 runners, without a hosted fallback. The test shards
+        start beside the build and `wait-for-products.py` holds each one until the build and
+        the Metal library have succeeded. Seven strict audio tests remain hosted on `xcode-27`
         while native decoding is investigated; they share the native products and exactly-once gate.
         `.github/workflows/darkbloom-watchdog.yml` keeps its default 30-minute wait threshold
         and at most one rescue. Native-only reruns still request native runners.
