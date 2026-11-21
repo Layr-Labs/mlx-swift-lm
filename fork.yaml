@@ -98,11 +98,16 @@ def:
             acceptance packet, so a flagged row or committed verify position emits nothing.
             Identity-greedy batches skip unused parameter/history tensor construction and the
             unused all-greedy mask while retaining constraints, transforms and sampler row state.
+            Plain decode steps of a model that declares no command-buffer limits commit every 100
+            operations (`CBv2DecodeCommandBufferDefault`), unless the process pins
+            `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` or sets
+            `DARKBLOOM_CBV2_DECODE_COMMAND_BUFFERS=0`; partitioning never changes a result.
             Opt-in native reasoning budgets count confirmed thought payload tokens, force the
             validated close marker at N, and continue the same request within its total output
             limit. Budget rows use target decoding without MTP or chaining.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
+            - "changelog.d/decode-command-buffers-default.md"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
             - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
