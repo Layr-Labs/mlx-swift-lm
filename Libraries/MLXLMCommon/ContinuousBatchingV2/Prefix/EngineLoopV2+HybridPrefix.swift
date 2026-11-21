@@ -23,10 +23,12 @@ extension EngineLoopV2 {
             // The cap is provenance for the manifest; the boundary rule is
             // position alignment alone, whatever chunk produced the range,
             // unless the model's prefill output depends on the partition.
+            // Set only while the canonical grid is on (`canonicalPartition`).
+            let partition = rec.canonicalPartition
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id),
-                chunkGrid: recurrentCheckpointChunkGrid)
+                chunkGrid: recurrentCheckpointChunkGrid, partition: partition)
             recurrentCheckpointGeometry[id] = geometry
             if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             recurrentGeometryObserverForTesting?(
@@ -110,7 +112,8 @@ extension EngineLoopV2 {
                     spec: spec, layers: layers, assistant: assistant, qwen4: qwen4,
                     mediaIdentity: rec.request.hybridPrefixIdentity,
                     mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
-                    mediaSideStateRequired: !causalMediaCheckpoints))
+                    mediaSideStateRequired: !causalMediaCheckpoints,
+                    canonical: partition != nil))
         }
         // Detach on the sole evaluator of the live graph. Publication/drop
         // may then wait for these events on another queue without a graph race.
@@ -184,6 +187,21 @@ extension EngineLoopV2 {
             case .cancelled, .error, .terminal: intent.allowsCompletePublication = false
             }
             return intent
+        }
+        // An Exact Turn Continuation keeps what it finished: a cancelled one
+        // publishes its staged grid boundaries, each a complete exact state,
+        // with the prompt cut at the deepest of them.
+        if rec.request.isContinuation, case .cancelled = reason,
+            let cache = hybridPrefixCache,
+            let highest = cache.highestStagedPosition(requestID: rec.id),
+            highest > 0, highest <= min(rec.numComputedTokens, rec.request.promptTokens.count),
+            rec.request.permitsHybridCheckpoint(
+                layerKinds: layerKinds, causalMedia: causalMediaCheckpoints)
+        {
+            return .init(
+                requestID: rec.id, tokens: Array(rec.request.promptTokens.prefix(highest)),
+                cacheSalt: rec.request.checkpointCacheSalt,
+                receiptID: rec.request.prefixCacheReceiptID)
         }
         guard hybridPrefixCache?.hasStagedCheckpoints(requestID: rec.id) == true,
             rec.request.permitsHybridCheckpoint(
