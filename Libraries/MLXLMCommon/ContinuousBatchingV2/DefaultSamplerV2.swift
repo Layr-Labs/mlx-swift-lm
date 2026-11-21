@@ -135,8 +135,11 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
         pipeline: LogitsPipelineV2, speculative: Bool
     ) -> MLXArray {
-        if let observe = penaltyCountObserverForTesting, let counts = pipeline.outputCountsForTesting {
-            for (row, id) in requestIDs.enumerated() where CBv2MTPVerifyPenalties.applies(params[row]) {
+        if let observe = penaltyCountObserverForTesting,
+            let counts = pipeline.outputCountsForTesting
+        {
+            for (row, id) in requestIDs.enumerated()
+            where CBv2MTPVerifyPenalties.applies(params[row]) {
                 observe(.init(kind: .sample, id: id, counts: [counts[row].asArray(Float.self)]))
             }
         }
@@ -549,14 +552,16 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
             counts = counts + window
         }
         if let observe = penaltyCountObserverForTesting {
-            let used = draftsNeeded > 0 ? penalties.drafts?[0..., ..<draftsNeeded].asType(.int32) : nil
+            let used =
+                draftsNeeded > 0 ? penalties.drafts?[0..., ..<draftsNeeded].asType(.int32) : nil
             for r in 0 ..< b where penaltyRows[r] {
-                observe(.init(
-                    kind: .verify, id: requestIDs[r],
-                    counts: (0 ..< w).map { counts[r, $0].asArray(Float.self) },
-                    outputTokens: Array(penalties.outputTokens[r]),
-                    drafts: used.map { $0[r].asArray(Int32.self).map(Int.init) } ?? [],
-                    columnOffset: penalties.columnOffset))
+                observe(
+                    .init(
+                        kind: .verify, id: requestIDs[r],
+                        counts: (0 ..< w).map { counts[r, $0].asArray(Float.self) },
+                        outputTokens: Array(penalties.outputTokens[r]),
+                        drafts: used.map { $0[r].asArray(Int32.self).map(Int.init) } ?? [],
+                        columnOffset: penalties.columnOffset))
             }
         }
         let flatCounts = counts.reshaped([b * w, vocab])
