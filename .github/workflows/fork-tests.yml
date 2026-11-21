@@ -77,7 +77,9 @@ jobs:
 
   build:
     name: Build
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-8x16]
+    # Every test job waits for this cold, CPU-bound build: it takes the
+    # largest signed size (FORKDIFF.md, Job sizes).
+    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-12x32]
     permissions:
       contents: read
     timeout-minutes: 90

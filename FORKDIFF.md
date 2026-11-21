@@ -69,7 +69,8 @@ Each Darkbloom macOS job names its VM size in its runner label, for example
 size that the approval pins (12 vCPUs, 32 GiB). The image pipeline signs
 4x16, 4x24, 8x16 and 12x32. A job gets the smallest signed size that has 30%
 headroom over its measured memory peak. A job that took less than 10 minutes
-must stay under 10 minutes.
+must stay under 10 minutes. Build is the exception: every test job waits for
+it, and its cold build is CPU-bound, so it takes the largest signed size.
 
 The peak of a job is the larger of two sampler figures: used memory (app +
 wired + compressed) and the sum of the lifetime peak footprints of the
@@ -80,7 +81,7 @@ measured every job.
 
 | Job | Size | Data before the sampler | Measured (size: wall time, peak) |
 |---|---|---|---|
-| Build | 8x16 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16: 361 and 457 s, 10.04 GiB. The sampler scales 339 sampled seconds to about 547 s on 4 vCPUs (+61%); the slower builds (583 s) would then take more than 10 minutes on 4x16. |
+| Build | 12x32 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16: 361 and 457 s, 10.04 GiB. On 8x16 (#468) the median of the build step went from 269 s on 12 vCPUs (n=51 runs, 43711096547 to 44767807509) to 362 s (n=16, 44750661761 to 44819969123); it was 301 s after #480 (n=7). Every test job waits for it, so it went back to 12x32: 32 GiB is 3.2 times the peak, and it costs about the same vCPU-minutes because the build is CPU-bound. 12x32 did not queue longer: the build queued for a median 55 s on 12 vCPUs and 88 s on 8x16 (n=51 and 23), and in the same runs the 12x32 test shards queued for 70 s against 78 s for 4x24 (n=39 and 205). |
 | Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. | 4x16: 231 and 306 s, 10.04 GiB (`air-lld` 6.52) |
 | Test shards 1 to 12 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB (shard 7 10.25 GiB, shard 9 7.88 GiB). Shards 7 and 9 ran on 12x32 until issue #469 was fixed: their tests read the admission ledger before the checkpoint store's callback had dropped its last export, whose manifest permit is charged until then. On 4 vCPUs that callback can still be running at the request's final event. |
 | Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. | not run on pull requests |
