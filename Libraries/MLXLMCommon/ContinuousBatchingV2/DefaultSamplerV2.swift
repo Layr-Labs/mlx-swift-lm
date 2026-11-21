@@ -62,6 +62,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         let steps: [UInt64]
     }
     private var speculation: SpeculativeSample?
+    /// The offer of the current step (`planCertifiedTokens`), consumed by `certifiedSample`.
+    private var certifiedPlan: CBv2CertifiedTokenRequest?
     /// Confirmed output-token counts `[vocab]` per penalty row for MTP
     /// verification, folded incrementally from the row's confirmed output
     /// (`folded` tokens so far; `last` = the last folded token, a cheap
@@ -87,7 +89,34 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray {
         sampleObserverForTesting?(requestIDs, stepIndex)
-        let vocab = logits.dim(-1)
+        certifiedPlan = nil
+        let pipeline = configure(
+            vocab: logits.dim(-1), requestIDs: requestIDs,
+            pendingSampledTokens: pendingSampledTokens, rowContext: rowContext)
+
+        // A chained successor over constrained rows samples before its
+        // predecessor's token is confirmed: snapshot the pre-sample state so
+        // `redrawChainedSuccessor` can replay this draw exactly.
+        let speculative =
+            pendingSampledTokens != nil && constraintSampler.hasRows(in: requestIDs)
+        if speculative {
+            constraintSampler.beginSpeculation()
+            speculation = SpeculativeSample(
+                requestIDs: requestIDs, params: params,
+                penalties: pipeline.penaltyState, steps: sampler.stepIndices)
+        } else {
+            speculation = nil
+        }
+        return draw(
+            logits: logits, params: params, requestIDs: requestIDs,
+            pipeline: pipeline, speculative: speculative)
+    }
+
+    /// The pipeline for `vocab`, (re)configured for `requestIDs`.
+    private func configure(
+        vocab: Int, requestIDs: [CBv2RequestID], pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
+    ) -> LogitsPipelineV2 {
         if pipeline?.vocabSize != vocab {
             pipeline = LogitsPipelineV2(vocabSize: vocab)
             configuredIDs = []
@@ -110,23 +139,51 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         }
         // Same IDs ⇒ the incremental commits below already covered every
         // token sampled since configuration (including any pending ones).
+        return pipeline
+    }
 
-        // A chained successor over constrained rows samples before its
-        // predecessor's token is confirmed: snapshot the pre-sample state so
-        // `redrawChainedSuccessor` can replay this draw exactly.
-        let speculative =
-            pendingSampledTokens != nil && constraintSampler.hasRows(in: requestIDs)
-        if speculative {
-            constraintSampler.beginSpeculation()
-            speculation = SpeculativeSample(
-                requestIDs: requestIDs, params: params,
-                penalties: pipeline.penaltyState, steps: sampler.stepIndices)
-        } else {
-            speculation = nil
-        }
-        return draw(
-            logits: logits, params: params, requestIDs: requestIDs,
-            pipeline: pipeline, speculative: speculative)
+    /// True when the configured rows' draw passes through a hard mask (a token constraint or
+    /// grammar, or a reasoning budget): `draw` builds the mask exactly when this holds, and
+    /// `planCertifiedTokens` never offers then.
+    private var masksLogits: Bool { constraintSampler.hasRows || budgetSampler.hasRows }
+
+    /// Configures for `requestIDs` exactly as `sample` would and, when this step's draw needs no
+    /// transform beyond temperature (`LogitsPipelineV2.appliesOnlyTemperature`) and no hard mask
+    /// (`masksLogits`), returns an offer carrying the row kinds, the
+    /// pipeline's own temperature divisor and the noise `sample` would draw. The same decision
+    /// guards `certifiedSample`, so an offer can never reach a row that transforms its logits.
+    func planCertifiedTokens(
+        vocab: Int, requestIDs: [CBv2RequestID], pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
+    ) -> CBv2CertifiedTokenRequest? {
+        let pipeline = configure(
+            vocab: vocab, requestIDs: requestIDs, pendingSampledTokens: pendingSampledTokens,
+            rowContext: rowContext)
+        certifiedPlan = nil
+        guard pipeline.appliesOnlyTemperature, !masksLogits else { return nil }
+        let request = CBv2CertifiedTokenRequest(
+            vocabularySize: vocab, greedy: sampler.greedyRows,
+            temperature: pipeline.temperatureColumn, noise: sampler.pendingNoise(vocab: vocab))
+        certifiedPlan = request
+        return request
+    }
+
+    /// `sample` for a step whose tokens a model chose through the offer from
+    /// `planCertifiedTokens`: the same commits and bookkeeping, with `tokens` as the draw.
+    func certifiedSample(
+        _ request: CBv2CertifiedTokenRequest, tokens: MLXArray, requestIDs: [CBv2RequestID],
+        stepIndex: Int
+    ) -> MLXArray {
+        sampleObserverForTesting?(requestIDs, stepIndex)
+        precondition(
+            certifiedPlan === request && configuredIDs == requestIDs,
+            "certified tokens without this step's offer")
+        certifiedPlan = nil
+        speculation = nil
+        pipeline!.commit(sampledTokens: tokens)
+        sampler.commit()
+        pendingStepLogprobs = nil
+        return tokens
     }
 
     /// One configured draw: transforms, grammar mask, selection, state
@@ -151,7 +208,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         let output = pipeline.process(
             logits,
             rawLogprobsFrom: logits,
-            hardMask: constraintSampler.hasRows || budgetSampler.hasRows
+            hardMask: masksLogits
                 ? { [constraintSampler, budgetSampler] transformed in
                     budgetSampler.mask(
                         constraintSampler.mask(

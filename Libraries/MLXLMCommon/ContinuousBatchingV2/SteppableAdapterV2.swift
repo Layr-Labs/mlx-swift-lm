@@ -54,6 +54,20 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2CertifiedTokenModel {
+    public var cbv2SupportsCertifiedTokens: Bool {
+        (model as? any CBv2CertifiedTokenModel)?.cbv2SupportsCertifiedTokens ?? false
+    }
+
+    public var cbv2CertifiedVocabularySize: Int {
+        (model as? any CBv2CertifiedTokenModel)?.cbv2CertifiedVocabularySize ?? 0
+    }
+
+    public func cbv2WarmCertifiedTokens() {
+        (model as? any CBv2CertifiedTokenModel)?.cbv2WarmCertifiedTokens()
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
     public var cbv2PositionAxisCount: Int? {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount

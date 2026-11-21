@@ -187,7 +187,10 @@ extension Inkling2Kernels {
         let flat = x.reshaped(rows, k)
         let out: MLXArray
         let operand = operandType(x: x.dtype, weight: w.dtype, dense: true)
-        if gemvSite("rows"), gemvCovers(rows: rows, outputs: n, inputs: k, operand: operand) {
+        if let coded = Inkling2BytesProjection.product(flat, w) {
+            out = coded
+        } else if gemvSite("rows"), gemvCovers(rows: rows, outputs: n, inputs: k, operand: operand)
+        {
             out = gemvProduct(flat, w, operand: operand)
         } else if mmaCovers(outputs: n, inputs: k) {
             out = tiledProduct(flat, w)

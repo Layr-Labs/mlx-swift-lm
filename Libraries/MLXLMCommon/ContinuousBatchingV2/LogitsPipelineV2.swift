@@ -285,6 +285,19 @@ public final class LogitsPipelineV2 {
         rowIndices = nil
     }
 
+    /// True when `process` applies nothing to the configured rows beyond the temperature divide
+    /// (and the caller's hard mask): no logprob capture, logit bias, penalty or top-k / top-p /
+    /// min-p. `process` takes exactly that path when this holds, so certified token selection
+    /// (`CBv2CertifiedTokenRequest`) and the pipeline share one definition: a stage added below the
+    /// fast path must clear this, or it never runs.
+    public var appliesOnlyTemperature: Bool {
+        !wantsLogprobs && biasMatrix == nil && repetitionPenalty == nil
+            && frequencyPenalty == nil && presencePenalty == nil && !anyTopKPMinP
+    }
+
+    /// The `[B, 1]` divisor of stage (3) (greedy rows pinned to 1), nil when no row divides.
+    public var temperatureColumn: MLXArray? { temperature }
+
     // MARK: Step path — graph-build only, no host syncs, no per-row loops
 
     /// Apply the ordered transform pipeline to raw logits [B, vocab].
@@ -301,6 +314,17 @@ public final class LogitsPipelineV2 {
         // Work in float32 for numerically stable softmax/cumsum (vLLM does
         // the same). f16→f32 is exact, so greedy argmax is unaffected.
         var x = logits.asType(.float32)
+
+        // Temperature only: the stages below would all be identities.
+        if appliesOnlyTemperature {
+            if let temperature {
+                x = x / temperature
+            }
+            if let hardMask {
+                x = hardMask(x)
+            }
+            return Output(sampling: x, rawLogprobs: nil)
+        }
 
         // (0) Raw logprobs BEFORE any transform. (The counter is a telemetry
         // side effect only; the transform pipeline itself stays pure.)

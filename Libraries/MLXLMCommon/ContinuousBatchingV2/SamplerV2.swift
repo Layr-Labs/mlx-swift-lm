@@ -114,6 +114,15 @@ public final class SamplerV2 {
         }
     }
 
+    /// Per-row greedy flags, row-aligned with `setRows`.
+    var greedyRows: [Bool] { rows.map(\.greedy) }
+
+    /// The Exp(1) noise `sample` would draw at the current step indices (`[B, vocab]`, greedy rows
+    /// 1), or nil when every row is greedy. Pure: does not advance the steps.
+    func pendingNoise(vocab: Int) -> MLXArray? {
+        allGreedy ? nil : exponentialNoise(vocab: vocab)
+    }
+
     /// Per-row step indices (RNG key inputs), row-aligned with `setRows`.
     var stepIndices: [UInt64] { rows.map(\.step) }
 
