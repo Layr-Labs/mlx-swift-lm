@@ -17,6 +17,7 @@ enum Inkling2RowExact {
 
     /// `x @ w.T` for `x` of shape `[..., K]` and `w` `[N, K]`, in the dtype matmul gives.
     static func matmul(_ x: MLXArray, transposedWeight w: MLXArray) -> MLXArray {
+        if active, let y = Inkling2Kernels.rowProduct(x, transposedWeight: w) { return y }
         guard active else { return prefillMatmul(x, transposedWeight: w) }
         let shape = x.shape
         let k = shape.last!

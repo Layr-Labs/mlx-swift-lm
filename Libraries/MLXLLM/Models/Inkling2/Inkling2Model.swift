@@ -137,10 +137,18 @@ public final class Inkling2TextModel: Module {
             let previousHidden = hidden
             hidden = preLoopHidden
             blocks = preLoopBlocks
-            // Each layer's messages when it runs (bit-identical to slicing all of them).
+            // Row-exact steps take every loop layer's messages from one kernel
+            // launch per pass (decode kernels); otherwise each layer's messages when it
+            // runs (bit-identical to slicing all of them).
+            let precomputed =
+                Inkling2RowExact.active
+                ? Inkling2Kernels.loopMessages(
+                    queries: messageInput.query, blocks: previousBlocks, partial: previousHidden)
+                : nil
             for (i, layer) in (c.loop.coreStart ..< c.loop.coreEnd).enumerated() {
-                let messages = messageInput(
-                    layer: i, blocks: previousBlocks, partial: previousHidden)
+                let messages =
+                    precomputed.map { Inkling2Kernels.plane($0, i) }
+                    ?? messageInput(layer: i, blocks: previousBlocks, partial: previousHidden)
                 run(layer, pass: pass, messages: messages)
             }
         }

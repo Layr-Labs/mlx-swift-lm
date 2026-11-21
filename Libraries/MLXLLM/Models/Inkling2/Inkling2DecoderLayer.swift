@@ -123,6 +123,12 @@ final class Inkling2DecoderLayer: Module {
         _ hidden: MLXArray, blocks: [MLXArray], messages: MLXArray?, slot: Int,
         state: Inkling2StepState
     ) -> MLXArray {
+        if Inkling2RowExact.active,
+            let y = Inkling2Kernels.decoderLayer(
+                self, hidden, blocks: blocks, messages: messages, slot: slot, state: state)
+        {
+            return y
+        }
         let dtype = hidden.dtype
         let message: (Int) -> MLXArray? = { i in messages?[.ellipsis, i, 0...] }
 
