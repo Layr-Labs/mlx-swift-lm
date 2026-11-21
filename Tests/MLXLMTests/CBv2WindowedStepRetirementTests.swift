@@ -343,6 +343,7 @@ final class CBv2WindowedStepRetirementTests: XCTestCase {
         XCTAssertEqual(result.finishReason, .length)
         XCTAssertEqual(result.tokens, expected.tokens)
         XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved, 256)
+        store.finishPublicationCallbacks(engine: warm)
         await warm.shutdown()
         XCTAssertEqual(backend.bytesReserved, 0)
         XCTAssertEqual(warm.admissionForTesting.bytesReserved, 0)

@@ -556,6 +556,9 @@ private enum NemotronH35BackendOracle {
                 )
             }
             let saved = Array(store.saved.dropFirst(archives.count))
+            // Neither the terminal nor shutdown waits for the store's callback
+            // to drop its last export, whose manifest permit is on the ledger.
+            store.finishPublicationCallbacks(engine: engine)
             await engine.shutdown()
             XCTAssertEqual(storage.backend.bytesReserved, 0)
             XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)

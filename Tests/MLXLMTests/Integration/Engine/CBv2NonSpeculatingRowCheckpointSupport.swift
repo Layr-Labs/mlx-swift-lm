@@ -130,6 +130,9 @@ func cbv2ExpectNonSpeculatingDonorCheckpoints(
     let reference = await archives(referenceStore)
     #expect(eligibleServed.tokens == unconstrained.tokens)
     #expect(reference.map(\.manifest.position) == positions)
+    // A store's callback can hold its last export's manifest permit past the
+    // terminal: drain the callbacks before each ledger check.
+    referenceStore.finishPublicationCallbacks(engine: eligible)
     released(eligible, eligibleBackend)
     await eligible.shutdown()
 
@@ -137,6 +140,7 @@ func cbv2ExpectNonSpeculatingDonorCheckpoints(
     let (donor, donorBackend) = try make(store)
     let on = try await cbv2ServeControlled(donor, request(4, controlled: true))
     let saved = await archives(store)
+    store.finishPublicationCallbacks(engine: donor)
     released(donor, donorBackend)
     let off = try await cbv2ServeControlled(donor, request(5, controlled: true, cached: false))
     #expect(on.tokens == expected.tokens, "capture on")
@@ -153,6 +157,7 @@ func cbv2ExpectNonSpeculatingDonorCheckpoints(
         #expect(ours.manifest.assistantCodecID != nil)
         #expect(sameTensors(ours, theirs), "position \(ours.manifest.position)")
     }
+    store.finishPublicationCallbacks(engine: donor)
     released(donor, donorBackend)
     await donor.shutdown()
 
@@ -169,6 +174,7 @@ func cbv2ExpectNonSpeculatingDonorCheckpoints(
         #expect(served.saved == 2 * chunk, "request \(id)")
         #expect(served.usage?.prefixCacheReplayTokens == 0, "request \(id)")
         if controlled { #expect(served.logprobBits == expected.logprobBits, "restored") }
+        reopened.finishPublicationCallbacks(engine: warm)
         released(warm, warmBackend)
     }
     #expect((warm.mtpMetricsSnapshot()?.draftedTokens ?? 0) > 0)

@@ -209,8 +209,11 @@ struct Qwen35CardDefaultCheckpointTests {
         engine.mtpMetricsSnapshot()?.draftedTokens ?? 0
     }
 
-    /// Every charge and every assistant request state is back.
-    static func released(_ engine: EngineV2, _ backend: any CBv2KVBackend) {
+    /// Every charge and every assistant request state is back. A store's
+    /// callback can hold its last export's manifest permit past the terminal,
+    /// so its publication callbacks drain first.
+    static func released(_ engine: EngineV2, _ backend: any CBv2KVBackend, store: Store? = nil) {
+        store?.finishPublicationCallbacks(engine: engine)
         let state = engine.loopForTesting.onEngineQueueSync {
             (
                 engine.admissionForTesting.bytesReserved, backend.bytesReserved,
@@ -260,7 +263,7 @@ struct Qwen35CardDefaultCheckpointTests {
         let (donor, donorBackend) = try Self.engine(fixture, store: store)
         let on = try await cbv2ServeControlled(donor, Self.card(11, shape))
         let saved = await Self.archives(store)
-        Self.released(donor, donorBackend)
+        Self.released(donor, donorBackend, store: store)
         let off = try await cbv2ServeControlled(donor, Self.card(11, shape, cached: false))
         #expect(on.tokens == expected.tokens, "capture on")
         #expect(off.tokens == expected.tokens, "capture off")
@@ -271,7 +274,7 @@ struct Qwen35CardDefaultCheckpointTests {
         #expect(Self.drafted(donor) == 0, "the card's row never drafts")
         #expect(saved.map(\.manifest.position) == Self.positions, "the card row's checkpoints")
         #expect(store.saved.count == saved.count, "capture off saves nothing")
-        Self.released(donor, donorBackend)
+        Self.released(donor, donorBackend, store: store)
         await donor.shutdown()
 
         let referenceStore = Store(segmentBytes: 4096)
@@ -286,7 +289,7 @@ struct Qwen35CardDefaultCheckpointTests {
             #expect(ours.manifest.assistantCodecID != nil)
             #expect(Self.sameTensors(ours, theirs), "position \(ours.manifest.position)")
         }
-        Self.released(eligible, eligibleBackend)
+        Self.released(eligible, eligibleBackend, store: referenceStore)
         await eligible.shutdown()
 
         for acceptance in Self.acceptances {
@@ -312,7 +315,7 @@ struct Qwen35CardDefaultCheckpointTests {
                 #expect(served.finish == reference.finish, "\(label)")
                 #expect(served.saved == 2 * Self.chunk, "\(label)")
                 #expect(served.usage?.prefixCacheReplayTokens == 0, "\(label)")
-                Self.released(warm, warmBackend)
+                Self.released(warm, warmBackend, store: reopened)
             }
             #expect(Self.drafted(warm) > 0, "\(acceptance.name)")
             await warm.shutdown()
@@ -357,7 +360,7 @@ struct Qwen35CardDefaultCheckpointTests {
         }
         #expect(saved.map(\.manifest.position) == Self.positions)
         #expect(Self.drafted(engine) == 0)
-        Self.released(engine, backend)
+        Self.released(engine, backend, store: store)
         await engine.shutdown()
     }
 
@@ -420,7 +423,7 @@ struct Qwen35CardDefaultCheckpointTests {
         let (eligible, eligibleBackend) = try Self.engine(fixture, store: referenceStore)
         _ = try await cbv2ServeControlled(eligible, Self.speculating(43))
         let reference = await Self.archives(referenceStore)
-        Self.released(eligible, eligibleBackend)
+        Self.released(eligible, eligibleBackend, store: referenceStore)
         await eligible.shutdown()
 
         let store = Store(segmentBytes: 4096)
@@ -445,7 +448,7 @@ struct Qwen35CardDefaultCheckpointTests {
             #expect(ours.manifest == theirs.manifest, "position \(ours.manifest.position)")
             #expect(Self.sameTensors(ours, theirs), "position \(ours.manifest.position)")
         }
-        Self.released(engine, backend)
+        Self.released(engine, backend, store: store)
         await engine.shutdown()
     }
 

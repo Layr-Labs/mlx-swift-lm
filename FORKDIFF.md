@@ -24,10 +24,24 @@ is not listed yet), the job waits 20 seconds and tries once more.
 
 Fork Tests, PR lint, the fork-diff check and page rendering use Darkbloom
 macOS or Linux ARM64 runners. Each compute job queues independently with
-the full native runner labels; these jobs have no hosted fallback and do
-not reserve all seven Mac jobs before the build starts. The repository's
-approval still determines the image and the network policy. Each macOS job
-names its VM size ([Job sizes](#job-sizes)).
+the full native runner labels; these jobs have no hosted fallback. The
+repository's approval still determines the image and the network policy.
+Each macOS job names its VM size ([Job sizes](#job-sizes)).
+
+The test shards start beside Build and Metal library, as soon as the shard
+map is ready, as Layr-Labs/d-inference's test jobs do. Each one queues for
+its Mac, checks out and selects Xcode while the build runs, then
+`.github/scripts/wait-for-products.py` holds it until both jobs have
+succeeded (it reads the run's jobs every 15 s and fails when either did not
+succeed). Before, the shards were created only when the build ended, and
+their queue and setup (p50 107 s from the build's end to the download,
+runs 44750661761 to 44868059797) came after it. In the first run with early
+start (44881140704) it took 2 to 13 s. The cost: each shard's Mac idles for
+most of the build. In that run the shards waited 289 to 355 s, 356
+vCPU-minutes in all (about $0.36 at $0.001 per vCPU-minute). A shard whose
+build failed fails at the wait instead of being skipped. The wait counts
+against the shard's 45-minute job timeout, so no step gets more time than
+before; it ends with an error after 30 minutes.
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
@@ -69,8 +83,7 @@ measured every job.
 |---|---|---|---|
 | Build | 12x32 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16: 361 and 457 s, 10.04 GiB. On 8x16 (#468) the median of the build step went from 269 s on 12 vCPUs (n=51 runs, 43711096547 to 44767807509) to 362 s (n=16, 44750661761 to 44819969123); it was 301 s after #480 (n=7). Every test job waits for it, so it went back to 12x32: 32 GiB is 3.2 times the peak, and it costs about the same vCPU-minutes because the build is CPU-bound. 12x32 did not queue longer: the build queued for a median 55 s on 12 vCPUs and 88 s on 8x16 (n=51 and 23), and in the same runs the 12x32 test shards queued for 70 s against 78 s for 4x24 (n=39 and 205). |
 | Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. | 4x16: 231 and 306 s, 10.04 GiB (`air-lld` 6.52) |
-| Test shards 1 to 6, 8 and 10 to 12 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB. |
-| Test shards 7 and 9 (`test-12x32`, the plan's `SHARDS_12X32`) | 12x32 | Same runs. | On 4 vCPUs (4x16 and 4x24) tests in them find admission bytes still reserved after a request's final event (issue #469): `HistoricalWindowCheckpointEngineTests` in shard 9 failed in both runs, `Qwen35CardDefaultCheckpointTests` in shard 7 in one of three. Memory is not the cause: shard 7 peaked at 10.25 GiB, shard 9 at 7.88 GiB. They keep 12x32, the size they ran on before, and move to 4x24 in `test` when #469 is fixed. |
+| Test shards 1 to 12 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB (shard 7 10.25 GiB, shard 9 7.88 GiB). Shards 7 and 9 ran on 12x32 until issue #469 was fixed: their tests read the admission ledger before the checkpoint store's callback had dropped its last export, whose manifest permit is charged until then. On 4 vCPUs that callback can still be running at the request's final event. |
 | Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. | not run on pull requests |
 | PR lint | 4x16 | 35 s on 12 vCPUs. | 4x16: 31 s, 6.04 GiB |
 

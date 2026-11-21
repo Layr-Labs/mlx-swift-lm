@@ -8,8 +8,10 @@ name: Fork Tests
 # One job builds the package and its tests, and lists the tests. Another job
 # builds the full Metal library at the same time. Both hand their products to
 # the test jobs as artifacts. Runs that are not for a pull request also save
-# them in the Actions cache, for later runs to restore. The test jobs download
-# the products and run in parallel.
+# them in the Actions cache, for later runs to restore. The test jobs start
+# beside them, as soon as the shard map is ready: each gets its Mac, checks out
+# and selects Xcode during the build, then waits for both jobs
+# (.github/scripts/wait-for-products.py), downloads the products and runs.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
@@ -48,7 +50,6 @@ jobs:
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
       audio-shard: ${{ steps.matrix.outputs.audio-shard }}
-      shards-12x32: ${{ steps.matrix.outputs.shards-12x32 }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -61,22 +62,18 @@ jobs:
           python3 .github/scripts/test-runner-sizes.py
           python3 .github/scripts/test-ci-resource-sampler.py
 
+      - name: Test the wait for the products
+        run: python3 .github/scripts/test-wait-for-products.py
+
       - name: Read the shard numbers
         id: matrix
         # The seven-test audio exception uses its separate hosted shard.
-        # The native shards in SHARDS_12X32 run in test-12x32, the others in
-        # test (issue #469).
-        env:
-          SHARDS_12X32: "[7, 9]"
         run: |
           shards=$(python3 .github/scripts/test_shards.py matrix --runner native)
           audio_shards=$(python3 .github/scripts/test_shards.py matrix --runner hosted)
           jq -e 'length == 1' <<< "$audio_shards" > /dev/null
-          printf 'shards=%s\naudio-shard=%s\nshards-12x32=%s\n' \
-            "$(jq -c --argjson large "$SHARDS_12X32" '. - $large' <<< "$shards")" \
-            "$(jq -r '.[0]' <<< "$audio_shards")" \
-            "$(jq -c --argjson large "$SHARDS_12X32" 'map(select(. as $s | any($large[]; . == $s)))' <<< "$shards")" \
-            >> "$GITHUB_OUTPUT"
+          printf 'shards=%s\naudio-shard=%s\n' \
+            "$shards" "$(jq -r '.[0]' <<< "$audio_shards")" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build
@@ -407,10 +404,17 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
+    # No `needs: [build, metallib]`: the shards start beside them, so their
+    # Macs, checkouts and Xcode are ready when the products are. "Wait for
+    # the products" holds the downloads until both jobs have succeeded.
+    needs: plan
     runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x24]
     permissions:
       contents: read
+      # wait-for-products.py reads this run's jobs.
+      actions: read
+    # The wait counts against the job's 45 minutes, so no step that ran
+    # before the early start gets more time.
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -427,90 +431,11 @@ jobs:
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
 
-      - name: Download the test products
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: test-products
-          path: ${{ runner.temp }}/test-products
-
-      - name: Unpack the test products
-        run: .github/scripts/test-products.sh unpack "$RUNNER_TEMP/test-products/test-products.tar.zst"
-
-      - name: Use the package versions of the build
-        run: cp .build/fork-tests-Package.resolved Package.resolved
-
-      - name: Download the Metal library
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: metallib
-          path: ${{ runner.temp }}/metallib
-
-      - name: Run the shard
-        # Runs each run of the shard in its own swift test process, also
-        # after an earlier run failed. The runs without the Metal library go
-        # first, then the script stages the library. A strict group fails
-        # when it skips a test or executes zero tests. Every run fails when a
-        # test fails. The job summary shows the time and result of each run.
-        run: >-
-          python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
-          --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
-          --metallib "$RUNNER_TEMP/metallib/mlx.metallib"
-          --list .build/fork-tests-list.txt
-
-      - name: Upload the test results
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: shard-${{ matrix.shard }}-results
-          path: ${{ runner.temp }}/results
-          retention-days: 7
-
-      - name: Upload the crash reports
-        # A crash of a test process writes a report with the backtrace of
-        # each thread to ~/Library/Logs/DiagnosticReports. The test log
-        # names no test after a crash, so the report is the evidence.
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: crash-reports-shard-${{ matrix.shard }}
-          path: ~/Library/Logs/DiagnosticReports/*
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Report the resource samples
-        # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
-        if: ${{ always() }}
-        run: python3 .github/scripts/ci-resource-sampler.py report "$RUNNER_TEMP/resource-samples" || true
-
-  # Shards 7 and 9 (the plan's SHARDS_12X32) keep 12x32, the size they ran on
-  # before the sizes were explicit. On 4 vCPUs (4x16 and 4x24) tests in them
-  # find admission bytes still reserved after a request's final event (issue
-  # #469): HistoricalWindowCheckpointEngineTests in shard 9 and
-  # Qwen35CardDefaultCheckpointTests in shard 7. When #469 is fixed, delete
-  # this job and the plan's shards-12x32 output: shards 7 and 9 then run in
-  # `test` on 4x24. Its steps are those of `test`.
-  test-12x32:
-    name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
-    if: ${{ needs.plan.outputs.shards-12x32 != '[]' }}
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-12x32]
-    permissions:
-      contents: read
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.plan.outputs.shards-12x32) }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Start the resource sampler
-        # Report-only (.github/scripts/ci-resource-sampler.py): every 5 s it
-        # samples memory and busy vCPUs. It never fails the job.
-        run: python3 .github/scripts/ci-resource-sampler.py start "$RUNNER_TEMP/resource-samples"
-
-      - name: Select Xcode
-        uses: ./.github/actions/select-xcode
+      - name: Wait for the products
+        # Fails when Build or Metal library did not succeed, or after 30 minutes.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/wait-for-products.py
 
       - name: Download the test products
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -734,7 +659,7 @@ jobs:
 
   verify:
     name: Each test ran once
-    needs: [list, test, test-12x32, audio]
+    needs: [list, test, audio]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
     # It only reads artifacts, and it is the last job a pull request waits
     # for: a hosted runner starts at once, a new sandbox in about a minute.
@@ -776,7 +701,7 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [build, test, test-12x32, audio]
+    needs: [build, test, audio]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished. Pull
     # requests skip it: it starts after the last shard and adds a new

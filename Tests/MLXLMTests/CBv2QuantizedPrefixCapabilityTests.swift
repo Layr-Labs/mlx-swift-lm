@@ -157,6 +157,7 @@ struct CBv2QuantizedPrefixCapabilityTests {
         let resumed = request(11)
         #expect(try reopened.stage(engine: warmEngine, request: resumed))
         let warm = await cbv2SchedCollect(try warmEngine.submit(resumed))
+        reopened.finishPublicationCallbacks(engine: warmEngine)
         await warmEngine.shutdown()
         #expect(warm.finishReason == .length && warm.tokens == cold.tokens)
         #expect((warm.usage?.prefixCachePrefillTokensSaved ?? 0) > 0)
