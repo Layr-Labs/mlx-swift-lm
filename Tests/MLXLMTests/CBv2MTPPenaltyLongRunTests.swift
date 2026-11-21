@@ -108,7 +108,9 @@ struct CBv2MTPPenaltyLongRunTests {
         final class Log: @unchecked Sendable {
             private let lock = NSLock()
             private var items: [CBv2PenaltyCountObservation] = []
-            func append(_ item: CBv2PenaltyCountObservation) { lock.withLock { items.append(item) } }
+            func append(_ item: CBv2PenaltyCountObservation) {
+                lock.withLock { items.append(item) }
+            }
             var all: [CBv2PenaltyCountObservation] { lock.withLock { items } }
         }
         let sampler = CBv2DefaultSampler(fallbackSeed: 41)
@@ -120,7 +122,8 @@ struct CBv2MTPPenaltyLongRunTests {
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
             sampler: sampler,
-            detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2PenaltyLongRunTokenizer()),
+            detokenizerFactory: CBv2TextDetokenizerFactory(
+                tokenizer: CBv2PenaltyLongRunTokenizer()),
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
                 prefillChunkSize: 16, maxWaiting: 16),
@@ -153,15 +156,21 @@ struct CBv2MTPPenaltyLongRunTests {
     private func expectExactCounts(
         _ served: Served, id: CBv2RequestID, emitted: [Int], _ name: String
     ) -> (draws: Int, verifies: Int) {
-        var draws = 0, verifies = 0, lastDrawn = 0, lastConfirmed = 0
+        var draws = 0
+        var verifies = 0
+        var lastDrawn = 0
+        var lastConfirmed = 0
         for observation in served.observations where observation.id == id {
             switch observation.kind {
             case .sample:
                 draws += 1
                 let counts = observation.counts[0]
                 let n = Int(counts.reduce(0, +))
-                guard n >= lastDrawn, n <= emitted.count, counts == recount(emitted.prefix(n)) else {
-                    Issue.record("\(name): draw \(draws) counts \(n) do not recount the first emitted tokens")
+                guard n >= lastDrawn, n <= emitted.count, counts == recount(emitted.prefix(n))
+                else {
+                    Issue.record(
+                        "\(name): draw \(draws) counts \(n) do not recount the first emitted tokens"
+                    )
                     return (draws, verifies)
                 }
                 lastDrawn = n
@@ -171,7 +180,8 @@ struct CBv2MTPPenaltyLongRunTests {
                 guard confirmed.count >= lastConfirmed, confirmed.count <= emitted.count,
                     Array(emitted.prefix(confirmed.count)) == confirmed
                 else {
-                    Issue.record("\(name): verify \(verifies) confirmed output is not the emitted prefix")
+                    Issue.record(
+                        "\(name): verify \(verifies) confirmed output is not the emitted prefix")
                     return (draws, verifies)
                 }
                 lastConfirmed = confirmed.count
@@ -194,7 +204,7 @@ struct CBv2MTPPenaltyLongRunTests {
     private func script(from expected: [Int], seed: UInt64, k: Int) -> [Int] {
         var state = seed
         func next() -> UInt64 {
-            state = state &* 6364136223846793005 &+ 1442695040888963407
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
             return state >> 33
         }
         return (expected + [Int](repeating: 0, count: 2 * k)).map { token in
@@ -214,20 +224,35 @@ struct CBv2MTPPenaltyLongRunTests {
     }
 
     private let cases: [Case] = [
-        Case(name: "t0-presence-frequency", sampling: .init(temperature: 0, frequencyPenalty: 0.3, presencePenalty: 0.6),
-             maxTokens: 2500),
-        Case(name: "t0-rectangular-k3", sampling: .init(temperature: 0, frequencyPenalty: 0.5, presencePenalty: 1.5),
-             maxTokens: 2001, k: 3, mode: .rectangular),
-        Case(name: "t1-card", sampling: .init(temperature: 1, topP: 0.95, topK: 20, frequencyPenalty: 0.2,
-                                               presencePenalty: 1.5, seed: 1234),
-             maxTokens: 2000),
-        Case(name: "t07-holdback", sampling: .init(temperature: 0.7, frequencyPenalty: 0.4, presencePenalty: 0.5, seed: 77),
-             maxTokens: 2003, stops: ["<3><31><31><31>"]),
-        Case(name: "t0-late-stop-string", sampling: .init(temperature: 0, frequencyPenalty: 0.25, presencePenalty: 0.5),
-             maxTokens: 2000, lateStop: true),
-        Case(name: "t1-late-stop-token", sampling: .init(temperature: 1, topP: 0.9, frequencyPenalty: 0.3,
-                                                          presencePenalty: 0.8, seed: 9),
-             maxTokens: 2000, k: 3, lateStopToken: true),
+        Case(
+            name: "t0-presence-frequency",
+            sampling: .init(temperature: 0, frequencyPenalty: 0.3, presencePenalty: 0.6),
+            maxTokens: 2500),
+        Case(
+            name: "t0-rectangular-k3",
+            sampling: .init(temperature: 0, frequencyPenalty: 0.5, presencePenalty: 1.5),
+            maxTokens: 2001, k: 3, mode: .rectangular),
+        Case(
+            name: "t1-card",
+            sampling: .init(
+                temperature: 1, topP: 0.95, topK: 20, frequencyPenalty: 0.2,
+                presencePenalty: 1.5, seed: 1234),
+            maxTokens: 2000),
+        Case(
+            name: "t07-holdback",
+            sampling: .init(
+                temperature: 0.7, frequencyPenalty: 0.4, presencePenalty: 0.5, seed: 77),
+            maxTokens: 2003, stops: ["<3><31><31><31>"]),
+        Case(
+            name: "t0-late-stop-string",
+            sampling: .init(temperature: 0, frequencyPenalty: 0.25, presencePenalty: 0.5),
+            maxTokens: 2000, lateStop: true),
+        Case(
+            name: "t1-late-stop-token",
+            sampling: .init(
+                temperature: 1, topP: 0.9, frequencyPenalty: 0.3,
+                presencePenalty: 0.8, seed: 9),
+            maxTokens: 2000, k: 3, lateStopToken: true),
     ]
 
     @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
@@ -260,14 +285,20 @@ struct CBv2MTPPenaltyLongRunTests {
             }
             let baseline = try await serve(target: target, script: nil, request: req, k: c.k)
             let mtp = try await serve(
-                target: target, script: script(from: unstopped.tokens, seed: UInt64(index + 1), k: c.k),
+                target: target,
+                script: script(from: unstopped.tokens, seed: UInt64(index + 1), k: c.k),
                 request: req, k: c.k, verificationMode: c.mode)
-            #expect(mtp.tokens == baseline.tokens, "\(c.name): MTP stream equals the MTP-off stream")
+            #expect(
+                mtp.tokens == baseline.tokens, "\(c.name): MTP stream equals the MTP-off stream")
             #expect(mtp.finish == baseline.finish, "\(c.name)")
             let metrics = try #require(mtp.metrics)
-            #expect(metrics.rounds > baseline.tokens.count / 8, "\(c.name): rows speculate throughout")
-            #expect(metrics.acceptedTokens < metrics.draftedTokens, "\(c.name): drafts were rejected")
-            #expect(Array(unstopped.tokens.prefix(baseline.tokens.count)) == baseline.tokens, "\(c.name)")
+            #expect(
+                metrics.rounds > baseline.tokens.count / 8, "\(c.name): rows speculate throughout")
+            #expect(
+                metrics.acceptedTokens < metrics.draftedTokens, "\(c.name): drafts were rejected")
+            #expect(
+                Array(unstopped.tokens.prefix(baseline.tokens.count)) == baseline.tokens,
+                "\(c.name)")
             let checked = expectExactCounts(mtp, id: id, emitted: unstopped.tokens, c.name)
             #expect(checked.verifies > baseline.tokens.count / 8, "\(c.name): \(checked)")
             _ = expectExactCounts(baseline, id: id, emitted: unstopped.tokens, "\(c.name) MTP-off")
