@@ -598,7 +598,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
                 token >= 0 && token < vocab ? Int32(token) : nil
             }
             if !fresh.isEmpty {
-                counts = counts.at[MLXArray(fresh)].add(Float(1))
+                counts = counts.at[MLXArray(Array(fresh.suffix(1)))].add(Float(1))
             }
         }
         mtpPenaltyCounts[id] = (tokens.count, tokens.last ?? -1, counts)
