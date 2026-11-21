@@ -14,8 +14,9 @@ import MLXLMCommon
 /// geometry) and each 64 MiB KV segment the history reads, so decode committed after
 /// almost every MoE operation, reached MLX's limit of ten command buffers in flight,
 /// and waited inside evaluation instead of encoding ahead of the GPU. These steps
-/// commit by dispatch count only: weights and segments add no memory. Prefill chunks
-/// and MTP rounds keep the defaults. Results do not depend on the partitioning.
+/// commit by dispatch count only: weights and segments add no memory. MTP rounds of
+/// short rows take the same limits through their own switch (`speculativeCurrent`);
+/// prefill chunks keep the defaults. Results do not depend on the partitioning.
 /// Cluster Qwen sessions set their own (identical) limits; this switch doesn't reach
 /// them.
 enum Qwen35DecodeCommandBuffers {
@@ -43,6 +44,22 @@ enum Qwen35DecodeCommandBuffers {
 
     static var current: GPU.CommandBufferLimits? {
         (overrideForTesting ?? enabled) ? limits : nil
+    }
+
+    /// MTP rounds whose rows each carry at most
+    /// `EngineLoopV2.speculativeCommandBufferRowTokens` tokens (the assistant's draft
+    /// steps and the target's verification windows, or a prompt chunk that short)
+    /// take the same `limits` unless `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS` is `0`,
+    /// `off`, `false` or `no`, as Gemma 4's and GLM's rounds do. Read once.
+    static let speculativeEnvironmentKey = "DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS"
+    static let speculativeEnabled = enabled(
+        ProcessInfo.processInfo.environment[speculativeEnvironmentKey])
+
+    /// Tests only, as `overrideForTesting`, for MTP rounds.
+    nonisolated(unsafe) static var speculativeOverrideForTesting: Bool?
+
+    static var speculativeCurrent: GPU.CommandBufferLimits? {
+        (speculativeOverrideForTesting ?? speculativeEnabled) ? limits : nil
     }
 }
 
