@@ -202,6 +202,34 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(logicalDelta >= 0, "CBv2LayerCache: negative logicalDelta \(logicalDelta)")
+        precondition(
+            keys.ndim == 4 && values.ndim == 4,
+            "CBv2LayerCache: compacted K/V must be rank 4")
+        let stored = keys.dim(2)
+        precondition(
+            rows.count == keys.dim(0) && values.dim(0) == rows.count && values.dim(2) == stored,
+            "CBv2LayerCache: K/V batch or token count does not match rows")
+        for (rowIndex, row) in rows.enumerated() {
+            if stored > 0 {
+                _ = row.update(
+                    keys: keys[rowIndex ..< rowIndex + 1],
+                    values: values[rowIndex ..< rowIndex + 1])
+            }
+            if logicalDelta > 0 {
+                row.addPositionDelta(logicalDelta)
+            }
+        }
+        let advance = stored + logicalDelta
+        if advance > 0 {
+            cachedPositionOffsets = cachedPositionOffsets + Int32(advance)
+        }
+    }
+
     public func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
@@ -229,7 +257,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 
     private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
-        MLXArray(rows.map { Int32($0.absoluteOffset) })
+        MLXArray(rows.map { Int32($0.ropePositionOffset) })
     }
 }
 

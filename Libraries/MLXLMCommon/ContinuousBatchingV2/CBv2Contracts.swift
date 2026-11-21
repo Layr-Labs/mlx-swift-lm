@@ -460,9 +460,21 @@ func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
 /// absolute position counter and its storage. There is no shared frontier.
 public protocol CBv2SequenceKV: AnyObject {
     /// Absolute position of the next token to be written (== number of
-    /// tokens processed for this sequence at this layer). Monotonic; never
-    /// mutated by other sequences joining/leaving.
+    /// physical KV tokens written for this sequence at this layer). Monotonic;
+    /// never mutated by other sequences joining/leaving.
     var absoluteOffset: Int { get }
+    /// Logical RoPE position of the next token to be written. Equal to
+    /// `absoluteOffset` for uncompacted sequences; exceeds `absoluteOffset` by
+    /// the omitted-token delta after prompt compaction (e.g. Block-SDCM).
+    var ropePositionOffset: Int { get }
+    /// True when physical KV storage holds a compacted subset of the prompt
+    /// (`ropePositionOffset != absoluteOffset`). Compacted rows never donate
+    /// exact-token prefix checkpoints or enter speculative verify rounds.
+    var isCompacted: Bool { get }
+    /// Record `delta >= 0` omitted prompt positions so subsequent decode steps
+    /// compute RoPE at the exact original logical position while physical KV
+    /// writes remain dense at `absoluteOffset`.
+    func addPositionDelta(_ delta: Int)
     /// Number of KV entries physically retained (≤ absoluteOffset for
     /// windowed caches; == absoluteOffset for full caches).
     var retainedCount: Int { get }
@@ -522,6 +534,17 @@ public protocol CBv2SequenceKV: AnyObject {
 }
 
 extension CBv2SequenceKV {
+    /// Default: uncompacted rows use `absoluteOffset` as their RoPE position.
+    public var ropePositionOffset: Int { absoluteOffset }
+    /// Default: compacted iff logical RoPE offset diverges from physical count.
+    public var isCompacted: Bool { ropePositionOffset != absoluteOffset }
+    /// Default: only storage types that track `positionDelta` accept non-zero deltas.
+    public func addPositionDelta(_ delta: Int) {
+        precondition(
+            delta == 0,
+            "addPositionDelta(\(delta)) is not supported by \(type(of: self))")
+    }
+
     /// Default: only sliding-window storage supports position fast-forward.
     public func fastForward(to offset: Int) {
         preconditionFailure(
@@ -763,6 +786,17 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// Commit pre-attended prompt K/V (optionally compacted to fewer tokens than
+    /// the original prompt) and advance logical RoPE offsets by
+    /// `keys.dim(2) + logicalDelta` while physical storage writes only `keys.dim(2)`.
+    func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int)
+}
+
+extension CBv2AttendingLayerCache {
+    public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
+        preconditionFailure(
+            "writeCompactedPromptKV is not implemented by \(type(of: self))")
+    }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)
@@ -850,6 +884,12 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Minimum prompt length for solo whole-prompt dispatch when prompt
+    /// compaction (e.g. Gemma 4 Block-SDCM) is enabled. Nil = off.
+    /// Unlike `soloPrefillStripeTokens`, this does NOT widen paged sliding-window
+    /// rings because the model commits only the trailing window (<= window size)
+    /// to sliding caches.
+    public var soloCompactionMinPromptTokens: Int? = nil
     /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
     /// endpoint for a cold text prompt shorter than its armed solo stripe.
     /// Nil preserves the existing range geometry; the caller supplies the

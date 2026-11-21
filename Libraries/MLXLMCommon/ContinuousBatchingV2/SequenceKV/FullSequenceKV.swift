@@ -83,7 +83,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
     static let initialSlack = 256
 
     public private(set) var absoluteOffset: Int = 0
+    private var positionDelta: Int = 0
+    public var ropePositionOffset: Int { absoluteOffset + positionDelta }
     public var retainedCount: Int { absoluteOffset }
+
+    public func addPositionDelta(_ delta: Int) {
+        precondition(delta >= 0, "CBv2FullSequenceKV: negative position delta \(delta)")
+        positionDelta += delta
+    }
 
     /// Hard cap on this sequence's length; growth beyond it is an engine
     /// admission bug and traps.
@@ -227,7 +234,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
     /// decrement makes the un-confirmed tail structurally unreachable and
     /// the confirmed prefix is untouched), so speculative begin/commit are
     /// the contract's default no-ops.
-    public var supportsSpeculativeWrites: Bool { true }
+    public var supportsSpeculativeWrites: Bool { !isCompacted }
 
     /// Rollback the last `n` tokens (speculative rejection). The un-confirmed
     /// tail is structurally unreachable afterwards: every view this class

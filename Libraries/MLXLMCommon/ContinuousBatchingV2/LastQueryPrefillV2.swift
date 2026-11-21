@@ -27,10 +27,13 @@ import Foundation
 import MLX
 
 /// Layer caches that can commit a full prompt chunk's K/V while attending
-/// only its newest query. Conformance is a CAPABILITY claim: the contiguous
-/// backend's `CBv2LayerCache` conforms; paged and custom caches do not, and
-/// the model falls back to ordinary chunk attention for them.
+/// only its newest query. Conformance is a CAPABILITY claim: `CBv2LayerCache`
+/// and `PagedLayerCache` conform, and callers must check `supportsLastQueryPrefill`
+/// on the concrete instance before invoking `updateAndAttendLastQuery`.
 public protocol CBv2LastQueryPrefillLayerCache: CBv2AttendingLayerCache {
+    /// Whether this layer cache instance currently qualifies for last-query
+    /// prefill (e.g. native unquantized full-attention paged or contiguous cache).
+    var supportsLastQueryPrefill: Bool { get }
     /// - queries: `[B, queryHeads, 1, headDim]` — the frontier row only,
     ///   already RoPE'd at the chunk's LAST absolute position.
     /// - keys: `[B, kvHeads, L, headDim]` — the COMPLETE chunk.
@@ -41,4 +44,8 @@ public protocol CBv2LastQueryPrefillLayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray
+}
+
+extension CBv2LastQueryPrefillLayerCache {
+    public var supportsLastQueryPrefill: Bool { true }
 }

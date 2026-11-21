@@ -371,10 +371,11 @@ public final class SchedulerV2 {
         // its optional preserved stripe ceiling), it is prefilling (not decode-ready),
         // and it is not itself paused. Solo also means raising the step
         // budget to the stripe cannot starve a decode row — there is none.
-        let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
-            guard let stripe = config.soloPrefillStripeTokens,
-                stripe > config.prefillChunkSize
-            else { return nil }
+        let soloStripe: (tokens: Int, id: CBv2RequestID, isCompaction: Bool)? = {
+            let hasStripe =
+                (config.soloPrefillStripeTokens ?? 0) > config.prefillChunkSize
+            let hasCompaction = (config.soloCompactionMinPromptTokens ?? 0) > 0
+            guard hasStripe || hasCompaction else { return nil }
             let liveRunning = running.filter {
                 !$0.cancelRequested && $0.remainingTokens > 0
             }
@@ -402,11 +403,24 @@ public final class SchedulerV2 {
                 solo.multimodalBlocks.isEmpty,
                 solo.remainingTokens > 1
             else { return nil }
-            guard
+            // Solo whole-prompt compaction (e.g. Gemma 4 Block-SDCM): arm for
+            // fresh cold text prompts at or above the configured floor so the
+            // model observes the complete prompt in one pass without inflating
+            // paged sliding-window rings or splitting at demanded checkpoints.
+            if let minCompaction = config.soloCompactionMinPromptTokens,
+                minCompaction > 0,
+                solo.request.multimodal == nil,
+                solo.numComputedTokens == 0,
+                solo.prefixReusePlan == nil,
+                solo.remainingTokens >= minCompaction
+            {
+                return (tokens: solo.remainingTokens, id: solo.id, isCompaction: true)
+            }
+            guard hasStripe,
                 let selectedStripe = config.resolvedSoloPrefillStripeTokens(
                     isMultimodal: solo.request.multimodal != nil)
             else { return nil }
-            return (tokens: selectedStripe, id: solo.id)
+            return (tokens: selectedStripe, id: solo.id, isCompaction: false)
         }()
         let soloStripeTokens = soloStripe?.tokens
         // The stripe belongs to ONE armed request. A successor admitted in
@@ -427,6 +441,12 @@ public final class SchedulerV2 {
         var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
         var demandedCheckpointRanges: [CBv2RequestID: CBv2DemandedCheckpointRange] = [:]
         func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            // Compacted rows veto checkpoint capture and need whole-prompt
+            // visibility for boundary scoring, so never split them at a
+            // demanded prefix-checkpoint boundary.
+            if soloStripe?.id == rec.id, soloStripe?.isCompaction == true {
+                return proposed
+            }
             let range = config.demandedCheckpointRange(
                 promptTokens: rec.request.promptTokens.count,
                 hintTokens: rec.request.prefixCheckpointTargetTokens,
