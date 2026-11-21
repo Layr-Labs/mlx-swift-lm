@@ -148,7 +148,7 @@ extension EngineLoopV2 {
             // generic capacity.reserve may precede or follow this handoff.
             return try adopted.moveToActiveRequest { auxiliary in
                 do {
-                    if staged.codec.historicalLayout != nil {
+                    if staged.codec.historicalLayout != nil, !staged.codec.historicalRecurrent {
                         guard auxiliary.isEmpty, !(mtp?.tracksPersistentHistory ?? false) else {
                             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                         }

@@ -4,6 +4,11 @@ import MLX
 extension EngineLoopV2 {
     func captureRecurrentCheckpoints(_ step: CBv2InFlightStep) {
         guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
+        // Mixed historical + recurrent codecs capture through the historical
+        // path, which owns both the boundary geometry and the state copy.
+        if hybridPrefixCache == nil, completeCheckpointCapture?.codec.historicalRecurrent == true {
+            return
+        }
         var nativeCaptureWork: CBv2NativeCompletePrefixWork?
         defer { nativeCaptureWork?.finishAfterDroppingConsumers() }
         var roots: [MLXArray] = []

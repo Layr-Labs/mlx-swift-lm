@@ -191,7 +191,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         hintTokens: Int? = nil, resumedAt: Int = 0,
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) -> [MLXArray] {
-        guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical, !isClosed,
+        guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical,
+            !codec.historicalRecurrent, !isClosed,
             position > 1, chunkSize > 1,
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize),
             !mediaTargetOnly || mediaIdentity != nil,

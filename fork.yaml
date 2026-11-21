@@ -623,6 +623,22 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/BaichuanM1.swift"
             - "Tests/MLXLMTests/BaichuanM1WindowMaskTiedHeadTests.swift"
+        - title: "Inkling 2 Mini (native looped model, paged attention, DSpark MTP)"
+          description: |
+            Native `inkling2_loop` text model for `thinkingmachines/Inkling-2-Mini`. NVFP4 and MXFP8 experts load
+            as stored, without requantization. Attention uses a learned relative bias with per-query sinks and
+            short convolutions; block attention residuals mix layer inputs; layers 6-17 run three passes.
+            The model runs only on the paged CBv2 engine: a model-owned paged attention kernel reached through
+            the `PagedLayerCache` seam, convolution state as recurrent state, historical-window prefix
+            checkpoints, and row-exact decode/verify kernels for projections and grouped experts.
+            The DSpark drafter (`mtp.safetensors`) drives MTP with row-exact rectangular verification and its
+            own durable prefix-checkpoint layout. The vision tower, processor and VLM wrapper are in the
+            vision-language section.
+          globs:
+            - "Libraries/MLXLLM/Models/Inkling2/**"
+            - "Tests/MLXLMTests/Inkling2*.swift"
+            - "Tests/MLXLMTests/Integration/Inkling2/**"
+            - "changelog.d/inkling2-mini-*.md"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
             Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:

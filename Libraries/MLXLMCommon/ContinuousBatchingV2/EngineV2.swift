@@ -900,6 +900,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
+        scheduler.fixedPrefillChunkGrid =
+            modelCapabilities.requiresFixedPrefillChunkGrid
+            ? schedulerConfig.prefillChunkSize : nil
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
@@ -923,6 +926,28 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // A solo stripe gives a cold prompt a partition other than the
             // chunk grid that chunk-aligned checkpoints assume.
             && (!modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
+        // Recurrent state beside sliding-window attention: windowed rows keep
+        // the historical window export, the state follows the target tensors.
+        let windowedRecurrentCheckpointEligible =
+            !fullRecurrentCheckpointEligible
+            && modelCapabilities.supportsRecurrentCheckpointReuse
+            && (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+            && layerKinds.contains { kind in
+                if case .slidingWindow = kind.attention { return true }
+                return false
+            }
+            && layerKinds.allSatisfy { kind in
+                kind.sharesKVWithLayer == nil && kind.valueHeadDim == kind.headDim
+                    && kind.qwen4IndexerCompressRatio == nil && !kind.isBidirectional
+            }
+            && !(mtpDriver?.tracksPersistentHistory ?? false)
+            && checkpointQuantization == nil
+            && (backend as? PagedKVBackend)?.nativeModelBinding == nil
+            && schedulerConfig.enablePrefixCache
+            // Grid-cut stripes keep the chunk-aligned boundaries.
+            && (!modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                || modelCapabilities.requiresFixedPrefillChunkGrid
                 || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
         let hybridEligible =
             fullRecurrentCheckpointEligible
@@ -991,9 +1016,26 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
+        } else if windowedRecurrentCheckpointEligible, let completePrefixCache,
+            let pagedCheckpointConfig, pagedCheckpointConfig.quantization == nil,
+            let segmentedPool,
+            let recurrentSpec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
+            (try? CBv2HistoricalAttentionLayout(
+                layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil,
+            case let codec = CBv2CompleteCheckpointCodec(
+                identity: completePrefixCache.identity, layerKinds: layerKinds,
+                recurrentSpec: recurrentSpec, kvDTypes: segmentedPool.layerDTypes,
+                assistant: nil, admission: admission, pagedConfig: pagedCheckpointConfig,
+                historicalRecurrent: true),
+            codec.historicalRecurrent
+        {
+            self.completePrefixCache = completePrefixCache
+            self.completeCheckpointCodec = codec
+            self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
         } else if schedulerConfig.enablePrefixCache,
             (model as? any CBv2HistoricalAttentionCheckpointProviding)?
                 .cbv2SupportsHistoricalAttentionCheckpoint == true,
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             !(mtpDriver?.tracksPersistentHistory ?? false),
             let completePrefixCache, let pagedCheckpointConfig, let segmentedPool,
             (try? CBv2HistoricalAttentionLayout(

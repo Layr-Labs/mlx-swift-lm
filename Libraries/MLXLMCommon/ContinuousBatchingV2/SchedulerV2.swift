@@ -280,6 +280,17 @@ public final class SchedulerV2 {
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
 
+    /// Fixed prompt-chunk grid (`CBv2ModelCapabilities.requiresFixedPrefillChunkGrid`;
+    /// nil = off, the historical planning). A text prompt's chunks then end
+    /// only at multiples of this size from position 0 or at the prompt's
+    /// end: a chunk the step's remaining budget cannot hold waits for a
+    /// later step instead of being shortened, solo stripes are cut at grid
+    /// boundaries, and demanded short checkpoints are not taken. Progress:
+    /// the first prompt row visited in a step always gets its full grid
+    /// chunk, even past the step budget. Requests with multimodal blocks keep
+    /// the block snapping (not covered by the grid).
+    public var fixedPrefillChunkGrid: Int?
+
     /// Starvation guard for block-sized vision chunks (PR#63 review): the id
     /// of a row whose next multimodal block fits a FULL step budget (submit
     /// validates that) but not the budget REMAINING after earlier rows were
@@ -427,6 +438,7 @@ public final class SchedulerV2 {
         var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
         var demandedCheckpointRanges: [CBv2RequestID: CBv2DemandedCheckpointRange] = [:]
         func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            if fixedPrefillChunkGrid != nil, rec.multimodalBlocks.isEmpty { return proposed }
             let range = config.demandedCheckpointRange(
                 promptTokens: rec.request.promptTokens.count,
                 hintTokens: rec.request.prefixCheckpointTargetTokens,
@@ -442,6 +454,34 @@ public final class SchedulerV2 {
                 demandedShortCheckpointPositions[rec.id] = rec.numComputedTokens + range.count
             }
             return range.count
+        }
+        // Fixed chunk grid: whether a prompt row already got a grid chunk this
+        // step, and the grid-aligned chunk of `rec` within `proposed` tokens
+        // (nil when the grid does not apply to the row; 0 = wait).
+        var gridChunkAssigned = false
+        func gridApplies(to rec: CBv2ScheduledRequest) -> Bool {
+            guard let grid = fixedPrefillChunkGrid, grid > 0, rec.multimodalBlocks.isEmpty
+            else { return false }
+            return rec.numComputedTokens < rec.request.promptTokens.count
+        }
+        func gridChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int? {
+            guard gridApplies(to: rec), let grid = fixedPrefillChunkGrid else { return nil }
+            let start = rec.numComputedTokens
+            let promptEnd = rec.request.promptTokens.count
+            var chunk: Int
+            if start + proposed >= promptEnd {
+                chunk = promptEnd - start
+            } else {
+                let boundary = ((start + proposed) / grid) * grid
+                chunk = boundary > start ? boundary - start : 0
+            }
+            if chunk <= 0, !gridChunkAssigned {
+                // Progress guarantee: the first prompt row of the step takes
+                // its full grid chunk whatever the budget left.
+                chunk = min(promptEnd, (start / grid + 1) * grid) - start
+            }
+            if chunk > 0 { gridChunkAssigned = true }
+            return chunk
         }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
@@ -555,7 +595,9 @@ public final class SchedulerV2 {
 
         // 1. RUNNING first, in order.
         var idx = 0
-        while idx < running.count, budget > 0, !stopScheduling {
+        while idx < running.count,
+            budget > 0 || (fixedPrefillChunkGrid != nil && !gridChunkAssigned), !stopScheduling
+        {
             let rec = running[idx]
             if rec.isPaused || rec.cancelRequested || rec.remainingTokens <= 0
                 || rec.id == deferredAdmittedID
@@ -567,6 +609,12 @@ public final class SchedulerV2 {
             // flip `isDecodeReady`, and the quota must charge what the row
             // WAS when it was scheduled.
             let isPrefillRow = !rec.isDecodeReady
+            // Past the budget only a grid prompt row may still be visited (its
+            // progress guarantee); every other row waits as before.
+            if budget <= 0, !isPrefillRow || !gridApplies(to: rec) {
+                idx += 1
+                continue
+            }
             // Cap binds BEFORE any mutation, exactly like the quota skip: a
             // row beyond the cap is left untouched for a later step (FCFS —
             // earlier running rows claimed the slots).
@@ -641,6 +689,13 @@ public final class SchedulerV2 {
             // first (earlier rows would otherwise starve it indefinitely).
             n = demandedCheckpointChunk(for: rec, proposed: n)
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
+            if isPrefillRow, let gridded = gridChunk(for: rec, proposed: max(0, n)) {
+                guard gridded > 0 else {
+                    idx += 1
+                    continue
+                }
+                n = gridded
+            }
             if n <= 0 {
                 if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
                 idx += 1
@@ -746,7 +801,8 @@ public final class SchedulerV2 {
         // or a step-scratch refusal holds admission.
         if preemptions.isEmpty, !stopScheduling, !admissionHoldActive {
             var wIdx = 0
-            while budget > 0, running.count < config.maxConcurrentRequests,
+            while budget > 0 || (fixedPrefillChunkGrid != nil && !gridChunkAssigned),
+                running.count < config.maxConcurrentRequests,
                 wIdx < waiting.count
             {
                 let rec = waiting[wIdx]
@@ -806,6 +862,11 @@ public final class SchedulerV2 {
                 chunk = demandedCheckpointChunk(for: rec, proposed: chunk)
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
+                if let gridded = gridChunk(for: rec, proposed: max(0, chunk)) {
+                    // FCFS: a waiter whose grid chunk does not fit ends the pass.
+                    guard gridded > 0 else { break }
+                    chunk = gridded
+                }
                 guard chunk > 0 else {
                     // Same starvation guard as the running path: a head-of-
                     // queue block that fits a full budget but not what the

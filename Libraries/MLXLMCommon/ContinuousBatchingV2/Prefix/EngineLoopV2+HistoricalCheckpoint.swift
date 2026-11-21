@@ -221,7 +221,8 @@ extension CBv2CompleteCheckpointCapture {
         }
         let retiring = stageHistorical(
             candidate, requestID: requestID,
-            position: position, stride: historicalCheckpointStrideTokens,
+            position: position,
+            stride: codec.historicalRecurrent ? nil : historicalCheckpointStrideTokens,
             hintTokens: hintTokens, resumedAt: resumedAt)
         if !retiring.isEmpty {
             queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
@@ -278,6 +279,33 @@ extension EngineLoopV2 {
                 let state = kvStates[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
+            if capture.codec.historicalRecurrent {
+                // Recurrent state exists only at a range end, so the recurrent
+                // boundary rule decides; windows are copied now, the state at commit.
+                guard step.recurrentEvaluations[id] != nil,
+                    rec.request.permitsDurableHybridCheckpoint(layerKinds: layerKinds),
+                    let cap = step.recurrentCheckpointChunkSizes[id]
+                else { continue }
+                let boundary = geometry.record(
+                    range: range, cap: cap, promptLength: rec.request.promptTokens.count,
+                    packed: step.packedPrefixRows.contains(id),
+                    chunkGrid: recurrentCheckpointChunkGrid)
+                recurrentCheckpointGeometry[id] = geometry
+                if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
+                guard boundary, range.upperBound < rec.request.promptTokens.count else { continue }
+                let retention = capture.retention(
+                    requestID: id, stride: nil,
+                    hintTokens: rec.request.prefixCheckpointTargetTokens,
+                    resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0)
+                if let candidate = try capture.prepareHistorical(
+                    position: range.upperBound, chunkSize: cap, state: state,
+                    allowance: capture.historicalStagingAllowance(
+                        requestID: id, retention: retention, role: .latest))
+                {
+                    step.historicalCheckpoints[id] = [candidate]
+                }
+                continue
+            }
             if capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical {
                 guard let cap = step.recurrentCheckpointChunkSizes[id],
                     cap >= scheduler.config.prefillChunkSize,
@@ -469,6 +497,14 @@ extension EngineLoopV2 {
                     {
                         capture.discardHistorical(candidate)
                     } else {
+                        if capture.codec.historicalRecurrent {
+                            // The recurrent commit for this step already ran,
+                            // so the confirmed state sits at the range end.
+                            guard let historical = candidate.historical,
+                                let layers = recurrentStates[id]?.confirmedStateSnapshot()
+                            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                            try historical.attachRecurrentState(layers, codec: capture.codec)
+                        }
                         let rec = scheduler.record(for: id)
                         capture.commitHistorical(
                             candidate, requestID: id,
