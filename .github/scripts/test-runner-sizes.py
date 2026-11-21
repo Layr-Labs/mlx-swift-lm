@@ -30,7 +30,8 @@ SIGNED = {"4x16", "4x24", "8x16", "12x32"}
 MACOS = "darkbloom-macos-arm64"
 # (workflow, job) for a job, (workflow, "lane <name>") for a route lane: its size.
 SIZES = {
-    ("fork-tests.yml", "build"): "8x16",
+    # Every test job waits for the build; it takes the largest signed size.
+    ("fork-tests.yml", "build"): "12x32",
     ("fork-tests.yml", "metallib"): "4x16",
     ("fork-tests.yml", "test"): "4x24",
     # Shards 7 and 9 until #469 is fixed; then they move to `test` at 4x24.
