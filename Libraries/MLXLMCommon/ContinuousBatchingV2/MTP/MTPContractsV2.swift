@@ -290,6 +290,10 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// products). Each row then commits its own accepted prefix. False keeps
     /// one common committed width for every row of the rectangular step.
     var commitsAcceptedPrefixPerRow: Bool { get }
+    /// Expert assignments from which a routed-expert target sorts rows by
+    /// expert while it builds this drafter's verify windows
+    /// (`SwitchGLUSortScope`). nil keeps the target's own threshold.
+    var verifySortMinimumAssignments: Int? { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -337,6 +341,7 @@ extension CBv2MTPDrafter {
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
     public var commitsAcceptedPrefixPerRow: Bool { false }
+    public var verifySortMinimumAssignments: Int? { nil }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
@@ -427,6 +432,19 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// One draft step for several requests' rounds at once (a cohort): the
+    /// same history upkeep as `draftStep` on each row in turn, built as shared
+    /// launches (for example one output-head product for every row). A row's
+    /// proposal may differ in bits from its own `draftStep` (shared products);
+    /// that changes only how many target tokens a round accepts. `tokens[b]` is `[1, 1]`, `hiddens[b]` `[1, 1, H]`, `shortlists[b]`
+    /// as for `draftStep`. Returns each row's `[1]` int32 proposal and
+    /// `[1, 1, H]` hidden, or nil when this drafter does not batch these rows
+    /// (the engine then calls `draftStep` per row). Drafts only decide how many
+    /// target tokens a round accepts; committed tokens stay target tokens.
+    func draftRowsStep(
+        tokens: [MLXArray], hiddens: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> (tokens: [MLXArray], hiddens: [MLXArray])?
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
@@ -460,6 +478,10 @@ extension CBv2MTPRequestStatefulDrafter {
     public var supportsOrdinaryDecodeHistory: Bool { false }
     public var submitsEveryDraftStepEarly: Bool { false }
     public var draftShortlistSize: Int? { nil }
+    public func draftRowsStep(
+        tokens: [MLXArray], hiddens: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> (tokens: [MLXArray], hiddens: [MLXArray])? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
@@ -737,6 +759,11 @@ public struct CBv2MTPMetrics: Sendable {
     public var seedSteps: Int = 0
     /// Nonblocking assistant graph submissions before target verification.
     public var earlyDraftSubmissions: Int = 0
+    /// Cohort draft steps built as shared launches (`draftRowsStep`).
+    public var batchedDraftSteps: Int = 0
+    /// Multi-row verify steps whose rows committed different widths
+    /// (`commitsAcceptedPrefixPerRow`).
+    public var rowWidthSplitSteps: Int = 0
     /// Total draft tokens proposed across all rounds.
     public var draftedTokens: Int = 0
     /// Total draft tokens accepted across all rounds.
