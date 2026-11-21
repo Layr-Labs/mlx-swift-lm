@@ -99,6 +99,8 @@ final class CBv2ContiguousHistoricalCheckpointTests: XCTestCase {
         // Publication prioritizes the deepest boundary before the first checkpoint.
         XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
         XCTAssertEqual(coldBackend.bytesReserved, 0)
+        // The store's callback can still hold its last export's manifest permit.
+        store.finishPublicationCallbacks(engine: coldEngine)
         XCTAssertEqual(coldEngine.admissionForTesting.bytesReserved, 0)
         await coldEngine.shutdown()
         let reopened = CompleteCheckpointFixtureStore(
@@ -111,6 +113,7 @@ final class CBv2ContiguousHistoricalCheckpointTests: XCTestCase {
         XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, chunk)
         XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
         XCTAssertEqual(warmBackend.bytesReserved, 0)
+        reopened.finishPublicationCallbacks(engine: warmEngine)
         XCTAssertEqual(warmEngine.admissionForTesting.bytesReserved, 0)
         await warmEngine.shutdown()
     }
@@ -132,6 +135,7 @@ final class CBv2ContiguousHistoricalCheckpointTests: XCTestCase {
         XCTAssertEqual(actual.finishReason, .length)
         XCTAssertEqual(actual.tokens, expected.tokens)
         XCTAssertEqual(store.releaseCount, 1)
+        store.finishPublicationCallbacks(engine: warm)
         await warm.shutdown()
         XCTAssertEqual(backend.bytesReserved, 0)
         XCTAssertEqual(warm.admissionForTesting.bytesReserved, 0)
@@ -162,6 +166,7 @@ final class CBv2ContiguousHistoricalCheckpointTests: XCTestCase {
         let result = try await collection.value
         XCTAssertEqual(result.finishReason, .length)
         XCTAssertEqual(backend.bytesReserved, 0)
+        store.finishPublicationCallbacks(engine: warm)
         XCTAssertEqual(warm.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(store.releaseCount, 1)
     }

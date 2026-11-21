@@ -158,6 +158,47 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         return (engine, backend)
     }
 
+    /// The request's KV and reservations retire before its terminal, but the
+    /// store's callback may still hold the last export, whose manifest keeps
+    /// its host-memory permit on the ledger. Drain the callbacks first.
+    private func assertPagedReleased(
+        _ engine: EngineV2, _ backend: PagedKVBackend, store: CompleteCheckpointFixtureStore,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0, file: file, line: line)
+        XCTAssertEqual(backend.bytesWired, 0, file: file, line: line)
+    }
+
+    /// Issue #469 in miniature. The store returns from its completion but
+    /// keeps the export: the terminal arrives with the KV retired and exactly
+    /// that manifest's permit still charged, which `assertPagedReleased`
+    /// drains to zero.
+    func testStoreHeldExportKeepsOnlyItsManifestPermitAfterTheTerminal() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(segmentBytes: 258, completionGate: gate)
+        let (engine, backend) = try engine(store)
+        defer { gate.resume.signal() }
+        let stream = try engine.submit(
+            .init(
+                id: .init(1), promptTokens: (0 ..< chunk + 1).map { ($0 * 7) % 29 },
+                maxTokens: 2, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001)))
+        let collection = Task { await cbv2SchedCollect(stream) }
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered, "the store callback holds the export after its completion")
+        let result = await collection.value
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk])
+        XCTAssertEqual(backend.bytesReserved, 0, "the request's KV retired before its terminal")
+        XCTAssertEqual(
+            engine.admissionForTesting.bytesReserved,
+            try CBv2CheckpointManifestMemory.reservationBytes(position: chunk),
+            "only the store-held manifest's permit is still charged")
+        gate.resume.signal()
+        assertPagedReleased(engine, backend, store: store)
+        await engine.shutdown()
+    }
+
     func testRestartUsesHistoricalWindowAfterDonorHasWrappedSeveralTimes() async throws {
         let store = CompleteCheckpointFixtureStore(segmentBytes: 258)
         let (first, firstBackend) = try engine(store)
@@ -171,8 +212,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         // published deepest first; the interior 2c is never written.
         XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
         XCTAssertEqual(store.saved.map(\.manifest.chunkSize), [chunk, chunk])
-        XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(firstBackend.bytesWired, 0)
+        assertPagedReleased(first, firstBackend, store: store)
         await first.shutdown()
 
         // Reopen only the EARLIER boundary, whose donor ring was overwritten
@@ -188,8 +228,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         XCTAssertEqual(warm.tokens, cold.tokens)
         XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, chunk)
         XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
-        XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(secondBackend.bytesWired, 0)
+        assertPagedReleased(second, secondBackend, store: reopened)
         await second.shutdown()
     }
 
@@ -212,8 +251,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                     maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))))
         XCTAssertEqual(cold.finishReason, .length)
         XCTAssertEqual(plain.saved.map(\.manifest.position), [5 * chunk, chunk])
-        XCTAssertEqual(unhinted.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(unhintedBackend.bytesWired, 0)
+        assertPagedReleased(unhinted, unhintedBackend, store: plain)
         await unhinted.shutdown()
 
         // Other prompts share 3c + 7 tokens: the fork boundary 3c is kept.
@@ -229,8 +267,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             hinted.tokens, cold.tokens, "a retention hint never changes what is generated")
         XCTAssertEqual(store.saved.map(\.manifest.position), [5 * chunk, 3 * chunk, chunk])
         XCTAssertTrue(store.saved.allSatisfy { $0.manifest.position % $0.manifest.chunkSize == 0 })
-        XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(firstBackend.bytesWired, 0)
+        assertPagedReleased(first, firstBackend, store: store)
         await first.shutdown()
 
         for (id, position) in [(2, chunk), (3, 3 * chunk), (5, 5 * chunk)] {
@@ -245,8 +282,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             XCTAssertEqual(warm.tokens, cold.tokens, "restore at \(position)")
             XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, position)
             XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
-            XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-            XCTAssertEqual(secondBackend.bytesWired, 0)
+            assertPagedReleased(second, secondBackend, store: reopened)
             await second.shutdown()
         }
     }
@@ -311,8 +347,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             observed.contains(3 * chunk), "the next range was a plain chunk [2c, 3c): \(observed)")
         // Deepest, the fork target captured after the cap change, the first.
         XCTAssertEqual(positions, [5 * chunk, 3 * chunk, chunk])
-        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(backend.bytesWired, 0)
+        assertPagedReleased(engine, backend, store: store)
         await engine.shutdown()
 
         let deepest = try XCTUnwrap(positions.max())
@@ -326,8 +361,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         let warm = await cbv2SchedCollect(try second.submit(warmRequest))
         XCTAssertEqual(warm.tokens, donor.tokens)
         XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, deepest)
-        XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(secondBackend.bytesWired, 0)
+        assertPagedReleased(second, secondBackend, store: reopened)
         await second.shutdown()
     }
 
@@ -388,8 +422,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             XCTAssertEqual(
                 Array(reopened.saved.map(\.manifest.position).dropFirst()), expected,
                 "hint \(String(describing: hint))")
-            XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-            XCTAssertEqual(secondBackend.bytesWired, 0)
+            assertPagedReleased(second, secondBackend, store: reopened)
             await second.shutdown()
         }
     }
@@ -437,8 +470,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             async let left = cbv2SchedCollect(first)
             async let right = cbv2SchedCollect(second)
             let (a, b) = await (left, right)
-            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
-            XCTAssertEqual(backend.bytesWired, 0)
+            assertPagedReleased(engine, backend, store: reopened)
             return (model, engine, a.tokens, b.tokens, a.usage?.prefixCachePrefillTokensSaved ?? -1)
         }
 
@@ -574,7 +606,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             let otherResult = await other.value
             let preemptions = engine.loopForTesting.onEngineQueueSync { engine.preemptionCount }
             await engine.shutdown()
-            capture.queue.sync {}
+            store.finishPublicationCallbacks(engine: engine)
             XCTAssertEqual(admission.transientBytesReserved, 0)
             XCTAssertEqual(
                 admission.bytesReserved, 0, "the ledger returns to its value before the donor")
@@ -657,9 +689,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
 
         func run(capacity: Int, cap: Int) async throws -> Run {
             let model = GatedHistoricalAttentionModel(gateAtDecodeCall: 2)
+            let store = CompleteCheckpointFixtureStore()
             let (engine, backend) = try engine(
-                CompleteCheckpointFixtureStore(), model: model,
-                rowsPerStep: 2, capacity: capacity)
+                store, model: model, rowsPerStep: 2, capacity: capacity)
             let capture = try XCTUnwrap(engine.completeCheckpointCapture)
             let admission = engine.admissionForTesting
             let lock = NSLock()
@@ -711,7 +743,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             }
             let donorResult = await donor.value
             await engine.shutdown()
-            capture.queue.sync {}
+            store.finishPublicationCallbacks(engine: engine)
             XCTAssertEqual(admission.bytesReserved, 0)
             XCTAssertEqual(backend.bytesWired, 0)
             return lock.withLock {

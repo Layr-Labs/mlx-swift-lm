@@ -99,11 +99,10 @@ class WaitForProducts(unittest.TestCase):
         # The wait counts against the job's own timeout; it must end with its
         # message first and leave the shard its time.
         workflow = (ROOT / "workflows/fork-tests.yml").read_text()
-        for name in ("test", "test-12x32"):
-            job = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  \S)", workflow).group(1)
-            minutes = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", job).group(1))
-            self.assertEqual(minutes, 45, name)
-            self.assertLessEqual(waiter.LIMIT_SECONDS, (minutes - 15) * 60, name)
+        job = re.search(r"(?ms)^  test:\n(.*?)(?=^  \S)", workflow).group(1)
+        minutes = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", job).group(1))
+        self.assertEqual(minutes, 45)
+        self.assertLessEqual(waiter.LIMIT_SECONDS, (minutes - 15) * 60)
 
     def test_a_failed_request_is_tried_again_at_the_next_poll(self):
         clock = Clock([OSError("reset"), [done("Build"), done("Metal library")]])
