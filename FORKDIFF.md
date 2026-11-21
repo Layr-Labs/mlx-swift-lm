@@ -39,7 +39,9 @@ runs 44750661761 to 44868059797) came after it. In the first run with early
 start (44881140704) it took 2 to 13 s. The cost: each shard's Mac idles for
 most of the build. In that run the shards waited 289 to 355 s, 356
 vCPU-minutes in all (about $0.36 at $0.001 per vCPU-minute). A shard whose
-build failed fails at the wait instead of being skipped.
+build failed fails at the wait instead of being skipped. The wait counts
+against the shard's 45-minute job timeout, so no step gets more time than
+before; it ends with an error after 30 minutes.
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share

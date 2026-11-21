@@ -10,6 +10,7 @@ import importlib.util
 import io
 from pathlib import Path
 import re
+import time
 import unittest
 import urllib.error
 
@@ -29,11 +30,11 @@ def done(name, conclusion="success"):
     return job(name, "completed", conclusion)
 
 
-def http_error(code, **headers):
+def http_error(code, body=b"", **headers):
     message = email.message.Message()
     for key, value in headers.items():
         message[key.replace("_", "-")] = value
-    return urllib.error.HTTPError("https://api.github.com/x", code, "refused", message, io.BytesIO(b""))
+    return urllib.error.HTTPError("https://api.github.com/x", code, "refused", message, io.BytesIO(body))
 
 
 class Clock:
@@ -90,9 +91,19 @@ class WaitForProducts(unittest.TestCase):
 
     def test_fails_at_the_limit(self):
         clock = Clock([[job("Build"), job("Metal library")]])
-        with self.assertRaisesRegex(waiter.WaitError, "not ready after 2700 s"):
+        with self.assertRaisesRegex(waiter.WaitError, f"not ready after {waiter.LIMIT_SECONDS} s"):
             clock.wait()
         self.assertEqual(clock.now, waiter.LIMIT_SECONDS)
+
+    def test_the_wait_ends_before_the_test_job_times_out(self):
+        # The wait counts against the job's own timeout; it must end with its
+        # message first and leave the shard its time.
+        workflow = (ROOT / "workflows/fork-tests.yml").read_text()
+        for name in ("test", "test-12x32"):
+            job = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  \S)", workflow).group(1)
+            minutes = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", job).group(1))
+            self.assertEqual(minutes, 45, name)
+            self.assertLessEqual(waiter.LIMIT_SECONDS, (minutes - 15) * 60, name)
 
     def test_a_failed_request_is_tried_again_at_the_next_poll(self):
         clock = Clock([OSError("reset"), [done("Build"), done("Metal library")]])
@@ -111,6 +122,16 @@ class WaitForProducts(unittest.TestCase):
         self.assertEqual(clock.wait(), 40)
         clock = Clock([http_error(429), [done("Build"), done("Metal library")]])
         self.assertEqual(clock.wait(), waiter.RATE_LIMIT_PAUSE_SECONDS)
+        # A secondary limit may name itself only in the body.
+        secondary = http_error(403, b'{"message": "You have exceeded a secondary rate limit."}')
+        clock = Clock([secondary, [done("Build"), done("Metal library")]])
+        self.assertEqual(clock.wait(), waiter.RATE_LIMIT_PAUSE_SECONDS)
+        # No request left: until the budget resets, and never past the limit.
+        reset = str(int(time.time()) + 3 * waiter.LIMIT_SECONDS)
+        clock = Clock([http_error(403, X_RateLimit_Remaining="0", X_RateLimit_Reset=reset)])
+        with self.assertRaisesRegex(waiter.WaitError, "not ready after"):
+            clock.wait()
+        self.assertEqual(clock.sleeps, [waiter.LIMIT_SECONDS])
 
     def test_the_workflow_job_names_are_the_ones_it_waits_for(self):
         workflow = (ROOT / "workflows/fork-tests.yml").read_text()

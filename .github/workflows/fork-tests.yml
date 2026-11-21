@@ -419,9 +419,9 @@ jobs:
       contents: read
       # wait-for-products.py reads this run's jobs.
       actions: read
-    # Up to 45 minutes of waiting for the products, then the shard's own
-    # 45 minutes (Run the shard).
-    timeout-minutes: 90
+    # The wait counts against the job's 45 minutes, so no step that ran
+    # before the early start gets more time.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -438,7 +438,7 @@ jobs:
         uses: ./.github/actions/select-xcode
 
       - name: Wait for the products
-        # Fails when Build or Metal library did not succeed, or after 45 minutes.
+        # Fails when Build or Metal library did not succeed, or after 30 minutes.
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/wait-for-products.py
@@ -467,7 +467,6 @@ jobs:
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.
-        timeout-minutes: 45
         run: >-
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
@@ -518,9 +517,9 @@ jobs:
       contents: read
       # wait-for-products.py reads this run's jobs.
       actions: read
-    # Up to 45 minutes of waiting for the products, then the shard's own
-    # 45 minutes (Run the shard).
-    timeout-minutes: 90
+    # The wait counts against the job's 45 minutes, so no step that ran
+    # before the early start gets more time.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -537,7 +536,7 @@ jobs:
         uses: ./.github/actions/select-xcode
 
       - name: Wait for the products
-        # Fails when Build or Metal library did not succeed, or after 45 minutes.
+        # Fails when Build or Metal library did not succeed, or after 30 minutes.
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/wait-for-products.py
@@ -566,7 +565,6 @@ jobs:
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.
-        timeout-minutes: 45
         run: >-
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"

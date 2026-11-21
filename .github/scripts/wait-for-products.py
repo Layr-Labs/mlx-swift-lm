@@ -26,9 +26,10 @@ import urllib.request
 
 JOBS = ("Build", "Metal library")
 POLL_SECONDS = 15
-# The build takes 5 to 10 minutes. The limit ends the wait with a message
-# before the job's own timeout.
-LIMIT_SECONDS = 45 * 60
+# The build takes 5 to 10 minutes. The wait counts against the test job's own
+# 45-minute timeout (fork-tests.yml); the limit ends it with a message and
+# leaves the download and the shard 15 minutes.
+LIMIT_SECONDS = 30 * 60
 # GitHub lists every job of a run when it starts; a job still missing after
 # this long will not appear.
 MISSING_SECONDS = 120
@@ -64,15 +65,16 @@ def pause_after(failure, poll):
     """Seconds to wait after a failed request; raise when the token is refused.
 
     GitHub answers a rate-limited request with 429, or with 403 and
-    Retry-After or no request left. Any other 401, 403 or 404 means that the
-    token cannot read the run's jobs.
+    Retry-After, no request left or a message naming the limit. Any other
+    401, 403 or 404 means that the token cannot read the run's jobs.
     """
     if not isinstance(failure, urllib.error.HTTPError) or failure.code not in (401, 403, 404, 429):
         return poll
     headers = failure.headers
     retry_after = headers.get("Retry-After")
     exhausted = headers.get("X-RateLimit-Remaining") == "0"
-    if failure.code != 429 and not retry_after and not exhausted:
+    if not (failure.code == 429
+            or (failure.code == 403 and (retry_after or exhausted or names_rate_limit(failure)))):
         raise WaitError(f"The run's jobs cannot be read ({failure}); the job needs the token permission actions: read")
     try:
         if retry_after:
@@ -82,6 +84,14 @@ def pause_after(failure, poll):
     except (TypeError, ValueError):
         pass
     return max(poll, RATE_LIMIT_PAUSE_SECONDS)
+
+
+def names_rate_limit(failure):
+    """Whether an error answer's body names a rate limit; a secondary limit may send no header."""
+    try:
+        return b"rate limit" in failure.read().lower()
+    except (OSError, http.client.HTTPException):
+        return False
 
 
 def wait(fetch=run_jobs, names=JOBS, poll=POLL_SECONDS, limit=LIMIT_SECONDS, missing=MISSING_SECONDS,
