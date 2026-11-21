@@ -27,21 +27,37 @@ struct Gemma4BlockSDCMTests {
         #expect(lc.mode == .lightcone)
         #expect(lc.minPromptTokens == 2048)
         #expect(lc.earlyMoEK == 6)
+        #expect(lc.interiorMoEK(forLayer: 2) == 6)
         #expect(lc.keepSchedule[12] == 0.40)
+
+        let lcDefault = Gemma4BlockSDCMConfig.resolve(environment: [
+            Gemma4BlockSDCMConfig.envKey: "lightcone"
+        ])
+        #expect(lcDefault.interiorMoEK(forLayer: 2) == 2)
+        #expect(lcDefault.interiorMoEK(forLayer: 6) == 5)
+        #expect(lcDefault.interiorMoEK(forLayer: 12) == 8)
+        #expect(lcDefault.earlySparseFullLayer == 5)
 
         let bal = Gemma4BlockSDCMConfig.resolve(environment: [
             Gemma4BlockSDCMConfig.envKey: "balanced"
         ])
         #expect(bal.mode == .balanced)
-        #expect(bal.earlyMoEK == 4)
-        #expect(bal.lateMoEK == 4)
+        #expect(bal.keepSchedule[6] == 0.46)
+        #expect(bal.blockSize == 64)
+        #expect(bal.interiorMoEK(forLayer: 2) == 2)
+        #expect(bal.interiorMoEK(forLayer: 6) == 6)
+        #expect(bal.lateMoEK == 8)
+        #expect(bal.reversePrefixQuota[6] == 0.30)
 
         let fast = Gemma4BlockSDCMConfig.resolve(environment: [
             Gemma4BlockSDCMConfig.envKey: "fast"
         ])
         #expect(fast.mode == .fast)
-        #expect(fast.keepSchedule[6] == 0.45)
-        #expect(fast.earlyMoEK == 8)
+        #expect(fast.keepSchedule[6] == 0.36)
+        #expect(fast.blockSize == 32)
+        #expect(fast.interiorMoEK(forLayer: 2) == 2)
+        #expect(fast.interiorMoEK(forLayer: 6) == 6)
+        #expect(fast.reversePrefixQuota[6] == 0.32)
     }
 
     // MARK: - Arbitrary-Position RoPE Exact Parity
@@ -745,5 +761,342 @@ struct Gemma4BlockSDCMTests {
         eval(t2Logits)
         #expect(t2Logits.shape == [1, 6, model.vocabularySize])
         #expect(!MLX.isNaN(t2Logits).any().item(Bool.self))
+    }
+
+    // MARK: - Block-SDCM v2 Invariants
+
+    @Test("trueSlidingWindowStart excludes out-of-window compacted keys and preserves uncompacted tail")
+    func trueSlidingWindowStartInvariants() {
+        // Uncompacted prompt: keeps exact trailing `W` tokens.
+        let contig = (0 ..< 2048).map { Int32($0) }
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: contig, originalLength: 2048, slidingWindow: 1024) == 1024)
+
+        // Compacted prompt (originalLength = 9600, W = 1024): every kept key must satisfy
+        // origPos >= 9600 - 1024 + 1 = 8577 so decode at pos 9600 stays within sliding window W.
+        let compacted: [Int32] = [0, 100, 1200, 4500, 8576, 8577, 9000, 9599]
+        let start = Gemma4BlockSDCM.trueSlidingWindowStart(
+            positionsHost: compacted, originalLength: 9600, slidingWindow: 1024)
+        #expect(start == 5)
+        for p in compacted[start...] {
+            #expect(Int(p) >= 9600 - 1024 + 1)
+        }
+        #expect(compacted.last == 9599)
+
+        // Edge cases: empty positions, no tokens within window, and non-positive slidingWindow.
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: [], originalLength: 0, slidingWindow: 1024) == 0)
+        let outOfWindow: [Int32] = [0, 100, 1200, 4500, 8576]
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: outOfWindow, originalLength: 9600, slidingWindow: 1024)
+                == outOfWindow.count)
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: compacted, originalLength: 9600, slidingWindow: 1)
+                == compacted.count)
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: contig, originalLength: 2048, slidingWindow: 0) == contig.count)
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: contig, originalLength: 2048, slidingWindow: -16) == contig.count)
+        #expect(
+            Gemma4BlockSDCM.trueSlidingWindowStart(
+                positionsHost: compacted, originalLength: 9600, slidingWindow: 0)
+                == compacted.count)
+    }
+
+    @Test("prefixLocalFullTailAttention matches exact explicit prefix+local+full-tail causal mask")
+    func prefixLocalFullTailParity() {
+        MLXRandom.seed(314)
+        let scale: Float = 1.0 / sqrt(32.0)
+
+        // Check multiple boundary geometries around `pos <= P + W` vs `pos > P + W`, including `P == 0`.
+        let cases: [(L: Int, P: Int, W: Int, tail: Int)] = [
+            (256, 32, 64, 32),
+            (320, 64, 64, 32),  // hits exact pos == P + W (128) and pos > P + W (192)
+            (320, 63, 64, 32),  // hits exact pos == P + W + 1 (128)
+            (256, 0, 64, 32),  // P == 0 skips prefix concatenation
+        ]
+        for c in cases {
+            let q = MLXRandom.normal([1, 4, c.L, 32]).asType(.float32)
+            let k = MLXRandom.normal([1, 2, c.L, 32]).asType(.float32)
+            let v = MLXRandom.normal([1, 2, c.L, 32]).asType(.float32)
+
+            let sparse = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                queries: q, keys: k, values: v,
+                prefixTokens: c.P, localWindow: c.W, tailTokens: c.tail, scale: scale)
+
+            let qPos = MLXArray((0 ..< c.L).map { Int32($0) }).expandedDimensions(axis: 1)
+            let kPos = MLXArray((0 ..< c.L).map { Int32($0) }).expandedDimensions(axis: 0)
+            let cut = Int32(c.L - c.tail)
+            let refMask =
+                (kPos .<= qPos)
+                .&& ((kPos .< Int32(c.P)) .|| ((qPos - kPos) .< Int32(c.W)) .|| (qPos .>= cut))
+            let ref = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .array(refMask))
+            eval(sparse, ref)
+            let diff = MLX.abs(sparse - ref).max().item(Float.self)
+            #expect(diff < 1e-5, "Prefix+Local+FullTail mismatch for \(c): \(diff)")
+        }
+
+        // L == 0 returns empty zeros cleanly; non-positive localWindow falls back safely to causal.
+        let emptyQ = MLXArray.zeros([1, 4, 0, 32], dtype: .float32)
+        let emptyK = MLXArray.zeros([1, 2, 0, 32], dtype: .float32)
+        let emptyOut = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+            queries: emptyQ, keys: emptyK, values: emptyK,
+            prefixTokens: 32, localWindow: 64, tailTokens: 32, scale: scale)
+        #expect(emptyOut.shape == [1, 4, 0, 32])
+
+        let smallQ = MLXRandom.normal([1, 4, 16, 32]).asType(.float32)
+        let smallK = MLXRandom.normal([1, 2, 16, 32]).asType(.float32)
+        let fallbackZeroW = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+            queries: smallQ, keys: smallK, values: smallK,
+            prefixTokens: -4, localWindow: 0, tailTokens: -4, scale: scale)
+        let exactCausal = MLXFast.scaledDotProductAttention(
+            queries: smallQ, keys: smallK, values: smallK, scale: scale, mask: .causal)
+        eval(fallbackZeroW, exactCausal)
+        #expect(MLX.abs(fallbackZeroW - exactCausal).max().item(Float.self) < 1e-5)
+    }
+
+    @Test("computeBilateralBlockScores GQA reverse resonance matches per-head reference and handles edge cases")
+    func bilateralBlockScoresGQAAndEdgeCases() {
+        MLXRandom.seed(777)
+        let nHeads = 8
+        let nKvHeads = 2
+        let g = nHeads / nKvHeads
+        let D = 16
+        let scale: Float = 1.0 / sqrt(Float(D))
+        let blockSize = 32
+
+        var cfg = Gemma4BlockSDCMConfig.fast
+        cfg.blockSize = blockSize
+        cfg.prefixKeep = 64
+        cfg.tailKeep = 64
+        cfg.reversePrefixEnd = 64
+        cfg.twoHopBlockPeaks = 4
+
+        // 1. L == 0 returns zero forward scores and nil reverse scores.
+        let zeroScores = Gemma4BlockSDCM.computeBilateralBlockScores(
+            queries: MLXArray.zeros([1, nHeads, 0, D], dtype: .float32),
+            keys: MLXArray.zeros([1, nKvHeads, 0, D], dtype: .float32),
+            positions: MLXArray([Int32]()),
+            positionsHost: [],
+            originalLength: 128,
+            scale: scale, nHeads: nHeads, nKvHeads: nKvHeads,
+            reverseQuotaFraction: 0.3, config: cfg)
+        #expect(zeroScores.forwardBlockScores == [0, 0, 0, 0])
+        #expect(zeroScores.reverseBlockScores == nil)
+        #expect(zeroScores.reverseQuotaFraction == 0)
+
+        // 2. Non-contiguous compacted positions (with dead blocks!) + GQA reverse log-odds parity.
+        // Original length 512 (16 blocks of 32), drop blocks 4 and 9 to simulate post-compaction gaps.
+        let origLen = 512
+        let nBlocks = origLen / blockSize
+        var nonContigPos: [Int32] = []
+        for b in 0 ..< nBlocks where b != 4 && b != 9 {
+            for j in 0 ..< blockSize {
+                nonContigPos.append(Int32(b * blockSize + j))
+            }
+        }
+        let L = nonContigPos.count  // 448 > reversePrefixEnd(64) + 256
+        let q = MLXRandom.normal([1, nHeads, L, D]).asType(.float32)
+        let k = MLXRandom.normal([1, nKvHeads, L, D]).asType(.float32)
+
+        let scores = Gemma4BlockSDCM.computeBilateralBlockScores(
+            queries: q, keys: k, positions: MLXArray(nonContigPos),
+            positionsHost: nonContigPos, originalLength: origLen,
+            scale: scale, nHeads: nHeads, nKvHeads: nKvHeads,
+            reverseQuotaFraction: 0.30, config: cfg)
+        #expect(scores.forwardBlockScores.count == nBlocks)
+        #expect(scores.forwardBlockScores.allSatisfy { $0.isFinite })
+        guard let revActual = scores.reverseBlockScores else {
+            Issue.record("Expected non-nil reverseBlockScores")
+            return
+        }
+        #expect(revActual.count == nBlocks)
+        #expect(revActual.allSatisfy { $0.isFinite })
+
+        // Naive unflattened per-head GQA reference for scale-free reciprocal-rank reverse log-odds.
+        let sinkEnd = 4
+        let prefEnd = 64
+        let tokenBlocks = nonContigPos.map { Int($0) / blockSize }
+        var blockCounts = [Int](repeating: 0, count: nBlocks)
+        for b in tokenBlocks { blockCounts[b] += 1 }
+        let interiorBlocks = (2 ..< (nBlocks - 2)).filter { blockCounts[$0] > 0 }
+        let interiorSet = Set(interiorBlocks)
+        var rrMaxRef = [Float](repeating: 0, count: nBlocks)
+        var rrSumRef = [Float](repeating: 0, count: nBlocks)
+        for h in 0 ..< nHeads {
+            let kv = h / g
+            let qH = q[0, h, 0..., 0...]  // [L, D]
+            let kSinkH = k[0, kv, ..<sinkEnd, 0...]  // [4, D]
+            let kPrefH = k[0, kv, sinkEnd ..< prefEnd, 0...]  // [60, D]
+            let dotP = matmul(qH, kPrefH.transposed(1, 0)) * scale
+            let dotS = matmul(qH, kSinkH.transposed(1, 0)) * scale
+            let resH = sigmoid(logSumExp(dotP, axis: -1) - logSumExp(dotS, axis: -1))
+            eval(resH)
+            let vals = resH.asArray(Float.self)
+            var bh = [Float](repeating: 0, count: nBlocks)
+            for i in 0 ..< L { bh[tokenBlocks[i]] += vals[i] }
+            for b in interiorBlocks { bh[b] /= Float(blockCounts[b]) }
+            // blockSize == 32 applies immediate alive-interior [0.25, 0.50, 0.25] smoothing
+            var sm = [Float](repeating: 0, count: nBlocks)
+            for b in interiorBlocks {
+                var acc = Float(0.50) * bh[b]
+                var w: Float = 0.50
+                if interiorSet.contains(b - 1) { acc += Float(0.25) * bh[b - 1]; w += 0.25 }
+                if interiorSet.contains(b + 1) { acc += Float(0.25) * bh[b + 1]; w += 0.25 }
+                sm[b] = acc / w
+            }
+            let ranked = interiorBlocks.sorted { lhs, rhs in
+                sm[lhs] != sm[rhs] ? sm[lhs] > sm[rhs] : lhs < rhs
+            }
+            for (rk, b) in ranked.enumerated() {
+                let rr = Float(1.0) / Float(4 + rk)
+                if rr > rrMaxRef[b] { rrMaxRef[b] = rr }
+                rrSumRef[b] += rr
+            }
+        }
+        var revRef = [Float](repeating: 0, count: nBlocks)
+        for b in interiorBlocks { revRef[b] = rrMaxRef[b] + Float(0.15) * rrSumRef[b] }
+        let maxRevDiff = zip(revActual, revRef).map { abs($0 - $1) }.max() ?? 0
+        #expect(maxRevDiff < 1e-4, "GQA qFlat/kPref reverse resonance mismatch: \(maxRevDiff)")
+
+        // 3. sinkEnd == 0 (all positions >= 4) and prefEnd <= sinkEnd safely disable reverse scores.
+        let shiftedPos = (0 ..< L).map { Int32($0 + 10) }
+        let noSinkScores = Gemma4BlockSDCM.computeBilateralBlockScores(
+            queries: q, keys: k, positions: MLXArray(shiftedPos),
+            positionsHost: shiftedPos, originalLength: L + 10,
+            scale: scale, nHeads: nHeads, nKvHeads: nKvHeads,
+            reverseQuotaFraction: 0.30, config: cfg)
+        #expect(noSinkScores.reverseBlockScores == nil)
+        #expect(noSinkScores.forwardBlockScores.allSatisfy { $0.isFinite })
+
+        var tinyRevCfg = cfg
+        tinyRevCfg.reversePrefixEnd = 4  // prefEnd <= sinkEnd
+        let emptyPrefScores = Gemma4BlockSDCM.computeBilateralBlockScores(
+            queries: q, keys: k, positions: MLXArray(nonContigPos),
+            positionsHost: nonContigPos, originalLength: origLen,
+            scale: scale, nHeads: nHeads, nKvHeads: nKvHeads,
+            reverseQuotaFraction: 0.30, config: tinyRevCfg)
+        #expect(emptyPrefScores.reverseBlockScores == nil)
+
+        // 4. Constant queries/keys (zero interior variance) stay finite with zero z-score blowup.
+        let constQ = MLXArray.ones([1, nHeads, L, D], dtype: .float32)
+        let constK = MLXArray.ones([1, nKvHeads, L, D], dtype: .float32)
+        let constScores = Gemma4BlockSDCM.computeBilateralBlockScores(
+            queries: constQ, keys: constK, positions: MLXArray(nonContigPos),
+            positionsHost: nonContigPos, originalLength: origLen,
+            scale: scale, nHeads: nHeads, nKvHeads: nKvHeads,
+            reverseQuotaFraction: 0.30, config: cfg)
+        #expect(constScores.forwardBlockScores.allSatisfy { $0.isFinite })
+        if let revConst = constScores.reverseBlockScores {
+            #expect(revConst.allSatisfy { $0 == 0 })
+        }
+
+        // 5. selectCompactedIndices stays deterministic and crash-free on NaN / -Inf scores with zero halo.
+        var degenerateFwd = [Float](repeating: 0, count: nBlocks)
+        degenerateFwd[5] = .nan
+        degenerateFwd[6] = -.infinity
+        degenerateFwd[7] = 5.0
+        var degenerateRev = [Float](repeating: -.infinity, count: nBlocks)
+        degenerateRev[10] = .nan
+        degenerateRev[11] = 4.0
+        var zeroHaloCfg = cfg
+        zeroHaloCfg.forwardHalo = 0
+        zeroHaloCfg.backwardHalo = 0
+        let keptDegenerate = Gemma4BlockSDCM.selectCompactedIndices(
+            boundaryScores: Gemma4SDCMBoundaryScores(
+                forwardBlockScores: degenerateFwd,
+                reverseBlockScores: degenerateRev,
+                reverseQuotaFraction: 0.25),
+            positions: nonContigPos,
+            originalLength: origLen,
+            targetFraction: 0.50,
+            config: zeroHaloCfg)
+        let keptDegenerateBlocks = Set(keptDegenerate.map { Int(nonContigPos[Int($0)]) / blockSize })
+        #expect(keptDegenerateBlocks.contains(7))
+        #expect(keptDegenerateBlocks.contains(11))
+    }
+
+    @Test("Quota-partitioned bilateral selection guarantees both top forward and top reverse prefix blocks")
+    func bilateralQuotaSelectionGuarantees() {
+        let blockSize = 32
+        let nBlocks = 32
+        let T = nBlocks * blockSize  // 1024 tokens
+        let positions = (0 ..< T).map { Int32($0) }
+
+        var fwd = [Float](repeating: 0.0, count: nBlocks)
+        var rev = [Float](repeating: 0.0, count: nBlocks)
+        // Pinned prefix block 1 has huge sink score; interior-only halo must NOT bleed into block 2!
+        fwd[1] = 100.0
+        rev[1] = 100.0
+        // Forward-only peak at block 8 (bottom-question hit)
+        fwd[8] = 10.0
+        // Reverse-only peak at block 18 (top-of-prompt instruction hit, invisible to forward!)
+        rev[18] = 10.0
+        // Ensure non-adjacent interior block 12 beats block 2 (score 0) when sink halo is blocked.
+        fwd[12] = 5.0
+        rev[12] = 5.0
+
+        var cfg = Gemma4BlockSDCMConfig.fast
+        cfg.blockSize = blockSize
+        cfg.prefixKeep = 64  // blocks 0..1
+        cfg.tailKeep = 96    // blocks 29..31
+        cfg.strataCount = 4
+        cfg.forwardHalo = 0.85
+        cfg.backwardHalo = 0.85
+
+        let boundary = Gemma4SDCMBoundaryScores(
+            forwardBlockScores: fwd,
+            reverseBlockScores: rev,
+            reverseQuotaFraction: 0.30)
+        let kept = Gemma4BlockSDCM.selectCompactedIndices(
+            boundaryScores: boundary, positions: positions,
+            originalLength: T, targetFraction: 0.45, config: cfg)
+        let keptBlocks = Set(kept.map { Int($0) / blockSize })
+        // Both forward peak (block 8) AND reverse peak (block 18) + halos must survive!
+        #expect(keptBlocks.contains(8))
+        #expect(keptBlocks.contains(18))
+        #expect(keptBlocks.contains(17))
+        #expect(keptBlocks.contains(19))
+        #expect(keptBlocks.contains(12))
+        // Block 2 (adjacent to pinned prefix block 1) must not inherit block 1's +100 sink score.
+        #expect(!keptBlocks.contains(2))
+    }
+
+    @Test("Gemma4Router.routeTopK matches callAsFunction at full topK and renormalizes softmax at smaller k")
+    func routerRouteTopKParityAndRenorm() throws {
+        MLXRandom.seed(99)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let router = Gemma4Router(model.configuration)
+        let x = MLXRandom.normal([1, 16, 64]).asType(.float32)
+
+        let (fullIdx, fullW) = router(x)
+        let (sameIdx, sameW) = router.routeTopK(x, topK: router.topK)
+        eval(fullIdx, fullW, sameIdx, sameW)
+        #expect(MLX.abs(fullIdx - sameIdx).max().item(Int32.self) == 0)
+        #expect(MLX.abs(fullW - sameW).max().item(Float.self) == 0)
+
+        // When perExpertScale == 1, routeTopK(k=2) softmax weights sum to 1.0 per token.
+        let (subIdx, subW) = router.routeTopK(x, topK: 2)
+        eval(subIdx, subW)
+        #expect(subIdx.shape == [1, 16, 2])
+        #expect(subW.shape == [1, 16, 2])
+        let rowSums = subW.sum(axis: -1)
+        eval(rowSums)
+        let sumErr = MLX.abs(rowSums - Float(1.0)).max().item(Float.self)
+        #expect(sumErr < 1e-5, "routeTopK softmax renormalization error: \(sumErr)")
+
+        // Boundary clamping: requestedK < 1 clamps to 1; requestedK > numExperts clamps to numExperts.
+        let (minIdx, minW) = router.routeTopK(x, topK: 0)
+        let (maxIdx, maxW) = router.routeTopK(x, topK: 99)
+        eval(minIdx, minW, maxIdx, maxW)
+        #expect(minIdx.shape == [1, 16, 1])
+        #expect(maxIdx.shape == [1, 16, model.configuration.numExperts ?? 8])
     }
 }

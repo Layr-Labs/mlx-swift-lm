@@ -1229,10 +1229,19 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        routeTopK(x, topK: topK)
+    }
+
+    /// Route `x` to the top `requestedK` experts with exact softmax renormalization
+    /// over the selected subset (identical to `callAsFunction` when `requestedK == topK`).
+    func routeTopK(
+        _ x: MLXArray, topK requestedK: Int
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
 
-        let kth = expertScores.dim(-1) - topK
+        let activeK = max(1, min(requestedK, expertScores.dim(-1)))
+        let kth = expertScores.dim(-1) - activeK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
