@@ -255,53 +255,95 @@ struct CBv2MTPPenaltyLongRunTests {
             maxTokens: 2000, k: 3, lateStopToken: true),
     ]
 
-    @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+    /// Serves one entry of `cases`. Its position in `cases` sets the request
+    /// ID and the draft script's seed. The target is rebuilt from its fixed
+    /// seed, so it is the same for every case.
+    private func check(_ name: String) async throws {
+        let index = try #require(cases.firstIndex { $0.name == name }, "\(name) is a case")
+        let c = cases[index]
         let target = try makeRankedTarget()
         let prompt = [3, 7, 11, 9, 13, 3, 3]
-        for (index, c) in cases.enumerated() {
-            let id = CBv2RequestID(UInt64(100 + index))
-            var req = CBv2Request(
-                id: id, promptTokens: prompt, sampling: c.sampling, maxTokens: c.maxTokens,
-                stopStrings: c.stops)
-            let unstopped = try await serve(target: target, script: nil, request: req, k: c.k)
-            try #require(unstopped.finish != nil && unstopped.tokens.count > 1000, "\(c.name)")
-            if c.lateStop || c.lateStopToken {
-                // Stop on a late first occurrence, so the stop lands deep in the run.
-                let stream = unstopped.tokens
-                if c.lateStop {
-                    let grams = (0 ..< stream.count - 2).map { Array(stream[$0 ..< $0 + 3]) }
-                    var first: [[Int]: Int] = [:]
-                    for (i, g) in grams.enumerated() where first[g] == nil { first[g] = i }
-                    let (gram, at) = try #require(first.max { $0.value < $1.value })
-                    try #require(at > 200, "\(c.name): no late trigram")
-                    req.stopStrings = [gram.map { "<\($0)>" }.joined()]
-                } else {
-                    var first: [Int: Int] = [:]
-                    for (i, t) in stream.enumerated() where first[t] == nil { first[t] = i }
-                    let (token, at) = try #require(first.max { $0.value < $1.value })
-                    try #require(at > 20, "\(c.name): no late token")
-                    req.stopTokens = [token]
-                }
+        let id = CBv2RequestID(UInt64(100 + index))
+        var req = CBv2Request(
+            id: id, promptTokens: prompt, sampling: c.sampling, maxTokens: c.maxTokens,
+            stopStrings: c.stops)
+        let unstopped = try await serve(target: target, script: nil, request: req, k: c.k)
+        try #require(unstopped.finish != nil && unstopped.tokens.count > 1000, "\(c.name)")
+        if c.lateStop || c.lateStopToken {
+            // Stop on a late first occurrence, so the stop lands deep in the run.
+            let stream = unstopped.tokens
+            if c.lateStop {
+                let grams = (0 ..< stream.count - 2).map { Array(stream[$0 ..< $0 + 3]) }
+                var first: [[Int]: Int] = [:]
+                for (i, g) in grams.enumerated() where first[g] == nil { first[g] = i }
+                let (gram, at) = try #require(first.max { $0.value < $1.value })
+                try #require(at > 200, "\(c.name): no late trigram")
+                req.stopStrings = [gram.map { "<\($0)>" }.joined()]
+            } else {
+                var first: [Int: Int] = [:]
+                for (i, t) in stream.enumerated() where first[t] == nil { first[t] = i }
+                let (token, at) = try #require(first.max { $0.value < $1.value })
+                try #require(at > 20, "\(c.name): no late token")
+                req.stopTokens = [token]
             }
-            let baseline = try await serve(target: target, script: nil, request: req, k: c.k)
-            let mtp = try await serve(
-                target: target,
-                script: script(from: unstopped.tokens, seed: UInt64(index + 1), k: c.k),
-                request: req, k: c.k, verificationMode: c.mode)
-            #expect(
-                mtp.tokens == baseline.tokens, "\(c.name): MTP stream equals the MTP-off stream")
-            #expect(mtp.finish == baseline.finish, "\(c.name)")
-            let metrics = try #require(mtp.metrics)
-            #expect(
-                metrics.rounds > baseline.tokens.count / 8, "\(c.name): rows speculate throughout")
-            #expect(
-                metrics.acceptedTokens < metrics.draftedTokens, "\(c.name): drafts were rejected")
-            #expect(
-                Array(unstopped.tokens.prefix(baseline.tokens.count)) == baseline.tokens,
-                "\(c.name)")
-            let checked = expectExactCounts(mtp, id: id, emitted: unstopped.tokens, c.name)
-            #expect(checked.verifies > baseline.tokens.count / 8, "\(c.name): \(checked)")
-            _ = expectExactCounts(baseline, id: id, emitted: unstopped.tokens, "\(c.name) MTP-off")
+        }
+        let baseline = try await serve(target: target, script: nil, request: req, k: c.k)
+        let mtp = try await serve(
+            target: target,
+            script: script(from: unstopped.tokens, seed: UInt64(index + 1), k: c.k),
+            request: req, k: c.k, verificationMode: c.mode)
+        #expect(
+            mtp.tokens == baseline.tokens, "\(c.name): MTP stream equals the MTP-off stream")
+        #expect(mtp.finish == baseline.finish, "\(c.name)")
+        let metrics = try #require(mtp.metrics)
+        #expect(
+            metrics.rounds > baseline.tokens.count / 8, "\(c.name): rows speculate throughout")
+        #expect(
+            metrics.acceptedTokens < metrics.draftedTokens, "\(c.name): drafts were rejected")
+        #expect(
+            Array(unstopped.tokens.prefix(baseline.tokens.count)) == baseline.tokens,
+            "\(c.name)")
+        let checked = expectExactCounts(mtp, id: id, emitted: unstopped.tokens, c.name)
+        #expect(checked.verifies > baseline.tokens.count / 8, "\(c.name): \(checked)")
+        _ = expectExactCounts(baseline, id: id, emitted: unstopped.tokens, "\(c.name) MTP-off")
+    }
+
+    // One suite per case, so the Fork Tests shard map can place each case on
+    // its own shard (it assigns whole suites).
+
+    @Suite struct T0PresenceFrequency {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t0-presence-frequency")
+        }
+    }
+
+    @Suite struct T0RectangularK3 {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t0-rectangular-k3")
+        }
+    }
+
+    @Suite struct T1Card {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t1-card")
+        }
+    }
+
+    @Suite struct T07Holdback {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t07-holdback")
+        }
+    }
+
+    @Suite struct T0LateStopString {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t0-late-stop-string")
+        }
+    }
+
+    @Suite struct T1LateStopToken {
+        @Test func penaltyCountsRecountTheEmittedTokensEveryRound() async throws {
+            try await CBv2MTPPenaltyLongRunTests().check("t1-late-stop-token")
         }
     }
 }
