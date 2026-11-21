@@ -77,6 +77,9 @@ final class Inkling2DecoderLayer: Module {
         guard !Inkling2RowExact.active, Inkling2RowExact.invariantPrefill,
             tokens < prefillExpertMinimumTokens
         else { return mlp(x) }
+        // The grouped prefill kernel is invariant for every chunk length: no padding
+        // where it takes the call (not for banks or shapes it does not cover).
+        if let y = Inkling2MoEPrefill.sparseMoE(mlp, x) { return y }
         let flat = x.reshaped(tokens, x.dim(-1))
         let padded = concatenated(
             [
