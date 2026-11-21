@@ -77,7 +77,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Arbitrary-Position RoPE Exact Parity
 
-    @Test("applyArbitraryPositionsRoPE matches standard RoPE bit-identically on sliding and full ProportionalRoPE")
+    @Test(
+        "applyArbitraryPositionsRoPE matches standard RoPE bit-identically on sliding and full ProportionalRoPE"
+    )
     func arbitraryPositionRoPEParity() {
         MLXRandom.seed(42)
         let L = 64
@@ -87,7 +89,9 @@ struct Gemma4BlockSDCMTests {
             maxPositionEmbeddings: 4096)
         let fullRope = initializeRope(
             dims: 128, base: 1_000_000, traditional: false,
-            scalingConfig: ["type": .string("proportional"), "partial_rotary_factor": .float(0.25)],
+            scalingConfig: [
+                "type": .string("proportional"), "partial_rotary_factor": .float(0.25),
+            ],
             maxPositionEmbeddings: 4096)
 
         // 1. Contiguous [0 ..< L] parity
@@ -124,7 +128,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Block-Atomic Selection Invariants
 
-    @Test("selectCompactedIndices preserves prefix, tail, atomic blocks, symmetric halos, and macro strata")
+    @Test(
+        "selectCompactedIndices preserves prefix, tail, atomic blocks, symmetric halos, and macro strata"
+    )
     func blockAtomicSelectionInvariants() {
         let T = 1024  // 16 blocks of 64
         let positions = (0 ..< T).map { Int32($0) }
@@ -135,7 +141,7 @@ struct Gemma4BlockSDCMTests {
         var cfg = Gemma4BlockSDCMConfig.lightcone
         cfg.blockSize = 64
         cfg.prefixKeep = 64  // block 0
-        cfg.tailKeep = 64    // block 15
+        cfg.tailKeep = 64  // block 15
         cfg.strataCount = 4
         cfg.forwardHalo = 0.85
         cfg.backwardHalo = 0.85
@@ -203,7 +209,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - PagedLayerCache Last-Query Prefill Exact Parity
 
-    @Test("PagedLayerCache updateAndAttendLastQuery matches full-chunk updateAndAttend on frontier row")
+    @Test(
+        "PagedLayerCache updateAndAttendLastQuery matches full-chunk updateAndAttend on frontier row"
+    )
     func pagedLastQueryPrefillParity() throws {
         MLXRandom.seed(123)
         let kind = CBv2LayerKind(
@@ -299,7 +307,9 @@ struct Gemma4BlockSDCMTests {
         return Gemma4TextModel(config)
     }
 
-    @Test("End-to-end Block-SDCM prefills & decodes cleanly on Paged, Contiguous, and Standalone KV caches")
+    @Test(
+        "End-to-end Block-SDCM prefills & decodes cleanly on Paged, Contiguous, and Standalone KV caches"
+    )
     func endToEndBlockSDCMAllBackends() throws {
         MLXRandom.seed(99)
         let model = try Self.makeSyntheticGemma4MoE()
@@ -412,7 +422,8 @@ struct Gemma4BlockSDCMTests {
         do {
             let caches = model.newCache(parameters: nil)
             let input = LMInput(tokens: prompt.squeezed(axis: 0))
-            let prep = try model.prepare(input, cache: caches, state: nil, prefill: PrefillParameters())
+            let prep = try model.prepare(
+                input, cache: caches, state: nil, prefill: PrefillParameters())
             guard case .tokens(let remaining) = prep else {
                 Issue.record("Expected .tokens from prepare")
                 return
@@ -443,7 +454,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Lazy Multi-Turn Checkpoint Wake-Up
 
-    @Test("Gemma4SDCMCheckpoint wakes up newly attended blocks while excluding already-kept positions")
+    @Test(
+        "Gemma4SDCMCheckpoint wakes up newly attended blocks while excluding already-kept positions"
+    )
     func lazyCheckpointWakeUp() {
         let T = 256  // 4 blocks of 64
         let positions = (0 ..< T).map { Int32($0) }
@@ -483,7 +496,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Scheduler Solo Whole-Prompt Compaction
 
-    @Test("SchedulerV2 arms solo whole-prompt prefill for cold text requests when soloCompactionMinPromptTokens is set")
+    @Test(
+        "SchedulerV2 arms solo whole-prompt prefill for cold text requests when soloCompactionMinPromptTokens is set"
+    )
     func schedulerSoloCompactionArmsOnlyForColdSoloText() throws {
         var config = CBv2SchedulerConfig(
             maxConcurrentRequests: 4,
@@ -547,7 +562,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Edge Cases & Prefix-Veto Regressions
 
-    @Test("Block-SDCM math handles L=1, L<=prefix+tail, gaps > window, empty wake-up, and KVCacheSimple.copy")
+    @Test(
+        "Block-SDCM math handles L=1, L<=prefix+tail, gaps > window, empty wake-up, and KVCacheSimple.copy"
+    )
     func blockSDCMEdgeCases() {
         let cfg = Gemma4BlockSDCMConfig.lightcone
 
@@ -602,7 +619,8 @@ struct Gemma4BlockSDCMTests {
         #expect(
             emptyCkpt.selectWakeUpIndices(
                 queryQ: q1, keyK: k1, scale: 1.0, nHeads: 4, nKvHeads: 2,
-                alreadyKeptPositions: []).isEmpty)
+                alreadyKeptPositions: []
+            ).isEmpty)
 
         // KVCacheSimple.copy preserves positionDelta and ropeOffset
         let simple = KVCacheSimple()
@@ -617,7 +635,9 @@ struct Gemma4BlockSDCMTests {
         }
     }
 
-    @Test("PagedLayerCache writeCompactedPromptKV handles stored=0, chunked sliding writes, and resident prefix veto")
+    @Test(
+        "PagedLayerCache writeCompactedPromptKV handles stored=0, chunked sliding writes, and resident prefix veto"
+    )
     func pagedWriteCompactedEdgeCasesAndPrefixVeto() throws {
         MLXRandom.seed(314)
         let fullKind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
@@ -677,7 +697,9 @@ struct Gemma4BlockSDCMTests {
         #expect(slidingRow.ropePositionOffset == 129)
     }
 
-    @Test("PagedLayerCache updateAndAttendLastQuery matches updateAndAttend for B>1 with history and gates sliding off")
+    @Test(
+        "PagedLayerCache updateAndAttendLastQuery matches updateAndAttend for B>1 with history and gates sliding off"
+    )
     func pagedLastQueryPrefillBatchedAndHistoryParity() throws {
         MLXRandom.seed(271)
         let fullKind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
@@ -686,8 +708,10 @@ struct Gemma4BlockSDCMTests {
         let poolConfig = PagedKVPoolConfig(
             pageSize: 16, capacityBytes: 16 * 1024 * 1024, dtype: .float32, maxPrefillChunk: 128)
 
-        let backendFull = try PagedKVBackend(layerKinds: [fullKind, slidingKind], config: poolConfig)
-        let backendLast = try PagedKVBackend(layerKinds: [fullKind, slidingKind], config: poolConfig)
+        let backendFull = try PagedKVBackend(
+            layerKinds: [fullKind, slidingKind], config: poolConfig)
+        let backendLast = try PagedKVBackend(
+            layerKinds: [fullKind, slidingKind], config: poolConfig)
         let sFull0 = try backendFull.makeSequenceState(
             layerKinds: [fullKind, slidingKind], promptLength: 64, maxLength: 256)
         let sFull1 = try backendFull.makeSequenceState(
@@ -716,8 +740,10 @@ struct Gemma4BlockSDCMTests {
         let qHist = MLXRandom.normal([2, 4, 19, 64]).asType(.float32)
         let kHist = MLXRandom.normal([2, 2, 19, 64]).asType(.float32)
         let vHist = MLXRandom.normal([2, 2, 19, 64]).asType(.float32)
-        _ = cachesFull[0].updateAndAttend(queries: qHist, keys: kHist, values: vHist, scale: 0.25, sinks: nil)
-        _ = cachesLast[0].updateAndAttend(queries: qHist, keys: kHist, values: vHist, scale: 0.25, sinks: nil)
+        _ = cachesFull[0].updateAndAttend(
+            queries: qHist, keys: kHist, values: vHist, scale: 0.25, sinks: nil)
+        _ = cachesLast[0].updateAndAttend(
+            queries: qHist, keys: kHist, values: vHist, scale: 0.25, sinks: nil)
 
         // Second chunk: full vs last-query for B=2 over existing history
         let L = 23
@@ -727,14 +753,17 @@ struct Gemma4BlockSDCMTests {
         let outFull = cachesFull[0].updateAndAttend(
             queries: q2, keys: k2, values: v2, scale: 0.25, sinks: nil)
         let outLast = cachesLast[0].updateAndAttendLastQuery(
-            queries: q2[0..., 0..., (L - 1)..., 0...], keys: k2, values: v2, scale: 0.25, sinks: nil)
+            queries: q2[0..., 0..., (L - 1)..., 0...], keys: k2, values: v2, scale: 0.25, sinks: nil
+        )
         eval(outFull, outLast)
         let diff = MLX.abs(outFull[0..., 0..., (L - 1)..., 0...] - outLast).max().item(Float.self)
         #expect(diff < 1e-4, "Batched + history paged last-query mismatch: \(diff)")
         #expect(cachesLast[0].hostPositionOffsets == [Int32(19 + L), Int32(19 + L)])
     }
 
-    @Test("Standalone multi-turn prompt and decode after Block-SDCM remain finite across compacted sliding layers")
+    @Test(
+        "Standalone multi-turn prompt and decode after Block-SDCM remain finite across compacted sliding layers"
+    )
     func standaloneMultiTurnAfterBlockSDCM() throws {
         MLXRandom.seed(55)
         let model = try Self.makeSyntheticGemma4MoE()
@@ -780,7 +809,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Block-SDCM v2 Invariants
 
-    @Test("trueSlidingWindowStart excludes out-of-window compacted keys and preserves uncompacted tail")
+    @Test(
+        "trueSlidingWindowStart excludes out-of-window compacted keys and preserves uncompacted tail"
+    )
     func trueSlidingWindowStartInvariants() {
         // Uncompacted prompt: keeps exact trailing `W` tokens.
         let contig = (0 ..< 2048).map { Int32($0) }
@@ -877,7 +908,9 @@ struct Gemma4BlockSDCMTests {
         #expect(MLX.abs(fallbackZeroW - exactCausal).max().item(Float.self) < 1e-5)
     }
 
-    @Test("computeBilateralBlockScores GQA reverse resonance matches per-head reference and handles edge cases")
+    @Test(
+        "computeBilateralBlockScores GQA reverse resonance matches per-head reference and handles edge cases"
+    )
     func bilateralBlockScoresGQAAndEdgeCases() {
         MLXRandom.seed(777)
         let nHeads = 8
@@ -963,8 +996,14 @@ struct Gemma4BlockSDCMTests {
             for b in interiorBlocks {
                 var acc = Float(0.50) * bh[b]
                 var w: Float = 0.50
-                if interiorSet.contains(b - 1) { acc += Float(0.25) * bh[b - 1]; w += 0.25 }
-                if interiorSet.contains(b + 1) { acc += Float(0.25) * bh[b + 1]; w += 0.25 }
+                if interiorSet.contains(b - 1) {
+                    acc += Float(0.25) * bh[b - 1]
+                    w += 0.25
+                }
+                if interiorSet.contains(b + 1) {
+                    acc += Float(0.25) * bh[b + 1]
+                    w += 0.25
+                }
                 sm[b] = acc / w
             }
             let ranked = interiorBlocks.sorted { lhs, rhs in
@@ -1033,12 +1072,15 @@ struct Gemma4BlockSDCMTests {
             originalLength: origLen,
             targetFraction: 0.50,
             config: zeroHaloCfg)
-        let keptDegenerateBlocks = Set(keptDegenerate.map { Int(nonContigPos[Int($0)]) / blockSize })
+        let keptDegenerateBlocks = Set(
+            keptDegenerate.map { Int(nonContigPos[Int($0)]) / blockSize })
         #expect(keptDegenerateBlocks.contains(7))
         #expect(keptDegenerateBlocks.contains(11))
     }
 
-    @Test("Quota-partitioned bilateral selection guarantees both top forward and top reverse prefix blocks")
+    @Test(
+        "Quota-partitioned bilateral selection guarantees both top forward and top reverse prefix blocks"
+    )
     func bilateralQuotaSelectionGuarantees() {
         let blockSize = 32
         let nBlocks = 32
@@ -1061,7 +1103,7 @@ struct Gemma4BlockSDCMTests {
         var cfg = Gemma4BlockSDCMConfig.fast
         cfg.blockSize = blockSize
         cfg.prefixKeep = 64  // blocks 0..1
-        cfg.tailKeep = 96    // blocks 29..31
+        cfg.tailKeep = 96  // blocks 29..31
         cfg.strataCount = 4
         cfg.forwardHalo = 0.85
         cfg.backwardHalo = 0.85
@@ -1084,7 +1126,9 @@ struct Gemma4BlockSDCMTests {
         #expect(!keptBlocks.contains(2))
     }
 
-    @Test("Gemma4Router.routeTopK matches callAsFunction at full topK and renormalizes softmax at smaller k")
+    @Test(
+        "Gemma4Router.routeTopK matches callAsFunction at full topK and renormalizes softmax at smaller k"
+    )
     func routerRouteTopKParityAndRenorm() throws {
         MLXRandom.seed(99)
         let model = try Self.makeSyntheticGemma4MoE()
@@ -1117,7 +1161,9 @@ struct Gemma4BlockSDCMTests {
 
     // MARK: - Block-SDCM v3 (Turbo Early Tri-Signal + Position-Aware Sparse L5)
 
-    @Test("prefixLocalFullTailAttention with non-contiguous positions matches exact explicit mask and edge cases")
+    @Test(
+        "prefixLocalFullTailAttention with non-contiguous positions matches exact explicit mask and edge cases"
+    )
     func prefixLocalFullTailWithPositionsParity() {
         MLXRandom.seed(2026)
         let scale: Float = 1.0 / sqrt(32.0)
@@ -1218,7 +1264,8 @@ struct Gemma4BlockSDCMTests {
             .&& ((kPos128 .< Int32(32)) .|| ((qPos128 - kPos128) .< Int32(32))
                 .|| (qPos128 .>= Int32(96)))
         let refSmallW = MLXFast.scaledDotProductAttention(
-            queries: qSmallW, keys: kSmallW, values: vSmallW, scale: scale, mask: .array(refMask128))
+            queries: qSmallW, keys: kSmallW, values: vSmallW, scale: scale, mask: .array(refMask128)
+        )
         eval(sparseSmallW, refSmallW)
         #expect(MLX.abs(sparseSmallW - refSmallW).max().item(Float.self) < 1e-5)
 
@@ -1233,7 +1280,9 @@ struct Gemma4BlockSDCMTests {
         #expect(emptyOut.shape == [1, 4, 0, 32])
     }
 
-    @Test("selectEarlyTriSignalIndices retains Query MaxSim, Outlier Novelty, and Token-IDF blocks with targeted halo")
+    @Test(
+        "selectEarlyTriSignalIndices retains Query MaxSim, Outlier Novelty, and Token-IDF blocks with targeted halo"
+    )
     func earlyTriSignalSelectionGuarantees() {
         let bs = 32
         let nBlocks = 24
@@ -1277,7 +1326,7 @@ struct Gemma4BlockSDCMTests {
         let lay = MLXArray(layBuf, [1, T, D])
         var cfg = Gemma4BlockSDCMConfig.turbo
         cfg.prefixKeep = 64  // blocks 0..1
-        cfg.tailKeep = 64    // blocks 22..23
+        cfg.tailKeep = 64  // blocks 22..23
         cfg.strataCount = 4
 
         let kept = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
@@ -1304,7 +1353,9 @@ struct Gemma4BlockSDCMTests {
         #expect(keptBlocks.contains(16))
     }
 
-    @Test("selectEarlyTriSignalIndices handles T=0/1, p1<=p0, partial tail, nil/wrong tokenIDs, zero variance, large topHaloK, NaN/Inf, and FP16")
+    @Test(
+        "selectEarlyTriSignalIndices handles T=0/1, p1<=p0, partial tail, nil/wrong tokenIDs, zero variance, large topHaloK, NaN/Inf, and FP16"
+    )
     func earlyTriSignalEdgeCases() {
         let D = 16
         var cfg = Gemma4BlockSDCMConfig.turbo
@@ -1409,7 +1460,9 @@ struct Gemma4BlockSDCMTests {
         #expect(keptFP16.count < T)
     }
 
-    @Test("End-to-end turbo Block-SDCM v3 prefills and decodes cleanly across Paged and Standalone KV caches")
+    @Test(
+        "End-to-end turbo Block-SDCM v3 prefills and decodes cleanly across Paged and Standalone KV caches"
+    )
     func endToEndTurboPrefillAndDecode() throws {
         MLXRandom.seed(404)
         let model = try Self.makeSyntheticGemma4MoE()
