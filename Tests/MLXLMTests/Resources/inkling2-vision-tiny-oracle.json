@@ -1,0 +1,161 @@
+{
+ "reference": "transformers e3a65e2c21abb9c25a03704f2f25852f9ad03a18",
+ "transformers_version": "5.24.0.dev0",
+ "torch_version": "2.14.1",
+ "vision_config": {
+  "hidden_size": 64,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "mlp_ratio": 4.0,
+  "native_patch_size": 20,
+  "adapter_merge_size": 2,
+  "temporal_patch_size": 2,
+  "posemb_grid_size": 8,
+  "projection_hidden_dim": 128,
+  "projector_bias": false,
+  "text_hidden_size": 96,
+  "layer_norm_eps": 1e-05,
+  "rope_parameters": {
+   "rope_theta": 10000.0,
+   "rope_type": "axial"
+  }
+ },
+ "weight_count": 44,
+ "cases": [
+  {
+   "name": "one_token_40",
+   "height": 40,
+   "width": 40,
+   "channels": 3,
+   "png": false,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "pixel_sha256": "d41912c726bb024a384f77d6855ac572d783ceca7803ea3e0a28179c00e60e01"
+  },
+  {
+   "name": "odd_75x130",
+   "height": 75,
+   "width": 130,
+   "channels": 3,
+   "png": false,
+   "grid": [
+    1,
+    2,
+    4
+   ],
+   "pixel_sha256": "9705484761d6bd6568de4e4596ebcd1eb75fb93b93df53a64f0ed828d34516f2"
+  },
+  {
+   "name": "tiny_rgba_23x17",
+   "height": 23,
+   "width": 17,
+   "channels": 4,
+   "png": false,
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "pixel_sha256": "9582ce0823b362b554353a983296809526d9685a4b937d848dc8db5903938e12"
+  },
+  {
+   "name": "tall_403x95",
+   "height": 403,
+   "width": 95,
+   "channels": 3,
+   "png": false,
+   "grid": [
+    1,
+    11,
+    3
+   ],
+   "pixel_sha256": "7f3a4758b4d705a71bfc564c7c96ecc2c0783fda3f8fd721aca000c5ffb66556"
+  },
+  {
+   "name": "png_rgb_61x88",
+   "height": 61,
+   "width": 88,
+   "channels": 3,
+   "png": true,
+   "grid": [
+    1,
+    2,
+    3
+   ],
+   "pixel_sha256": "9b04d15f4886c72cfec7bf3e08c254dda1c6a0f047cd982ee523a709655dcce3"
+  },
+  {
+   "name": "png_rgba_44x41",
+   "height": 44,
+   "width": 41,
+   "channels": 4,
+   "png": true,
+   "grid": [
+    1,
+    2,
+    2
+   ],
+   "pixel_sha256": "df92fb4c7e6f6a99a8acb49da43f35102a182aaedae51e3a7829fc5a1f24ff98"
+  },
+  {
+   "name": "pair",
+   "grids": [
+    [
+     1,
+     2,
+     4
+    ],
+    [
+     1,
+     1,
+     1
+    ]
+   ]
+  }
+ ],
+ "large": [
+  {
+   "height": 4096,
+   "width": 4096,
+   "grid": [
+    1,
+    103,
+    103
+   ],
+   "pixel_sha256": "2025f5a8431d73ea9ee23b6852de5445abe3fdaab52f62cd640270068bfa01ac"
+  },
+  {
+   "height": 3000,
+   "width": 1000,
+   "grid": [
+    1,
+    75,
+    25
+   ],
+   "pixel_sha256": "c0be8977f2cf85a3f87dca637d49a6b0a63299fe56e1a2f0dd114d384e670e7d"
+  },
+  {
+   "height": 517,
+   "width": 333,
+   "grid": [
+    1,
+    13,
+    9
+   ],
+   "pixel_sha256": "8ae287f18e540f8e785e30508181f87c49c24f36ee4d73b9650865c5ccddcbdd"
+  },
+  {
+   "height": 40,
+   "width": 4096,
+   "grid": [
+    1,
+    1,
+    103
+   ],
+   "pixel_sha256": "0ee5006c65d9348e78939ee177645a5fbc7a3684b2797c4de493e45af8759047"
+  }
+ ]
+}

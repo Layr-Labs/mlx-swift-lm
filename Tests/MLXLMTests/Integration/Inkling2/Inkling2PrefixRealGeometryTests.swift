@@ -179,7 +179,8 @@ struct Inkling2PrefixRealGeometryTests {
         for (index, prompt) in prompts.enumerated() {
             let result = try await cbv2CollectFinished(
                 try off.submit(request(UInt64(10 + index), prompt: prompt, shape: shape)),
-                timeoutSeconds: 1200)
+                timeoutSeconds: 1200, label: "drafter off, prompt \(index)",
+                expectedTokens: shape.maxTokens)
             offTokens.append(result.tokens)
         }
         await off.shutdown()
@@ -191,7 +192,8 @@ struct Inkling2PrefixRealGeometryTests {
         let coldRanges = Ranges()
         coldRanges.observe(cold)
         let coldResult = try await cbv2CollectFinished(
-            try cold.submit(request(1, prompt: prompts[0], shape: shape)), timeoutSeconds: 1200)
+            try cold.submit(request(1, prompt: prompts[0], shape: shape)), timeoutSeconds: 1200,
+            label: "cold donor", expectedTokens: shape.maxTokens)
         seed.finishPublicationCallbacks(engine: cold)
         let coldEvents = eventLine(cold)
         let rounds = cold.mtpMetricsSnapshot()?.rounds ?? 0
@@ -232,7 +234,8 @@ struct Inkling2PrefixRealGeometryTests {
             let input = request(id, prompt: prompt, shape: shape)
             try #require(try restored.stage(engine: warm, request: input))
             let warmResult = try await cbv2CollectFinished(
-                try warm.submit(input), timeoutSeconds: 1200)
+                try warm.submit(input), timeoutSeconds: 1200, label: "restored prompt \(index)",
+                expectedTokens: shape.maxTokens)
             restored.finishPublicationCallbacks(engine: warm)
             let warmRounds = warm.mtpMetricsSnapshot()?.rounds ?? 0
             let warmAccepted = warm.mtpMetricsSnapshot()?.acceptedTokens ?? 0
@@ -362,7 +365,7 @@ struct Inkling2PrefixRealGeometryTests {
             _ = calls.take()
             let result = try await cbv2CollectFinished(
                 try engine.submit(Self.request(1, prompt: prompt, shape: shape)),
-                timeoutSeconds: 600)
+                timeoutSeconds: 600, label: "drafter \(drafting)", expectedTokens: shape.maxTokens)
             if drafting { #expect((engine.mtpMetricsSnapshot()?.rounds ?? 0) > 0) }
             await engine.shutdown()
             modes[drafting] = calls.take()
@@ -390,7 +393,8 @@ struct Inkling2PrefixRealGeometryTests {
         let (off, _) = try Self.engine(
             model: model, drafter: nil, dtype: dtype, shape: shape, store: nil)
         let offResult = try await cbv2CollectFinished(
-            try off.submit(Self.request(9, prompt: prompt, shape: shape)), timeoutSeconds: 600)
+            try off.submit(Self.request(9, prompt: prompt, shape: shape)), timeoutSeconds: 600,
+            label: "drafter off", expectedTokens: shape.maxTokens)
         await off.shutdown()
 
         drafter.refusesPrefixCaptureForTesting = true
@@ -399,7 +403,8 @@ struct Inkling2PrefixRealGeometryTests {
         let (cold, backend) = try Self.engine(
             model: model, drafter: drafter, dtype: dtype, shape: shape, store: store)
         let result = try await cbv2CollectFinished(
-            try cold.submit(Self.request(1, prompt: prompt, shape: shape)), timeoutSeconds: 600)
+            try cold.submit(Self.request(1, prompt: prompt, shape: shape)), timeoutSeconds: 600,
+            label: "refusing donor", expectedTokens: shape.maxTokens)
         store.finishPublicationCallbacks(engine: cold)
         let events = cold.completeCheckpointCapture?.events.snapshot ?? [:]
         let rounds = cold.mtpMetricsSnapshot()?.rounds ?? 0
