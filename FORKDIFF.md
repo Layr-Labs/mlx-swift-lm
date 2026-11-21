@@ -49,15 +49,17 @@ penalty test checks six independent cases. It was one test of 150 to 281 s
 (median 207 s over 11 green runs), alone in shard 12, which set the floor:
 about 230 s predicted with 14 shards. Each case is now its own suite
 (`CBv2MTPPenaltyLongRunTests/<case>`, same requests and assertions), so the
-map spreads the cases. Sixteen shards hold a predicted median "Run the
-shard" of 167 to 174 s (14 shards with the split cases: 188 to 195 s). The
-longest unit is now `KernelTests/GLM5NextMTPTests`, about 117 s. Against
-14 shards, each run asks for two more 4x24 Macs, and they also wait for
-the build: about 12 Mac-minutes, 48 vCPU-minutes (about $0.05 at $0.001
-per vCPU-minute), more per run. The shards hold their Macs while they wait
-for the build. In an earlier 16-shard run the 12x32 build was placed after
-all of its shards (129 s, against 33 to 69 s with 12 or 14 shards), before
-the runner plane placed jobs round robin.
+map spreads the cases; they took 18 to 49 s each (run 44937126105). Sixteen
+shards hold a predicted median "Run the shard" of 169 to 170 s (14 shards
+with the split cases: 189 to 191 s). The longest unit is now
+`KernelTests/GLM5NextMTPTests`, about 117 s. Against 14 shards, each run
+asks for two more 4x24 Macs, and they also wait for the build: about 12
+Mac-minutes, 48 vCPU-minutes (about $0.05 at $0.001 per vCPU-minute), more
+per run. The shards hold their Macs while they wait for the build. In an
+earlier 16-shard run the 12x32 build was placed after all of its shards
+(129 s, against 33 to 69 s with 12 or 14 shards). Since the runner plane
+places jobs round robin, the build of a 16-shard run started 39 s after it
+was queued, before any of its shards (run 44937126105).
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
