@@ -6,6 +6,7 @@ import MLXNN
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 /// The qwen3_5 compiled chains must be the unfused expressions' bits.
 final class Qwen35DecodeFusionsTests: XCTestCase {
@@ -60,6 +61,89 @@ final class Qwen35DecodeFusionsTests: XCTestCase {
                 XCTAssertEqual(bits(fused.beta), bits(beta), "beta \(dtype) \(shape)")
             }
         }
+    }
+
+    /// `siluMultiply` against `silu(gate) * up` on every 16-bit gate value
+    /// (bf16 and f16, three `up` rows each) and on float32 rows.
+    func testSiluMultiplyMatchesTheUnfusedProductOnEveryGateValue() {
+        for dtype in [DType.bfloat16, .float16] {
+            let values: [Float] = (0 ..< 65_536).map { pattern in
+                dtype == .bfloat16
+                    ? Float(bitPattern: UInt32(pattern) << 16)
+                    : Float(Float16(bitPattern: UInt16(pattern)))
+            }
+            let gate = MLXArray(values).asType(dtype)
+            for seed in [UInt64(21), 22, 23] {
+                let up = inputs([65_536], seed: seed, dtype: dtype)
+                let fused = Qwen35DecodeFusions.siluMultiply(gate, up)
+                let reference = silu(gate) * up
+                eval(fused, reference)
+                XCTAssertEqual(fused.dtype, reference.dtype)
+                XCTAssertEqual(bits(fused), bits(reference), "\(dtype) seed \(seed)")
+            }
+        }
+        let gate = inputs([4, 8_192], seed: 31, dtype: .float32)
+        let up = inputs([4, 8_192], seed: 32, dtype: .float32)
+        let fused = Qwen35DecodeFusions.siluMultiply(gate, up)
+        let reference = silu(gate) * up
+        eval(fused, reference)
+        XCTAssertEqual(bits(fused), bits(reference), "float32")
+    }
+
+    /// The dense MLP (one-stream decode, prompt chunks, the A3B shared expert)
+    /// writes the same bits with the fusion on and off, plain and 4-bit.
+    func testDenseMLPIsTheSameWithTheFusedSwiGLU() {
+        for (dtype, quantized) in [
+            (DType.bfloat16, false), (.bfloat16, true), (.float16, true), (.float32, false),
+        ] {
+            let mlp = Qwen3NextMLP(dimensions: 256, hiddenDimensions: 512)
+            mlp.update(
+                parameters: ModuleParameters.unflattened([
+                    ("gate_proj.weight", inputs([512, 256], seed: 41, dtype: dtype) / 24),
+                    ("up_proj.weight", inputs([512, 256], seed: 42, dtype: dtype) / 24),
+                    ("down_proj.weight", inputs([256, 512], seed: 43, dtype: dtype) / 32),
+                ]))
+            if quantized {
+                quantize(model: mlp, groupSize: 64, bits: 4)
+            }
+            for shape in [[1, 1, 256], [1, 7, 256], [3, 1, 256]] {
+                let x = inputs(shape, seed: 51, dtype: dtype)
+                let fused = Qwen35DecodeFusions.$v2Override.withValue(true) { mlp(x) }
+                let unfused = Qwen35DecodeFusions.$v2Override.withValue(false) { mlp(x) }
+                eval(fused, unfused)
+                XCTAssertEqual(fused.dtype, unfused.dtype)
+                XCTAssertEqual(
+                    bits(fused), bits(unfused), "\(dtype) quantized \(quantized) \(shape)")
+            }
+        }
+    }
+
+    /// The A3B shared-expert combine `combined + sigmoid(gate) * shared` as one
+    /// compiled kernel against the separate ops, on every 16-bit gate value.
+    func testSharedExpertCombineMatchesTheUnfusedOpsOnEveryGateValue() {
+        for dtype in [DType.bfloat16, .float16] {
+            let values: [Float] = (0 ..< 65_536).map { pattern in
+                dtype == .bfloat16
+                    ? Float(bitPattern: UInt32(pattern) << 16)
+                    : Float(Float16(bitPattern: UInt16(pattern)))
+            }
+            // One gate value per row, broadcast over the row as in the block.
+            let gate = MLXArray(values).asType(dtype).reshaped(65_536, 1)
+            let shared = inputs([65_536, 4], seed: 61, dtype: dtype)
+            let combined = inputs([65_536, 4], seed: 62, dtype: dtype)
+            let fused = Qwen4ExpFusions.sharedExpertCombine(combined, gate, shared)
+            let reference = combined + sigmoid(gate) * shared
+            eval(fused, reference)
+            XCTAssertEqual(fused.dtype, reference.dtype)
+            XCTAssertEqual(bits(fused), bits(reference), "\(dtype)")
+        }
+        let gate = inputs([16, 1, 1], seed: 63, dtype: .float32)
+        let shared = inputs([16, 1, 2048], seed: 64, dtype: .float32)
+        let combined = inputs([16, 1, 2048], seed: 65, dtype: .float32)
+        let fused = Qwen4ExpFusions.sharedExpertCombine(combined, gate, shared)
+        let reference = combined + sigmoid(gate) * shared
+        eval(fused, reference)
+        XCTAssertEqual(bits(fused), bits(reference), "float32")
     }
 
     func testGatedSiluNormTailMatchesTheGatedNormBitForBit() {

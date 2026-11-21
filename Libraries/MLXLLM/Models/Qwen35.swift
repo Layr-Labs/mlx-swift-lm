@@ -1802,6 +1802,11 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         if useQwen4AffineQMM && Qwen4ExpFusions.isEnabled {
             return Qwen4ExpFusions.sharedExpertCombine(combined, sharedGate, sharedY)
         }
+        // qwen3_5: the same compiled kernel (the same ops at their dtypes, so
+        // the same values) in place of a sigmoid, a multiply and an add.
+        if !useQwen4AffineQMM, Qwen35DecodeFusions.isEnabledV2 {
+            return Qwen4ExpFusions.sharedExpertCombine(combined, sharedGate, sharedY)
+        }
         sharedY = sigmoid(sharedGate) * sharedY
 
         return combined + sharedY
