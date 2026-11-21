@@ -24,10 +24,21 @@ is not listed yet), the job waits 20 seconds and tries once more.
 
 Fork Tests, PR lint, the fork-diff check and page rendering use Darkbloom
 macOS or Linux ARM64 runners. Each compute job queues independently with
-the full native runner labels; these jobs have no hosted fallback and do
-not reserve all seven Mac jobs before the build starts. The repository's
-approval still determines the image and the network policy. Each macOS job
-names its VM size ([Job sizes](#job-sizes)).
+the full native runner labels; these jobs have no hosted fallback. The
+repository's approval still determines the image and the network policy.
+Each macOS job names its VM size ([Job sizes](#job-sizes)).
+
+The test shards start beside Build and Metal library, as soon as the shard
+map is ready, as Layr-Labs/d-inference's test jobs do. Each one queues for
+its Mac, checks out and selects Xcode while the build runs, then
+`.github/scripts/wait-for-products.py` holds it until both jobs have
+succeeded (it reads the run's jobs every 15 s and fails when either did not
+succeed). Before, the shards were created only when the build ended, and
+their queue and setup (p50 107 s from the build's end to the download,
+runs 44750661761 to 44868059797) came after it. The cost: each shard's Mac
+idles for most of the build, 6 to 8 minutes, which is 380 to 490
+vCPU-minutes per run ($0.38 to $0.49 at $0.001 per vCPU-minute). A shard
+whose build failed fails at the wait instead of being skipped.
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share

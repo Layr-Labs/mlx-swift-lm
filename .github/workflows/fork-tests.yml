@@ -8,8 +8,10 @@ name: Fork Tests
 # One job builds the package and its tests, and lists the tests. Another job
 # builds the full Metal library at the same time. Both hand their products to
 # the test jobs as artifacts. Runs that are not for a pull request also save
-# them in the Actions cache, for later runs to restore. The test jobs download
-# the products and run in parallel.
+# them in the Actions cache, for later runs to restore. The test jobs start
+# beside them, as soon as the shard map is ready: each gets its Mac, checks out
+# and selects Xcode during the build, then waits for both jobs
+# (.github/scripts/wait-for-products.py), downloads the products and runs.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
@@ -60,6 +62,9 @@ jobs:
         run: |
           python3 .github/scripts/test-runner-sizes.py
           python3 .github/scripts/test-ci-resource-sampler.py
+
+      - name: Test the wait for the products
+        run: python3 .github/scripts/test-wait-for-products.py
 
       - name: Read the shard numbers
         id: matrix
@@ -405,11 +410,18 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
+    # No `needs: [build, metallib]`: the shards start beside them, so their
+    # Macs, checkouts and Xcode are ready when the products are. "Wait for
+    # the products" holds the downloads until both jobs have succeeded.
+    needs: plan
     runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x24]
     permissions:
       contents: read
-    timeout-minutes: 45
+      # wait-for-products.py reads this run's jobs.
+      actions: read
+    # Up to 45 minutes of waiting for the products, then the shard's own
+    # 45 minutes (Run the shard).
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -424,6 +436,12 @@ jobs:
 
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
+
+      - name: Wait for the products
+        # Fails when Build or Metal library did not succeed, or after 45 minutes.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/wait-for-products.py
 
       - name: Download the test products
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -449,6 +467,7 @@ jobs:
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.
+        timeout-minutes: 45
         run: >-
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
@@ -489,12 +508,19 @@ jobs:
   # `test` on 4x24. Its steps are those of `test`.
   test-12x32:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
+    # No `needs: [build, metallib]`: the shards start beside them, so their
+    # Macs, checkouts and Xcode are ready when the products are. "Wait for
+    # the products" holds the downloads until both jobs have succeeded.
+    needs: plan
     if: ${{ needs.plan.outputs.shards-12x32 != '[]' }}
     runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-12x32]
     permissions:
       contents: read
-    timeout-minutes: 45
+      # wait-for-products.py reads this run's jobs.
+      actions: read
+    # Up to 45 minutes of waiting for the products, then the shard's own
+    # 45 minutes (Run the shard).
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -509,6 +535,12 @@ jobs:
 
       - name: Select Xcode
         uses: ./.github/actions/select-xcode
+
+      - name: Wait for the products
+        # Fails when Build or Metal library did not succeed, or after 45 minutes.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/wait-for-products.py
 
       - name: Download the test products
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -534,6 +566,7 @@ jobs:
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.
+        timeout-minutes: 45
         run: >-
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
