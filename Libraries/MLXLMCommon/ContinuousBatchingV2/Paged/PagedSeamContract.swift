@@ -270,6 +270,16 @@ package protocol CBv2MTPRectangularSerializing: AnyObject {
     /// in a `defer`.
     var mtpSerializesRectangularAttention: Bool { get set }
     var mtpBatchesRectangularAttention: Bool { get set }
+    /// Opt-in: attend a round's (row, column) pairs as rows of one decode
+    /// dispatch. A cache without such a path keeps its column loop.
+    var mtpBatchesRectangularColumnsAsRows: Bool { get set }
+}
+
+extension CBv2MTPRectangularSerializing {
+    package var mtpBatchesRectangularColumnsAsRows: Bool {
+        get { false }
+        set {}
+    }
 }
 
 /// The contiguous cache already owns the stored flag (`LayerCacheV2.swift`),

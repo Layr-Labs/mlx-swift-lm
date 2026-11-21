@@ -37,7 +37,8 @@ public enum MLXServer {
             modelID: configuration.model,
             model: model,
             modelType: configuration.modelType,
-            defaultToolCallParser: configuration.toolCallParser
+            defaultToolCallParser: configuration.toolCallParser,
+            onyxParsing: configuration.onyxParsing
         )
 
         let embeddingEngine: MLXEmbedderContainerEngine?
@@ -52,10 +53,15 @@ public enum MLXServer {
         } else {
             embeddingEngine = nil
         }
+        // A model whose protocol fixes the reasoning channel (Muse Glimmer's
+        // Onyx) selects its parser when none was requested.
+        let loadedToolCallFormat = await model.configuration.toolCallFormat
         let service = MLXOpenAIService(
             engine: engine,
             embeddingEngine: embeddingEngine,
             defaultReasoningParser: configuration.reasoningParser
+                ?? ReasoningParserFormat.inferred(
+                    modelType: configuration.modelType, toolCallFormat: loadedToolCallFormat)
         )
         let app = MLXServerApplication.buildApplication(
             service: service,
@@ -66,12 +72,15 @@ public enum MLXServer {
         try await app.runService()
     }
 
-    static func modelConfiguration(for idOrPath: String, revision: String = "main") -> ModelConfiguration {
+    static func modelConfiguration(for idOrPath: String, revision: String = "main")
+        -> ModelConfiguration
+    {
         let expandedPath: String
         if idOrPath == "~" {
             expandedPath = FileManager.default.homeDirectoryForCurrentUser.path
         } else if idOrPath.hasPrefix("~/") {
-            expandedPath = FileManager.default.homeDirectoryForCurrentUser
+            expandedPath =
+                FileManager.default.homeDirectoryForCurrentUser
                 .appending(path: String(idOrPath.dropFirst(2)))
                 .path
         } else {

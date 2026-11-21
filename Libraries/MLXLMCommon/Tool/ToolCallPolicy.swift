@@ -19,14 +19,20 @@ public struct ToolCallPolicy: Hashable, Sendable {
     /// apply. Generation callers set it through ``GenerateParameters/toolCallPolicy``.
     public var returnsFailedCallsAsText: Bool
 
+    /// How Muse Glimmer's Onyx frames and ATEM calls are read. The default
+    /// keeps upstream's strict reading; see ``OnyxParsingMode``.
+    public var onyxParsing: OnyxParsingMode
+
     public init(
         recovery: ToolCallRecoveryPolicy = .conservative,
         validation: ToolCallValidationPolicy = .permissive,
-        returnsFailedCallsAsText: Bool = true
+        returnsFailedCallsAsText: Bool = true,
+        onyxParsing: OnyxParsingMode = .strict
     ) {
         self.recovery = recovery
         self.validation = validation
         self.returnsFailedCallsAsText = returnsFailedCallsAsText
+        self.onyxParsing = onyxParsing
     }
 }
 
