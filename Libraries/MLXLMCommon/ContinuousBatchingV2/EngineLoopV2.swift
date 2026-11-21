@@ -5397,9 +5397,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // state through `deferredReleases`. Publish before that fence
             // releases the pages so the completed prefix remains reusable.
             let detachedState = step.deferredReleases.first { $0.id == id }?.state
-            publishFinalizedResidentBlocks(
-                requestID: id, safeComputedEnd: range.upperBound,
-                state: detachedState)
+            let rowState = detachedState ?? kvStates[id]
+            if rowState?.contains(where: { $0?.isCompacted == true }) != true {
+                publishFinalizedResidentBlocks(
+                    requestID: id, safeComputedEnd: range.upperBound,
+                    state: detachedState)
+            }
         }
 
         // Materialize any lazy logprob gathers at this same boundary (they
@@ -6178,7 +6181,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         var rows: [CBv2SequenceKV] = []
         var bytes = 0
         for row in state {
-            guard let row, row.absoluteOffset >= promptCount,
+            guard let row, !row.isCompacted, row.absoluteOffset >= promptCount,
                 let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
             else { return nil }
             let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
@@ -6329,7 +6332,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func stateCoversDonation(
         _ state: [CBv2SequenceKV?], tokenCount: Int
     ) -> Bool {
-        guard tokenCount > 1 else { return false }
+        guard tokenCount > 1, !state.contains(where: { $0?.isCompacted == true }) else {
+            return false
+        }
         var cacheableLayers = 0
         for (i, kind) in layerKinds.enumerated() {
             var cacheable = kind.sharesKVWithLayer == nil
@@ -7093,7 +7098,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard let row = state.compactMap({ $0 }).first else {
             preconditionFailure("CBv2 position state has no owning attention row")
         }
-        return row.absoluteOffset
+        return row.ropePositionOffset
     }
 
     // MARK: Watchdog (engine health signal)

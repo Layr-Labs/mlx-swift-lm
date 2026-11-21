@@ -363,7 +363,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
-        hostPositionOffsets = pagedRows.map { Int32($0.absoluteOffset) }
+        hostPositionOffsets = pagedRows.map { Int32($0.ropePositionOffset) }
         cachedPositionOffsets = MLXArray(hostPositionOffsets)
     }
 
@@ -688,6 +688,71 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         retainedPrefillKV = []
         kvOnlyPromptWritesForTesting += 1
         advancePositionOffsets(by: keys.dim(2))
+    }
+
+    public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "PagedLayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(logicalDelta >= 0, "PagedLayerCache: negative logicalDelta \(logicalDelta)")
+        precondition(
+            keys.ndim == 4 && values.ndim == 4,
+            "PagedLayerCache: compacted K/V must be rank 4")
+        let b = keys.dim(0)
+        let stored = keys.dim(2)
+        precondition(
+            b == pagedRows.count && values.dim(0) == b && values.dim(2) == stored,
+            "PagedLayerCache: compacted K/V batch or token length mismatch")
+        if pool.usesStepOwnedAttention {
+            pool.writeValidation.refuse(
+                "compacted prompt KV write is not supported under step-owned attention",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            return
+        }
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: stored, layerIndex: layerIndex)
+        else { return }
+        if stored > 0 {
+            let maxWindowWrite = max(1, pool.config.maxPrefillChunk)
+            for (index, row) in pagedRows.enumerated() {
+                let rowKeys = (b == 1 ? keys : keys[index ..< (index + 1)]).squeezed(axis: 0)
+                let rowValues = (b == 1 ? values : values[index ..< (index + 1)]).squeezed(axis: 0)
+                if row.windowSize != nil && stored > maxWindowWrite {
+                    // Chunk windowed writes to stay within `maxPrefillChunk` when the
+                    // sliding window exceeds the configured chunk size (e.g. W=1024, chunk=512).
+                    var start = 0
+                    while start < stored {
+                        let end = min(stored, start + maxWindowWrite)
+                        row.write(
+                            keys: rowKeys[0..., start ..< end, 0...],
+                            values: rowValues[0..., start ..< end, 0...])
+                        if pool.writeValidation.isFaulted { return }
+                        start = end
+                    }
+                } else {
+                    row.write(keys: rowKeys, values: rowValues)
+                    if pool.writeValidation.isFaulted { return }
+                }
+            }
+        }
+        if logicalDelta > 0 {
+            for row in pagedRows {
+                row.addPositionDelta(logicalDelta)
+            }
+        }
+        retainedPrefillKV = []
+        retainedQuantizedViews = []
+        dropPrefillMirrors()
+        let advance = stored + logicalDelta
+        if advance > 0 {
+            advancePositionOffsets(by: advance)
+        }
     }
 
     /// Write K/V without leftover dense SDPA so gathered QSA can attend the
@@ -2040,5 +2105,70 @@ extension PagedLayerCache: CBv2MultimodalSpanCapableCache {
 
     public var honorsSpanMaskContexts: Bool {
         !pool.usesStepOwnedAttention && Self.honorsSpanMaskContextsByConstruction
+    }
+}
+
+// MARK: - Final-layer last-query prefill
+
+extension PagedLayerCache: CBv2LastQueryPrefillLayerCache {
+    public var supportsLastQueryPrefill: Bool {
+        !pagedRows.isEmpty && !pool.writeValidation.isFaulted
+            && kind.attention == .full && kind.headDim == kind.valueHeadDim
+            && kind.sharesKVWithLayer == nil && attentionSoftcap == nil
+            && pool.groupKey(forLayer: layerIndex).quantization == nil
+            && !pool.usesStepOwnedAttention && attentionMetadata == nil
+            && attentionPacket == nil && boundSpanContext == nil
+            && !mtpSerializesRectangularAttention && !mtpBatchesRectangularAttention
+    }
+
+    public func updateAndAttendLastQuery(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        precondition(
+            supportsLastQueryPrefill,
+            "[PagedLayerCache] last-query prefill requires a native full-attention layer")
+        precondition(
+            queries.ndim == 4 && keys.ndim == 4 && values.ndim == 4,
+            "[PagedLayerCache] last-query prefill tensors must be rank 4")
+        let b = queries.dim(0)
+        let kvL = keys.dim(2)
+        precondition(
+            b > 0 && b == pagedRows.count && keys.dim(0) == b && values.dim(0) == b,
+            "[PagedLayerCache] last-query prefill batch mismatch")
+        precondition(
+            queries.dim(2) == 1 && kvL > 1 && values.dim(2) == kvL,
+            "[PagedLayerCache] last-query prefill requires qL=1 and kvL>1")
+        precondition(
+            queries.dim(1) == kind.queryHeads && queries.dim(3) == kind.headDim,
+            "[PagedLayerCache] last-query prefill Q shape does not match layer kind")
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: kvL, layerIndex: layerIndex)
+        else { return faultOutput(queries) }
+        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let chunkSinks = prefillSinks(effectiveSinks, queryDType: queries.dtype)
+        var views: [PrefillKV] = []
+        views.reserveCapacity(b)
+        let output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+            let row = pagedRows[index]
+            let kv = prefillKVWritingChunk(
+                row: row, chunkKeys: slice(keys), chunkValues: slice(values),
+                dtype: queries.dtype)
+            views.append(kv)
+            return MLXFast.scaledDotProductAttention(
+                queries: slice(queries),
+                keys: cast(kv.keys, to: queries.dtype),
+                values: cast(kv.values, to: queries.dtype),
+                scale: scale, mask: .none, sinks: chunkSinks)
+        }
+        retainedPrefillKV = retainsChunkForBorrowers ? views : []
+        advancePositionOffsets(by: kvL)
+        return finishAttentionCall(output)
     }
 }

@@ -694,8 +694,13 @@ internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.Positi
     } else if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
+    } else if let cache {
+        switch cache.ropeOffset {
+        case .scalar(let value): .scalar(value)
+        case .batch(let values): .batch(values + 0)
+        }
     } else {
-        .scalar(cache?.offset ?? 0)
+        .scalar(0)
     }
 }
 
@@ -1693,6 +1698,7 @@ public class Gemma4TextModelInner: Module {
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
+    var blockSDCMConfig: Gemma4BlockSDCMConfig = .current
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
@@ -1896,12 +1902,58 @@ public class Gemma4TextModelInner: Module {
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
 
+        // Block-Atomic Causal-Adjoint Multigrid (Block-SDCM) prefill fast path.
+        // Engages only for solo cold text prefills above `minPromptTokens` when
+        // enabled; all short prompts, packed batches, vision spans, prefix-cache
+        // suffixes, MTP captures, unsupported caches, and tensor-parallel ranks
+        // keep the exact path.
+        let initialOffset: Int = {
+            for layerCache in fullCache {
+                if let v2 = layerCache as? (any CBv2AttendingLayerCache),
+                    let row = v2.rows.first
+                {
+                    return row.ropePositionOffset
+                }
+                if let layerCache {
+                    if case .scalar(let value) = layerCache.ropeOffset {
+                        return value
+                    }
+                    return layerCache.offset
+                }
+            }
+            return 0
+        }()
+        if layers.first?.selfAttn.tensorParallel == nil,
+            fullCache.allSatisfy({ $0.map(Gemma4BlockSDCM.supportsCache) ?? true }),
+            Gemma4BlockSDCM.canRun(
+                sdcm: blockSDCMConfig,
+                modelConfig: config,
+                schedulePrefill: schedulePrefill,
+                batchSize: h.dim(0),
+                sequenceLength: h.dim(1),
+                hasInputEmbedding: inputEmbedding != nil,
+                hasImageMask: imageTokenMask != nil,
+                hasCaptureHook: captureHook != nil,
+                initialOffset: initialOffset)
+        {
+            let (postNorm, _) = forwardBlockSDCMTrunk(
+                h,
+                fullCache: fullCache,
+                sdcm: blockSDCMConfig,
+                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
+                    schedulePrefill: schedulePrefill))
+            return (postNorm, nil)
+        }
+
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
         // Gemma4's fully bidirectional prefill by symmetrizing both global and
         // sliding causal masks. Either mode needs a materialized array; ordinary
         // text and single-token decode retain the symbolic causal fast path.
+        // Multi-turn standalone follow-ups on compacted caches build per-layer
+        // masks because deeper sliding layers hold fewer live tokens than layer 0.
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
+        var maskPerLayer: [MLXFast.ScaledDotProductAttentionMaskMode?]? = nil
         if !isCBv2 {
             let useBidirectionalVision =
                 imageTokenMask != nil && config.useBidirectionalAttention == "vision"
@@ -1909,26 +1961,35 @@ public class Gemma4TextModelInner: Module {
             let useBidirectionalAll =
                 config.useBidirectionalAttention == "all" && h.dim(1) > 1
             let forceArrayMask = useBidirectionalVision || useBidirectionalAll
-            for (i, layer) in layers.enumerated() {
-                let lt = layer.layerType
-                if maskByType[lt] == nil {
-                    var mask: MLXFast.ScaledDotProductAttentionMaskMode
-                    if lt == "sliding_attention" {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
-                            returnArray: forceArrayMask)
-                    } else {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: nil,
-                            returnArray: forceArrayMask)
+            let hasCompactedStandaloneCache =
+                h.dim(1) > 1
+                && fullCache.contains { (($0 as? KVCacheSimple)?.positionDelta ?? 0) > 0 }
+
+            func buildLegacyMask(layerType: String, cache: KVCache?)
+                -> MLXFast.ScaledDotProductAttentionMaskMode
+            {
+                var mask = createAttentionMask(
+                    h: h, cache: cache,
+                    windowSize: layerType == "sliding_attention" ? config.slidingWindow : nil,
+                    returnArray: forceArrayMask)
+                if useBidirectionalVision, let imageTokenMask {
+                    mask = gemma4TextOverlayBidirectionalVision(mask, isVision: imageTokenMask)
+                } else if useBidirectionalAll {
+                    mask = gemma4TextSymmetrizeMask(mask)
+                }
+                return mask
+            }
+
+            if hasCompactedStandaloneCache {
+                maskPerLayer = layers.enumerated().map { i, layer in
+                    buildLegacyMask(layerType: layer.layerType, cache: fullCache[i])
+                }
+            } else {
+                for (i, layer) in layers.enumerated() {
+                    let lt = layer.layerType
+                    if maskByType[lt] == nil {
+                        maskByType[lt] = buildLegacyMask(layerType: lt, cache: fullCache[i])
                     }
-                    if useBidirectionalVision, let imageTokenMask {
-                        mask = gemma4TextOverlayBidirectionalVision(
-                            mask, isVision: imageTokenMask)
-                    } else if useBidirectionalAll {
-                        mask = gemma4TextSymmetrizeMask(mask)
-                    }
-                    maskByType[lt] = mask
                 }
             }
         }
@@ -1951,7 +2012,7 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            let mask = maskPerLayer?[idx] ?? maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
@@ -1967,7 +2028,8 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                hasCapableCache: (fullCache[idx] as? (any CBv2LastQueryPrefillLayerCache))?
+                    .supportsLastQueryPrefill ?? false)
             let (out, kvState, positionOffset) = layer.forward(
                 h,
                 mask: mask,
@@ -2132,6 +2194,19 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// keys are decoder-relative use these roots without owning another tower.
     public var decoderLayers: [Module] { model.layers }
 
+    /// Block-SDCM prefill configuration (defaults to `Gemma4BlockSDCMConfig.current`).
+    public var blockSDCMConfig: Gemma4BlockSDCMConfig {
+        get { model.blockSDCMConfig }
+        set { model.blockSDCMConfig = newValue }
+    }
+
+    /// True when this Gemma 4 topology qualifies for Block-SDCM prefill (non-shared KV,
+    /// non-PLE, non-fully-bidirectional MoE without tensor parallelism).
+    public var supportsBlockSDCM: Bool {
+        model.layers.first?.selfAttn.tensorParallel == nil
+            && Gemma4BlockSDCM.supportsModelConfig(config)
+    }
+
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     /// Tensor parallel: the tied head projects this rank's vocabulary rows only.
@@ -2170,9 +2245,35 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             return .tokens(input.text)
         }
 
+        // Block-SDCM whole-prompt prefill for standalone `generate` / `ModelBenchmark`:
+        // evaluate `[0 ..< T-1]` in a single pass so full-attention boundary scoring
+        // observes the full prompt, then hand the final token to TokenIterator.
+        let y = input.text
+        let prefixLength = y.tokens.size - 1
+        if supportsBlockSDCM,
+            !cache.isEmpty,
+            cache.allSatisfy({ $0.offset == 0 && Gemma4BlockSDCM.supportsCache($0) }),
+            Gemma4BlockSDCM.canRun(
+                sdcm: blockSDCMConfig,
+                modelConfig: config,
+                schedulePrefill: true,
+                batchSize: 1,
+                sequenceLength: prefixLength,
+                hasInputEmbedding: false,
+                hasImageMask: false,
+                hasCaptureHook: false,
+                initialOffset: 0)
+        {
+            let prefixRange = 0 ..< prefixLength
+            let hidden = model.cbv2Prefill(
+                y.tokens[.newAxis, prefixRange], cache: cache, inputEmbedding: nil)
+            eval(hidden)
+            eval(cache)
+            return .tokens(y[prefixLength...])
+        }
+
         // A prompt that fits in one chunk goes to the iterator whole.
         let stepSize = prefill.resolvedStepSize()
-        let y = input.text
         guard y.tokens.size > stepSize else { return .tokens(y) }
 
         let processed = try prefill.forEachChunk(

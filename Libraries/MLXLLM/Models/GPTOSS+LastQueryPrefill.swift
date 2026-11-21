@@ -9,7 +9,8 @@ func gptossLastQueryPrefillEligible(
 ) -> Bool {
     guard sequenceLength > 1, isFinalFullLayer,
           let cache = cache as? any CBv2LastQueryPrefillLayerCache else { return false }
-    return cache.kind.attention == .full && cache.kind.sharesKVWithLayer == nil
+    return cache.supportsLastQueryPrefill
+        && cache.kind.attention == .full && cache.kind.sharesKVWithLayer == nil
 }
 
 extension AttentionBlock {
