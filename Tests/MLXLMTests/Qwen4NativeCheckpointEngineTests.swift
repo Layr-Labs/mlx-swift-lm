@@ -97,7 +97,12 @@ final class Qwen4NativeCheckpointEngineTests: XCTestCase {
         return (engine, backend)
     }
 
-    private func released(_ engine: EngineV2, _ backend: PagedKVBackend) {
+    /// A store's callback can hold its last export's manifest permit past the
+    /// terminal, so its publication callbacks drain first.
+    private func released(
+        _ engine: EngineV2, _ backend: PagedKVBackend, store: CompleteCheckpointFixtureStore? = nil
+    ) {
+        store?.finishPublicationCallbacks(engine: engine)
         let bytes = engine.loopForTesting.onEngineQueueSync {
             (
                 engine.admissionForTesting.bytesReserved, backend.bytesReserved, backend.bytesWired,
@@ -182,7 +187,7 @@ final class Qwen4NativeCheckpointEngineTests: XCTestCase {
             XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
             XCTAssertTrue(
                 store.saved.allSatisfy { $0.manifest.tensors.contains { $0.role == .indexKeys } })
-            released(donor, donorBackend)
+            released(donor, donorBackend, store: store)
             await donor.shutdown()
             let reopened = CompleteCheckpointFixtureStore(archives: store.saved, segmentBytes: 1024)
             let (warm, warmBackend) = try engine(
@@ -202,7 +207,7 @@ final class Qwen4NativeCheckpointEngineTests: XCTestCase {
                 XCTAssertEqual(actual.tokens, expected.tokens, "mtp=\(mtp), boundary=\(item.1)")
                 XCTAssertEqual(actual.usage?.prefixCachePrefillTokensSaved, item.1)
                 XCTAssertEqual(actual.usage?.prefixCacheReplayTokens, 0)
-                released(warm, warmBackend)
+                released(warm, warmBackend, store: reopened)
                 released(cold, coldBackend)
             }
             if mtp {

@@ -135,7 +135,12 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
         return (engine, backend)
     }
 
-    private func assertReleased(_ engine: EngineV2, _ backend: PagedKVBackend) {
+    /// A store's callback can hold its last export's manifest permit past the
+    /// terminal, so its publication callbacks drain first.
+    private func assertReleased(
+        _ engine: EngineV2, _ backend: PagedKVBackend, store: CompleteCheckpointFixtureStore? = nil
+    ) {
+        store?.finishPublicationCallbacks(engine: engine)
         let state = engine.loopForTesting.onEngineQueueSync {
             (
                 engine.admissionForTesting.bytesReserved, backend.bytesReserved, backend.bytesWired,
@@ -167,7 +172,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
                         && $0.manifest.assistantCodecID != nil
                         && $0.manifest.tensors.contains { $0.role == .assistantHidden }
                 })
-            assertReleased(donor, donorBackend)
+            assertReleased(donor, donorBackend, store: store)
             await donor.shutdown()
 
             // The reopened store owns only Data and manifests. Target weights,
@@ -196,7 +201,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
                 XCTAssertEqual(actual.usage?.prefixCacheReplayTokens, 0)
                 XCTAssertEqual(actual.usage?.prefixCacheTier, .snapshot)
                 if index == 0 { XCTAssertEqual(actual.tokens, donated.tokens) }
-                assertReleased(warm, warmBackend)
+                assertReleased(warm, warmBackend, store: reopened)
                 assertReleased(cold, coldBackend)
             }
             XCTAssertGreaterThan(
@@ -217,7 +222,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
             prefixCacheReceiptID: .init(1007))
         let expected = await cbv2SchedCollect(try donor.submit(request))
         XCTAssertEqual(expected.finishReason, .length)
-        assertReleased(donor, donorBackend)
+        assertReleased(donor, donorBackend, store: store)
         await donor.shutdown()
 
         let reopened = CompleteCheckpointFixtureStore(archives: store.saved, segmentBytes: 4096)
@@ -233,7 +238,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
         }
         let cancelledResult = await cbv2SchedCollect(cancelled)
         XCTAssertEqual(cancelledResult.finishReason, .cancelled)
-        assertReleased(candidate, backend)
+        assertReleased(candidate, backend, store: reopened)
         XCTAssertEqual(reopened.releaseCount, 1)
 
         // Fail only the post-staging suffix allocation. Its rollback must leave
@@ -253,7 +258,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
         XCTAssertEqual(fallback.usage?.prefixCachePrefillTokensSaved, 0)
         XCTAssertEqual(fallback.usage?.prefixCacheOutcome, .adoptionFailed)
         XCTAssertGreaterThan(allocationCalls, 1)
-        assertReleased(candidate, backend)
+        assertReleased(candidate, backend, store: reopened)
         XCTAssertEqual(reopened.releaseCount, 2)
         await candidate.shutdown()
 
@@ -280,7 +285,7 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
         XCTAssertEqual(restoredCold.usage?.prefixCachePrefillTokensSaved, 0)
         XCTAssertEqual(restoredCold.usage?.prefixCacheOutcome, .adoptionFailed)
         XCTAssertEqual(rejectedStore.releaseCount, 1)
-        assertReleased(rejected, rejectedBackend)
+        assertReleased(rejected, rejectedBackend, store: rejectedStore)
         await rejected.shutdown()
     }
 }
