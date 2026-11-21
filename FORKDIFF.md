@@ -43,13 +43,17 @@ build failed fails at the wait instead of being skipped. The wait counts
 against the shard's 45-minute job timeout, so no step gets more time than
 before; it ends with an error after 30 minutes.
 
-There are 16 test shards. With 12, the run ended with the slowest shard,
-usually one on a slow Mac. Sixteen shards hold fewer seconds of tests each
-(a predicted median "Run the shard" of 168 to 170 s, against 200 to 243 s).
+There are 14 test shards. With 12, the run ended with the slowest shard,
+usually one on a slow Mac. Fourteen shards hold fewer seconds of tests each
+(a predicted median "Run the shard" of 191 to 192 s, against 200 to 243 s).
 Shard 12 runs #478's long penalty test alone: one test of about 174 s that
-cannot be split, 195 s predicted. Each run asks for four more 4x24 Macs, and
-they also wait for the build. That adds about 24 Mac-minutes, 96
-vCPU-minutes (about $0.10 at $0.001 per vCPU-minute), to each run.
+cannot be split, 195 s predicted. Each run asks for two more 4x24 Macs, and
+they also wait for the build. That adds about 12 Mac-minutes, 48
+vCPU-minutes (about $0.05 at $0.001 per vCPU-minute), to each run. Sixteen
+shards would save about 23 s more, but the shards hold their Macs while
+they wait for the build, and in a 16-shard run the 12x32 build was placed
+after all of its shards (129 s, against 33 to 56 s for 12 shards). Try more
+shards only once the build no longer competes with waiting shards.
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
@@ -91,7 +95,7 @@ measured every job.
 |---|---|---|---|
 | Build | 12x32 | A cold build (the plane gives these sandboxes no cache): 363 to 583 s on 12 vCPUs, of which the compile is 261 to 412 s (runs 44505218067 to 44685968782). The same cold build took 1,273 s on the hosted 3-vCPU `xcode-27` Mac (run 43365935094). | 8x16: 361 and 457 s, 10.04 GiB. On 8x16 (#468) the median of the build step went from 269 s on 12 vCPUs (n=51 runs, 43711096547 to 44767807509) to 362 s (n=16, 44750661761 to 44819969123); it was 301 s after #480 (n=7). Every test job waits for it, so it went back to 12x32: 32 GiB is 3.2 times the peak, and it costs about the same vCPU-minutes because the build is CPU-bound. 12x32 did not queue longer: the build queued for a median 55 s on 12 vCPUs and 88 s on 8x16 (n=51 and 23), and in the same runs the 12x32 test shards queued for 70 s against 78 s for 4x24 (n=39 and 205). |
 | Metal library | 4x16 | 153 to 301 s on 12 vCPUs (same runs); 436 s cold on the hosted 3-vCPU, 7 GiB Mac. | 4x16: 231 and 306 s, 10.04 GiB (`air-lld` 6.52) |
-| Test shards 1 to 16 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB (shard 7 10.25 GiB, shard 9 7.88 GiB). Shards 7 and 9 ran on 12x32 until issue #469 was fixed: their tests read the admission ledger before the checkpoint store's callback had dropped its last export, whose manifest permit is charged until then. On 4 vCPUs that callback can still be running at the request's final event. |
+| Test shards 1 to 14 (`test`) | 4x24 | 206 to 480 s on 12 vCPUs with 12 shards (runs 44682883296, 44685968782). About 150 s of each is the download of the test products. | 4x16: 206 to 728 s (shard 5 spent 390 s on downloads). Shard 8: 13.26 GiB used, 6.4 GiB compressed, memory pressure at warning, 0.06 GiB swapped; over the 12.3 GiB that 16 GiB allows. 4x24: 216 to 488 s; shard 8 17.84 GiB of footprints, the others at most 12.01 GiB (shard 7 10.25 GiB, shard 9 7.88 GiB). Shards 7 and 9 ran on 12x32 until issue #469 was fixed: their tests read the admission ledger before the checkpoint store's callback had dropped its last export, whose manifest permit is charged until then. On 4 vCPUs that callback can still be running at the request's final event. |
 | Coverage (pushes to `main` only) | 4x16 | 56 to 196 s on 12 vCPUs. | not run on pull requests |
 | PR lint | 4x16 | 35 s on 12 vCPUs. | 4x16: 31 s, 6.04 GiB |
 
