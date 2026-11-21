@@ -359,8 +359,8 @@ extension Inkling2Model: CBv2PositionedRecurrentLanguageModelForwardable,
         capabilities.requiresNativePagedKV = true
         // Pages plus conv state at a boundary restore a prefix exactly.
         capabilities.supportsRecurrentCheckpointReuse = true
-        // The DSpark drafter (a separate change) drives MTP rounds; without the flag the
-        // engine never builds the round driver.
+        // The DSpark drafter (Inkling2DSparkCBv2.swift) drives MTP rounds;
+        // without the flag the engine never builds the round driver.
         capabilities.supportsMTP = true
         // With fixed-row prefill products (invariantPrefillBlockRows) prefill is
         // chunk-invariant (Inkling2InvarianceProbeTests): any partition of a

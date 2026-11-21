@@ -75,7 +75,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 : CBv2CompleteCheckpointManifest.pagedAsymmetricMTPLayout
         }
         if historicalRecurrent {
-            return CBv2CompleteCheckpointManifest.pagedHistoricalRecurrentLayout
+            return assistant == nil
+                ? CBv2CompleteCheckpointManifest.pagedHistoricalRecurrentLayout
+                : CBv2CompleteCheckpointManifest.pagedHistoricalRecurrentMTPLayout
         }
         if recurrentSpec == nil { return CBv2CompleteCheckpointManifest.historicalAttentionLayout }
         return pagedConfig == nil
@@ -104,10 +106,12 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         let asymmetric = layerKinds.contains { $0.valueHeadDim != $0.headDim }
         self.unsupportedAsymmetricGeometry = asymmetric
         self.recurrentSpec = recurrentSpec
-        // Exact native rows only: no assistant, no Qwen4 side state, no lossy profile.
+        // Exact native rows only: no Qwen4 side state, no lossy profile. An
+        // assistant must keep its own exact history (historical coding).
         let mixedHistoricalRecurrent =
             historicalRecurrent && recurrentSpec?.layers.isEmpty == false && !asymmetric
-            && pagedConfig != nil && pagedConfig?.quantization == nil && assistant == nil
+            && pagedConfig != nil && pagedConfig?.quantization == nil
+            && (assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding)
             && qwen4Geometries.isEmpty && checkpointQuantization == nil
             && nativePagedBinding == nil && glm5NextBackend == nil
         self.kvDTypes = kvDTypes
@@ -173,7 +177,7 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true)
             : (!asymmetric && (recurrentSpec == nil || mixedHistoricalRecurrent)
                 && pagedConfig != nil
-                && assistant == nil
+                && (assistant == nil || mixedHistoricalRecurrent)
                 ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil)
         self.historicalRecurrent = mixedHistoricalRecurrent && self.historicalLayout != nil
         self.contiguousLayout =
@@ -238,6 +242,13 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 : historicalLayout.tensorDescriptors(position: position)
             if historicalRecurrent {
                 descriptors.append(contentsOf: try recurrentStateDescriptors())
+                if assistant != nil {
+                    // Media requests stay target-only and never use this layout.
+                    guard !mediaTargetOnly else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    descriptors.append(contentsOf: try assistantDescriptors(position: position))
+                }
             }
             return descriptors
         }
@@ -270,6 +281,15 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             result.append(contentsOf: descriptors)
         }
         return result
+    }
+
+    /// The assistant's own prefix-history tensors at `position`.
+    func assistantDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
+        guard let assistant,
+            let descriptors = assistant.prefixCheckpointTensorDescriptors(
+                targetInputCount: position), !descriptors.isEmpty
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        return descriptors
     }
 
     /// Convolution then recurrent state for each spec layer, in spec order.

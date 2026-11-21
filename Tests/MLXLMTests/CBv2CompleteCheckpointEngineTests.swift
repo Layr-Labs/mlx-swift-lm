@@ -36,6 +36,7 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
     private var closed = false
     private var releases = 0
     private var disarmedAt: [Int] = []
+    private var donationFailures: [String] = []
     let maximumPosition: Int
     let segmentBytes: Int
     let gate: CheckpointPublicationGate?
@@ -68,6 +69,13 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
         lock.lock()
         defer { lock.unlock() }
         return releases
+    }
+    /// Errors a donation swallowed (the archive is then simply missing), e.g.
+    /// a `segmentBytes` above `CBv2CompleteCheckpointManifest.maximumSegmentBytes`.
+    var donationErrors: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return donationFailures
     }
     /// Positions reported by `recordRecurrentCaptureDisarmed(packedAt:)`, in order.
     var recurrentCaptureDisarmedPackedAt: [Int] {
@@ -168,6 +176,9 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
                     completionGate?.block()
                 }
             } catch {
+                lock.lock()
+                donationFailures.append("position \(source.manifest.position): \(error)")
+                lock.unlock()
                 source.close()
                 completion([])
             }

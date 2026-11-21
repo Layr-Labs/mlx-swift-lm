@@ -4432,7 +4432,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let historyRows = mtpOrdinaryHistoryRows(ids)
         let certified = certifiedTokenRequest(
-            ids: ids, pendingSampledTokens: lazyTokens, otherLogitReaders: !historyRows.isEmpty)
+            ids: ids, pendingSampledTokens: lazyTokens,
+            otherLogitReaders: mtpHistoryNeedsFullLogits(historyRows))
         let (last, cacheInnerState, recurrent, hidden) = try CBv2CertifiedTokenRequest.$current
             .withValue(certified) {
                 try decodeLogits(
@@ -4676,7 +4677,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let frontierCapture = prefillFrontierCapture()
             let certified = certifiedTokenRequest(
                 ids: decodeIDs, pendingSampledTokens: nil,
-                otherLogitReaders: !historyRows.isEmpty
+                otherLogitReaders: mtpHistoryNeedsFullLogits(historyRows)
                     || (frontierCapture != nil
                         && decodeRows.contains { $0.start < $0.rec.request.promptTokens.count })
             )
@@ -5337,12 +5338,29 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         finishStatefulMTPEvaluation(step)
+        var assistantCopyFailure: MLXError?
         do { try captureSettledHistoricalAssistants(step) } catch {
             if nativeShutdownState != nil {
                 failNativeCompletion(.nativeWorkFailed)
                 return
             }
-            step.discard.formUnion(step.historicalCheckpoints.keys)
+            if let error = error as? MLXError {
+                // A device error fails the cohort exactly as a failed
+                // checkpoint copy does at commit (`historicalFailure`):
+                // discarded, then finished with an error.
+                assistantCopyFailure = error
+                step.discard.formUnion(step.participants)
+            } else {
+                // Any other refusal loses only the checkpoints. Discarding a
+                // live donor's step would roll back its recurrent state while
+                // its KV writes and scheduler progress stand.
+                for candidate in step.historicalCheckpoints.values.joined() {
+                    completeCheckpointCapture?.events.record(
+                        .assistantCaptureRefused, position: candidate.position, error: error)
+                    completeCheckpointCapture?.discardHistorical(candidate)
+                }
+                step.historicalCheckpoints.removeAll()
+            }
         }
         if nativeCompletePrefixContract != nil {
             guard nativeShutdownState?.mayExecute == true else { return }
@@ -5408,7 +5426,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        let historicalFailure = commitHistoricalCheckpoints(step)
+        let historicalFailure = commitHistoricalCheckpoints(step) ?? assistantCopyFailure
         captureRecurrentCheckpoints(step)
 
         // Pre-eviction window views are step-scoped, not paused/retired request
