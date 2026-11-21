@@ -78,10 +78,11 @@ enum CBv2AttentionV1 {
     /// everything else keeps today's blocked path, so Gemma 4 (head_dim 256
     /// sliding, 512 full) is unaffected.
     ///
-    /// Pure in (layer kind, L, head dims, dtype, device), so one chunk always
-    /// takes the same route. It is NOT chunk-partition invariant for head_dim
-    /// 256 on NAX, where a chunk below 1024 queries keeps the composed blocks:
-    /// the two routes differ within rounding.
+    /// Pure in (layer kind, L, head dims, dtype, device, prefill-row scope), so
+    /// one chunk always takes the same route. Outside a prefill-row scope it is
+    /// NOT chunk-partition invariant for head_dim 256 on NAX, where a chunk
+    /// below 1024 queries keeps the composed blocks: the two routes differ
+    /// within rounding. Inside the scope such chunks fuse from 16 queries.
     static func usesFusedCausalPrefill(
         kind: CBv2LayerKind, queries: MLXArray, values: MLXArray,
         softcap: Float?, hasSpanContext: Bool
@@ -107,9 +108,10 @@ enum CBv2AttentionV1 {
     /// fallback: unblocked, that would materialize the whole
     /// `[heads, L, kL]` score tensor. So it is deliberately narrower than
     /// MLX: head_dim 192 is fallback-only for `qL > 8` there; head_dim 256
-    /// takes the NAX head-dim-split kernel only from 1024 queries, and fp32
-    /// is excluded rather than mirroring `MLX_ENABLE_TF32`; `qL <= 8` (the
-    /// vector kernels) is not a prompt chunk worth routing.
+    /// takes the NAX head-dim-split kernel only from 1024 queries (16 in a
+    /// prefill-row scope), and fp32 is excluded rather than mirroring
+    /// `MLX_ENABLE_TF32`; `qL <= 8` (the vector kernels) is not a prompt
+    /// chunk worth routing.
     static func mlxFusesCausalAttention(
         queryLength: Int, queryHeadDim: Int, valueHeadDim: Int, dtype: DType,
         naxAvailable: Bool
@@ -117,9 +119,16 @@ enum CBv2AttentionV1 {
         guard queryLength > 8, queryHeadDim == valueHeadDim else { return false }
         switch queryHeadDim {
         case 64, 72, 80, 96, 128: return true
-        case 256: return naxAvailable && queryLength >= 1024 && dtype != .float32
+        case 256:
+            return naxAvailable && queryLength >= headDim256FusedMinimumQueries
+                && dtype != .float32
         default: return false
         }
+    }
+
+    /// MLX reads the building thread's prefill-row scope when it creates the SDPA op.
+    static var headDim256FusedMinimumQueries: Int {
+        GPU.prefillRowInvarianceRows > 0 ? 16 : 1024
     }
 
     /// The sink logits an `MLXFast.scaledDotProductAttention` call may be

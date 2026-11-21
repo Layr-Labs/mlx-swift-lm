@@ -969,6 +969,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
     let cacheProvider: CBv2LayerCacheProvider
     let model: CBv2SteppableModel
+    /// Reference rows of the prefill-row scope for `.prefill` forwards; 0 when off.
+    let prefillRowInvarianceRows: Int
     let sampler: CBv2StepSampler
     let detokenizerFactory: CBv2DetokenizerFactory
     let layerKinds: [CBv2LayerKind]
@@ -1343,6 +1345,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.rectangularDenseBudget = rectangularDenseBudget
         self.nativeQuiescentCleanup = nativeQuiescentCleanup
         self.model = model
+        self.prefillRowInvarianceRows = CBv2PrefillRowInvariance.engineRows(
+            model: model, config: scheduler.config)
         self.layerKinds = layerKinds
         self.backend = backend
         self.cacheProvider = cacheProvider
@@ -3429,8 +3433,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         let value = MiMoV26RectangularDenseAdmission.withBudget(denseBudget) {
             MiMoV26BlockBatchAttention.withBudget(phase == .prefill ? blockBatchBudget : nil) {
                 MiMoV26NAXKeyRangeNative.withContext(rangeContext) {
-                    CBv2ForwardShapeObservation.dispatch(
-                        step: buildingForwardShapes, phase: phase, body)
+                    withPrefillRowInvariance(phase: phase) {
+                        CBv2ForwardShapeObservation.dispatch(
+                            step: buildingForwardShapes, phase: phase, body)
+                    }
                 }
             }
         }

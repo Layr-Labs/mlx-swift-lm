@@ -1311,6 +1311,7 @@
             "MLXLMTests.CBv2PagedFrozenChunkGatherTests",
             "MLXLMTests.CBv2PagedPrefixReuseChunkRatioTests",
             "MLXLMTests.CBv2PrefillLogitDigestTests",
+            "MLXLMTests.CBv2PrefillRowInvarianceTests",
             "MLXLMTests.CBv2ProcessMemoryOwnershipTests",
             "MLXLMTests.CBv2QueryBlockAttentionCausalityTests",
             "MLXLMTests.CBv2QueryBlockAttentionKVStateTests",

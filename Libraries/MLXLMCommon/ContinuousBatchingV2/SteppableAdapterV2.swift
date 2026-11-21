@@ -54,6 +54,12 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2PrefillRowInvarianceProviding {
+    public var prefillRowInvarianceFamily: CBv2PrefillRowInvariance.Family? {
+        (model as? CBv2PrefillRowInvarianceProviding)?.prefillRowInvarianceFamily
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
     public var cbv2PositionAxisCount: Int? {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount

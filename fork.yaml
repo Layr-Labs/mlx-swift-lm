@@ -139,6 +139,25 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
             - "changelog.d/paged-import-host-zeroed-growth.md"
             - "docs/runtime-kv-quantization.md"
+        - title: "Prefill-row invariance (opt-in, dense Qwen 3.5)"
+          description: |
+            `CBv2PrefillRowInvariance` gates, per model family, whether the engine builds each
+            `.prefill` forward in MLX's prefill-row scope (`GPU.withPrefillRowInvariance`,
+            Layr-Labs/mlx-swift). In the scope quantized products of a prompt chunk split K as the
+            engine's longest chunk does (at least 4,096 rows), head-dim 256 attention on NAX fuses
+            from 16 queries (the library's mirror `CBv2AttentionV1.mlxFusesCausalAttention` follows
+            the scope). Paged prompt attention already blocks queries in 128s from the chunk start, so
+            a prompt then has the same bits however it is cut on multiples of 128, and a prefix restored
+            at such a position continues a cold run bit for bit. Qualified: dense
+            `Qwen35Model` (Qwen 3.5 9B, Qwen 3.8 27B). Default off for every family
+            (`defaultOn` is empty); `DARKBLOOM_PREFILL_ROW_INVARIANCE=1` turns qualified families on.
+            Decode rows, mixed decode/prompt steps, MTP verification and drafts stay outside the
+            scope. Batch-invariant kernels (Thinking Machines, 2025) applied to chunked prefill.
+          globs:
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/CBv2PrefillRowInvariance.swift"
+            - "Libraries/MLXLLM/Models/Qwen35PrefillRowInvariance.swift"
+            - "Tests/MLXLMTests/CBv2PrefillRowInvarianceTests.swift"
+            - "changelog.d/prefill-row-invariance.md"
         - title: "Prefix checkpoints"
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
@@ -970,7 +989,8 @@ def:
       description: |
         `Package.swift` points MLX at the Layr-Labs `mlx-swift` fork and adds the server, bench and
         test targets. Its native pin includes the current-pass barrier before fast Metal fence
-        waits; this ordering correction does not qualify an installed distributed model.
+        waits; this ordering correction does not qualify an installed distributed model. The pin
+        also carries the per-thread prefill-row scope (Layr-Labs/mlx-swift#78, Layr-Labs/mlx#71).
         `patches/` carries the loader patches applied to that dependency; `.gitignore`
         keeps reference implementations out of the tree and `.gitattributes` protects the immutable
         benchmark prompt whose byte content is committed alongside its token IDs and receipts.
