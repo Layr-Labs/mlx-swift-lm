@@ -44,6 +44,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     /// before engine use; never replace during execution. Invoked once per
     /// sample on the engine queue. No callback result changes sampling.
     var sampleObserverForTesting: (([CBv2RequestID], Int) -> Void)?
+    /// Test-only: the presence/frequency counts each draw or verify call
+    /// applies to a penalty row, read back to the host. No effect on sampling.
+    var penaltyCountObserverForTesting: ((CBv2PenaltyCountObservation) -> Void)?
     public var supportsTokenConstraints: Bool { true }
     public var supportsReasoningBudgets: Bool { true }
     public var supportsConstrainedChainedDecode: Bool { true }
@@ -132,6 +135,11 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
         pipeline: LogitsPipelineV2, speculative: Bool
     ) -> MLXArray {
+        if let observe = penaltyCountObserverForTesting, let counts = pipeline.outputCountsForTesting {
+            for (row, id) in requestIDs.enumerated() where CBv2MTPVerifyPenalties.applies(params[row]) {
+                observe(.init(kind: .sample, id: id, counts: [counts[row].asArray(Float.self)]))
+            }
+        }
         // Apply the grammar exactly once, after arithmetic transforms and
         // before top-k/top-p/min-p. This preserves the valid language even
         // for malformed-but-decodable penalties that can resurrect
@@ -540,6 +548,17 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
             let window = prefix[0..., penalties.columnOffset ..< (penalties.columnOffset + w), 0...]
             counts = counts + window
         }
+        if let observe = penaltyCountObserverForTesting {
+            let used = draftsNeeded > 0 ? penalties.drafts?[0..., ..<draftsNeeded].asType(.int32) : nil
+            for r in 0 ..< b where penaltyRows[r] {
+                observe(.init(
+                    kind: .verify, id: requestIDs[r],
+                    counts: (0 ..< w).map { counts[r, $0].asArray(Float.self) },
+                    outputTokens: Array(penalties.outputTokens[r]),
+                    drafts: used.map { $0[r].asArray(Int32.self).map(Int.init) } ?? [],
+                    columnOffset: penalties.columnOffset))
+            }
+        }
         let flatCounts = counts.reshaped([b * w, vocab])
         var freqs = [Float](repeating: 0, count: b * w)
         var press = [Float](repeating: 0, count: b * w)
@@ -619,4 +638,19 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     func maskFreeSpanVerification(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
         constraintSampler.mask(logits, requestIDs: requestIDs)
     }
+}
+
+/// Test-only observation of the presence/frequency counts a penalty row was
+/// scored with (`CBv2DefaultSampler.penaltyCountObserverForTesting`).
+struct CBv2PenaltyCountObservation {
+    enum Kind { case sample, verify }
+    let kind: Kind
+    let id: CBv2RequestID
+    /// `.sample`: one row of counts; `.verify`: one per window position.
+    let counts: [[Float]]
+    /// `.verify` only: the confirmed output the engine passed, the round's
+    /// drafts used, and the window's first global position.
+    var outputTokens: [Int] = []
+    var drafts: [Int] = []
+    var columnOffset = 0
 }

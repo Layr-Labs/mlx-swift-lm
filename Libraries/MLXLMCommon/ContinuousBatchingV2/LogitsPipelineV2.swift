@@ -394,6 +394,10 @@ public final class LogitsPipelineV2 {
         fileprivate let ringPos: MLXArray?
     }
 
+    /// Test-only: the incremental output counts `[B, vocab]`, nil without
+    /// presence/frequency rows.
+    var outputCountsForTesting: MLXArray? { outputCounts }
+
     var penaltyState: PenaltyState {
         PenaltyState(
             outputCounts: outputCounts, repWindowCounts: repWindowCounts,
