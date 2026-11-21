@@ -178,6 +178,8 @@ jobs:
         id: build
         # --enable-code-coverage instruments the test binaries. The test jobs
         # write the coverage data, and the coverage job reports it.
+        # -debug-info-format none: the test products drop the object files
+        # and dSYMs that hold DWARF, so the build emits none and runs no dsymutil.
         # -enable-incremental-file-hashing lets the Swift driver keep the
         # restored objects of a file whose content did not change. The
         # checkout gives every file a new modification time.
@@ -206,6 +208,7 @@ jobs:
           # Swift 6.4 defaults to Swift Build; every SwiftPM call here uses the native
           # build system, so --skip-build and --show-bin-path find these products.
           CC=$wrapper swift build --build-system native --build-tests --enable-code-coverage --disable-index-store \
+            -debug-info-format none \
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
