@@ -1945,8 +1945,14 @@ public class Gemma4TextModelInner: Module {
                 hasCaptureHook: captureHook != nil,
                 initialOffset: initialOffset)
         {
+            let earlyTokenIDs: [Int32]? =
+                blockSDCMConfig.earlyPreCompactAfterLayer.map {
+                    (0 ..< max(0, layers.count - 1)).contains($0)
+                } == true
+                ? inputs.asType(.int32).asArray(Int32.self) : nil
             let (postNorm, _) = forwardBlockSDCMTrunk(
                 h,
+                inputTokenIDs: earlyTokenIDs,
                 fullCache: fullCache,
                 sdcm: blockSDCMConfig,
                 isExpertPrefill: gemma4AllowsWeightedExpertUnsort(

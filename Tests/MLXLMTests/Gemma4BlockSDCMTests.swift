@@ -58,6 +58,21 @@ struct Gemma4BlockSDCMTests {
         #expect(fast.interiorMoEK(forLayer: 2) == 2)
         #expect(fast.interiorMoEK(forLayer: 6) == 6)
         #expect(fast.reversePrefixQuota[6] == 0.32)
+        #expect(fast.earlyPreCompactAfterLayer == nil)
+
+        for alias in ["turbo", "v3", "l1", "ultra"] {
+            let turbo = Gemma4BlockSDCMConfig.resolve(environment: [
+                Gemma4BlockSDCMConfig.envKey: alias
+            ])
+            #expect(turbo.mode == .turbo)
+            #expect(turbo.earlyPreCompactAfterLayer == 0)
+            #expect(turbo.earlyPreCompactRatio == 0.55)
+            #expect(turbo.earlyPreCompactBlockSize == 64)
+            #expect(turbo.earlyPreCompactTopHaloK == 8)
+            #expect(turbo.blockSize == 32)
+            #expect(turbo.keepSchedule[6] == 0.36)
+            #expect(turbo.reversePrefixQuota[24] == 0.20)
+        }
     }
 
     // MARK: - Arbitrary-Position RoPE Exact Parity
@@ -1098,5 +1113,401 @@ struct Gemma4BlockSDCMTests {
         eval(minIdx, minW, maxIdx, maxW)
         #expect(minIdx.shape == [1, 16, 1])
         #expect(maxIdx.shape == [1, 16, model.configuration.numExperts ?? 8])
+    }
+
+    // MARK: - Block-SDCM v3 (Turbo Early Tri-Signal + Position-Aware Sparse L5)
+
+    @Test("prefixLocalFullTailAttention with non-contiguous positions matches exact explicit mask and edge cases")
+    func prefixLocalFullTailWithPositionsParity() {
+        MLXRandom.seed(2026)
+        let scale: Float = 1.0 / sqrt(32.0)
+
+        func verifyAgainstReference(
+            posHost: [Int32], P: Int, W: Int, tail: Int, chunkSize: Int, label: String
+        ) {
+            let L = posHost.count
+            let posArr = MLXArray(posHost)
+            let q = MLXRandom.normal([1, 4, L, 32]).asType(.float32)
+            let k = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+            let v = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+
+            let sparse = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                queries: q, keys: k, values: v,
+                positions: posArr, positionsHost: posHost,
+                prefixTokens: P, localWindow: W, tailTokens: tail,
+                scale: scale, chunkSize: chunkSize)
+
+            let ref: MLXArray
+            if W <= 0 || tail >= L {
+                ref = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v, scale: scale, mask: .causal)
+            } else {
+                let qPos = posArr.expandedDimensions(axis: 1)
+                let kPos = posArr.expandedDimensions(axis: 0)
+                let qIdx = MLXArray((0 ..< L).map { Int32($0) }).expandedDimensions(axis: 1)
+                let tailCut = Int32(max(0, L - max(0, tail)))
+                let refMask =
+                    (kPos .<= qPos)
+                    .&& ((kPos .< Int32(max(0, P))) .|| ((qPos - kPos) .< Int32(W))
+                        .|| (qIdx .>= tailCut))
+                ref = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v, scale: scale, mask: .array(refMask))
+            }
+            eval(sparse, ref)
+            let diff = MLX.abs(sparse - ref).max().item(Float.self)
+            #expect(diff < 1e-5, "Position-aware sparse L5 mismatch (\(label)): \(diff)")
+        }
+
+        // Simulate 55% post-L0 compacted positions: keep prefix [0..<64], tail [576..<640], and alternating interior blocks.
+        let origLen = 640
+        var compactedPos: [Int32] = []
+        for b in 0 ..< (origLen / 32) {
+            if b < 2 || b >= 18 || b.isMultiple(of: 2) {
+                for j in 0 ..< 32 { compactedPos.append(Int32(b * 32 + j)) }
+            }
+        }
+        // Test across small chunk, medium chunk, default chunkSize (1024 > L), and non-positive chunkSize.
+        for chunk in [16, 64, 1024, 0, -8] {
+            verifyAgainstReference(
+                posHost: compactedPos, P: 64, W: 96, tail: 64, chunkSize: chunk,
+                label: "compacted chunk=\(chunk)")
+        }
+        // P == 0, T == 0, T >= L (cut <= 0), W <= 0.
+        verifyAgainstReference(
+            posHost: compactedPos, P: 0, W: 96, tail: 64, chunkSize: 32, label: "P=0")
+        verifyAgainstReference(
+            posHost: compactedPos, P: 64, W: 96, tail: 0, chunkSize: 32, label: "T=0")
+        verifyAgainstReference(
+            posHost: compactedPos, P: 0, W: 96, tail: 0, chunkSize: 32, label: "P=0,T=0")
+        verifyAgainstReference(
+            posHost: compactedPos, P: 64, W: 96, tail: compactedPos.count, chunkSize: 32,
+            label: "T==L")
+        verifyAgainstReference(
+            posHost: compactedPos, P: 64, W: 0, tail: 64, chunkSize: 32, label: "W=0")
+        verifyAgainstReference(
+            posHost: compactedPos, P: 64, W: -16, tail: 64, chunkSize: 32, label: "W<0")
+
+        // Arbitrary large gaps >> W where k0 transitions across pEnd (and where pEnd == 0).
+        let hugeGapPos: [Int32] = [0, 1, 2, 3, 500, 501, 502, 4000, 4001, 9000, 9001, 9002]
+        verifyAgainstReference(
+            posHost: hugeGapPos, P: 3, W: 16, tail: 2, chunkSize: 2, label: "huge-gaps-prefix")
+        verifyAgainstReference(
+            posHost: hugeGapPos, P: 3, W: 16, tail: 0, chunkSize: 1, label: "huge-gaps-chunk1")
+        let shiftedPos: [Int32] = [100, 101, 250, 251, 600, 601, 900]
+        verifyAgainstReference(
+            posHost: shiftedPos, P: 50, W: 32, tail: 1, chunkSize: 2, label: "pEnd==0")
+
+        // Exact window boundary: pos[cut - 1] - pos[pEnd] == W - 1 (exact causal) vs == W (sparse).
+        let boundaryPos: [Int32] = [0, 1, 10, 15, 25, 26, 40]
+        verifyAgainstReference(
+            posHost: boundaryPos, P: 10, W: 17, tail: 1, chunkSize: 1024, label: "span==W-1")
+        verifyAgainstReference(
+            posHost: boundaryPos, P: 10, W: 16, tail: 1, chunkSize: 1024, label: "span==W")
+
+        // Contiguous overload with small W < 64 where L - P - T > W (must NOT fall back to causal).
+        let qSmallW = MLXRandom.normal([1, 4, 128, 32]).asType(.float32)
+        let kSmallW = MLXRandom.normal([1, 2, 128, 32]).asType(.float32)
+        let vSmallW = MLXRandom.normal([1, 2, 128, 32]).asType(.float32)
+        let sparseSmallW = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+            queries: qSmallW, keys: kSmallW, values: vSmallW,
+            prefixTokens: 32, localWindow: 32, tailTokens: 32, scale: scale)
+        let qPos128 = MLXArray((0 ..< 128).map { Int32($0) }).expandedDimensions(axis: 1)
+        let kPos128 = MLXArray((0 ..< 128).map { Int32($0) }).expandedDimensions(axis: 0)
+        let refMask128 =
+            (kPos128 .<= qPos128)
+            .&& ((kPos128 .< Int32(32)) .|| ((qPos128 - kPos128) .< Int32(32))
+                .|| (qPos128 .>= Int32(96)))
+        let refSmallW = MLXFast.scaledDotProductAttention(
+            queries: qSmallW, keys: kSmallW, values: vSmallW, scale: scale, mask: .array(refMask128))
+        eval(sparseSmallW, refSmallW)
+        #expect(MLX.abs(sparseSmallW - refSmallW).max().item(Float.self) < 1e-5)
+
+        // L == 0 returns empty zeros cleanly.
+        let emptyOut = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+            queries: MLXArray.zeros([1, 4, 0, 32], dtype: .float32),
+            keys: MLXArray.zeros([1, 2, 0, 32], dtype: .float32),
+            values: MLXArray.zeros([1, 2, 0, 32], dtype: .float32),
+            positions: MLXArray([Int32]()),
+            positionsHost: [],
+            prefixTokens: 32, localWindow: 64, tailTokens: 32, scale: scale, chunkSize: 0)
+        #expect(emptyOut.shape == [1, 4, 0, 32])
+    }
+
+    @Test("selectEarlyTriSignalIndices retains Query MaxSim, Outlier Novelty, and Token-IDF blocks with targeted halo")
+    func earlyTriSignalSelectionGuarantees() {
+        let bs = 32
+        let nBlocks = 24
+        let T = nBlocks * bs  // 768 tokens
+        let D = 16
+
+        // Build synthetic embeddings [1, T, D]:
+        //  - Boilerplate interior blocks point along axis 0.
+        //  - Prefix tokens [4..<32] point along axis 1; block 6 matches prefix (Query MaxSim hit) -> should keep 6 + halo 5,7!
+        //  - Post-L0 layerHidden has block 12 pointing along axis 2 (zero lexical overlap Outlier Novelty hit!).
+        //  - Token IDs are uniform boilerplate (id=10) except block 16 has unique rare IDs (5000..5031 -> Token-IDF hit!).
+        var embBuf = [Float](repeating: 0, count: T * D)
+        var layBuf = [Float](repeating: 0, count: T * D)
+        var tokIDs = [Int32](repeating: 10, count: T)
+
+        for i in 0 ..< T {
+            embBuf[i * D + 0] = 1.0
+            layBuf[i * D + 0] = 1.0
+        }
+        // Prefix query along axis 1
+        for i in 4 ..< 32 {
+            embBuf[i * D + 0] = 0.0
+            embBuf[i * D + 1] = 1.0
+        }
+        // Block 6: matches prefix query in embedding space (Query MaxSim hit)
+        for i in (6 * bs) ..< (7 * bs) {
+            embBuf[i * D + 0] = 0.0
+            embBuf[i * D + 1] = 1.0
+        }
+        // Block 12: orthogonal outlier in post-L0 hidden state (C @ C^T Novelty hit)
+        for i in (12 * bs) ..< (13 * bs) {
+            layBuf[i * D + 0] = 0.0
+            layBuf[i * D + 2] = 1.0
+        }
+        // Block 16: unique rare token IDs (Token-IDF Rarity hit)
+        for j in 0 ..< bs {
+            tokIDs[16 * bs + j] = Int32(5000 + j)
+        }
+
+        let emb = MLXArray(embBuf, [1, T, D])
+        let lay = MLXArray(layBuf, [1, T, D])
+        var cfg = Gemma4BlockSDCMConfig.turbo
+        cfg.prefixKeep = 64  // blocks 0..1
+        cfg.tailKeep = 64    // blocks 22..23
+        cfg.strataCount = 4
+
+        let kept = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: tokIDs,
+            embeddingHidden: emb,
+            layerHidden: lay,
+            targetFraction: 0.50,
+            blockSize: bs,
+            topHaloK: 1,
+            config: cfg)
+        // Strictly ascending and compacted below T
+        #expect(kept.count < T)
+        for i in 1 ..< kept.count { #expect(kept[i] > kept[i - 1]) }
+        let keptBlocks = Set(kept.map { Int($0) / bs })
+        // Prefix & tail pinned
+        #expect(keptBlocks.contains(0) && keptBlocks.contains(1))
+        #expect(keptBlocks.contains(22) && keptBlocks.contains(23))
+        // Signal 1 (Query MaxSim) + targeted ±1 halo
+        #expect(keptBlocks.contains(6))
+        #expect(keptBlocks.contains(5) && keptBlocks.contains(7))
+        // Signal 2 (C @ C^T Outlier Novelty)
+        #expect(keptBlocks.contains(12))
+        // Signal 3 (CPU Token-IDF Rarity)
+        #expect(keptBlocks.contains(16))
+    }
+
+    @Test("selectEarlyTriSignalIndices handles T=0/1, p1<=p0, partial tail, nil/wrong tokenIDs, zero variance, large topHaloK, NaN/Inf, and FP16")
+    func earlyTriSignalEdgeCases() {
+        let D = 16
+        var cfg = Gemma4BlockSDCMConfig.turbo
+        cfg.prefixKeep = 32
+        cfg.tailKeep = 32
+        cfg.strataCount = 4
+
+        // 1. T = 0, T = 1, and D = 0
+        #expect(
+            Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+                tokenIDs: [],
+                embeddingHidden: MLXArray.zeros([1, 0, D], dtype: .float32),
+                layerHidden: MLXArray.zeros([1, 0, D], dtype: .float32),
+                targetFraction: 0.50, blockSize: 16, topHaloK: 4, config: cfg
+            ).isEmpty)
+        #expect(
+            Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+                tokenIDs: [42],
+                embeddingHidden: MLXArray.ones([1, 1, D], dtype: .float32),
+                layerHidden: MLXArray.ones([1, 1, D], dtype: .float32),
+                targetFraction: 0.50, blockSize: 16, topHaloK: 4, config: cfg
+            ) == [0])
+        #expect(
+            Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+                tokenIDs: [1, 2, 3, 4],
+                embeddingHidden: MLXArray.zeros([1, 4, 0], dtype: .float32),
+                layerHidden: MLXArray.zeros([1, 4, 0], dtype: .float32),
+                targetFraction: 0.50, blockSize: 2, topHaloK: 1, config: cfg
+            ) == [0, 1, 2, 3])
+
+        // 2. p1 <= p0 (T = 16 -> p0 = 4, T/4 = 4 => p1 == p0) with > 4 interior blocks
+        var tinyCfg = cfg
+        tinyCfg.prefixKeep = 2
+        tinyCfg.tailKeep = 2
+        tinyCfg.strataCount = 2
+        MLXRandom.seed(11)
+        let emb16 = MLXRandom.normal([1, 16, D]).asType(.float32)
+        let lay16 = MLXRandom.normal([1, 16, D]).asType(.float32)
+        let kept16 = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: nil, embeddingHidden: emb16, layerHidden: lay16,
+            targetFraction: 0.50, blockSize: 2, topHaloK: 1, config: tinyCfg)
+        #expect(kept16.first == 0 && kept16.last == 15)
+        #expect(kept16.count < 16)
+
+        // 3. Partial last block (T % bs != 0), nil & wrong-length tokenIDs, and constant zero-variance inputs
+        let T = 373  // 12 blocks of 32 (last block has 21 tokens)
+        let bs = 32
+        let embRand = MLXRandom.normal([1, T, D]).asType(.float32)
+        let layRand = MLXRandom.normal([1, T, D]).asType(.float32)
+        let keptNilTok = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: nil, embeddingHidden: embRand, layerHidden: layRand,
+            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+        let keptBadTok = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: [1, 2, 3], embeddingHidden: embRand, layerHidden: layRand,
+            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+        #expect(keptNilTok == keptBadTok)
+        #expect(keptNilTok.first == 0 && keptNilTok.last == Int32(T - 1))
+        #expect(keptNilTok.count < T)
+
+        let constEmb = MLXArray.ones([1, T, D], dtype: .float32)
+        let constLay = MLXArray.ones([1, T, D], dtype: .float32)
+        let constTok = [Int32](repeating: 7, count: T)
+        let keptConst = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: constTok, embeddingHidden: constEmb, layerHidden: constLay,
+            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+        #expect(keptConst.first == 0 && keptConst.last == Int32(T - 1))
+        #expect(keptConst.count < T)
+
+        // 4. topHaloK far exceeding needInteriorBlocks must stay bounded by needInteriorBlocks and compact < T.
+        let keptHugeHalo = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: constTok, embeddingHidden: embRand, layerHidden: layRand,
+            targetFraction: 0.50, blockSize: bs, topHaloK: 100, config: cfg)
+        let keptHugeHaloBlocks = Set(keptHugeHalo.map { Int($0) / bs })
+        // Pinned: block 0 (32) + block 11 (21) = 53 tokens; desired = 187 -> needInteriorBlocks = ceil(134/32) = 5.
+        #expect(keptHugeHaloBlocks.count == 2 + 5)
+        #expect(keptHugeHalo.count < T)
+
+        // 5. Non-finite inputs (NaN / +Inf / -Inf) remain crash-free, strictly ascending, and pinned.
+        var badEmb = [Float](repeating: 1.0, count: T * D)
+        var badLay = [Float](repeating: 1.0, count: T * D)
+        badEmb[5 * D] = .nan
+        badEmb[100 * D] = .infinity
+        badLay[120 * D] = -.infinity
+        badLay[200 * D] = .nan
+        let keptNonFinite = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: constTok,
+            embeddingHidden: MLXArray(badEmb, [1, T, D]),
+            layerHidden: MLXArray(badLay, [1, T, D]),
+            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+        #expect(keptNonFinite.first == 0 && keptNonFinite.last == Int32(T - 1))
+        for i in 1 ..< keptNonFinite.count { #expect(keptNonFinite[i] > keptNonFinite[i - 1]) }
+
+        // 6. FP16 inputs with large magnitude (30,000 -> would overflow FP16 when squared) stay safe.
+        let fp16Emb = (embRand * Float(10_000.0)).asType(.float16)
+        let fp16Lay = (layRand * Float(10_000.0)).asType(.float16)
+        let keptFP16 = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
+            tokenIDs: (0 ..< T).map { Int32($0 % 64) },
+            embeddingHidden: fp16Emb,
+            layerHidden: fp16Lay,
+            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+        #expect(keptFP16.first == 0 && keptFP16.last == Int32(T - 1))
+        #expect(keptFP16.count < T)
+    }
+
+    @Test("End-to-end turbo Block-SDCM v3 prefills and decodes cleanly across Paged and Standalone KV caches")
+    func endToEndTurboPrefillAndDecode() throws {
+        MLXRandom.seed(404)
+        let model = try Self.makeSyntheticGemma4MoE()
+        var turboCfg = Gemma4BlockSDCMConfig.turbo
+        turboCfg.minPromptTokens = 128
+        turboCfg.prefixKeep = 16
+        turboCfg.tailKeep = 16
+        turboCfg.earlyPreCompactAfterLayer = 0
+        turboCfg.earlyPreCompactRatio = 0.60
+        turboCfg.earlyPreCompactBlockSize = 16
+        turboCfg.earlyPreCompactTopHaloK = 2
+        turboCfg.blockSize = 16
+        // Synthetic 12-layer 5:1 model has full attention at layers 5 and 11.
+        turboCfg.keepSchedule = [6: 0.35]
+        turboCfg.reversePrefixQuota = [6: 0.25]
+        turboCfg.reversePrefixEnd = 24
+        turboCfg.earlySparseFullLayer = 5
+        turboCfg.sparsePrefixTokens = 16
+        turboCfg.sparseLocalWindow = 32
+        turboCfg.sparseTailTokens = 16
+        turboCfg.slidingChunkSize = 64
+        model.blockSDCMConfig = turboCfg
+
+        let T = 256
+        let promptIDs = (0 ..< T).map { Int32(($0 * 11 + 5) % model.vocabularySize) }
+        let prompt1D = MLXArray(promptIDs)
+        let prompt = prompt1D.expandedDimensions(axis: 0)
+        let nextTok = MLXArray([Int32(7)]).reshaped([1, 1])
+
+        // 1. Standalone KVCache (`prepare` prefills [0 ..< T - 1], returns final token)
+        do {
+            let simpleCaches = model.newCache(parameters: nil)
+            let prepared = try model.prepare(
+                LMInput(tokens: prompt1D), cache: simpleCaches, state: nil,
+                prefill: PrefillParameters())
+            guard case .tokens(let remaining) = prepared else {
+                Issue.record("Expected .tokens from turbo Block-SDCM prepare")
+                return
+            }
+            #expect(remaining.tokens.size == 1)
+            for c in simpleCaches {
+                if case .scalar(let off) = c.ropeOffset {
+                    #expect(off == T - 1)
+                } else {
+                    Issue.record("Expected scalar ropeOffset on standalone cache")
+                }
+            }
+            let frontierLogits = model(
+                remaining.tokens.expandedDimensions(axis: 0), cache: simpleCaches)
+            eval(frontierLogits)
+            #expect(frontierLogits.shape == [1, 1, model.vocabularySize])
+            #expect(!MLX.isNaN(frontierLogits).any().item(Bool.self))
+
+            let decLogits = model(nextTok, cache: simpleCaches)
+            eval(decLogits)
+            #expect(decLogits.shape == [1, 1, model.vocabularySize])
+            #expect(!MLX.isNaN(decLogits).any().item(Bool.self))
+        }
+
+        // 2. PagedLayerCache via CBv2
+        do {
+            let kinds = model.cbv2LayerKinds
+            let backend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024,
+                    dtype: .float32, maxPrefillChunk: 256))
+            let state = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: T, maxLength: T + 32)
+            defer { backend.release(state) }
+            let rows = state.map { $0 as! PagedSequenceKV }
+            let pagedCaches = backend.makeLayerCaches()
+            let caches: [KVCache] = pagedCaches.enumerated().map { idx, c in
+                c.setRows([rows[idx]])
+                return c
+            }
+
+            let pagedOut = model.cbv2Prefill(
+                prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(pagedOut)
+            #expect(pagedOut.shape == [1, model.vocabularySize])
+            #expect(!MLX.isNaN(pagedOut).any().item(Bool.self))
+
+            // Layer 5 runs AFTER L0 early pre-compaction (< T); Layer 11 runs AFTER L6 bilateral compaction (< L5).
+            #expect(rows[5].absoluteOffset < T)
+            #expect(rows[11].absoluteOffset < rows[5].absoluteOffset)
+            for layer in 0 ..< kinds.count {
+                #expect(rows[layer].ropePositionOffset == T)
+                #expect(rows[layer].isCompacted)
+            }
+
+            let pagedDec = model(nextTok, cache: caches)
+            eval(pagedDec)
+            #expect(pagedDec.shape == [1, 1, model.vocabularySize])
+            #expect(!MLX.isNaN(pagedDec).any().item(Bool.self))
+            for layer in 0 ..< kinds.count {
+                #expect(rows[layer].ropePositionOffset == T + 1)
+            }
+        }
     }
 }
