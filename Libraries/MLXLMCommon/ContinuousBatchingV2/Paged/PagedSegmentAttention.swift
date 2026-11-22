@@ -37,6 +37,28 @@ enum PagedSegmentAttention {
             """
     }
 
+    /// `body` with the side-by-side pass A: one threadgroup holds every head
+    /// group of a kv head (`PagedAttentionKernel.sideBySideHeadsPerRound`).
+    static func sideBody(bindings: Int) -> String {
+        let pointers = (0 ..< bindings).map { "segment\($0)" }.joined(separator: ", ")
+        return """
+            const device int32_t* record = records + threadgroup_position_in_grid.y * STRIDE;
+            const cbv2::PagedSegmentAccessor<T, SEGMENTS> cache{
+                {\(pointers)}, value_offsets, record, (size_t)KVH * S * D};
+            const uint3 position(threadgroup_position_in_grid.x, record[0], record[1]);
+            if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+                fence[0] = previous[0] + 1;
+            }
+            threadgroup float q_smem[GQA * D];
+            threadgroup float red_smem[NSG * HRED * (D + 2)];
+            cbv2::paged_attention_part_side_impl<T, D, S, GQA, HPT, NSG, PTOK, HRED, HAS_WRITE, HAS_SOFTCAP>(
+                q, knew, vnew, cache, seqinfo, seqinfo, params, KVH, 0, record[6],
+                q_smem, red_smem, partials, meta,
+                position, thread_position_in_threadgroup, simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """
+    }
+
     private static func kernel(
         key: PagedAttentionKernelKey, bindings: Int, kvHeads: Int,
         source: String, allocatesScratch: Bool = false
@@ -50,7 +72,9 @@ enum PagedSegmentAttention {
                 name: name,
                 inputNames: inputNames(bindings: bindings, allocatesScratch: allocatesScratch),
                 outputNames: ["fence"] + (allocatesScratch ? ["partials", "meta"] : []),
-                source: body(bindings: bindings), header: source, ensureRowContiguous: true,
+                source: key.sideHeadsPerRound > 0
+                    ? sideBody(bindings: bindings) : body(bindings: bindings),
+                header: source, ensureRowContiguous: true,
                 mutableInputs: (allocatesScratch ? [] : ["partials", "meta"])
                     + (key.hasWrite ? (0 ..< bindings).map { "segment\($0)" } : []))
             kernels[name] = made
@@ -83,7 +107,8 @@ enum PagedSegmentAttention {
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
         dispatchCache: PagedSegmentDispatchCache? = nil,
         zeroFilledScratch: Bool = false,
-        seqinfoCache: PagedSegmentSeqinfoCache? = nil
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil,
+        sideBySideMinimumTokens: Int = PagedAttentionKernel.sideBySideMinimumTokens
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -138,10 +163,14 @@ enum PagedSegmentAttention {
         var partials: MLXArray? =
             zeroFilledScratch ? MLXArray.zeros(partialsShape, dtype: .float32) : nil
         var meta: MLXArray? = zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil
+        let side = PagedAttentionKernel.sideBySideForDispatch(
+            headDim: d, gqa: gqa, maxAttendLength: maxLength,
+            minimumTokens: sideBySideMinimumTokens)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
-            partitionTokens: ptok, hasWrite: newKeys != nil)
+            partitionTokens: ptok, hasWrite: newKeys != nil, sideHeadsPerRound: side ?? 0)
+        let threads = side == nil ? 32 * nsg : 32 * nsg * splits
         for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
             let segments = bucket.segmentIDs.map { group.segments[$0]! }
             let bindingCount = bucket.bindingClass
@@ -154,26 +183,27 @@ enum PagedSegmentAttention {
                 [q, k, v] + backing + [
                     seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
                 ]
-            let template: [(String, any KernelTemplateArg)] = [
+            var template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("D", d), ("S", group.pageSize),
                 ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
                 ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
                 ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
                 ("STRIDE", PagedSegmentDispatchPlan.recordStride),
             ]
+            if let side { template.append(("HRED", side)) }
             let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
             if let partials, let meta {
                 group.writeFence =
                     kernel(
                         key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
                         inputs + [partials, meta], template: template, grid: grid,
-                        threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[
+                        threadGroup: (threads, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[
                         0]
             } else {
                 let outputs = kernel(
                     key: partKey, bindings: bindingCount, kvHeads: kvh, source: source,
                     allocatesScratch: true)(
-                        inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
+                        inputs, template: template, grid: grid, threadGroup: (threads, 1, 1),
                         outputShapes: [[1], partialsShape, [metaCount]],
                         outputDTypes: [.int32, .float32, .float32])
                 group.writeFence = outputs[0]
