@@ -27,7 +27,8 @@ run selects. So a new test always runs, also when nobody adds it to the
 map. A shard has at most one rest run. When several shards have one, the
 tests split by unit over them (split_rest), so the new suites of a pull
 request do not all wait in one shard. The shard lists the tests, finds its
-share and runs only them, by their full IDs.
+share and runs only them, by their full IDs, in the same process as its main
+run with the default settings (rest_host): no second test process starts.
 
 "hosted_tests" records exact temporary runner exceptions. They have their
 own shard with "runner": "hosted"; a new plan preserves those identities
@@ -194,6 +195,7 @@ def resolve_runs(data: dict) -> list[dict]:
                 "metallib": bool(first.get("metallib", True)),
                 "env": first.get("env", {}),
                 "before": first.get("before", []),
+                "own_process": bool(first.get("own_process", False)),
                 "timeout_minutes": max([m.get("timeout_minutes", 30) for m in members] or [30]),
             })
     rest_shards = [run["shard"] for run in runs if run["rest"]]
@@ -286,6 +288,31 @@ def selection(run: dict, runs: list[dict], tests: list[str]) -> list[str]:
     return [test for test in tests if selects(run, test)]
 
 
+def rest_host(rest_run: dict, runs: list[dict]) -> dict | None:
+    """Return the shard's last main run with the default settings, where the planner puts units."""
+    hosts = [run for run in runs if run["shard"] == rest_run["shard"] and not run["rest"]
+             and all(run[key] == default for key, default in SETTINGS)]
+    return hosts[-1] if hosts else None
+
+
+def shard_selections(runs: list[dict], all_runs: list[dict], listed: list[str]) -> dict[str, tuple]:
+    """Return, for each run of one shard, its own tests, the rest tests that it also runs,
+    and the run that runs its own tests instead (for a rest run).
+
+    A rest run's tests run in its host run (rest_host) when the host selects tests, so the
+    shard starts no second test process for them.
+    """
+    own = {run["id"]: selection(run, all_runs, listed) for run in runs}
+    rest = {run["id"]: [] for run in runs}
+    host_of = {run["id"]: None for run in runs}
+    for run in runs:
+        host = rest_host(run, runs) if run["rest"] else None
+        if host and own[host["id"]]:
+            rest[host["id"]] = own[run["id"]]
+            host_of[run["id"]] = host["id"]
+    return {run["id"]: (own[run["id"]], rest[run["id"]], host_of[run["id"]]) for run in runs}
+
+
 # check
 
 
@@ -340,12 +367,14 @@ def expand(value: str) -> str:
     return value.replace("{temp}", os.environ.get("RUNNER_TEMP", "/tmp"))
 
 
-def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None) -> list[str]:
+def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None,
+                rest: list[str] = ()) -> list[str]:
     """Return the swift test command of one attempt of a run.
 
     With `exact`, the command selects these tests by their full IDs. A later
     attempt runs only the tests that did not execute because the test process
-    stopped.
+    stopped. Without it, the run's filters select its tests and full IDs
+    select the rest tests that it also runs.
     """
     outputs = ["--xunit-output", str(folder / f"xunit-{attempt}.xml"),
                "--event-stream-output-path", str(folder / f"events-{attempt}.jsonl"),
@@ -353,7 +382,7 @@ def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None) 
     if exact is not None:
         patterns = [exact_pattern(test) for test in exact]
     else:
-        patterns = [f for part in run["parts"] for f in part["filters"]]
+        patterns = [f for part in run["parts"] for f in part["filters"]] + [exact_pattern(test) for test in rest]
     filters = [a for pattern in patterns for a in ("--filter", pattern)]
     return ["swift", "test", *BUILD_SYSTEM, "--skip-build", "--no-parallel", *filters, *outputs]
 
@@ -429,6 +458,7 @@ def command_run(args: argparse.Namespace) -> int:
     failed = []
     summary = []
     staged = False
+    selections = shard_selections(runs, all_runs, listed)
     ordered = [run for run in runs if not run["metallib"]] + [run for run in runs if run["metallib"]]
     for run in ordered:
         if run["metallib"] and not staged:
@@ -457,20 +487,27 @@ def command_run(args: argparse.Namespace) -> int:
         for step in run["before"]:
             status = subprocess.run([expand(a) for a in step], cwd=ROOT, env=env).returncode or status
         attempt = 1
-        chosen = selection(run, all_runs, listed)
-        if run["rest"] and chosen:
-            print(f"This shard's rest run runs {len(chosen)} tests that are in no shard of the map. "
+        own, rest, host = selections[run["id"]]
+        chosen = own + rest
+        unmapped = rest if not run["rest"] else ([] if host else own)
+        if unmapped:
+            print(f"{run['id']} runs {len(unmapped)} tests that are in no shard of the map. "
                   "The shard map check reports them all.", flush=True)
-        if run["rest"] and not chosen:
+        if host:
+            note = f"{host} runs the {len(own)} tests of this rest run." if own else \
+                "Each listed test is in another run of the map."
+            (folder / "log-1.txt").write_text(note + "\n")
+            print(note, flush=True)
+        elif run["rest"] and not chosen:
             (folder / "log-1.txt").write_text("Each listed test is in another run of the map.\n")
             print("Each listed test is in another run of the map.", flush=True)
-        elif not chosen:
+        elif not own:
             (folder / "log-1.txt").write_text("The run selects no listed test.\n")
             print(f"::error::{run['id']} selects no listed test.", flush=True)
             status = 1
         elif status == 0:
             exact = chosen if needs_exact(run) else None
-            status = stream(run_command(run, folder, 1, exact), env, folder / "log-1.txt",
+            status = stream(run_command(run, folder, 1, exact, rest), env, folder / "log-1.txt",
                             run["timeout_minutes"] * 60)
             # A test process that stops, for example on a fatal error, does
             # not run the tests after the one that stopped it. The next
@@ -485,7 +522,7 @@ def command_run(args: argparse.Namespace) -> int:
                       f"the {len(remaining)} tests that did not execute.", flush=True)
                 stream(run_command(run, folder, attempt, remaining), env, folder / f"log-{attempt}.txt",
                        run["timeout_minutes"] * 60)
-            for problem in run_problems(run, chosen, folder, listed):
+            for problem in run_problems(run, own, folder, listed, rest):
                 print(f"::error::{run['id']}: {problem}", flush=True)
                 status = status or 1
         else:
@@ -513,18 +550,21 @@ def command_run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def run_problems(run: dict, chosen: list[str], folder: Path, listed: list[str]) -> list[str]:
+def run_problems(run: dict, chosen: list[str], folder: Path, listed: list[str],
+                 rest: list[str] = ()) -> list[str]:
     """Return the problems of a finished run, other than test failures.
 
-    A run fails when it executed none of its tests. A strict group fails when
-    it executed none of its tests or skipped one. A skipped test in a strict
-    group means that a precondition is broken, for example a missing Metal
-    library.
+    A run fails when it executed none of its tests, or none of the rest tests
+    that it also runs. A strict group fails when it executed none of its tests
+    or skipped one. A skipped test in a strict group means that a precondition
+    is broken, for example a missing Metal library.
     """
     executions, skipped = executed_tests(folder, listed=listed)
     problems = []
     if not any(canonical(test) in executions for test in chosen):
         problems.append("the run executed zero tests.")
+    if rest and not any(canonical(test) in executions for test in rest):
+        problems.append("the run executed none of the rest tests.")
     for part in run["parts"]:
         if not part["strict"]:
             continue

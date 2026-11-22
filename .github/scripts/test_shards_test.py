@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Tests for test_shards.py. They need no Xcode and no Swift build."""
 
+import argparse
+import contextlib
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_shards  # noqa: E402
@@ -166,6 +171,98 @@ class RestSplitTests(unittest.TestCase):
         rest = sorted(test for share in shares for test in share)
         self.assertEqual(rest, sorted(self.rest_owners(owners)))
         self.assertEqual(len(rest), len(set(rest)))
+
+    def test_the_main_run_with_the_default_settings_runs_the_share(self):
+        tests = TESTS + self.NEW
+        runs = test_shards.resolve_runs(self.data())
+        first = test_shards.shard_selections([r for r in runs if r["shard"] == 1], runs, tests)
+        second = test_shards.shard_selections([r for r in runs if r["shard"] == 2], runs, tests)
+        share1 = ["M.KernelTests/K2/run(dtype:)", *self.NEW[:3]]
+        # Shard 1: unit (no Metal library) and paged (default) come before M.A, the last default run.
+        self.assertEqual(first["shard1-run3"], (["M.A/testOne", "M.A/testTwo", "M.Paged/exclusive()"], share1, None))
+        self.assertEqual(first["shard1-run4"], (share1, [], "shard1-run3"))
+        self.assertEqual(first["shard1-run2"][1:], ([], None))
+        # Shard 2: the extra exclusive pass sets an environment variable, so K1 runs the share.
+        self.assertEqual(second["shard2-run1"][1:], (["M.B/testOne", "M.free()", *self.NEW[3:]], None))
+        self.assertEqual(second["shard2-run2"][2], "shard2-run1")
+        self.assertEqual(second["shard2-run3"][1:], ([], None))
+
+    def test_a_shard_without_a_default_run_that_selects_tests_keeps_its_rest_run(self):
+        groups = [{"name": "unit", "strict": True, "metallib": False, "filters": [r"\.UnitTests/"]},
+                  {"name": "gone", "filters": [r"^M\.Gone/"]}]
+        shards = [{"runs": [{"groups": ["unit"]}, {"rest": True}]},
+                  {"runs": [{"groups": ["gone"]}, {"rest": True}]}]
+        runs = test_shards.resolve_runs(make_map(shards, groups))
+        for shard in (1, 2):
+            selections = test_shards.shard_selections([r for r in runs if r["shard"] == shard], runs, TESTS)
+            rest_id = f"shard{shard}-run2"
+            self.assertIsNone(selections[rest_id][2])
+            self.assertEqual(selections[f"shard{shard}-run1"][1], [])
+        owners, _ = test_shards.partition(runs, TESTS)
+        shares = [test_shards.shard_selections([r for r in runs if r["shard"] == s], runs, TESTS)[f"shard{s}-run2"][0]
+                  for s in (1, 2)]
+        self.assertEqual(sorted(shares[0] + shares[1]),
+                         sorted(t for t, o in owners.items() if o[0] in ("shard1-run2", "shard2-run2")))
+
+    def test_the_main_run_selects_the_share_by_full_id_after_its_own_filters(self):
+        runs = test_shards.resolve_runs(self.data())
+        k1 = next(r for r in runs if r["units"] == ["M.KernelTests/K1"])
+        command = test_shards.run_command(k1, Path("/r"), 1, None, ["M.B/testOne", "M.NewMid/a()"])
+        self.assertEqual(command[6:12], ["--filter", r"^M\.KernelTests/K1/", "--filter", r"^M\.B/testOne$",
+                                        "--filter", r"^M\.NewMid/a\(\)"])
+
+    def test_a_main_run_whose_rest_tests_did_not_execute_fails(self):
+        runs = test_shards.resolve_runs(self.data())
+        k1 = next(r for r in runs if r["units"] == ["M.KernelTests/K1"])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "log-1.txt").write_text("")
+            (folder / "events-1.jsonl").write_text(events(started("M.KernelTests/K1/run()/K.swift:1:1", 1),
+                                                          ended("M.KernelTests/K1/run()/K.swift:1:1", 2)))
+            tests = TESTS + self.NEW
+            self.assertEqual(test_shards.run_problems(k1, ["M.KernelTests/K1/run()"], folder, tests, ["M.NewMid/a()"]),
+                             ["the run executed none of the rest tests."])
+            self.assertEqual(test_shards.run_problems(k1, ["M.KernelTests/K1/run()"], folder, tests), [])
+
+    def test_every_test_runs_once_and_no_rest_run_starts_a_process(self):
+        tests = TESTS + self.NEW
+        commands = []
+
+        def fake_stream(command, env, log, timeout):
+            # A stand-in for swift test: execute every listed test that one of its filters selects.
+            filters = [command[i + 1] for i, a in enumerate(command) if a == "--filter"]
+            events_path = Path(command[command.index("--event-stream-output-path") + 1])
+            ran = [t for t in tests if any(re.search(f, t) for f in filters)]
+            events_path.write_text(events(*[e for i, t in enumerate(ran) for e in (started(t, i), ended(t, i + 0.5))]))
+            log.write_text("")
+            commands.append((log.parent.name, ran))
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "map.json").write_text(json.dumps(self.data()))
+            (root / "tests.txt").write_text("\n".join(tests) + "\n")
+            done = subprocess.CompletedProcess([], 0, stdout="/bin\n")
+            with mock.patch.object(test_shards, "stream", fake_stream), \
+                    mock.patch.object(test_shards.subprocess, "run", return_value=done), \
+                    mock.patch.object(test_shards, "find_metallibs", return_value=[]), \
+                    mock.patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_STEP_SUMMARY": ""}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                for shard in (1, 2):
+                    args = argparse.Namespace(map=root / "map.json", shard=shard, results=root / "results" / str(shard),
+                                              metallib=root / "mlx.metallib", list=root / "tests.txt")
+                    self.assertEqual(test_shards.command_run(args), 0)
+            started_runs = [name for name, _ in commands]
+            self.assertNotIn("shard1-run4", started_runs)
+            self.assertNotIn("shard2-run2", started_runs)
+            self.assertIn("shard1-run3 runs the 4 tests", (root / "results/1/shard1-run4/log-1.txt").read_text())
+            self.assertEqual(dict(commands)["shard2-run1"], ["M.B/testOne", "M.KernelTests/K1/run()", "M.free()",
+                                                            *self.NEW[3:]])
+            verify = subprocess.run([sys.executable, test_shards.__file__, "--map", str(root / "map.json"), "verify",
+                                     "--list", str(root / "tests.txt"), "--results", str(root / "results")],
+                                    capture_output=True, text=True, env={**os.environ, "GITHUB_STEP_SUMMARY": ""})
+            self.assertEqual(verify.returncode, 0, verify.stdout)
+            self.assertIn("Each listed test executed exactly once in the main pass.", verify.stdout)
 
     def test_check_accepts_the_split_and_verify_names_the_rest_run_of_a_missing_test(self):
         with tempfile.TemporaryDirectory() as directory:
