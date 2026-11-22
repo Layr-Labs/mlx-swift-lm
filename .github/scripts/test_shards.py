@@ -22,9 +22,12 @@ from two sources:
   skip leaves it out of its suite, for example the exclusive paged kernel
   test in the main pass.
 
-A run with "rest": true selects every test that no other main run selects.
-So a new test always runs, also when nobody adds it to the map. The shard
-lists the tests, finds those tests and runs only them, by their full IDs.
+The runs with "rest": true together select every test that no other main
+run selects. So a new test always runs, also when nobody adds it to the
+map. A shard has at most one rest run. When several shards have one, the
+tests split by unit over them (split_rest), so the new suites of a pull
+request do not all wait in one shard. The shard lists the tests, finds its
+share and runs only them, by their full IDs.
 
 "hosted_tests" records exact temporary runner exceptions. They have their
 own shard with "runner": "hosted"; a new plan preserves those identities
@@ -177,6 +180,7 @@ def resolve_runs(data: dict) -> list[dict]:
             runs.append({
                 "id": run_id,
                 "shard": shard_index,
+                "estimated_seconds": shard.get("estimated_seconds", 0),
                 "groups": run.get("groups", []),
                 "units": run.get("units", []),
                 "tests": run.get("tests", []),
@@ -189,8 +193,11 @@ def resolve_runs(data: dict) -> list[dict]:
                 "before": first.get("before", []),
                 "timeout_minutes": max([m.get("timeout_minutes", 30) for m in members] or [30]),
             })
-    if len([run for run in runs if run["rest"]]) != 1:
-        raise SystemExit("error: the map must have exactly one rest run.")
+    rest_shards = [run["shard"] for run in runs if run["rest"]]
+    if not rest_shards:
+        raise SystemExit("error: the map must have a rest run.")
+    if len(rest_shards) != len(set(rest_shards)):
+        raise SystemExit("error: a shard has more than one rest run.")
     return runs
 
 
@@ -206,14 +213,35 @@ def part_selects(part: dict, test_id: str) -> bool:
 
 
 def selects(run: dict, test_id: str) -> bool:
-    """Return whether a run that is not the rest run selects a test."""
+    """Return whether a run that is not a rest run selects a test."""
     return any(part_selects(part, test_id) for part in run["parts"])
+
+
+def split_rest(rest_runs: list[dict], rest: list[str], tests: list[str]) -> list[list[str]]:
+    """Split the tests that no other main run selects over the rest runs.
+
+    The map has no durations for these tests. Their units (unit_of), most
+    tests first, go one at a time to the rest run whose shard has the
+    lowest estimated seconds, counting one second for each test it got.
+    Every job computes the same split from the same list and map.
+    """
+    containers = containers_of(tests)
+    units: dict[str, list[str]] = {}
+    for test in rest:
+        units.setdefault(unit_of(test, containers), []).append(test)
+    loads = [float(run["estimated_seconds"]) for run in rest_runs]
+    shares: list[list[str]] = [[] for _ in rest_runs]
+    for _, members in sorted(units.items(), key=lambda item: (-len(item[1]), item[0])):
+        index = min(range(len(rest_runs)), key=lambda i: (loads[i], i))
+        shares[index].extend(members)
+        loads[index] += len(members)
+    return shares
 
 
 def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     """Return the main runs that select each test, and the problems found.
 
-    The rest run selects each test that no other main run selects.
+    The rest runs share the tests that no other main run selects (split_rest).
     """
     owners: dict[str, list[str]] = {test: [] for test in tests}
     problems = []
@@ -229,12 +257,12 @@ def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]],
             continue
         for test in chosen:
             owners[test].append(run["id"])
-    for run in runs:
-        if run["rest"]:
-            rest = [test for test, owned in owners.items() if not owned]
-            run["selected"] = len(rest)
-            for test in rest:
-                owners[test].append(run["id"])
+    rest_runs = [run for run in runs if run["rest"]]
+    rest = [test for test, owned in owners.items() if not owned]
+    for run, share in zip(rest_runs, split_rest(rest_runs, rest, tests)):
+        run["selected"] = len(share)
+        for test in share:
+            owners[test].append(run["id"])
     for test, runs_of_test in owners.items():
         if len(runs_of_test) > 1:
             problems.append(f"{test} is in more than one main run: {', '.join(runs_of_test)}.")
@@ -244,8 +272,8 @@ def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]],
 def selection(run: dict, runs: list[dict], tests: list[str]) -> list[str]:
     """Return the listed tests that a run selects."""
     if run["rest"]:
-        owners, _ = partition([other for other in runs if not other["rest"]], tests)
-        return [test for test, owned in owners.items() if not owned]
+        owners, _ = partition(runs, tests)
+        return [test for test, owned in owners.items() if run["id"] in owned]
     return [test for test in tests if selects(run, test)]
 
 
@@ -262,9 +290,11 @@ def command_check(args: argparse.Namespace) -> int:
     for run in runs:
         kind = "extra" if run["extra"] else ("rest" if run["rest"] else "main")
         print(f"{run['id']}: {kind}, {run['selected']} tests")
-        if run["rest"] and run["selected"]:
-            print(f"::warning::{run['selected']} tests are in no shard of the map, so the rest run "
-                  "runs them. Run test_shards.py plan to add them to the map.")
+    rest = [run["selected"] for run in runs if run["rest"] and run["selected"]]
+    if rest:
+        where = "the rest run of 1 shard runs" if len(rest) == 1 else f"the rest runs of {len(rest)} shards run"
+        print(f"::warning::{sum(rest)} tests are in no shard of the map, so {where} them. "
+              "Run test_shards.py plan to add them to the map.")
     print(f"{len(tests)} tests in the list.")
     for problem in problems[:200]:
         print(f"::error::{problem}")
@@ -420,8 +450,8 @@ def command_run(args: argparse.Namespace) -> int:
         attempt = 1
         chosen = selection(run, all_runs, listed)
         if run["rest"] and chosen:
-            print(f"::warning::{len(chosen)} tests are in no shard of the map. The rest run runs "
-                  "them. Run test_shards.py plan to add them to the map.", flush=True)
+            print(f"::warning::This shard's rest run runs {len(chosen)} tests that are in no shard of the "
+                  "map. Run test_shards.py plan to add them to the map.", flush=True)
         if run["rest"] and not chosen:
             (folder / "log-1.txt").write_text("Each listed test is in another run of the map.\n")
             print("Each listed test is in another run of the map.", flush=True)
@@ -678,7 +708,6 @@ def command_plan(args: argparse.Namespace) -> int:
     count = args.shards
     loads = [float(overhead)] * count
     shards: list[dict] = [{"groups": [], "alone": [], "units": [], "tests": []} for _ in range(count)]
-    rest_shard = count - 1
 
     def lightest() -> int:
         return min(range(count), key=lambda index: loads[index])
@@ -715,8 +744,7 @@ def command_plan(args: argparse.Namespace) -> int:
                 run["tests"] = sorted(shard["tests"])
             runs.append(run)
         runs += [{"groups": [name]} for name in shard["alone"] if groups[name].get("metallib", True)]
-        if index == rest_shard:
-            runs.append({"rest": True})
+        runs.append({"rest": True})
         data["shards"].append({"estimated_seconds": round(loads[index]), "runs": runs})
     if hosted:
         data["shards"].append({"runner": "hosted", "estimated_seconds": round(
