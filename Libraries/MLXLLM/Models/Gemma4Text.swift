@@ -1372,11 +1372,12 @@ class Gemma4Router: Module {
         if let maxActive = batchUnionMaxExperts,
             maxActive >= activeK, maxActive < numExperts,
             expertScores.ndim == 3,
-            expertScores.dim(0) >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize,
-            expertScores.dim(1) == 1
+            expertScores.dim(0) * expertScores.dim(1)
+                >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize,
+            expertScores.dim(1) <= 16
         {
-            let batchSize = expertScores.dim(0)
-            let scoresF32 = expertScores.reshaped(batchSize, numExperts).asType(.float32)
+            let flatRows = expertScores.dim(0) * expertScores.dim(1)
+            let scoresF32 = expertScores.reshaped(flatRows, numExperts).asType(.float32)
             let rowMax = MLX.max(scoresF32, axis: -1, keepDims: true)
             let rowMin = MLX.min(scoresF32, axis: -1, keepDims: true)
             let isDegenerate = (rowMax - rowMin) .<= Float(1e-6)
@@ -1798,6 +1799,9 @@ public class Gemma4DecoderLayer: Module {
     /// summed across ranks before their separate post-norms.
     var tensorParallel: Gemma4TensorParallelContext?
     private let compiledFeedforward = Gemma4CompiledFeedforwardCache()
+    /// Set by `installDFlashContextTap` so extended block-diffusion verify windows
+    /// (`width = 4...16`, `B * width <= maxCompiledRows`) reuse the compiled FFN trace.
+    var compiledExtendedVerificationWidth: Bool = false
     private var _decodeMoETopK: Int?
     /// Optional decode-only MoE top-K override (`DARKBLOOM_GEMMA4_DECODE_MOE_TOPK`).
     /// `nil` means exact checkpoint `router.topK`.
@@ -2047,12 +2051,12 @@ public class Gemma4DecoderLayer: Module {
         allowDecodeMoETopK: Bool
     ) -> (MLXArray, MLXArray) {
         let allowDecode = allowDecodeMoETopK && !isExpertPrefill
-        let activeTopK: Int? = (allowDecode && input.dim(1) <= 3) ? decodeMoETopK : nil
-        // Batch-union couples expert selection across rows, so never engage inside
-        // row-independent `Gemma4BatchDecodeProjection` or `Gemma4PrefillProjection` scopes.
+        let activeTopK: Int? = (allowDecode && input.dim(1) <= 16) ? decodeMoETopK : nil
+        // Batch-union couples expert selection across rows/speculative tokens, so never
+        // engage inside row-independent `Gemma4BatchDecodeProjection` or `Gemma4PrefillProjection`.
         let batchUnionMax: Int? =
-            (allowDecode && input.dim(1) == 1
-                && input.dim(0) >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize
+            (allowDecode && input.dim(1) <= 16
+                && input.dim(0) * input.dim(1) >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize
                 && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active)
             ? decodeMoEBatchUnionMaxExperts : nil
         if activeTopK != nil || batchUnionMax != nil {
@@ -2222,6 +2226,87 @@ public class Gemma4TextModelInner: Module {
     let lastSlidingAttentionNonSharedIdx: Int
     var blockSDCMConfig: Gemma4BlockSDCMConfig = .current
 
+    struct DFlashContextTap {
+        let owner: ObjectIdentifier
+        let layerIDs: [Int]
+        let projector: ([MLXArray]) -> MLXArray
+    }
+
+    struct DFlashTapAccumulator {
+        private let tap: DFlashContextTap
+        private let slotByLayer: [Int: Int]
+        private var slots: [MLXArray?]
+
+        init(_ tap: DFlashContextTap) {
+            self.tap = tap
+            var map: [Int: Int] = [:]
+            map.reserveCapacity(tap.layerIDs.count)
+            for (slot, layerID) in tap.layerIDs.enumerated() {
+                map[layerID] = slot
+            }
+            self.slotByLayer = map
+            self.slots = Array(repeating: nil, count: tap.layerIDs.count)
+        }
+
+        func tapsLayer(_ layerIdx: Int) -> Bool {
+            slotByLayer[layerIdx] != nil
+        }
+
+        mutating func record(layerIdx: Int, hidden: MLXArray) {
+            if let slot = slotByLayer[layerIdx] {
+                slots[slot] = hidden
+            }
+        }
+
+        mutating func compact(_ transform: (MLXArray) -> MLXArray) {
+            for slot in slots.indices {
+                if let existing = slots[slot] {
+                    slots[slot] = transform(existing)
+                }
+            }
+        }
+
+        func projectIfComplete() -> MLXArray? {
+            guard !slots.isEmpty else { return nil }
+            let tapped = slots.compactMap { $0 }
+            guard tapped.count == slots.count else { return nil }
+            return tap.projector(tapped)
+        }
+    }
+
+    /// Optional DFlash multi-layer context tap installed by `Gemma4CBv2DFlashDrafter`.
+    /// Guarded by `dflashTapLock` and owner identity so concurrent teardown of an earlier
+    /// drafter never races with `forwardTrunk` or clobbers a newer drafter's tap.
+    private let dflashTapLock = NSLock()
+    private var dflashTapStorage: DFlashContextTap?
+
+    func snapshotDFlashTap() -> DFlashContextTap? {
+        dflashTapLock.withLock { dflashTapStorage }
+    }
+
+    var hasActiveDFlashTap: Bool {
+        dflashTapLock.withLock { dflashTapStorage != nil }
+    }
+
+    func setDFlashTap(
+        owner: ObjectIdentifier,
+        layerIDs: [Int],
+        projector: @escaping ([MLXArray]) -> MLXArray
+    ) {
+        dflashTapLock.withLock {
+            dflashTapStorage = DFlashContextTap(
+                owner: owner, layerIDs: layerIDs, projector: projector)
+        }
+    }
+
+    func clearDFlashTap(owner: ObjectIdentifier) -> Bool {
+        dflashTapLock.withLock {
+            guard dflashTapStorage?.owner == owner else { return false }
+            dflashTapStorage = nil
+            return true
+        }
+    }
+
     /// Restore `QuantizedEmbedding` before an ancestor or direct parameter update
     /// writes 8-bit `embed_tokens.*` checkpoint tensors onto a `Gemma4Hi4Lo4Embedding`.
     func restoreQuantizedEmbeddingIfNeeded(for parameters: ModuleParameters) throws {
@@ -2364,13 +2449,15 @@ public class Gemma4TextModelInner: Module {
     public func callCapturingPreNorm(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
-        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil,
+        schedulePrefill: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray) {
         // Same rank-1 defense as `callAsFunction`: token ids may arrive as
         // [N] on cache-reuse turns; forwardTrunk assumes [B, L].
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let r = forwardTrunk(
-            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
+            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true,
+            schedulePrefill: schedulePrefill)
         return (r.postNorm, r.preNorm!)
     }
 
@@ -2468,6 +2555,14 @@ public class Gemma4TextModelInner: Module {
             return lens
         }()
         let minRowSeqLen = resolvedRowLengths?.min() ?? h.dim(1)
+        let dflashTapSnapshot = capturePreNorm ? snapshotDFlashTap() : nil
+        let blockSDCMAllowsPreNorm =
+            dflashTapSnapshot.map { tap in
+                !tap.layerIDs.isEmpty
+                    && Set(tap.layerIDs).count == tap.layerIDs.count
+                    && tap.layerIDs.allSatisfy { (0 ..< (layers.count - 1)).contains($0) }
+            } ?? false
+        let blockSDCMBlocksPreNorm = capturePreNorm && !blockSDCMAllowsPreNorm
         if layers.first?.selfAttn.tensorParallel == nil,
             fullCache.allSatisfy({ $0.map(Gemma4BlockSDCM.supportsCache) ?? true }),
             Gemma4BlockSDCM.canRun(
@@ -2478,7 +2573,7 @@ public class Gemma4TextModelInner: Module {
                 sequenceLength: minRowSeqLen,
                 hasInputEmbedding: inputEmbedding != nil,
                 hasImageMask: imageTokenMask != nil,
-                hasCaptureHook: captureHook != nil,
+                hasCaptureHook: captureHook != nil || blockSDCMBlocksPreNorm,
                 initialOffset: initialOffset)
         {
             let batchSize = h.dim(0)
@@ -2512,6 +2607,7 @@ public class Gemma4TextModelInner: Module {
                 }
             }
             if densityOK {
+                var capturedDFlashContext: MLXArray? = nil
                 let (postNorm, _) = forwardBlockSDCMTrunk(
                     h,
                     inputTokenIDRows: tokenRows,
@@ -2519,8 +2615,11 @@ public class Gemma4TextModelInner: Module {
                     fullCache: fullCache,
                     sdcm: blockSDCMConfig,
                     isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                        schedulePrefill: schedulePrefill))
-                return (postNorm, nil)
+                        schedulePrefill: schedulePrefill),
+                    dflashTap: dflashTapSnapshot,
+                    onDFlashContext: dflashTapSnapshot != nil
+                        ? { capturedDFlashContext = $0 } : nil)
+                return (postNorm, capturedDFlashContext)
             }
         }
 
@@ -2577,6 +2676,12 @@ public class Gemma4TextModelInner: Module {
         var intermediates = [(kv: Gemma4SharedKVState?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
         let submissionStride = Gemma4LayerSubmission.stride
+        var dflashAccumulator = dflashTapSnapshot.map(DFlashTapAccumulator.init)
+        // Decode-only MoE overrides (top-k reduction and batch-union) apply strictly on
+        // decode / speculative verification (`cache != nil`, not a cold multi-token prompt).
+        let allowDecodeMoE =
+            !schedulePrefill && inputEmbedding == nil && cache != nil
+            && (h.dim(1) == 1 || initialOffset > 0)
 
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
@@ -2594,10 +2699,12 @@ public class Gemma4TextModelInner: Module {
             let mask = maskPerLayer?[idx] ?? maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
-            // K/V depend on it.
+            // K/V depend on it. Disable final-layer narrowing when capturing
+            // full pre-norm hidden or when the final layer itself is tapped.
             let isFinalPromptLayer =
                 schedulePrefill && isCBv2 && idx == layers.count - 1
                 && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
+                && !(capturePreNorm && (dflashAccumulator?.tapsLayer(idx) ?? true))
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
                 ? min(gemma4PrefillTailRows, h.dim(1)) : nil
@@ -2625,10 +2732,11 @@ public class Gemma4TextModelInner: Module {
                 // affecting the serving path selected by the benchmark.
                 isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
                     schedulePrefill: schedulePrefill),
-                allowDecodeMoETopK: !schedulePrefill
+                allowDecodeMoETopK: allowDecodeMoE
             )
             h = out
             intermediates[idx] = (kvState, positionOffset)
+            dflashAccumulator?.record(layerIdx: idx, hidden: out)
             if let captureHook {
                 captureHook(idx, kvState.gemma4KeyValuePair)
             }
@@ -2651,6 +2759,9 @@ public class Gemma4TextModelInner: Module {
         }
 
         let postNorm = norm(h)
+        if let projected = dflashAccumulator?.projectIfComplete() {
+            return (postNorm, projected)
+        }
         return (postNorm, capturePreNorm ? h : nil)
     }
 }
@@ -3002,6 +3113,61 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
     }
 
+    /// Install an owner-scoped DFlash multi-layer target context tap and projector.
+    func installDFlashContextTap(
+        owner: ObjectIdentifier,
+        layerIDs: [Int],
+        projector: @escaping ([MLXArray]) -> MLXArray
+    ) {
+        model.setDFlashTap(owner: owner, layerIDs: layerIDs, projector: projector)
+        for layer in model.layers {
+            layer.compiledExtendedVerificationWidth = true
+            layer.invalidateCompiledTraces()
+        }
+    }
+
+    func clearDFlashContextTap(owner: ObjectIdentifier) {
+        guard model.clearDFlashTap(owner: owner) else { return }
+        for layer in model.layers {
+            layer.compiledExtendedVerificationWidth = false
+            layer.invalidateCompiledTraces()
+        }
+    }
+
+    /// Raw vocabulary readout for speculative draft argmax (skips monotonic softcap
+    /// while respecting tensor-parallel vocabulary sharding).
+    func applyFastDraftLMHead(_ hidden: MLXArray) -> MLXArray {
+        if let tensorParallelHead {
+            return tensorParallelHead.project(model.embedTokens, hidden)
+        }
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
+    }
+
+    /// Exact greedy argmax over the target LM head for speculative draft tokens.
+    /// When `Gemma4Hi4Lo4Embedding` is active, runs `sparseExactHeadSample(mode: .greedy)`
+    /// for unbiased exact 8-bit argmax at ~0.5× memory bandwidth without materializing
+    /// `[B, L, vocab]` logits; otherwise falls back to exact `argMax(applyFastDraftLMHead)`.
+    func draftArgMax(_ hidden: MLXArray) -> MLXArray {
+        if supportsSparseExactHeadSampling,
+            let hi4 = model.embedTokens as? Gemma4Hi4Lo4Embedding
+        {
+            let b = hidden.dim(0)
+            let l = hidden.dim(1)
+            let h = hidden.dim(2)
+            if let sampled = hi4.sparseExactHeadSample(
+                hidden: hidden.reshaped([b * l, h]),
+                mode: .greedy,
+                softcap: 0)
+            {
+                return sampled.tokens.reshaped([b, l])
+            }
+        }
+        return argMax(applyFastDraftLMHead(hidden), axis: -1).asType(.int32)
+    }
+
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
     internal func _testCallInner(
         _ inputs: MLXArray,
@@ -3339,11 +3505,70 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return CBv2MTPCaptureLayers(full: full, sliding: sliding)
     }
 
+    public var cbv2SupportsRequestStatefulMTP: Bool {
+        model.hasActiveDFlashTap
+    }
+
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+
+    public func cbv2ForwardGreedyVerifyWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)? {
+        guard supportsSparseExactHeadSampling,
+            let hi4 = model.embedTokens as? Gemma4Hi4Lo4Embedding
+        else { return nil }
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        let b = postNorm.dim(0)
+        let l = postNorm.dim(1)
+        let h = postNorm.dim(2)
+        if let sampled = hi4.sparseExactHeadSample(
+            hidden: postNorm.reshaped([b * l, h]),
+            mode: .greedy,
+            softcap: config.finalLogitSoftcapping)
+        {
+            return (
+                sampled.tokens.reshaped([b, l]),
+                sampled.nonFinite.reshaped([b, l]),
+                preNorm
+            )
+        }
+        // Trunk already advanced KV: never return nil after mutating cache.
+        let logits = applyLMHead(postNorm)
+        let nonFinite = isNaN(sum(logits - logits, axes: [2])).asType(.int32)
+        let greedy = argMax(logits, axis: -1).asType(.int32)
+        return (greedy, nonFinite, preNorm)
+    }
+
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache], requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        guard cbv2SupportsRequestStatefulMTP else { return nil }
+        let (postNorm, contextHidden) = model.callCapturingPreNorm(
+            tokens, cache: caches, schedulePrefill: true)
+        switch requirement {
+        case .evaluationOnly:
+            // Preserve graph dependency on both the full trunk (`postNorm` / all KV writes)
+            // and the tapped DFlash context projection so `finalize`'s `eval` blocks until
+            // every GPU write finishes before pages or shared events can be recycled.
+            let anchor =
+                postNorm[0..., -1, 0 ..< 1] + contextHidden[0..., -1, 0 ..< 1] * Float(0)
+            return (anchor, contextHidden)
+        case .lastPositionLogits:
+            let last = postNorm.dim(1) - 1
+            let logits = applyLMHead(postNorm[0..., last ..< (last + 1), 0...]).squeezed(axis: 1)
+            return (logits, contextHidden)
+        }
+    }
+}
+
+extension Gemma4TextModel: CBv2MTPPolicyTopTwoProviding {
+    public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
+        cbv2TopTwoRows(logits)
     }
 }
 

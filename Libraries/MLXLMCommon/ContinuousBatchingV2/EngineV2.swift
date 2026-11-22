@@ -900,9 +900,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         var effectiveSchedulerConfig = schedulerConfig
         // Request-stateful neural MTP routes prompt prefills through `forwardWithHidden`
-        // (`schedulePrefill: false`), which bypasses Block-SDCM; disarm whole-prompt
-        // compaction so prompts stay within `maxPrefillChunk`.
-        if mtpDriver?.tracksPersistentHistory == true {
+        // (`schedulePrefill: false`), which bypasses Block-SDCM unless the drafter explicitly
+        // supports compacted paged speculation (e.g. Gemma 4 DFlash with lockstep tap compaction).
+        if mtpDriver?.tracksPersistentHistory == true,
+            mtpDriver?.drafter.supportsCompactedPagedSpeculation != true
+        {
             effectiveSchedulerConfig.soloCompactionMinPromptTokens = nil
             effectiveSchedulerConfig.allowConcurrentCompaction = false
             effectiveSchedulerConfig.maxPackedCompactionBatch = 1
@@ -1701,6 +1703,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         guard cbv2LayerKindsAllowPrefixReuse(layerKinds) else {
             return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
+        // Request-stateful drafters without prefix checkpoint restoration (e.g. DFlash)
+        // must see every prompt token's target hidden state from position 0.
+        if mtpBlocksAttentionPrefixReuse {
+            return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
         // Vision requests NEVER look up the prefix cache (v1 policy — the
         // donation side is excluded symmetrically in
         // `EngineLoopV2.donationIntent`): token-id hashes cannot see image
@@ -1793,13 +1800,19 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             outcome: .adoptionFailed, matchedTokens: hit.matched)
     }
 
+    private var mtpBlocksAttentionPrefixReuse: Bool {
+        loop.mtp?.tracksPersistentHistory == true
+            && !(loop.mtp?.drafter is any CBv2MTPPrefixCheckpointDrafter)
+    }
+
     /// Pure submit-thread hash preparation for the resident paged L1. The
     /// mutable index and physical page refs are intentionally untouched here.
     private func makeResidentPrefixProbe(for request: CBv2Request) -> CBv2PagedPrefixProbe? {
         guard let residentPrefixBackend,
             request.prefixCacheEnabled,
             cbv2LayerKindsAllowPrefixReuse(layerKinds),
-            request.multimodal == nil
+            request.multimodal == nil,
+            !mtpBlocksAttentionPrefixReuse
         else { return nil }
         return residentPrefixBackend.preparePrefixProbe(
             tokens: request.promptTokens, cacheSalt: request.cacheSalt)

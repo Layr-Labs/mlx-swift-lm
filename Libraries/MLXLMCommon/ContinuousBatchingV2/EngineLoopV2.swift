@@ -4043,17 +4043,27 @@ public final class EngineLoopV2: @unchecked Sendable {
             )
         var hidden: MLXArray?
         if returnsHidden {
-            guard let recurrentModel = mtp?.model as? any CBv2RecurrentMTPSteppableModel else {
-                preconditionFailure("CBv2 ordinary MTP history requires the recurrent hidden seam")
+            if let recurrentModel = mtp?.model as? any CBv2RecurrentMTPSteppableModel,
+                recurrentModel.recurrentStateSpec != nil
+            {
+                let captured = try mtpRecurrentForwardWithHidden(
+                    ids: ids, tokens: tokens, caches: caches, positionIds: positionIds,
+                    phase: phase, model: recurrentModel)
+                forward = (
+                    captured.logits,
+                    Dictionary(uniqueKeysWithValues: zip(ids, captured.evaluations)),
+                    captured.innerState
+                )
+                hidden = captured.lastHidden
+            } else if let mtpModel = mtp?.model {
+                let captured = try checkedModelForward(phase: phase) {
+                    mtpModel.forwardWithHidden(tokens: tokens, caches: caches)
+                }
+                forward = (captured.logits, [:], [])
+                hidden = captured.lastHidden
+            } else {
+                preconditionFailure("CBv2 ordinary MTP history requires an MTP hidden seam")
             }
-            let captured = try mtpRecurrentForwardWithHidden(
-                ids: ids, tokens: tokens, caches: caches, positionIds: positionIds,
-                phase: phase, model: recurrentModel)
-            forward = (
-                captured.logits, Dictionary(uniqueKeysWithValues: zip(ids, captured.evaluations)),
-                captured.innerState
-            )
-            hidden = captured.lastHidden
         } else {
             forward = try targetForward(
                 tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)

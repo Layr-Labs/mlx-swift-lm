@@ -397,7 +397,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
     }
 
     public var supportsRequestStatefulMTP: Bool {
-        model is any CBv2RecurrentMTPForwardable
+        if let forwardable = model as? CBv2MTPForwardable,
+            forwardable.cbv2SupportsRequestStatefulMTP
+        {
+            return true
+        }
+        return model is any CBv2RecurrentMTPForwardable
     }
 
     public func forwardWithHidden(
@@ -408,6 +413,37 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
                 "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
+    }
+
+    public func forwardGreedyVerifyWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)? {
+        guard let forwardable = model as? CBv2MTPForwardable else { return nil }
+        return forwardable.cbv2ForwardGreedyVerifyWithHidden(tokens, caches: asKVCaches(caches))
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPPrefillSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        if let forwardable = model as? CBv2MTPForwardable,
+            let narrowed = forwardable.cbv2ForwardWithHiddenForPrefill(
+                tokens, caches: asKVCaches(caches), requirement: requirement)
+        {
+            return narrowed
+        }
+        let full = forwardWithHidden(tokens: tokens, caches: caches)
+        switch requirement {
+        case .evaluationOnly:
+            let anchor =
+                full.logits[0..., -1, 0 ..< 1] + full.lastHidden[0..., -1, 0 ..< 1] * Float(0)
+            return (anchor, full.lastHidden)
+        case .lastPositionLogits:
+            let last = full.logits.dim(1) - 1
+            return (full.logits[0..., last, 0...], full.lastHidden)
+        }
     }
 }
 

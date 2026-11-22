@@ -1373,11 +1373,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
             return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
         }
-        if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
+        if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, !rows.isEmpty,
             let keys, let values
         {
             let group = pool.group(rows[0].groupKey)
-            if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
+            if PagedMTPBatchedColumns.eligible(queries: queries, rows: rows, group: group) {
                 mtpBatchedAttentionCalls += 1
                 let before = PagedMultiQueryAttention.dispatches
                 defer {
@@ -1385,7 +1385,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 }
                 return PagedMTPBatchedColumns.attend(
                     queries: queries, keys: keys, values: values,
-                    row: rows[0], group: group, sinks: preparedSinks(sinks),
+                    rows: rows, group: group, sinks: preparedSinks(sinks),
                     params: params(scale: scale),
                     softcap: attentionSoftcap != nil, source: pool.kernelSource,
                     dispatchCache: segmentDispatchCache)

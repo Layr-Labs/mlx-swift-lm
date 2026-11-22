@@ -118,8 +118,13 @@ extension EngineLoopV2 {
         }
         return rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+            return Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
         }
+    }
+
+    var mtpAllowsCompactedPagedStorage: Bool {
+        mtp?.usesTokenOnlyDrafter == true
+            || mtp?.drafter.supportsCompactedPagedSpeculation == true
     }
 
     /// Every storage-owning row must support value-exact multi-token writes
@@ -130,7 +135,10 @@ extension EngineLoopV2 {
         _ state: [CBv2SequenceKV?], tokenOnly: Bool = false
     ) -> Bool {
         if tokenOnly {
-            return state.allSatisfy { $0?.supportsTokenOnlySpeculativeWrites ?? true }
+            return state.allSatisfy {
+                ($0?.supportsSpeculativeWrites ?? true)
+                    || ($0?.supportsTokenOnlySpeculativeWrites ?? true)
+            }
         }
         return state.allSatisfy { $0?.supportsSpeculativeWrites ?? true }
     }
@@ -148,7 +156,7 @@ extension EngineLoopV2 {
         guard mtpHistoryEligible(rec) else { return .none }
         let depth = mtp.planDepth
         guard let state = kvStates[rec.id] else { return .none }
-        guard Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter) else {
+        guard Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage) else {
             if recordSkips { mtp.recordSkip("kv_unsupported") }
             return .none
         }
@@ -224,7 +232,7 @@ extension EngineLoopV2 {
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
         let eligible = rows.filter { rec in
             guard mtpHistoryEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+            return Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
         }
         guard !eligible.isEmpty else { return false }
         // Token-only drafters break chained decode ONLY when the exact cohort and
@@ -306,7 +314,7 @@ extension EngineLoopV2 {
         }
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+            return Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
         }
         let tokenOnlyRows: [CBv2ScheduledRequest] =
             mtp.usesTokenOnlyDrafter
@@ -349,6 +357,21 @@ extension EngineLoopV2 {
                 })
             if tailDepth < mtp.planDepth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
+            }
+        }
+        if mtp.planDepth > CBv2MTPConfig.testedMaxDraftTokens {
+            var headroomLimit = mtp.planDepth
+            for rec in activeSpeculationRows {
+                guard let state = kvStates[rec.id] else { continue }
+                for layerKV in state {
+                    if let paged = layerKV as? PagedSequenceKV, paged.speculativeHeadroom < Int.max
+                    {
+                        headroomLimit = min(headroomLimit, max(0, paged.speculativeHeadroom - 1))
+                    }
+                }
+            }
+            if headroomLimit < mtp.planDepth {
+                mtp.clampPlanDepth(to: headroomLimit, reason: "ring_speculative_headroom")
             }
         }
         if let tokenOnly = mtp.tokenOnlyDrafter, mtp.planDepth > 0 {
@@ -395,7 +418,7 @@ extension EngineLoopV2 {
         for rec in rows {
             let storageEligible =
                 kvStates[rec.id].map {
-                    Self.mtpStorageEligible($0, tokenOnly: mtp.usesTokenOnlyDrafter)
+                    Self.mtpStorageEligible($0, tokenOnly: mtpAllowsCompactedPagedStorage)
                 } ?? false
             if mtpBasicEligible(rec), kvStates[rec.id] != nil, !storageEligible {
                 mtp.recordSkip("kv_unsupported")
@@ -416,7 +439,7 @@ extension EngineLoopV2 {
         !rows.isEmpty
             && rows.allSatisfy { rec in
                 guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-                return Self.mtpStorageEligible(state, tokenOnly: mtp?.usesTokenOnlyDrafter == true)
+                return Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
             }
     }
 
@@ -439,7 +462,7 @@ extension EngineLoopV2 {
             // here is not ineligibility; route them through the hidden-returning
             // MTP prefill path so persistent history starts at prompt position 0.
             guard let state = kvStates[assignment.id] else { return true }
-            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+            return Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
         }
     }
 
@@ -458,7 +481,7 @@ extension EngineLoopV2 {
                     rec, range: Self.mtpPlannedRange(rec, assignment))
             }
             guard let state = kvStates[assignment.id] else { return false }
-            return !Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+            return !Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
                 || (assignment.numTokens == 1 && rec.generatedTokenCount > 0
                     && rec.numComputedTokens == rec.tokens.count)
         }

@@ -709,12 +709,14 @@ extension EngineLoopV2 {
         var assistantOwnersTransferred = false
         defer {
             if !assistantOwnersTransferred {
-                // Draft column zero may already be evaluating. Restore its
-                // owner before unwinding; request retirement synchronizes and
-                // calls releaseRequestState before returning capacity.
+                // Draft column zero may already be evaluating. Discard any staged
+                // round before restoring ownership so subsequent observations or
+                // drafts never observe `roundActive == true`.
+                let statefulDrafter = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
                 _ = nativeCommit {
                     for row in rowMetadata {
                         if let state = row.assistantState {
+                            statefulDrafter?.discardRound(requestState: state)
                             mtp.restoreAssistantState(state, for: row.id)
                         }
                     }
@@ -789,6 +791,12 @@ extension EngineLoopV2 {
                             anchor: fullRow.absoluteOffset))
                     captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
                     captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+                } else if mtp.drafter.supportsCompactedPagedSpeculation {
+                    precondition(
+                        state.compactMap { $0 }.allSatisfy {
+                            $0.ropePositionOffset == carry.kvOffset
+                        },
+                        "CBv2 request-stateful MTP target KV is not aligned with its carry")
                 } else {
                     precondition(
                         state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
@@ -820,57 +828,82 @@ extension EngineLoopV2 {
             try mtpFreezeCaptures(captured)
             seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
-                var currentTokens = (0 ..< batch).map {
-                    seedColumn[$0 ..< $0 + 1, 0...]
-                }
-                var currentHidden = carryHiddens
-                for draftIndex in 0 ..< k {
-                    var nextRows: [MLXArray] = []
-                    var nextHiddens: [MLXArray] = []
-                    var stepEvalTargets: [MLXArray] = []
-                    nextRows.reserveCapacity(batch)
-                    nextHiddens.reserveCapacity(batch)
-                    for (index, row) in verifyRows.enumerated() {
-                        guard let requestState = rowMetadata[index].assistantState else {
-                            preconditionFailure(
-                                "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)"
-                            )
-                        }
-                        let result = stateful.draftStep(
-                            tokens: currentTokens[index],
-                            hidden: currentHidden[index],
-                            shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                            requestState: requestState)
-                        let next = result.tokens.reshaped([1])
-                        nextRows.append(next)
-                        nextHiddens.append(result.hidden)
-                        stepEvalTargets.append(next)
-                        stepEvalTargets.append(result.hidden)
-                        stepEvalTargets.append(
-                            contentsOf: stateful.evaluationTargets(for: requestState))
-                    }
-                    // Publish the first mutable head-cache generation before
-                    // constructing a deeper generation, and every generation for a
-                    // drafter that opts in, so its steps run while the target graph
-                    // is built. This is nonblocking and joins the round's sole
-                    // finalize fence.
-                    if draftIndex == 0 || stateful.submitsEveryDraftStepEarly {
-                        retainNativeWork(
-                            stepEvalTargets,
-                            owners: rowMetadata.compactMap {
-                                $0.assistantState.map { $0 as AnyObject }
-                            }
+                let rowStates: [any CBv2MTPRequestState] = verifyRows.enumerated().map {
+                    index, row in
+                    guard let requestState = rowMetadata[index].assistantState else {
+                        preconditionFailure(
+                            "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)"
                         )
-                        try requireNativeWork()
-                        asyncEval(stepEvalTargets)
-                        try nativeWorkSubmitted()
-                        mtp.recordEarlyDraftSubmission()
                     }
-                    assistantEvalTargets.append(contentsOf: stepEvalTargets)
-                    let stepTokens = concatenated(nextRows, axis: 0)
-                    draftSteps.append(stepTokens)
-                    currentTokens = nextRows.map { $0.reshaped([1, 1]) }
-                    currentHidden = nextHiddens
+                    return requestState
+                }
+                if let parallel = mtpDraftParallelBlock(
+                    stateful: stateful,
+                    seedColumn: seedColumn,
+                    carryHiddens: carryHiddens,
+                    depth: k,
+                    rowStates: rowStates)
+                {
+                    retainNativeWork(
+                        parallel.evalTargets,
+                        owners: rowStates.map { $0 as AnyObject }
+                    )
+                    try requireNativeWork()
+                    asyncEval(parallel.evalTargets)
+                    try nativeWorkSubmitted()
+                    mtp.recordEarlyDraftSubmission()
+                    assistantEvalTargets.append(contentsOf: parallel.evalTargets)
+                    for draftIndex in 0 ..< k {
+                        let col = (0 ..< batch).map { parallel.rows[$0][draftIndex] }
+                        draftSteps.append(concatenated(col, axis: 0))
+                    }
+                } else {
+                    var currentTokens = (0 ..< batch).map {
+                        seedColumn[$0 ..< $0 + 1, 0...]
+                    }
+                    var currentHidden = carryHiddens
+                    for draftIndex in 0 ..< k {
+                        var nextRows: [MLXArray] = []
+                        var nextHiddens: [MLXArray] = []
+                        var stepEvalTargets: [MLXArray] = []
+                        nextRows.reserveCapacity(batch)
+                        nextHiddens.reserveCapacity(batch)
+                        for (index, row) in verifyRows.enumerated() {
+                            let requestState = rowStates[index]
+                            let result = stateful.draftStep(
+                                tokens: currentTokens[index],
+                                hidden: currentHidden[index],
+                                shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                                requestState: requestState)
+                            let next = result.tokens.reshaped([1])
+                            nextRows.append(next)
+                            nextHiddens.append(result.hidden)
+                            stepEvalTargets.append(next)
+                            stepEvalTargets.append(result.hidden)
+                            stepEvalTargets.append(
+                                contentsOf: stateful.evaluationTargets(for: requestState))
+                        }
+                        // Publish the first mutable head-cache generation before
+                        // constructing a deeper generation, and every generation for a
+                        // drafter that opts in, so its steps run while the target graph
+                        // is built. This is nonblocking and joins the round's sole
+                        // finalize fence.
+                        if draftIndex == 0 || stateful.submitsEveryDraftStepEarly {
+                            retainNativeWork(
+                                stepEvalTargets,
+                                owners: rowStates.map { $0 as AnyObject }
+                            )
+                            try requireNativeWork()
+                            asyncEval(stepEvalTargets)
+                            try nativeWorkSubmitted()
+                            mtp.recordEarlyDraftSubmission()
+                        }
+                        assistantEvalTargets.append(contentsOf: stepEvalTargets)
+                        let stepTokens = concatenated(nextRows, axis: 0)
+                        draftSteps.append(stepTokens)
+                        currentTokens = nextRows.map { $0.reshaped([1, 1]) }
+                        currentHidden = nextHiddens
+                    }
                 }
             } else {
                 let prepared = mtp.drafter.prepare(rows: captures)
@@ -942,6 +975,56 @@ extension EngineLoopV2 {
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result
+    }
+
+    /// Try drafting all `depth` tokens across `rowStates` in parallel via
+    /// `draftBlockBatch`, falling back to per-row `draftBlock`. Discards any
+    /// partial per-row rounds on fallback so callers can chain `draftStep`.
+    private func mtpDraftParallelBlock(
+        stateful: any CBv2MTPRequestStatefulDrafter,
+        seedColumn: MLXArray,
+        carryHiddens: [MLXArray],
+        depth: Int,
+        rowStates: [any CBv2MTPRequestState]
+    ) -> (rows: [[MLXArray]], evalTargets: [MLXArray])? {
+        let batch = rowStates.count
+        var evalTargets: [MLXArray] = []
+        if let batched = stateful.draftBlockBatch(
+            seedTokens: seedColumn,
+            seedHiddens: carryHiddens,
+            depth: depth,
+            requestStates: rowStates),
+            batched.count == batch,
+            batched.allSatisfy({ $0.count == depth })
+        {
+            for index in 0 ..< batch {
+                evalTargets.append(contentsOf: batched[index])
+                evalTargets.append(contentsOf: stateful.evaluationTargets(for: rowStates[index]))
+            }
+            return (batched, evalTargets)
+        }
+
+        var perRow: [[MLXArray]] = []
+        perRow.reserveCapacity(batch)
+        for index in 0 ..< batch {
+            guard
+                let block = stateful.draftBlock(
+                    seedTokens: seedColumn[index ..< index + 1, 0...],
+                    seedHidden: carryHiddens[index],
+                    depth: depth,
+                    requestState: rowStates[index]),
+                block.count == depth
+            else {
+                for j in 0 ..< perRow.count {
+                    stateful.discardRound(requestState: rowStates[j])
+                }
+                return nil
+            }
+            perRow.append(block)
+            evalTargets.append(contentsOf: block)
+            evalTargets.append(contentsOf: stateful.evaluationTargets(for: rowStates[index]))
+        }
+        return (perRow, evalTargets)
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

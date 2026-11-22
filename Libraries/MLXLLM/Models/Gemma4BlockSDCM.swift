@@ -50,6 +50,11 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         /// sparse L5 attention. ~3.8-4.1x faster (>10,500 tok/s on M3 Ultra) while preserving ~90%
         /// accuracy across 9K-16K code and natural-language prose suites.
         case turbo
+        /// High-compression L1 Tri-Signal Pre-Compaction (`34%` after Layer 0) + aggressive
+        /// bilateral schedule (`18/11/9/8%`, 32-tok blocks) + low-k early MoE (`k = 2` on L0..L2,
+        /// `k = 3` on L3..L5, `k = 4` on L6..L11, `k = 6` on L12..L28, exact `k = 8` on L29 & tail 160).
+        /// Targets 5.5-7.5x prefill speedup on long contexts.
+        case hyper
     }
 
     public static let envKey = "DARKBLOOM_GEMMA4_PREFILL_SDCM"
@@ -299,6 +304,38 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         earlyPreCompactTopHaloK: 8
     )
 
+    public static let hyper = Gemma4BlockSDCMConfig(
+        mode: .hyper,
+        minPromptTokens: 3072,
+        keepSchedule: [6: 0.18, 12: 0.11, 18: 0.09, 24: 0.08],
+        earlyMoEK: 4,
+        lateMoEK: 6,
+        earlyMoEUntilLayer: 12,
+        layerMoEK: [
+            0: 2, 1: 2, 2: 2,
+            3: 3, 4: 3, 5: 3,
+            6: 4, 7: 4, 8: 4, 9: 4, 10: 4, 11: 4,
+        ],
+        blockSize: 32,
+        prefixKeep: 96,
+        tailKeep: 160,
+        forwardHalo: 0.85,
+        backwardHalo: 0.85,
+        strataCount: 4,
+        twoHopBlockPeaks: 24,
+        slidingChunkSize: 1024,
+        reversePrefixQuota: [6: 0.30, 12: 0.25, 18: 0.20, 24: 0.15],
+        reversePrefixEnd: 96,
+        earlySparseFullLayer: 5,
+        sparsePrefixTokens: 192,
+        sparseLocalWindow: 1024,
+        sparseTailTokens: 192,
+        earlyPreCompactAfterLayer: 0,
+        earlyPreCompactRatio: 0.34,
+        earlyPreCompactBlockSize: 64,
+        earlyPreCompactTopHaloK: 8
+    )
+
     public static func preset(for mode: Mode) -> Gemma4BlockSDCMConfig {
         switch mode {
         case .off: return .off
@@ -306,6 +343,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         case .balanced: return .balanced
         case .fast: return .fast
         case .turbo: return .turbo
+        case .hyper: return .hyper
         }
     }
 
@@ -322,6 +360,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
             return .fast
         case "turbo", "v3", "l1", "ultra":
             return .turbo
+        case "hyper", "extreme", "v4":
+            return .hyper
         default:
             return .off
         }
@@ -2615,7 +2655,9 @@ extension Gemma4TextModelInner {
         fullCache: [KVCache?],
         sdcm: Gemma4BlockSDCMConfig,
         isExpertPrefill: Bool,
-        captureCheckpointAtLayer: Int? = nil
+        captureCheckpointAtLayer: Int? = nil,
+        dflashTap: DFlashContextTap? = nil,
+        onDFlashContext: ((MLXArray) -> Void)? = nil
     ) -> (postNorm: MLXArray, checkpoint: Gemma4SDCMCheckpoint?) {
         let B = initialHidden.dim(0)
         let paddedLength = initialHidden.dim(1)
@@ -2655,6 +2697,8 @@ extension Gemma4TextModelInner {
 
         var pendingScores: [Gemma4SDCMBoundaryScores]? = nil
         var checkpoint: Gemma4SDCMCheckpoint? = nil
+        var dflashAccumulator = (onDFlashContext != nil ? dflashTap : nil)
+            .map(DFlashTapAccumulator.init)
 
         func applyCompaction(keepRows: [[Int32]]) {
             guard let nextLen = keepRows.first?.count,
@@ -2667,6 +2711,7 @@ extension Gemma4TextModelInner {
             if B == 1 {
                 let idxArray = MLXArray(keepRows[0])
                 h = h.take(idxArray, axis: 1)
+                dflashAccumulator?.compact { $0.take(idxArray, axis: 1) }
                 let nextPos = keepRows[0].map { positionsHostRows[0][Int($0)] }
                 positionsHostRows[0] = nextPos
                 positions = MLXArray(nextPos, [1, nextLen])
@@ -2683,6 +2728,7 @@ extension Gemma4TextModelInner {
                 }
                 let idxArray = MLXArray(flatKeep, [B, nextLen, 1])
                 h = MLX.takeAlong(h, idxArray, axis: 1)
+                dflashAccumulator?.compact { MLX.takeAlong($0, idxArray, axis: 1) }
                 positions = MLXArray(flatPos, [B, nextLen])
             }
             hasActiveRightPad = false
@@ -2788,6 +2834,7 @@ extension Gemma4TextModelInner {
                 }
                 earlyEmbeddingHidden = nil
             }
+            dflashAccumulator?.record(layerIdx: idx, hidden: h)
             if let ckptLayer = captureCheckpointAtLayer, idx == ckptLayer, B == 1 {
                 checkpoint = Gemma4SDCMCheckpoint(
                     hiddenStates: h,
@@ -2802,6 +2849,9 @@ extension Gemma4TextModelInner {
             }
         }
 
+        if let projected = dflashAccumulator?.projectIfComplete() {
+            onDFlashContext?(projected)
+        }
         return (norm(h), checkpoint)
     }
 }

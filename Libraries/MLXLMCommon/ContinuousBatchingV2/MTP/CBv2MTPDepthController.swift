@@ -185,9 +185,10 @@ final class CBv2MTPDepthController {
 
     init(
         maxDepth: Int, fixedDepth: Int?, fixedDepthByDecodeRows: [Int]? = nil,
-        useCommittedDecodeBaseline: Bool = false
+        useCommittedDecodeBaseline: Bool = false,
+        maxAllowedDepth: Int = CBv2MTPConfig.testedMaxDraftTokens
     ) {
-        let resolvedMax = min(max(maxDepth, 0), CBv2MTPConfig.testedMaxDraftTokens)
+        let resolvedMax = min(max(maxDepth, 0), max(0, maxAllowedDepth))
         self.maxDepth = resolvedMax
         self.fixedDepth = fixedDepth.map { min(max($0, 0), resolvedMax) }
         // Only a fixed depth takes a width table; an empty table is none.
