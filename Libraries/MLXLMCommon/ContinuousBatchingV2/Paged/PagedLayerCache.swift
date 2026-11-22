@@ -690,6 +690,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         advancePositionOffsets(by: keys.dim(2))
     }
 
+    public var supportsCompactedPromptKVWrite: Bool {
+        kind.sharesKVWithLayer == nil && !pool.usesStepOwnedAttention
+            && pool.groupKey(forLayer: layerIndex).quantization == nil
+            && pagedRows.allSatisfy(\.supportsCompactedPositionDelta)
+    }
+
     public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
         precondition(
             kind.sharesKVWithLayer == nil,
@@ -709,6 +715,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
             return
         }
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            pool.writeValidation.refuse(
+                "compacted prompt KV write is not supported under quantized paged storage",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            return
+        }
+        precondition(
+            pagedRows.allSatisfy(\.supportsCompactedPositionDelta),
+            "PagedLayerCache: bound rows must support compacted position deltas")
         guard
             pool.writeValidation.validate(
                 keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
@@ -741,10 +756,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 }
             }
         }
-        if logicalDelta > 0 {
-            for row in pagedRows {
+        for row in pagedRows {
+            if logicalDelta > 0 {
                 row.addPositionDelta(logicalDelta)
             }
+            row.markApproximatePrefill()
         }
         retainedPrefillKV = []
         retainedQuantizedViews = []

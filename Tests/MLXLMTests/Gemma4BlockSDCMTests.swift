@@ -37,6 +37,10 @@ struct Gemma4BlockSDCMTests {
         #expect(lcDefault.interiorMoEK(forLayer: 6) == 5)
         #expect(lcDefault.interiorMoEK(forLayer: 12) == 8)
         #expect(lcDefault.earlySparseFullLayer == 5)
+        #expect(lcDefault.sparseFullLayers.isEmpty)
+        #expect(lcDefault.usesSparseFullAttention(forLayer: 5))
+        #expect(!lcDefault.usesSparseFullAttention(forLayer: 11))
+        #expect(lcDefault.adaptiveRetentionFloorWindows == 2.0)
 
         let bal = Gemma4BlockSDCMConfig.resolve(environment: [
             Gemma4BlockSDCMConfig.envKey: "balanced"
@@ -48,6 +52,7 @@ struct Gemma4BlockSDCMTests {
         #expect(bal.interiorMoEK(forLayer: 6) == 6)
         #expect(bal.lateMoEK == 8)
         #expect(bal.reversePrefixQuota[6] == 0.30)
+        #expect(bal.adaptiveRetentionFloorWindows == 2.0)
 
         let fast = Gemma4BlockSDCMConfig.resolve(environment: [
             Gemma4BlockSDCMConfig.envKey: "fast"
@@ -59,6 +64,7 @@ struct Gemma4BlockSDCMTests {
         #expect(fast.interiorMoEK(forLayer: 6) == 6)
         #expect(fast.reversePrefixQuota[6] == 0.32)
         #expect(fast.earlyPreCompactAfterLayer == nil)
+        #expect(fast.adaptiveRetentionFloorWindows == 0)
 
         for alias in ["turbo", "v3", "l1", "ultra"] {
             let turbo = Gemma4BlockSDCMConfig.resolve(environment: [
@@ -72,7 +78,69 @@ struct Gemma4BlockSDCMTests {
             #expect(turbo.blockSize == 32)
             #expect(turbo.keepSchedule[6] == 0.36)
             #expect(turbo.reversePrefixQuota[24] == 0.20)
+            #expect(turbo.adaptiveRetentionFloorWindows == 0)
         }
+
+        for alias in ["coherent", "fullkv", "full", " FULLKV "] {
+            #expect(Gemma4BlockSDCMConfig.parseMode(alias) == .coherent)
+            let coherent = Gemma4BlockSDCMConfig.resolve(environment: [
+                Gemma4BlockSDCMConfig.envKey: alias
+            ])
+            #expect(coherent.mode == .coherent)
+            #expect(coherent.minPromptTokens == 1536)
+            #expect(coherent.keepSchedule.isEmpty)
+            #expect(coherent.earlyMoEK == 2)
+            #expect(coherent.lateMoEK == 2)
+            #expect(coherent.earlyMoEUntilLayer == 29)
+            #expect(coherent.layerMoEK.isEmpty)
+            #expect(coherent.interiorMoEK(forLayer: 0) == 2)
+            #expect(coherent.interiorMoEK(forLayer: 28) == 2)
+            #expect(coherent.interiorMoEK(forLayer: 29) == 2)
+            #expect(coherent.blockSize == 64)
+            #expect(coherent.prefixKeep == 128)
+            #expect(coherent.tailKeep == 1024)
+            #expect(coherent.earlySparseFullLayer == nil)
+            #expect(coherent.sparseFullLayers == [5, 11, 17])
+            #expect(coherent.usesSparseFullAttention(forLayer: 5))
+            #expect(coherent.usesSparseFullAttention(forLayer: 11))
+            #expect(coherent.usesSparseFullAttention(forLayer: 17))
+            #expect(!coherent.usesSparseFullAttention(forLayer: 23))
+            #expect(!coherent.usesSparseFullAttention(forLayer: 29))
+            #expect(coherent.sparsePrefixTokens == 256)
+            #expect(coherent.sparseLocalWindow == 1024)
+            #expect(coherent.sparseTailTokens == 1024)
+            #expect(coherent.skipInteriorSlidingLayers == [24, 25, 26, 27])
+            #expect(!coherent.skipInteriorSlidingLayers.contains(28))
+            #expect(coherent.adaptiveRetentionFloorWindows == 0)
+            #expect(coherent.hasActiveOptimizations)
+        }
+
+        // Clearing `earlySparseFullLayer` on presets like `.balanced` disables sparse L5.
+        var balancedNoSparse = Gemma4BlockSDCMConfig.balanced
+        #expect(balancedNoSparse.usesSparseFullAttention(forLayer: 5))
+        balancedNoSparse.earlySparseFullLayer = nil
+        #expect(!balancedNoSparse.usesSparseFullAttention(forLayer: 5))
+
+        let coherentOverride = Gemma4BlockSDCMConfig.resolve(environment: [
+            Gemma4BlockSDCMConfig.envKey: "coherent",
+            Gemma4BlockSDCMConfig.earlyMoEKEnvKey: "4",
+        ])
+        #expect(coherentOverride.earlyMoEK == 4)
+        #expect(coherentOverride.lateMoEK == 4)
+        #expect(coherentOverride.interiorMoEK(forLayer: 2) == 4)
+        #expect(coherentOverride.interiorMoEK(forLayer: 29) == 4)
+
+        #expect(!Gemma4BlockSDCMConfig.off.hasActiveOptimizations)
+        let noOpConfig = Gemma4BlockSDCMConfig(
+            mode: .coherent,
+            keepSchedule: [:],
+            earlyMoEK: 8,
+            lateMoEK: 8,
+            earlySparseFullLayer: nil,
+            sparseFullLayers: [],
+            skipInteriorSlidingLayers: []
+        )
+        #expect(!noOpConfig.hasActiveOptimizations)
     }
 
     // MARK: - Arbitrary-Position RoPE Exact Parity
@@ -175,6 +243,101 @@ struct Gemma4BlockSDCMTests {
             let hasBlock = (stratum * 4 ..< (stratum + 1) * 4).contains { blockCounts[$0] == 64 }
             #expect(hasBlock, "Missing macro stratum \(stratum)")
         }
+    }
+
+    private func compactedSlidingPrompt() -> (length: Int, window: Int, stored: [Int32]) {
+        let length = 259  // Only three tokens in the final 8-token block.
+        let window = 64
+        var cfg = Gemma4BlockSDCMConfig.fast
+        cfg.blockSize = 8
+        cfg.prefixKeep = 8
+        cfg.tailKeep = 8
+        cfg.slidingWindowToRetain = window
+        cfg.strataCount = 0
+        cfg.forwardHalo = 0
+        cfg.backwardHalo = 0
+
+        var positions = (0 ..< length).map { Int32($0) }
+        for fraction: Float in [0.55, 0.12] {
+            // Favor 200..<208 and distant prefix blocks over the rest of the window.
+            let scores: [Float] = positions.map { $0 / 8 == 25 ? 1000 : Float(length) - Float($0) }
+            let kept = Gemma4BlockSDCM.selectCompactedIndices(
+                scores: scores, positions: positions, originalLength: length,
+                targetFraction: fraction, config: cfg)
+            #expect(kept.count < positions.count)
+            positions = kept.map { positions[Int($0)] }
+            #expect(Array(positions.suffix(window)) == (195 ..< 259).map { Int32($0) })
+        }
+
+        let start = Gemma4BlockSDCM.trueSlidingWindowStart(
+            positionsHost: positions, originalLength: length, slidingWindow: window)
+        return (length, window, Array(positions[start...]))
+    }
+
+    @Test("Repeated pruning preserves exact sliding-ring visibility through decode and wraparound")
+    func compactedSlidingRingVisibility() {
+        let (length, window, stored) = compactedSlidingPrompt()
+        let tags = MLXArray(stored.map { Float($0) }).reshaped(1, 1, -1, 1)
+        let row = CBv2WindowedSequenceKV(window: window, kvHeads: 1, headDim: 1)
+        _ = row.update(keys: tags, values: tags)
+        row.addPositionDelta(length - tags.dim(2))
+        for q in length ... length + window {
+            #expect(row.ropePositionOffset == q)
+            let token = MLXArray([Float(q)]).reshaped(1, 1, 1, 1)
+            let (_, visible) = row.update(keys: token, values: token)
+            #expect(visible.asArray(Float.self) == (q - window + 1 ... q).map { Float($0) })
+        }
+    }
+
+    @Test("Paged decode sees exactly the original-position window after compaction and page reuse")
+    func pagedCompactedSlidingRingVisibility() throws {
+        let (length, window, stored) = compactedSlidingPrompt()
+        let kind = CBv2LayerKind(
+            attention: .slidingWindow(window), headDim: window, kvHeads: 1, queryHeads: 1)
+        let config = PagedKVPoolConfig(
+            pageSize: 16, capacityBytes: 8 << 20, dtype: .float32, maxPrefillChunk: 16)
+        let backend = try PagedKVBackend(layerKinds: [kind], config: config)
+        let ringTokens = PagedKVPool.ringPageCount(window: window, config: config) * config.pageSize
+        let lastQuery = length + ringTokens
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: length, maxLength: lastQuery + 1)
+        defer { backend.release(state) }
+        let row = try #require(state[0] as? PagedSequenceKV)
+        let cache = backend.makeLayerCaches()[0]
+        cache.setRows([row])
+
+        // Each dense window has one position per lane. The absolute tag distinguishes generations.
+        func taggedKV(_ positions: [Int32]) -> MLXArray {
+            var tags = [Float](repeating: 0, count: positions.count * window)
+            for (index, position) in positions.enumerated() {
+                tags[index * window + Int(position) % window] = Float(position)
+            }
+            return MLXArray(tags, [1, 1, positions.count, window])
+        }
+
+        let prompt = taggedKV(stored)
+        cache.writeCompactedPromptKV(
+            keys: prompt, values: prompt, logicalDelta: length - stored.count)
+        try #require(!backend.pool.writeValidation.isFaulted)
+        let zeroQuery = MLXArray.zeros([1, 1, 1, window], dtype: .float32)
+        for q in length ... lastQuery {
+            let token = taggedKV([Int32(q)])
+            let output = cache.updateAndAttend(
+                queries: zeroQuery, keys: token, values: token, scale: 1, sinks: nil)
+            try #require(!backend.pool.writeValidation.isFaulted)
+            try #require(output.shape == [1, 1, 1, window])
+
+            // A zero query weights the dense window uniformly; each lane identifies its contributor.
+            let dense = (q - window + 1) ... q
+            var expected = [Float](repeating: 0, count: window)
+            for p in dense { expected[p % window] = Float(p) / Float(window) }
+            let error = MLX.abs(output - MLXArray(expected)).max().item(Float.self)
+            #expect(error < 1e-5, "Paged attention read the wrong positions at query \(q)")
+            let visible = row.snapshot().keys.sum(axis: -1).asArray(Float.self)
+            #expect(visible == dense.map { Float($0) }, "Paged key order at query \(q)")
+            #expect(row.ropePositionOffset == q + 1)
+        }
+        #expect(row.absoluteOffset > ringTokens)
     }
 
     // MARK: - Chunked Banded Original-Position Sliding Attention Parity
@@ -320,7 +483,7 @@ struct Gemma4BlockSDCMTests {
             earlyMoEK: 2,
             lateMoEK: 4,
             earlyMoEUntilLayer: 6,
-            blockSize: 16,
+            blockSize: 8,
             prefixKeep: 16,
             tailKeep: 16,
             forwardHalo: 0.85,
@@ -373,6 +536,7 @@ struct Gemma4BlockSDCMTests {
             // Sliding layer 0 stored only trailing `slidingWindow = 48` tokens, with logical RoPE == 128!
             #expect(rows[0].absoluteOffset == 48)
             #expect(rows[0].ropePositionOffset == promptLen)
+            #expect(rows[6].absoluteOffset == 47)  // All W-1 prompt keys for the first decode.
 
             // Subsequent decode step must advance all layers' logical RoPE offset to 129 cleanly!
             let decLogits = model(nextTok, cache: caches)
@@ -798,8 +962,7 @@ struct Gemma4BlockSDCMTests {
         eval(t1Logits)
         #expect(!MLX.isNaN(t1Logits).any().item(Bool.self))
 
-        // Turn 2 multi-token prompt (n > 1) when layer 0 has 48 live tokens and compacted layer 6
-        // has fewer live tokens (< slidingWindow=48) — must produce finite logits without mask mismatch.
+        // Turn 2 multi-token prompt (n > 1) after filling the compacted sliding ring.
         let followUp = MLXArray([Int32(11), 12, 13, 14, 15, 16]).reshaped([1, 6])
         let t2Logits = model(followUp, cache: caches)
         eval(t2Logits)
@@ -1418,19 +1581,24 @@ struct Gemma4BlockSDCMTests {
         let constEmb = MLXArray.ones([1, T, D], dtype: .float32)
         let constLay = MLXArray.ones([1, T, D], dtype: .float32)
         let constTok = [Int32](repeating: 7, count: T)
+        var ringCfg = cfg
+        ringCfg.slidingWindowToRetain = 96
+        ringCfg.strataCount = 0
         let keptConst = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
             tokenIDs: constTok, embeddingHidden: constEmb, layerHidden: constLay,
-            targetFraction: 0.50, blockSize: bs, topHaloK: 2, config: cfg)
+            targetFraction: 0.10, blockSize: bs, topHaloK: 2, config: ringCfg)
         #expect(keptConst.first == 0 && keptConst.last == Int32(T - 1))
         #expect(keptConst.count < T)
+        #expect(Array(keptConst.suffix(96)) == (277 ..< 373).map { Int32($0) })
 
         // 4. topHaloK far exceeding needInteriorBlocks must stay bounded by needInteriorBlocks and compact < T.
         let keptHugeHalo = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
             tokenIDs: constTok, embeddingHidden: embRand, layerHidden: layRand,
             targetFraction: 0.50, blockSize: bs, topHaloK: 100, config: cfg)
         let keptHugeHaloBlocks = Set(keptHugeHalo.map { Int($0) / bs })
-        // Pinned: block 0 (32) + block 11 (21) = 53 tokens; desired = 187 -> needInteriorBlocks = ceil(134/32) = 5.
-        #expect(keptHugeHaloBlocks.count == 2 + 5)
+        // The last 32 tokens straddle blocks 10 and 11. With block 0 pinned, 4 interior blocks fit.
+        #expect(Set([0, 10, 11]).isSubset(of: keptHugeHaloBlocks))
+        #expect(keptHugeHaloBlocks.count == 3 + 4)
         #expect(keptHugeHalo.count < T)
 
         // 5. Non-finite inputs (NaN / +Inf / -Inf) remain crash-free, strictly ascending, and pinned.
@@ -1486,7 +1654,7 @@ struct Gemma4BlockSDCMTests {
         turboCfg.slidingChunkSize = 64
         model.blockSDCMConfig = turboCfg
 
-        let T = 256
+        let T = 259
         let promptIDs = (0 ..< T).map { Int32(($0 * 11 + 5) % model.vocabularySize) }
         let prompt1D = MLXArray(promptIDs)
         let prompt = prompt1D.expandedDimensions(axis: 0)
@@ -1549,6 +1717,8 @@ struct Gemma4BlockSDCMTests {
             // Layer 5 runs AFTER L0 early pre-compaction (< T); Layer 11 runs AFTER L6 bilateral compaction (< L5).
             #expect(rows[5].absoluteOffset < T)
             #expect(rows[11].absoluteOffset < rows[5].absoluteOffset)
+            #expect(rows[1].absoluteOffset == 47)  // After turbo's early prune.
+            #expect(rows[6].absoluteOffset == 47)  // After the subsequent bilateral prune.
             for layer in 0 ..< kinds.count {
                 #expect(rows[layer].ropePositionOffset == T)
                 #expect(rows[layer].isCompacted)
@@ -1562,5 +1732,1563 @@ struct Gemma4BlockSDCMTests {
                 #expect(rows[layer].ropePositionOffset == T + 1)
             }
         }
+    }
+
+    // MARK: - Hardening Regressions (Partial Chunks, Cache Roles, Capabilities, Request Veto)
+
+    private static func makeHardeningSDCMConfig() -> Gemma4BlockSDCMConfig {
+        Gemma4BlockSDCMConfig(
+            mode: .fast,
+            minPromptTokens: 96,
+            keepSchedule: [6: 0.50],
+            earlyMoEK: 2,
+            lateMoEK: 4,
+            earlyMoEUntilLayer: 6,
+            blockSize: 8,
+            prefixKeep: 16,
+            tailKeep: 16,
+            forwardHalo: 0.85,
+            backwardHalo: 0.50,
+            strataCount: 2,
+            twoHopBlockPeaks: 4,
+            slidingChunkSize: 32
+        )
+    }
+
+    private static func makeContiguousCBv2Caches(
+        kinds: [CBv2LayerKind], promptLength: Int, maxLength: Int = 256
+    ) -> (rows: [CBv2SequenceKV], caches: [KVCache]) {
+        let rows: [CBv2SequenceKV] = kinds.map { kind in
+            switch kind.attention {
+            case .full:
+                CBv2FullSequenceKV(
+                    promptLength: promptLength, maxLength: maxLength,
+                    kvHeads: kind.kvHeads, headDim: kind.headDim)
+            case .slidingWindow(let w):
+                CBv2WindowedSequenceKV(
+                    window: w, kvHeads: kind.kvHeads, headDim: kind.headDim)
+            }
+        }
+        let caches: [KVCache] = kinds.enumerated().map { idx, kind in
+            let cache = CBv2LayerCache(layerIndex: idx, kind: kind)
+            cache.setRows([rows[idx]])
+            return cache
+        }
+        return (rows, caches)
+    }
+
+    @Test("CBv2 .evaluationOnly intermediate prefill chunks bypass Block-SDCM")
+    func evaluationOnlyPrefillBypassesBlockSDCM() throws {
+        MLXRandom.seed(701)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let sdcm = Self.makeHardeningSDCMConfig()
+        model.blockSDCMConfig = sdcm
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: model.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+
+        #expect(
+            !Gemma4BlockSDCM.canRun(
+                sdcm: sdcm, modelConfig: model.configuration, schedulePrefill: true,
+                allowsBlockSDCM: false, batchSize: 1, sequenceLength: 128,
+                hasInputEmbedding: false, hasImageMask: false, hasCaptureHook: false,
+                initialOffset: 0))
+        #expect(
+            Gemma4BlockSDCM.canRun(
+                sdcm: sdcm, modelConfig: model.configuration, schedulePrefill: true,
+                allowsBlockSDCM: true, batchSize: 1, sequenceLength: 128,
+                hasInputEmbedding: false, hasImageMask: false, hasCaptureHook: false,
+                initialOffset: 0))
+
+        let promptLen = 160
+        let firstChunkLen = 128  // >= minPromptTokens(96), cold offset 0
+        let prompt = MLXArray((0 ..< promptLen).map { Int32(($0 * 7 + 3) % 200) })
+            .expandedDimensions(axis: 0)
+        let chunk1 = prompt[0..., 0 ..< firstChunkLen]
+        let chunk2 = prompt[0..., firstChunkLen ..< promptLen]
+
+        let kinds = model.cbv2LayerKinds
+        let (onRows, onCaches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        let (offRows, offCaches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+
+        let handleOn = model.cbv2Prefill(
+            chunk1, inputEmbedding: nil, cache: onCaches, requirement: .evaluationOnly)
+        let handleOff = offModel.cbv2Prefill(
+            chunk1, inputEmbedding: nil, cache: offCaches, requirement: .evaluationOnly)
+        eval(handleOn, handleOff)
+        #expect(handleOn.shape == [1, 1])
+
+        // Intermediate chunk must keep exact KV on every layer.
+        for idx in 0 ..< kinds.count {
+            #expect(!onRows[idx].isCompacted)
+            #expect(!onRows[idx].usedApproximatePrefill)
+            #expect(onRows[idx].ropePositionOffset == firstChunkLen)
+            #expect(onRows[idx].absoluteOffset == offRows[idx].absoluteOffset)
+        }
+        #expect(onRows[5].absoluteOffset == firstChunkLen)
+        #expect(onRows[11].absoluteOffset == firstChunkLen)
+
+        let logitsOn = model.cbv2Prefill(
+            chunk2, inputEmbedding: nil, cache: onCaches, requirement: .lastPositionLogits)
+        let logitsOff = offModel.cbv2Prefill(
+            chunk2, inputEmbedding: nil, cache: offCaches, requirement: .lastPositionLogits)
+        eval(logitsOn, logitsOff)
+        #expect(MLX.abs(logitsOn - logitsOff).max().item(Float.self) < 1e-4)
+        #expect(onRows[11].absoluteOffset == promptLen)
+        #expect(!onRows[11].isCompacted)
+        #expect(!onRows[11].usedApproximatePrefill)
+    }
+
+    @Test("Standalone cache validation rejects capped full RotatingKVCache and mismatched sliding caches")
+    func standaloneCappedFullCacheRejectedByBlockSDCM() throws {
+        MLXRandom.seed(702)
+        let model = try Self.makeSyntheticGemma4MoE()
+        model.blockSDCMConfig = Self.makeHardeningSDCMConfig()
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: model.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+
+        let window = model.configuration.slidingWindow
+        // Full-attention layers accept unbounded KVCacheSimple only.
+        #expect(Gemma4BlockSDCM.supportsCache(StandardKVCache(), isSliding: false, slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                RotatingKVCache(maxSize: 64, keep: 4), isSliding: false, slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                RotatingKVCache(maxSize: window, keep: 0), isSliding: false, slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                ChunkedKVCache(chunkSize: 64), isSliding: false, slidingWindow: window))
+
+        // Sliding-attention layers accept RotatingKVCache(maxSize == window, keep == 0) only.
+        #expect(
+            Gemma4BlockSDCM.supportsCache(
+                RotatingKVCache(maxSize: window, keep: 0), isSliding: true, slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                RotatingKVCache(maxSize: window, keep: 4), isSliding: true, slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                RotatingKVCache(maxSize: window + 16, keep: 0), isSliding: true,
+                slidingWindow: window))
+        #expect(
+            !Gemma4BlockSDCM.supportsCache(
+                CompilableRotatingKVCache(maxSize: window, keep: 0), isSliding: true,
+                slidingWindow: window))
+        #expect(!Gemma4BlockSDCM.supportsCache(KVCacheSimple(), isSliding: true, slidingWindow: window))
+
+        let cappedParams = GenerateParameters(maxKVSize: 64)
+        let cappedCaches = model.newCache(parameters: cappedParams)
+        #expect(
+            !Gemma4BlockSDCM.supportsCaches(
+                cappedCaches.map { $0 as KVCache? }, modelConfig: model.configuration))
+
+        let promptLen = 128
+        let prompt1D = MLXArray((0 ..< promptLen).map { Int32(($0 * 5 + 1) % 200) })
+        let prompt = prompt1D.expandedDimensions(axis: 0)
+
+        // prepare() must bypass Block-SDCM when full layers are capped with RotatingKVCache.
+        let prepResult = try model.prepare(
+            LMInput(tokens: prompt1D), cache: cappedCaches, state: nil,
+            prefill: PrefillParameters(stepSize: 512))
+        guard case .tokens(let remaining) = prepResult else {
+            Issue.record("Expected .tokens from prepare on capped full cache")
+            return
+        }
+        #expect(remaining.tokens.size == promptLen)
+        #expect(cappedCaches.allSatisfy { $0.offset == 0 })
+
+        // Direct cbv2Prefill on capped caches must also stay on the exact path.
+        let cappedOffCaches = offModel.newCache(parameters: cappedParams)
+        let logitsOn = model.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: cappedCaches, requirement: .lastPositionLogits)
+        let logitsOff = offModel.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: cappedOffCaches, requirement: .lastPositionLogits)
+        eval(logitsOn, logitsOff)
+        #expect(MLX.abs(logitsOn - logitsOff).max().item(Float.self) < 1e-4)
+    }
+
+    @Test("Default CBv2AttendingLayerCache conformer and step-owned PagedLayerCache are rejected before mutating any layer")
+    func incapableCBv2AndStepOwnedPagedCachesRejectedBeforeMutation() throws {
+        MLXRandom.seed(703)
+        let model = try Self.makeSyntheticGemma4MoE()
+        model.blockSDCMConfig = Self.makeHardeningSDCMConfig()
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: model.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+
+        let kinds = model.cbv2LayerKinds
+        let sharedKind = CBv2LayerKind(
+            attention: .full, sharesKVWithLayer: 0, headDim: 128, kvHeads: 2, queryHeads: 4)
+        let sharedKinds = [kinds[5], sharedKind]
+
+        // Capability property checks across cache types and backends.
+        #expect(CBv2LayerCache(layerIndex: 5, kind: kinds[5]).supportsCompactedPromptKVWrite)
+        #expect(!CBv2LayerCache(layerIndex: 1, kind: sharedKind).supportsCompactedPromptKVWrite)
+        #expect(
+            CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 24, kvDType: .float32))
+                .supportsCompactedPromptKVWrite)
+        #expect(CBv2LayerCacheBank(layerKinds: kinds).supportsCompactedPromptKVWrite)
+        #expect(!CBv2LayerCacheBank(layerKinds: sharedKinds).supportsCompactedPromptKVWrite)
+
+        let normalPaged = try PagedKVBackend(
+            layerKinds: sharedKinds,
+            config: PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 16 * 1024 * 1024, dtype: .float32,
+                maxPrefillChunk: 128))
+        let normalPagedCaches = normalPaged.makeLayerCaches()
+        #expect(normalPaged.supportsCompactedPromptKVWrite)
+        #expect(normalPagedCaches[0].supportsCompactedPromptKVWrite)
+        #expect(!normalPagedCaches[1].supportsCompactedPromptKVWrite)
+        #expect(!CBv2LayerCacheBank(caches: normalPagedCaches).supportsCompactedPromptKVWrite)
+
+        let stepLimits = try CBv2PagedGatheredAttentionLimits(
+            maximumBatchSize: 1, maximumQueryTokens: 128, maximumContextTokens: 256,
+            maximumInFlightGraphs: 2, maximumScratchBytes: 64 * 1024 * 1024,
+            admissionMode: .stepOwned(.pinnedMetal))
+        let stepBackend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                maxPrefillChunk: 128, gatheredAttention: stepLimits))
+        let stepCaches = stepBackend.makeLayerCaches()
+        #expect(!stepBackend.supportsCompactedPromptKVWrite)
+        #expect(stepCaches.allSatisfy { !$0.supportsCompactedPromptKVWrite })
+        #expect(!CBv2LayerCacheBank(caches: stepCaches).supportsCompactedPromptKVWrite)
+        #expect(
+            !Gemma4BlockSDCM.supportsCaches(
+                stepCaches.map { $0 as KVCache? }, modelConfig: model.configuration))
+
+        // 1. Default CBv2AttendingLayerCache conformer at the final layer must reject SDCM
+        // before mutating layers 0..<11 and fall back cleanly to exact attention.
+        let promptLen = 128
+        let prompt1D = MLXArray((0 ..< promptLen).map { Int32(($0 * 13 + 7) % 200) })
+        let prompt = prompt1D.expandedDimensions(axis: 0)
+        let (rows, cbv2Caches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        let defaultLast = DefaultAttendingLayerCache(
+            layerIndex: kinds.count - 1, kind: kinds[kinds.count - 1])
+        defaultLast.setRows([rows[kinds.count - 1]])
+        #expect(!defaultLast.supportsCompactedPromptKVWrite)
+
+        var mixedCaches: [KVCache] = cbv2Caches
+        mixedCaches[kinds.count - 1] = defaultLast
+        #expect(
+            !Gemma4BlockSDCM.supportsCaches(
+                mixedCaches.map { $0 as KVCache? }, modelConfig: model.configuration))
+        #expect(
+            !CBv2LayerCacheBank(
+                caches: mixedCaches.map { $0 as! any CBv2AttendingLayerCache }
+            ).supportsCompactedPromptKVWrite)
+
+        let (offRows, offCaches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        let logitsMixed = model.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: mixedCaches, requirement: .lastPositionLogits)
+        let logitsOff = offModel.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: offCaches, requirement: .lastPositionLogits)
+        eval(logitsMixed, logitsOff)
+        #expect(MLX.abs(logitsMixed - logitsOff).max().item(Float.self) < 1e-4)
+        for idx in 0 ..< kinds.count {
+            #expect(!rows[idx].isCompacted)
+            #expect(!rows[idx].usedApproximatePrefill)
+            #expect(rows[idx].absoluteOffset == offRows[idx].absoluteOffset)
+            #expect(rows[idx].ropePositionOffset == promptLen)
+        }
+
+        // 2. Step-owned PagedLayerCache (all-step or final-layer only) must reject SDCM
+        // cleanly before mutating any layer or faulting write validation.
+        let (rows2, cbv2Caches2) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        let stepState = try stepBackend.makeSequenceState(
+            layerKinds: kinds, promptLength: promptLen, maxLength: 256)
+        defer { stepBackend.release(stepState) }
+        for idx in 0 ..< kinds.count {
+            stepCaches[idx].setRows([stepState[idx]!])
+        }
+        var mixedStepCaches: [KVCache] = cbv2Caches2
+        mixedStepCaches[kinds.count - 1] = stepCaches[kinds.count - 1]
+        #expect(
+            !Gemma4BlockSDCM.supportsCaches(
+                mixedStepCaches.map { $0 as KVCache? }, modelConfig: model.configuration))
+
+        let prepAllStep = try model.prepare(
+            LMInput(tokens: prompt1D), cache: stepCaches, state: nil,
+            prefill: PrefillParameters(stepSize: 512))
+        guard case .tokens(let remainingAllStep) = prepAllStep else {
+            Issue.record("Expected .tokens from prepare on step-owned paged caches")
+            return
+        }
+        #expect(remainingAllStep.tokens.size == promptLen)
+        #expect(!stepBackend.pool.writeValidation.isFaulted)
+        for idx in 0 ..< kinds.count {
+            #expect(stepState[idx]!.absoluteOffset == 0)
+            #expect(!stepState[idx]!.isCompacted)
+            #expect(!stepState[idx]!.usedApproximatePrefill)
+        }
+
+        let prepMixedStep = try model.prepare(
+            LMInput(tokens: prompt1D), cache: mixedStepCaches, state: nil,
+            prefill: PrefillParameters(stepSize: 512))
+        guard case .tokens(let remainingMixedStep) = prepMixedStep else {
+            Issue.record("Expected .tokens from prepare on mixed step-owned caches")
+            return
+        }
+        #expect(remainingMixedStep.tokens.size == promptLen)
+        #expect(!stepBackend.pool.writeValidation.isFaulted)
+        for idx in 0 ..< (kinds.count - 1) {
+            #expect(rows2[idx].absoluteOffset == 0)
+            #expect(!rows2[idx].isCompacted)
+            #expect(!rows2[idx].usedApproximatePrefill)
+        }
+        #expect(stepState[kinds.count - 1]!.absoluteOffset == 0)
+        #expect(!stepState[kinds.count - 1]!.isCompacted)
+        #expect(!stepState[kinds.count - 1]!.usedApproximatePrefill)
+    }
+
+    @Test("Incapable backend or cache provider never widens solo compaction chunks past maxPrefillChunk")
+    func incapableBackendOrCacheProviderNeverWidensSoloCompactionChunk() async throws {
+        MLXRandom.seed(705)
+        let sdcmModel = try Self.makeSyntheticGemma4MoE()
+        sdcmModel.blockSDCMConfig = Self.makeHardeningSDCMConfig()
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: sdcmModel.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+        let kinds = sdcmModel.cbv2LayerKinds
+
+        // 1. Direct SchedulerV2.plan(compactionSupported: false) refuses widening and keeps
+        // demanded checkpoint boundaries intact.
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 4,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                enablePrefixCache: true)
+            config.soloCompactionMinPromptTokens = 1536
+            config.demandedLatestCheckpointMinimumTokens = 1024
+
+            let schedulerLong = SchedulerV2(config: config)
+            try schedulerLong.enqueue(
+                CBv2Request(
+                    id: CBv2RequestID(31), promptTokens: Array(repeating: 1, count: 6000),
+                    maxTokens: 16))
+            let planLong = schedulerLong.plan(compactionSupported: false)
+            #expect(planLong.assignments.count == 1)
+            #expect(planLong.assignments[0].numTokens == 2048)
+
+            let schedulerLatest = SchedulerV2(config: config)
+            try schedulerLatest.enqueue(
+                CBv2Request(
+                    id: CBv2RequestID(32), promptTokens: Array(repeating: 1, count: 1800),
+                    maxTokens: 16, cacheSalt: "salt-incapable"))
+            let planLatest = schedulerLatest.plan(compactionSupported: false)
+            #expect(planLatest.assignments.count == 1)
+            #expect(planLatest.assignments[0].numTokens == 1536)
+            #expect(!planLatest.demandedShortCheckpointRows.isEmpty)
+        }
+
+        // 2. Step-owned PagedKVBackend clears soloCompactionMinPromptTokens in EngineV2 and
+        // disarms soloCompactionSupported in direct EngineLoopV2 construction.
+        do {
+            let stepLimits = try CBv2PagedGatheredAttentionLimits(
+                maximumBatchSize: 1, maximumQueryTokens: 64, maximumContextTokens: 256,
+                maximumInFlightGraphs: 2, maximumScratchBytes: 64 * 1024 * 1024,
+                admissionMode: .stepOwned(.pinnedMetal))
+            let stepBackend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 64, gatheredAttention: stepLimits))
+            let stepBank = CBv2LayerCacheBank(caches: stepBackend.makeLayerCaches())
+            #expect(!stepBackend.supportsCompactedPromptKVWrite)
+            #expect(!stepBank.supportsCompactedPromptKVWrite)
+
+            var schedConfig = CBv2SchedulerConfig(
+                maxConcurrentRequests: 1,
+                maxBatchedTokensPerStep: 64,
+                prefillChunkSize: 64,
+                soloPrefillStripeTokens: nil)
+            schedConfig.soloCompactionMinPromptTokens = 96
+
+            let stepEngine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(sdcmModel),
+                layerKinds: kinds,
+                backend: stepBackend,
+                cacheProvider: stepBank,
+                sampler: CBv2DefaultSampler(fallbackSeed: 23),
+                schedulerConfig: schedConfig)
+            #expect(stepEngine.schedulerConfig.soloCompactionMinPromptTokens == nil)
+            await stepEngine.shutdown()
+
+            // A capable backend with an `.off` model must also disarm solo compaction.
+            let capableBackend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 64))
+            let capableBank = CBv2LayerCacheBank(caches: capableBackend.makeLayerCaches())
+            let offEngine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(offModel),
+                layerKinds: kinds,
+                backend: capableBackend,
+                cacheProvider: capableBank,
+                sampler: CBv2DefaultSampler(fallbackSeed: 23),
+                schedulerConfig: schedConfig)
+            #expect(offEngine.schedulerConfig.soloCompactionMinPromptTokens == nil)
+            await offEngine.shutdown()
+
+            // Direct EngineLoopV2 with a pre-built SchedulerV2 still carrying
+            // soloCompactionMinPromptTokens must disarm soloCompactionSupported before plan().
+            let directStepBackend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 64, gatheredAttention: stepLimits))
+            let directStepBank = CBv2LayerCacheBank(caches: directStepBackend.makeLayerCaches())
+            let directScheduler = SchedulerV2(config: schedConfig)
+            let directLoop = EngineLoopV2(
+                model: CBv2SteppableLanguageModelAdapter(sdcmModel),
+                layerKinds: kinds,
+                backend: directStepBackend,
+                cacheProvider: directStepBank,
+                sampler: CBv2DefaultSampler(fallbackSeed: 23),
+                detokenizerFactory: CBv2NullDetokenizerFactory(),
+                scheduler: directScheduler,
+                capacity: nil,
+                config: CBv2EngineLoopConfig(),
+                gauges: CBv2EngineGauges(kvBytesCapacity: directStepBackend.bytesCapacity))
+            _ = directLoop
+            #expect(!directScheduler.soloCompactionSupported)
+            try directScheduler.enqueue(
+                CBv2Request(
+                    id: CBv2RequestID(33), promptTokens: Array(repeating: 1, count: 160),
+                    maxTokens: 4))
+            let directPlan = directScheduler.plan()
+            #expect(directPlan.assignments.count == 1)
+            #expect(directPlan.assignments[0].numTokens == 64)
+        }
+
+        // 3. End-to-end EngineV2 with a real PagedKVBackend(maxPrefillChunk: 64) and an incapable
+        // CBv2LayerCacheProvider: scheduler refuses widening a 160-token cold prompt (> 64, >= 96),
+        // preventing PagedSequenceKV's windowed maxPrefillChunk trap and producing exact fallback.
+        do {
+            let pagedBackend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 64))
+            let incapableProvider = IncapableCacheProvider(
+                CBv2LayerCacheBank(caches: pagedBackend.makeLayerCaches()))
+            #expect(pagedBackend.supportsCompactedPromptKVWrite)
+            #expect(!incapableProvider.supportsCompactedPromptKVWrite)
+
+            let spy = CompactionObservingSteppableModel(
+                CBv2SteppableLanguageModelAdapter(sdcmModel), watchedLayer: kinds.count - 1)
+            var schedConfig = CBv2SchedulerConfig(
+                maxConcurrentRequests: 2,
+                maxBatchedTokensPerStep: 64,
+                prefillChunkSize: 64,
+                soloPrefillStripeTokens: nil)
+            schedConfig.soloCompactionMinPromptTokens = 96
+
+            let engine = EngineV2(
+                model: spy,
+                layerKinds: kinds,
+                backend: pagedBackend,
+                cacheProvider: incapableProvider,
+                sampler: CBv2DefaultSampler(fallbackSeed: 29),
+                schedulerConfig: schedConfig)
+            #expect(engine.schedulerConfig.soloCompactionMinPromptTokens == nil)
+
+            var refConfig = schedConfig
+            refConfig.soloCompactionMinPromptTokens = nil
+            let refBackend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 64))
+            let refEngine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(offModel),
+                layerKinds: kinds,
+                backend: refBackend,
+                cacheProvider: CBv2LayerCacheBank(caches: refBackend.makeLayerCaches()),
+                sampler: CBv2DefaultSampler(fallbackSeed: 29),
+                schedulerConfig: refConfig)
+
+            let promptLen = 160  // >= soloCompactionMinPromptTokens(96) and > maxPrefillChunk(64)
+            let promptTokens = (0 ..< promptLen).map { ($0 * 11 + 3) % 200 }
+            let greedy = CBv2SamplingParams(temperature: 0)
+
+            func collectTokens(_ engine: EngineV2, request: CBv2Request) async throws -> [Int] {
+                var out: [Int] = []
+                for await event in try engine.submit(request) {
+                    if case .delta(_, let tokens, _) = event {
+                        out.append(contentsOf: tokens)
+                    }
+                }
+                return out
+            }
+
+            let actualTokens = try await collectTokens(
+                engine,
+                request: CBv2Request(
+                    id: CBv2RequestID(130), promptTokens: promptTokens, sampling: greedy,
+                    maxTokens: 3))
+            let refTokens = try await collectTokens(
+                refEngine,
+                request: CBv2Request(
+                    id: CBv2RequestID(131), promptTokens: promptTokens, sampling: greedy,
+                    maxTokens: 3))
+
+            await engine.shutdown()
+            await refEngine.shutdown()
+
+            #expect(actualTokens == refTokens)
+            let observations = spy.observations
+            #expect(observations.map(\.tokenCount) == [64, 64, 32])
+            #expect(observations.allSatisfy { !$0.compacted && !$0.usedApproximatePrefill })
+        }
+    }
+
+    @Test("Frozen-replay rows report supportsCompactedPositionDelta == false and fall back before mutating any layer")
+    func frozenReplayRowRejectedBeforeMutatingAnyLayer() throws {
+        MLXRandom.seed(706)
+        let model = try Self.makeSyntheticGemma4MoE()
+        model.blockSDCMConfig = Self.makeHardeningSDCMConfig()
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: model.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+
+        let kinds = model.cbv2LayerKinds
+        let promptLen = 128
+        let prompt = MLXArray((0 ..< promptLen).map { Int32(($0 * 3 + 17) % 200) })
+            .expandedDimensions(axis: 0)
+
+        // Compute exact reference K/V so the frozen-replay snapshot at layer 11 is exact.
+        let (offRows, offCaches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        let logitsOff = offModel.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: offCaches, requirement: .lastPositionLogits)
+        eval(logitsOff)
+        let lastIdx = kinds.count - 1
+        let exactLastSnapshot = offRows[lastIdx].snapshot()
+        eval(exactLastSnapshot.keys, exactLastSnapshot.values)
+
+        // 1. Contiguous CBv2FrozenReplayFullSequenceKV(replayStart: 0) starts at offset 0
+        // (so initialOffset == 0), yet must reject Block-SDCM via supportsCompactedPositionDelta.
+        let lastKind = kinds[lastIdx]
+        let frozenRow = CBv2FrozenReplayFullSequenceKV(
+            snapshot: exactLastSnapshot,
+            replayStart: 0,
+            maxLength: 256,
+            kvHeads: lastKind.kvHeads,
+            headDim: lastKind.headDim)
+        #expect(frozenRow.absoluteOffset == 0)
+        #expect(frozenRow.ropePositionOffset == 0)
+        #expect(!frozenRow.supportsCompactedPositionDelta)
+
+        let (rows, cbv2Caches) = Self.makeContiguousCBv2Caches(
+            kinds: kinds, promptLength: promptLen)
+        for idx in 0 ..< lastIdx {
+            #expect(rows[idx].supportsCompactedPositionDelta)
+        }
+        let frozenCache = CBv2LayerCache(layerIndex: lastIdx, kind: lastKind)
+        #expect(frozenCache.supportsCompactedPromptKVWrite)  // unbound: empty rows
+        frozenCache.setRows([frozenRow])
+        #expect(!frozenCache.supportsCompactedPromptKVWrite)
+
+        var mixedCaches: [KVCache] = cbv2Caches
+        mixedCaches[lastIdx] = frozenCache
+        #expect(
+            !Gemma4BlockSDCM.supportsCaches(
+                mixedCaches.map { $0 as KVCache? }, modelConfig: model.configuration))
+
+        let logitsFrozen = model.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: mixedCaches, requirement: .lastPositionLogits)
+        eval(logitsFrozen)
+        #expect(MLX.abs(logitsFrozen - logitsOff).max().item(Float.self) < 1e-4)
+        for idx in 0 ..< lastIdx {
+            #expect(!rows[idx].isCompacted)
+            #expect(!rows[idx].usedApproximatePrefill)
+            #expect(rows[idx].absoluteOffset == promptLen)
+            #expect(rows[idx].ropePositionOffset == promptLen)
+        }
+        #expect(!frozenRow.isCompacted)
+        #expect(!frozenRow.usedApproximatePrefill)
+        #expect(frozenRow.absoluteOffset == promptLen)
+        #expect(frozenRow.ropePositionOffset == promptLen)
+
+        // 2. PagedSequenceKV rejects compaction once frozen-adopted (even at replayStart: 0)
+        // or fast-forwarded (baseOffset > 0).
+        let pagedBackend = try PagedKVBackend(
+            layerKinds: [kinds[0], lastKind],
+            config: PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 16 * 1024 * 1024, dtype: .float32,
+                maxPrefillChunk: 128, nominalMaxSequenceLength: 256))
+        let pagedState = try pagedBackend.makeSequenceState(
+            layerKinds: [kinds[0], lastKind], promptLength: promptLen, maxLength: 256)
+        defer { pagedBackend.release(pagedState) }
+        let pagedSliding = pagedState[0] as! PagedSequenceKV
+        let pagedFull = pagedState[1] as! PagedSequenceKV
+        let pagedCaches = pagedBackend.makeLayerCaches()
+        pagedCaches[0].setRows([pagedSliding])
+        pagedCaches[1].setRows([pagedFull])
+        #expect(pagedSliding.supportsCompactedPositionDelta)
+        #expect(pagedFull.supportsCompactedPositionDelta)
+        #expect(pagedCaches[0].supportsCompactedPromptKVWrite)
+        #expect(pagedCaches[1].supportsCompactedPromptKVWrite)
+
+        pagedFull.adoptFrozen(
+            keys: exactLastSnapshot.keys.squeezed(axis: 0).asType(.float32),
+            values: exactLastSnapshot.values.squeezed(axis: 0).asType(.float32),
+            replayStart: 0)
+        #expect(pagedFull.absoluteOffset == 0)
+        #expect(pagedFull.ropePositionOffset == 0)
+        #expect(!pagedFull.supportsCompactedPositionDelta)
+        #expect(!pagedCaches[1].supportsCompactedPromptKVWrite)
+
+        pagedSliding.fastForward(to: 16)
+        #expect(!pagedSliding.supportsCompactedPositionDelta)
+        #expect(!pagedCaches[0].supportsCompactedPromptKVWrite)
+    }
+
+    @Test("Zero-drop Block-SDCM marks sticky usedApproximatePrefill and blocks prefix-cache donation")
+    func zeroDropBlockSDCMMarksStickyApproximatePrefillAndBlocksDonation() async throws {
+        MLXRandom.seed(707)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let zeroDropSDCM = Gemma4BlockSDCMConfig(
+            mode: .fast,
+            minPromptTokens: 32,
+            keepSchedule: [6: 1.0],
+            earlyMoEK: 2,
+            lateMoEK: 4,
+            earlyMoEUntilLayer: 6,
+            blockSize: 8,
+            prefixKeep: 8,
+            tailKeep: 8,
+            forwardHalo: 0.85,
+            backwardHalo: 0.50,
+            strataCount: 2,
+            twoHopBlockPeaks: 4,
+            slidingChunkSize: 32
+        )
+        model.blockSDCMConfig = zeroDropSDCM
+
+        let kinds = model.cbv2LayerKinds
+        // Keep promptLen <= slidingWindow (48) so sliding layers also write all tokens
+        // with logicalDelta == 0 and isCompacted == false across every layer.
+        let promptLen = 40
+        let promptTokens = (0 ..< promptLen).map { ($0 * 7 + 9) % 200 }
+        let prompt = MLXArray(promptTokens.map(Int32.init)).expandedDimensions(axis: 0)
+
+        // 1. Direct contiguous CBv2 pass: zero positions dropped, yet every row has sticky
+        // usedApproximatePrefill == true and PrefixCacheV2 refuses donation.
+        do {
+            let (rows, caches) = Self.makeContiguousCBv2Caches(
+                kinds: kinds, promptLength: promptLen)
+            let logits = model.cbv2Prefill(
+                prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(logits)
+            for idx in 0 ..< kinds.count {
+                #expect(!rows[idx].isCompacted)
+                #expect(rows[idx].usedApproximatePrefill)
+                #expect(rows[idx].absoluteOffset == promptLen)
+                #expect(rows[idx].ropePositionOffset == promptLen)
+            }
+            let directPrefixCache = PrefixCacheV2(config: CBv2PrefixCacheConfig(blockSize: 16))
+            directPrefixCache.donate(
+                tokens: promptTokens, state: rows.map { $0 as CBv2SequenceKV? }, layerKinds: kinds)
+            #expect(directPrefixCache.stats().entryCount == 0)
+        }
+
+        // 2. Direct paged CBv2 pass: zero positions dropped, yet usedApproximatePrefill == true
+        // vetoes resident prefix page handle publication.
+        do {
+            let backend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 32 * 1024 * 1024, dtype: .float32,
+                    maxPrefillChunk: 128, nominalMaxSequenceLength: 256))
+            let state = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: promptLen, maxLength: 128)
+            defer { backend.release(state) }
+            let rows = state.map { $0 as! PagedSequenceKV }
+            let caches = backend.makeLayerCaches()
+            for idx in 0 ..< kinds.count {
+                caches[idx].setRows([rows[idx]])
+            }
+            let logits = model.cbv2Prefill(
+                prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(logits)
+            for idx in 0 ..< kinds.count {
+                #expect(!rows[idx].isCompacted)
+                #expect(rows[idx].usedApproximatePrefill)
+                #expect(rows[idx].absoluteOffset == promptLen)
+                #expect(rows[idx].ropePositionOffset == promptLen)
+            }
+            #expect(rows[5].prefixPageHandles(tokens: 0 ..< 16) == nil)
+            #expect(rows[11].prefixPageHandles(tokens: 0 ..< 16) == nil)
+        }
+
+        // 3. EngineV2 with PrefixCacheV2: zero-drop Block-SDCM request never donates,
+        // while disablePrefillCompaction: true donates normally on an identical engine.
+        do {
+            var schedConfig = CBv2SchedulerConfig(
+                maxConcurrentRequests: 2,
+                maxBatchedTokensPerStep: 128,
+                prefillChunkSize: 128,
+                soloPrefillStripeTokens: nil,
+                enablePrefixCache: true)
+            schedConfig.soloCompactionMinPromptTokens = 32
+
+            let spyApprox = CompactionObservingSteppableModel(
+                CBv2SteppableLanguageModelAdapter(model), watchedLayer: kinds.count - 1)
+            let approxPrefixCache = PrefixCacheV2(config: CBv2PrefixCacheConfig(blockSize: 16))
+            let approxEngine = EngineV2(
+                model: spyApprox,
+                layerKinds: kinds,
+                backend: CBv2ContiguousKVBackend(
+                    config: .init(bytesCapacity: 1 << 27, kvDType: .float32)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 31),
+                schedulerConfig: schedConfig,
+                prefixCache: approxPrefixCache)
+
+            let spyExact = CompactionObservingSteppableModel(
+                CBv2SteppableLanguageModelAdapter(model), watchedLayer: kinds.count - 1)
+            let exactPrefixCache = PrefixCacheV2(config: CBv2PrefixCacheConfig(blockSize: 16))
+            let exactEngine = EngineV2(
+                model: spyExact,
+                layerKinds: kinds,
+                backend: CBv2ContiguousKVBackend(
+                    config: .init(bytesCapacity: 1 << 27, kvDType: .float32)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 31),
+                schedulerConfig: schedConfig,
+                prefixCache: exactPrefixCache)
+
+            let greedy = CBv2SamplingParams(temperature: 0)
+            func drain(_ engine: EngineV2, request: CBv2Request) async throws {
+                for await _ in try engine.submit(request) {}
+            }
+
+            try await drain(
+                approxEngine,
+                request: CBv2Request(
+                    id: CBv2RequestID(140), promptTokens: promptTokens, sampling: greedy,
+                    maxTokens: 2))
+            try await drain(
+                exactEngine,
+                request: CBv2Request(
+                    id: CBv2RequestID(141), promptTokens: promptTokens, sampling: greedy,
+                    maxTokens: 2, disablePrefillCompaction: true))
+
+            await approxEngine.shutdown()
+            await exactEngine.shutdown()
+
+            #expect(spyApprox.observations.count == 1)
+            #expect(!spyApprox.observations[0].compacted)
+            #expect(spyApprox.observations[0].usedApproximatePrefill)
+            #expect(approxPrefixCache.stats().entryCount == 0)
+
+            #expect(spyExact.observations.count == 1)
+            #expect(!spyExact.observations[0].compacted)
+            #expect(!spyExact.observations[0].usedApproximatePrefill)
+            #expect(exactPrefixCache.stats().entryCount == 1)
+        }
+    }
+
+    @Test("disablePrefillCompaction vetoes SchedulerV2 solo compaction and EngineV2 single-chunk Block-SDCM")
+    func disablePrefillCompactionBypassesSDCMOnColdSoloPrompt() async throws {
+        // 1. SchedulerV2 must not arm isCompaction or suppress checkpoint splits when vetoed.
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 4,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                enablePrefixCache: true)
+            config.soloCompactionMinPromptTokens = 1536
+            config.demandedShortCheckpointMinimumTokens = 1024
+            config.demandedCheckpointPartitionIncludesLongPrompts = true
+            config.demandedLatestCheckpointMinimumTokens = 1024
+
+            let schedulerLong = SchedulerV2(config: config)
+            let vetoedLong = CBv2Request(
+                id: CBv2RequestID(21), promptTokens: Array(repeating: 1, count: 6000),
+                maxTokens: 16, disablePrefillCompaction: true)
+            try schedulerLong.enqueue(vetoedLong)
+            let planLong = schedulerLong.plan()
+            #expect(planLong.assignments.count == 1)
+            #expect(planLong.assignments[0].numTokens == 2048)
+
+            // With soloPrefillStripeTokens == nil, the latest-boundary rule applies:
+            // reach = 1800 - 1 - 64 = 1735 -> aligned down to 256-token boundary = 1536.
+            let schedulerHint = SchedulerV2(config: config)
+            var vetoedHint = CBv2Request(
+                id: CBv2RequestID(22), promptTokens: Array(repeating: 1, count: 1800),
+                maxTokens: 16, cacheSalt: "salt-veto", disablePrefillCompaction: true)
+            vetoedHint.prefixCheckpointTargetTokens = 1280
+            try schedulerHint.enqueue(vetoedHint)
+            let planHint = schedulerHint.plan()
+            #expect(planHint.assignments.count == 1)
+            #expect(planHint.assignments[0].numTokens == 1536)
+            #expect(!planHint.demandedShortCheckpointRows.isEmpty)
+
+            // Without the veto, solo compaction arms and keeps the prompt whole (1800).
+            let schedulerUnvetoed = SchedulerV2(config: config)
+            var unvetoedHint = CBv2Request(
+                id: CBv2RequestID(23), promptTokens: Array(repeating: 1, count: 1800),
+                maxTokens: 16, cacheSalt: "salt-allow", disablePrefillCompaction: false)
+            unvetoedHint.prefixCheckpointTargetTokens = 1280
+            try schedulerUnvetoed.enqueue(unvetoedHint)
+            let planUnvetoed = schedulerUnvetoed.plan()
+            #expect(planUnvetoed.assignments.count == 1)
+            #expect(planUnvetoed.assignments[0].numTokens == 1800)
+            #expect(planUnvetoed.demandedShortCheckpointRows.isEmpty)
+        }
+
+        // 2. EngineV2 single-chunk cold solo prompt (L <= prefillChunkSize): veto must still
+        // bypass Block-SDCM, while default requests on the same engine still compact.
+        MLXRandom.seed(704)
+        let sdcmModel = try Self.makeSyntheticGemma4MoE()
+        sdcmModel.blockSDCMConfig = Self.makeHardeningSDCMConfig()
+
+        let offModel = try Self.makeSyntheticGemma4MoE()
+        try offModel.update(parameters: sdcmModel.parameters(), verify: .all)
+        offModel.blockSDCMConfig = .off
+
+        let kinds = sdcmModel.cbv2LayerKinds
+        let spy = CompactionObservingSteppableModel(
+            CBv2SteppableLanguageModelAdapter(sdcmModel), watchedLayer: kinds.count - 1)
+
+        var schedConfig = CBv2SchedulerConfig(
+            maxConcurrentRequests: 2,
+            maxBatchedTokensPerStep: 256,
+            prefillChunkSize: 256,
+            soloPrefillStripeTokens: nil)
+        schedConfig.soloCompactionMinPromptTokens = 96
+
+        let engine = EngineV2(
+            model: spy,
+            layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27, kvDType: .float32)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 19),
+            schedulerConfig: schedConfig)
+
+        var refConfig = schedConfig
+        refConfig.soloCompactionMinPromptTokens = nil
+        let refEngine = EngineV2(
+            model: CBv2SteppableLanguageModelAdapter(offModel),
+            layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27, kvDType: .float32)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 19),
+            schedulerConfig: refConfig)
+
+        let promptLen = 128  // >= minPromptTokens(96) and <= prefillChunkSize(256)
+        let promptTokens = (0 ..< promptLen).map { ($0 * 9 + 5) % 200 }
+        let greedy = CBv2SamplingParams(temperature: 0)
+
+        func collectTokens(_ engine: EngineV2, request: CBv2Request) async throws -> [Int] {
+            var out: [Int] = []
+            for await event in try engine.submit(request) {
+                if case .delta(_, let tokens, _) = event {
+                    out.append(contentsOf: tokens)
+                }
+            }
+            return out
+        }
+
+        let vetoedTokens = try await collectTokens(
+            engine,
+            request: CBv2Request(
+                id: CBv2RequestID(100), promptTokens: promptTokens, sampling: greedy,
+                maxTokens: 3, disablePrefillCompaction: true))
+        let refTokens = try await collectTokens(
+            refEngine,
+            request: CBv2Request(
+                id: CBv2RequestID(101), promptTokens: promptTokens, sampling: greedy,
+                maxTokens: 3))
+        let compactedTokens = try await collectTokens(
+            engine,
+            request: CBv2Request(
+                id: CBv2RequestID(102), promptTokens: promptTokens, sampling: greedy,
+                maxTokens: 3))
+
+        await engine.shutdown()
+        await refEngine.shutdown()
+
+        #expect(vetoedTokens == refTokens)
+        #expect(compactedTokens.count == 3)
+
+        let observations = spy.observations
+        #expect(observations.count == 2)
+        // First request (disablePrefillCompaction == true): exact single-chunk prefill.
+        #expect(observations[0].scopeDisabled)
+        #expect(!observations[0].compacted)
+        #expect(!observations[0].usedApproximatePrefill)
+        #expect(observations[0].absoluteOffset == promptLen)
+        #expect(observations[0].ropeOffset == promptLen)
+        // Second request (disablePrefillCompaction == false): Block-SDCM compacted layer 11.
+        #expect(!observations[1].scopeDisabled)
+        #expect(observations[1].compacted)
+        #expect(observations[1].usedApproximatePrefill)
+        #expect(observations[1].absoluteOffset < promptLen)
+        #expect(observations[1].ropeOffset == promptLen)
+    }
+
+    // MARK: - Coherent Full-KV Mode & Adaptive 2W/L Retention Floor
+
+    @Test(
+        "effectiveTargetFraction enforces 2W/L floor across prompt lengths and guards degenerate inputs"
+    )
+    func effectiveTargetFractionAdaptiveFloor() {
+        let W = 1024
+        var bal = Gemma4BlockSDCMConfig.balanced
+        bal.slidingWindowToRetain = W
+        let schedule: [Float] = [0.46, 0.30, 0.24, 0.20]
+
+        // 1W: floor = 2.0 -> clamped to 1.0 across all compaction boundaries.
+        for planned in schedule {
+            #expect(bal.effectiveTargetFraction(planned: planned, originalLength: W) == 1.0)
+        }
+
+        // 2.4W (~2458 tokens): floor = 2048 / 2458 ≈ 0.8332.
+        let len24W = Int((2.4 * Float(W)).rounded())
+        let expected24W = Float(2 * W) / Float(len24W)
+        for planned in schedule {
+            let actual = bal.effectiveTargetFraction(planned: planned, originalLength: len24W)
+            #expect(abs(actual - expected24W) < 1e-5)
+        }
+
+        // 4W: floor = 0.50 lifts all four boundaries to 0.50.
+        for planned in schedule {
+            #expect(bal.effectiveTargetFraction(planned: planned, originalLength: 4 * W) == 0.50)
+        }
+
+        // 8W: floor = 0.25 -> 46 / 30 / 25 / 25%.
+        let at8W = schedule.map {
+            bal.effectiveTargetFraction(planned: $0, originalLength: 8 * W)
+        }
+        #expect(at8W == [0.46, 0.30, 0.25, 0.25])
+
+        // 16W and 32W: floor <= 0.125 -> planned 46 / 30 / 24 / 20% unchanged.
+        for mult in [16, 32] {
+            let actual = schedule.map {
+                bal.effectiveTargetFraction(planned: $0, originalLength: mult * W)
+            }
+            #expect(actual == schedule)
+        }
+
+        // Fast preset leaves adaptiveRetentionFloorWindows == 0.
+        var fast = Gemma4BlockSDCMConfig.fast
+        fast.slidingWindowToRetain = W
+        #expect(fast.effectiveTargetFraction(planned: 0.12, originalLength: W) == 0.12)
+
+        // Degenerate inputs stay finite and safe.
+        #expect(bal.effectiveTargetFraction(planned: 0.20, originalLength: 0) == 0.20)
+        #expect(bal.effectiveTargetFraction(planned: 0.20, originalLength: -64) == 0.20)
+        #expect(bal.effectiveTargetFraction(planned: .nan, originalLength: 4 * W) == 1.0)
+        #expect(bal.effectiveTargetFraction(planned: .infinity, originalLength: 4 * W) == 1.0)
+        #expect(bal.effectiveTargetFraction(planned: -.infinity, originalLength: 4 * W) == 1.0)
+        #expect(bal.effectiveTargetFraction(planned: -0.5, originalLength: 4 * W) == 0.50)
+        #expect(bal.effectiveTargetFraction(planned: 1.5, originalLength: 4 * W) == 1.0)
+
+        var noWindow = bal
+        noWindow.slidingWindowToRetain = 0
+        #expect(noWindow.effectiveTargetFraction(planned: 0.20, originalLength: W) == 0.20)
+        noWindow.slidingWindowToRetain = -16
+        #expect(noWindow.effectiveTargetFraction(planned: 0.20, originalLength: W) == 0.20)
+
+        for badFloor: Float in [0, -2.0, .nan, .infinity, -.infinity] {
+            var badCfg = bal
+            badCfg.adaptiveRetentionFloorWindows = badFloor
+            #expect(badCfg.effectiveTargetFraction(planned: 0.20, originalLength: W) == 0.20)
+            let initCfg = Gemma4BlockSDCMConfig(
+                mode: .balanced, keepSchedule: [6: 0.46], adaptiveRetentionFloorWindows: badFloor)
+            #expect(initCfg.adaptiveRetentionFloorWindows == 0)
+        }
+    }
+
+    @Test(
+        "Skipped interior sliding layer matches exact tail hidden states, RMS-matched interior, and sliding KV commit"
+    )
+    func skippedInteriorSlidingLayerParity() throws {
+        MLXRandom.seed(808)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let layerIdx = 6  // sliding layer (W = 48)
+        let layer = try #require(model.decoderLayers[layerIdx] as? Gemma4DecoderLayer)
+        let window = model.configuration.slidingWindow
+        let L = 128
+        let cut = L - window
+
+        let x = MLXRandom.normal([1, L, model.configuration.hiddenSize]).asType(.float32)
+        let positionsHost = (0 ..< L).map { Int32($0) }
+        let positions = MLXArray(positionsHost)
+
+        let baseCfg = Gemma4BlockSDCMConfig(
+            mode: .coherent,
+            minPromptTokens: 64,
+            keepSchedule: [:],
+            earlyMoEK: 8,
+            lateMoEK: 8,
+            tailKeep: window,
+            earlySparseFullLayer: nil
+        )
+        var skipCfg = baseCfg
+        skipCfg.skipInteriorSlidingLayers = [layerIdx]
+
+        let kind = model.cbv2LayerKinds[layerIdx]
+        let exactRow = CBv2WindowedSequenceKV(
+            window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
+        let exactCache = CBv2LayerCache(layerIndex: layerIdx, kind: kind)
+        exactCache.setRows([exactRow])
+
+        let skipRow = CBv2WindowedSequenceKV(
+            window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
+        let skipCache = CBv2LayerCache(layerIndex: layerIdx, kind: kind)
+        skipCache.setRows([skipRow])
+
+        let (exactOut, _) = layer.forwardBlockSDCM(
+            x, positions: positions, positionsHost: positionsHost, originalLength: L,
+            cache: exactCache, sdcm: baseCfg, isFinalLayer: false,
+            nextReverseQuota: nil, isExpertPrefill: false)
+        let (skipOut, _) = layer.forwardBlockSDCM(
+            x, positions: positions, positionsHost: positionsHost, originalLength: L,
+            cache: skipCache, sdcm: skipCfg, isFinalLayer: false,
+            nextReverseQuota: nil, isExpertPrefill: false)
+
+        let exactSnap = exactRow.snapshot()
+        let skipSnap = skipRow.snapshot()
+        eval(exactOut, skipOut, exactSnap.keys, exactSnap.values, skipSnap.keys, skipSnap.values)
+
+        let tailDiff = MLX.abs(
+            exactOut[0..., cut..., 0...] - skipOut[0..., cut..., 0...]
+        ).max().item(Float.self)
+        #expect(tailDiff < 1e-4, "Skipped sliding layer tail mismatch: \(tailDiff)")
+
+        let kDiff = MLX.abs(exactSnap.keys - skipSnap.keys).max().item(Float.self)
+        let vDiff = MLX.abs(exactSnap.values - skipSnap.values).max().item(Float.self)
+        #expect(kDiff < 1e-5, "Skipped sliding layer K cache mismatch: \(kDiff)")
+        #expect(vDiff < 1e-5, "Skipped sliding layer V cache mismatch: \(vDiff)")
+        #expect(skipRow.absoluteOffset == window)
+        #expect(skipRow.ropePositionOffset == L)
+        #expect(skipRow.usedApproximatePrefill)
+
+        let xTail = x[0..., cut..., 0...]
+        let hTail = skipOut[0..., cut..., 0...]
+        let rmsIn = MLX.sqrt((xTail * xTail).mean())
+        let rmsOut = MLX.sqrt((hTail * hTail).mean())
+        let beta = MLX.clip(rmsOut / MLX.maximum(rmsIn, MLXArray(Float(1e-4))), min: Float(0.25), max: Float(4.0))
+        let expectedInterior = x[0..., ..<cut, 0...] * beta
+        let intDiff = MLX.abs(skipOut[0..., ..<cut, 0...] - expectedInterior).max().item(Float.self)
+        #expect(intDiff < 1e-5, "Skipped sliding layer interior RMS-scale mismatch: \(intDiff)")
+
+        // Larger `tailKeep > window` (and > `slidingChunkSize`) exercises chunked sliding attention
+        // while still protecting all `tailKeep` tokens and committing trailing `window` KV.
+        let wideTail = window + 32  // 80 > slidingChunkSize (64)
+        let wideCut = L - wideTail
+        var wideSkipCfg = skipCfg
+        wideSkipCfg.tailKeep = wideTail
+        wideSkipCfg.slidingChunkSize = 64
+        let wideRow = CBv2WindowedSequenceKV(
+            window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
+        let wideCache = CBv2LayerCache(layerIndex: layerIdx, kind: kind)
+        wideCache.setRows([wideRow])
+        let (wideOut, _) = layer.forwardBlockSDCM(
+            x, positions: positions, positionsHost: positionsHost, originalLength: L,
+            cache: wideCache, sdcm: wideSkipCfg, isFinalLayer: false,
+            nextReverseQuota: nil, isExpertPrefill: false)
+        let wideSnap = wideRow.snapshot()
+        eval(wideOut, wideSnap.keys, wideSnap.values)
+        let wideTailDiff = MLX.abs(
+            exactOut[0..., wideCut..., 0...] - wideOut[0..., wideCut..., 0...]
+        ).max().item(Float.self)
+        #expect(wideTailDiff < 1e-4, "Wide-tail skipped sliding layer mismatch: \(wideTailDiff)")
+        #expect(wideRow.absoluteOffset == window)
+        #expect(wideRow.ropePositionOffset == L)
+        #expect(MLX.abs(exactSnap.keys - wideSnap.keys).max().item(Float.self) < 1e-5)
+
+        // Zero-input tail in FP16 must stay finite (beta falls back to 1.0 instead of FP16 inf).
+        let xZeroTailFP16 = concatenated(
+            [
+                MLXRandom.normal([1, cut, model.configuration.hiddenSize]).asType(.float16),
+                MLXArray.zeros([1, window, model.configuration.hiddenSize], dtype: .float16),
+            ],
+            axis: 1)
+        let (zeroTailOut, _) = layer.forwardBlockSDCM(
+            xZeroTailFP16, positions: positions, positionsHost: positionsHost, originalLength: L,
+            cache: nil, sdcm: skipCfg, isFinalLayer: false,
+            nextReverseQuota: nil, isExpertPrefill: false)
+        eval(zeroTailOut)
+        #expect(!MLX.isNaN(zeroTailOut).any().item(Bool.self))
+        #expect(!MLX.isInf(zeroTailOut).any().item(Bool.self))
+        let zeroTailIntDiff = MLX.abs(
+            zeroTailOut[0..., ..<cut, 0...].asType(.float32)
+                - xZeroTailFP16[0..., ..<cut, 0...].asType(.float32)
+        ).max().item(Float.self)
+        #expect(zeroTailIntDiff < 1e-4, "Zero-tail FP16 interior must keep beta == 1.0")
+    }
+
+    @Test(
+        "Coherent full-KV mode retains 100% full-attention KV, contiguous sliding tails, decodes cleanly, and blocks prefix donation"
+    )
+    func endToEndCoherentFullKVAllBackends() throws {
+        MLXRandom.seed(809)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let window = model.configuration.slidingWindow  // 48
+        let fullLayers: Set<Int> = [5, 11]
+        let skippedSlidingLayers: Set<Int> = [6, 7, 8, 9]
+
+        let coherentCfg = Gemma4BlockSDCMConfig(
+            mode: .coherent,
+            minPromptTokens: 96,
+            keepSchedule: [:],
+            earlyMoEK: 2,
+            lateMoEK: 2,
+            earlyMoEUntilLayer: 11,
+            layerMoEK: [:],
+            blockSize: 16,
+            prefixKeep: 16,
+            tailKeep: window,
+            slidingChunkSize: 32,
+            earlySparseFullLayer: 5,
+            sparsePrefixTokens: 16,
+            sparseLocalWindow: 32,
+            sparseTailTokens: 32,
+            sparseFullLayers: [5],
+            skipInteriorSlidingLayers: skippedSlidingLayers
+        )
+        model.blockSDCMConfig = coherentCfg
+
+        let promptLen = 128
+        #expect(
+            Gemma4BlockSDCM.canRun(
+                sdcm: coherentCfg, modelConfig: model.configuration, schedulePrefill: true,
+                allowsBlockSDCM: true, batchSize: 1, sequenceLength: promptLen,
+                hasInputEmbedding: false, hasImageMask: false, hasCaptureHook: false,
+                initialOffset: 0))
+
+        let promptTokens = (0 ..< promptLen).map { ($0 * 13 + 7) % 200 }
+        let prompt1D = MLXArray(promptTokens.map(Int32.init))
+        let prompt = prompt1D.expandedDimensions(axis: 0)
+        let nextTok = MLXArray([Int32(42)]).reshaped([1, 1])
+        let kinds = model.cbv2LayerKinds
+
+        // 1. Paged CBv2 Backend
+        do {
+            let backend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: 16, capacityBytes: 64 * 1024 * 1024,
+                    dtype: .float32, maxPrefillChunk: 128))
+            let state = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: promptLen, maxLength: 256)
+            defer { backend.release(state) }
+            let rows = state.map { $0 as! PagedSequenceKV }
+            let pagedCaches = backend.makeLayerCaches()
+            let caches: [KVCache] = pagedCaches.enumerated().map { idx, c in
+                c.setRows([rows[idx]])
+                return c
+            }
+
+            let prefillLogits = model.cbv2Prefill(
+                prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(prefillLogits)
+            #expect(prefillLogits.shape == [1, model.vocabularySize])
+            #expect(!MLX.isNaN(prefillLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(prefillLogits).any().item(Bool.self))
+            #expect(!backend.pool.writeValidation.isFaulted)
+
+            for idx in 0 ..< kinds.count {
+                #expect(rows[idx].ropePositionOffset == promptLen)
+                #expect(rows[idx].usedApproximatePrefill)
+                #expect(pagedCaches[idx].hostPositionOffsets == [Int32(promptLen)])
+                if fullLayers.contains(idx) {
+                    #expect(rows[idx].absoluteOffset == promptLen)
+                    #expect(!rows[idx].isCompacted)
+                    #expect(rows[idx].prefixPageHandles(tokens: 0 ..< 16) == nil)
+                } else {
+                    #expect(rows[idx].absoluteOffset == window)
+                }
+            }
+
+            let decLogits = model(nextTok, cache: caches)
+            eval(decLogits)
+            #expect(decLogits.shape == [1, 1, model.vocabularySize])
+            #expect(!MLX.isNaN(decLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(decLogits).any().item(Bool.self))
+            #expect(!backend.pool.writeValidation.isFaulted)
+            for idx in 0 ..< kinds.count {
+                #expect(rows[idx].ropePositionOffset == promptLen + 1)
+                #expect(pagedCaches[idx].hostPositionOffsets == [Int32(promptLen + 1)])
+            }
+        }
+
+        // 2. Contiguous CBv2 Backend
+        do {
+            let (rows, caches) = Self.makeContiguousCBv2Caches(
+                kinds: kinds, promptLength: promptLen)
+            let prefillLogits = model.cbv2Prefill(
+                prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(prefillLogits)
+            #expect(prefillLogits.shape == [1, model.vocabularySize])
+            #expect(!MLX.isNaN(prefillLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(prefillLogits).any().item(Bool.self))
+
+            for idx in 0 ..< kinds.count {
+                #expect(rows[idx].ropePositionOffset == promptLen)
+                #expect(rows[idx].usedApproximatePrefill)
+                if fullLayers.contains(idx) {
+                    #expect(rows[idx].absoluteOffset == promptLen)
+                    #expect(!rows[idx].isCompacted)
+                } else {
+                    #expect(rows[idx].absoluteOffset == window)
+                }
+            }
+
+            let prefixCache = PrefixCacheV2(config: CBv2PrefixCacheConfig(blockSize: 16))
+            prefixCache.donate(
+                tokens: promptTokens, state: rows.map { $0 as CBv2SequenceKV? }, layerKinds: kinds)
+            #expect(prefixCache.stats().entryCount == 0)
+
+            let decLogits = model(nextTok, cache: caches)
+            eval(decLogits)
+            #expect(decLogits.shape == [1, 1, model.vocabularySize])
+            #expect(!MLX.isNaN(decLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(decLogits).any().item(Bool.self))
+            for idx in 0 ..< kinds.count {
+                #expect(rows[idx].ropePositionOffset == promptLen + 1)
+            }
+        }
+
+        // 3. Standalone KVCache (`prepare` + frontier + decode)
+        do {
+            let caches = model.newCache(parameters: nil)
+            let prep = try model.prepare(
+                LMInput(tokens: prompt1D), cache: caches, state: nil, prefill: PrefillParameters())
+            guard case .tokens(let remaining) = prep else {
+                Issue.record("Expected .tokens from coherent prepare")
+                return
+            }
+            #expect(remaining.tokens.size == 1)
+
+            for idx in 0 ..< kinds.count {
+                if case .scalar(let ropePos) = caches[idx].ropeOffset {
+                    #expect(ropePos == promptLen - 1)
+                } else {
+                    Issue.record("Expected scalar ropeOffset at layer \(idx)")
+                }
+                if fullLayers.contains(idx) {
+                    let simple = try #require(caches[idx] as? KVCacheSimple)
+                    #expect(simple.offset == promptLen - 1)
+                    #expect(simple.positionDelta == 0)
+                } else {
+                    #expect(caches[idx].state[0].dim(2) == window)
+                }
+            }
+
+            let frontierLogits = model(remaining.tokens.expandedDimensions(axis: 0), cache: caches)
+            eval(frontierLogits)
+            #expect(!MLX.isNaN(frontierLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(frontierLogits).any().item(Bool.self))
+
+            let decLogits = model(nextTok, cache: caches)
+            eval(decLogits)
+            #expect(!MLX.isNaN(decLogits).any().item(Bool.self))
+            #expect(!MLX.isInf(decLogits).any().item(Bool.self))
+            for idx in 0 ..< kinds.count {
+                if case .scalar(let ropePos) = caches[idx].ropeOffset {
+                    #expect(ropePos == promptLen + 1)
+                } else {
+                    Issue.record("Expected scalar ropeOffset after decode at layer \(idx)")
+                }
+            }
+        }
+
+        // 4. Adaptive 2W/L floor inside trunk keeps 100% full-attention KV when L == 2 * W.
+        do {
+            let shortLen = 2 * window  // 96
+            var flooredCfg = Self.makeHardeningSDCMConfig()
+            flooredCfg.mode = .balanced
+            flooredCfg.minPromptTokens = shortLen
+            flooredCfg.adaptiveRetentionFloorWindows = 2.0
+            model.blockSDCMConfig = flooredCfg
+
+            let shortPrompt = prompt[0..., 0 ..< shortLen]
+            let (rows, caches) = Self.makeContiguousCBv2Caches(
+                kinds: kinds, promptLength: shortLen)
+            let logits = model.cbv2Prefill(
+                shortPrompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+            eval(logits)
+            #expect(!MLX.isNaN(logits).any().item(Bool.self))
+            #expect(rows[5].absoluteOffset == shortLen)
+            #expect(rows[11].absoluteOffset == shortLen)
+            #expect(!rows[11].isCompacted)
+            #expect(rows[11].usedApproximatePrefill)
+        }
+    }
+
+    @Test("willCompact skips no-op adaptive boundaries and matches selectCompactedIndices")
+    func willCompactMatchesSelectCompactedIndices() {
+        var bal = Gemma4BlockSDCMConfig.balanced
+        bal.slidingWindowToRetain = 1024
+
+        // Near 2W (T = 2049, 2100), adaptive 2W/L floor rounds up to all interior blocks.
+        for noOpLength in [2049, 2100] {
+            let pos = (0 ..< noOpLength).map { Int32($0) }
+            let target = bal.effectiveTargetFraction(planned: 0.46, originalLength: noOpLength)
+            #expect(target < 1.0)
+            #expect(
+                !Gemma4BlockSDCM.willCompact(
+                    positions: pos, originalLength: noOpLength, targetFraction: target, config: bal)
+            )
+            let nBlocks = (noOpLength + bal.blockSize - 1) / bal.blockSize
+            let kept = Gemma4BlockSDCM.selectCompactedIndices(
+                boundaryScores: Gemma4SDCMBoundaryScores(
+                    forwardBlockScores: [Float](repeating: 1.0, count: nBlocks)),
+                positions: pos, originalLength: noOpLength, targetFraction: target, config: bal)
+            #expect(kept.count == noOpLength)
+        }
+
+        // Above the 2W floor (T = 2427, 8825), compaction drops interior blocks.
+        for activeLength in [2427, 8825] {
+            let pos = (0 ..< activeLength).map { Int32($0) }
+            let target = bal.effectiveTargetFraction(planned: 0.46, originalLength: activeLength)
+            #expect(
+                Gemma4BlockSDCM.willCompact(
+                    positions: pos, originalLength: activeLength, targetFraction: target,
+                    config: bal))
+            let nBlocks = (activeLength + bal.blockSize - 1) / bal.blockSize
+            let kept = Gemma4BlockSDCM.selectCompactedIndices(
+                boundaryScores: Gemma4SDCMBoundaryScores(
+                    forwardBlockScores: (0 ..< nBlocks).map { Float($0 + 1) }),
+                positions: pos, originalLength: activeLength, targetFraction: target, config: bal)
+            #expect(kept.count < activeLength)
+        }
+
+        // Strata + reverse quota floor retaining all 6 surviving interior blocks is also a no-op.
+        var fast = Gemma4BlockSDCMConfig.fast
+        fast.slidingWindowToRetain = 1024
+        let fastPrefix = Array(0 ..< 128).map(Int32.init)
+        let fastSixInterior = Array(128 ..< (128 + 6 * 32)).map(Int32.init)
+        let fastTail = Array(512 ..< 1536).map(Int32.init)
+        let fastAlive = fastPrefix + fastSixInterior + fastTail
+        #expect(
+            !Gemma4BlockSDCM.willCompact(
+                positions: fastAlive, originalLength: 1536, targetFraction: 0.22,
+                reverseQuotaFraction: 0.28, config: fast))
+    }
+
+    @Test(
+        "Quantized paged KV refuses compacted writes fail-closed and falls back to exact prefill"
+    )
+    func quantizedPagedKVRefusesCompactedWrites() throws {
+        MLXRandom.seed(810)
+        let model = try Self.makeSyntheticGemma4MoE()
+        model.update(parameters: model.parameters().mapValues { $0.asType(.float16) })
+        let kinds = model.cbv2LayerKinds
+        let promptLen = 128
+
+        let quantBackend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float16,
+                maxPrefillChunk: 128, nominalMaxSequenceLength: 256,
+                segmentSizeBytes: 4 * 1024 * 1024,
+                quantization: PagedKVQuantizationConfig(recentTokenCount: 16)))
+        #expect(quantBackend.usesQuantizedStorage)
+        #expect(!quantBackend.supportsCompactedPromptKVWrite)
+
+        let state = try quantBackend.makeSequenceState(
+            layerKinds: kinds, promptLength: promptLen, maxLength: 256)
+        defer { quantBackend.release(state) }
+        let rows = state.map { $0 as! PagedSequenceKV }
+        let pagedCaches = quantBackend.makeLayerCaches()
+        let caches: [KVCache] = pagedCaches.enumerated().map { idx, c in
+            c.setRows([rows[idx]])
+            return c
+        }
+
+        for idx in 0 ..< kinds.count {
+            #expect(!rows[idx].supportsCompactedPositionDelta)
+            #expect(!pagedCaches[idx].supportsCompactedPromptKVWrite)
+        }
+        #expect(!Gemma4BlockSDCM.supportsCaches(caches, modelConfig: model.configuration))
+
+        // Coherent/Block-SDCM falls back to exact prefill without faulting quantized storage.
+        var cfg = Self.makeHardeningSDCMConfig()
+        cfg.mode = .coherent
+        cfg.keepSchedule = [:]
+        cfg.skipInteriorSlidingLayers = [6, 7]
+        cfg.tailKeep = model.configuration.slidingWindow
+        model.blockSDCMConfig = cfg
+
+        let prompt = MLXArray((0 ..< promptLen).map { Int32(($0 * 11 + 5) % 200) })
+            .expandedDimensions(axis: 0)
+        let logits = model.cbv2Prefill(
+            prompt, inputEmbedding: nil, cache: caches, requirement: .lastPositionLogits)
+        eval(logits)
+        #expect(!quantBackend.pool.writeValidation.isFaulted)
+        #expect(!MLX.isNaN(logits).any().item(Bool.self))
+        for idx in 0 ..< kinds.count {
+            #expect(!rows[idx].usedApproximatePrefill)
+            #expect(rows[idx].ropePositionOffset == promptLen)
+        }
+
+        // Direct writeCompactedPromptKV call refuses cleanly via writeValidation without advancing offsets.
+        let beforeOffset = rows[5].absoluteOffset
+        let dummyK = MLXArray.zeros(
+            [1, kinds[5].kvHeads, 4, kinds[5].headDim], dtype: .float16)
+        pagedCaches[5].writeCompactedPromptKV(keys: dummyK, values: dummyK, logicalDelta: 8)
+        #expect(quantBackend.pool.writeValidation.isFaulted)
+        #expect(rows[5].absoluteOffset == beforeOffset)
+        #expect(rows[5].ropePositionOffset == beforeOffset)
+    }
+}
+
+/// Wrapper `CBv2LayerCacheProvider` that deliberately omits
+/// `supportsCompactedPromptKVWrite` (inheriting the fail-closed default `false`).
+private final class IncapableCacheProvider: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
+    private let inner: CBv2LayerCacheBank
+
+    init(_ inner: CBv2LayerCacheBank) {
+        self.inner = inner
+    }
+
+    func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        inner.layerCaches(rowStates: rowStates)
+    }
+
+    func invalidateBoundComposition() {
+        inner.invalidateBoundComposition()
+    }
+
+    func releaseBoundRows() {
+        inner.releaseBoundRows()
+    }
+}
+
+/// Minimal `CBv2AttendingLayerCache` conformer relying on the default fail-closed
+/// `supportsCompactedPromptKVWrite == false` and trapping `writeCompactedPromptKV`.
+private final class DefaultAttendingLayerCache: CBv2AttendingLayerCache, KVCache {
+    let layerIndex: Int
+    let kind: CBv2LayerKind
+    private var storedRows: [CBv2SequenceKV] = []
+
+    init(layerIndex: Int, kind: CBv2LayerKind) {
+        self.layerIndex = layerIndex
+        self.kind = kind
+    }
+
+    var rows: [CBv2SequenceKV] { storedRows }
+    func setRows(_ rows: [CBv2SequenceKV]) { storedRows = rows }
+    var positionOffsets: MLXArray { MLXArray(storedRows.map { Int32($0.ropePositionOffset) }) }
+
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        CBv2AttentionV1.updateAndAttend(
+            rows: storedRows, kind: kind, queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks)
+    }
+
+    func attendBorrowing(
+        source: CBv2AttendingLayerCache, queries: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        CBv2AttentionV1.attendBorrowing(
+            sourceRows: source.rows, sourceKind: source.kind, kind: kind,
+            queries: queries, scale: scale, sinks: sinks)
+    }
+
+    var offset: Int { storedRows.map { $0.absoluteOffset }.max() ?? 0 }
+    var maxSize: Int? { nil }
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError("v2 models must call updateAndAttend, not KVCache.update")
+    }
+    var state: [MLXArray] {
+        get { [] }
+        set {}
+    }
+    var metaState: [String] {
+        get { [] }
+        set {}
+    }
+    var isTrimmable: Bool { false }
+    @discardableResult
+    func trim(_ n: Int) -> Int { 0 }
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode { .none }
+    func copy() -> any KVCache { fatalError("copy() unsupported in test cache") }
+    func innerState() -> [MLXArray] { [] }
+}
+
+private final class CompactionObservingSteppableModel: CBv2PrefillSteppableModel,
+    @unchecked Sendable
+{
+    struct Observation: Sendable {
+        let tokenCount: Int
+        let scopeDisabled: Bool
+        let compacted: Bool
+        let usedApproximatePrefill: Bool
+        let absoluteOffset: Int
+        let ropeOffset: Int
+    }
+
+    private let inner: CBv2SteppableLanguageModelAdapter
+    private let watchedLayer: Int
+    private let lock = NSLock()
+    private var recorded: [Observation] = []
+
+    init(_ inner: CBv2SteppableLanguageModelAdapter, watchedLayer: Int) {
+        self.inner = inner
+        self.watchedLayer = watchedLayer
+    }
+
+    var observations: [Observation] {
+        lock.withLock { recorded }
+    }
+
+    var supportsCompactedPromptPrefill: Bool {
+        inner.supportsCompactedPromptPrefill
+    }
+
+    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        inner.forward(tokens: tokens, caches: caches)
+    }
+
+    func prefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        let disabled = CBv2PrefillCompactionScope.isDisabled
+        let output = inner.prefill(
+            tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
+            requirement: requirement)
+        if let row = caches[watchedLayer].rows.first {
+            let obs = Observation(
+                tokenCount: tokens.dim(1),
+                scopeDisabled: disabled,
+                compacted: row.isCompacted,
+                usedApproximatePrefill: row.usedApproximatePrefill,
+                absoluteOffset: row.absoluteOffset,
+                ropeOffset: row.ropePositionOffset)
+            lock.withLock { recorded.append(obs) }
+        }
+        return output
     }
 }

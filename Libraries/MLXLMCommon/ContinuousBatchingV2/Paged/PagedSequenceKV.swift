@@ -64,10 +64,26 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     public private(set) var absoluteOffset: Int = 0
     private var positionDelta: Int = 0
+    private var _usedApproximatePrefill = false
     public var ropePositionOffset: Int { absoluteOffset + positionDelta }
+    public var usedApproximatePrefill: Bool { _usedApproximatePrefill || isCompacted }
+    public var supportsCompactedPositionDelta: Bool {
+        !released && !pool.usesStepOwnedAttention && !usesQuantizedStorage
+            && frozenHighWater == 0 && baseOffset == 0
+    }
+    public var supportsApproximatePrefillProvenance: Bool { true }
+
+    public func markApproximatePrefill() {
+        _usedApproximatePrefill = true
+    }
 
     public func addPositionDelta(_ delta: Int) {
         precondition(delta >= 0, "[PagedSequenceKV] negative position delta \(delta)")
+        if delta > 0 {
+            precondition(
+                supportsCompactedPositionDelta,
+                "[PagedSequenceKV] addPositionDelta(\(delta)) requires a live non-frozen row")
+        }
         positionDelta += delta
     }
     /// Qwen4 QSA indexer sidecar. Same lifecycle as `CBv2FullSequenceKV`.
@@ -844,7 +860,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// Opt-in, same-pool snapshots include partial pages. Every future write
     /// through this row first makes shared destination pages private.
     func immutableSnapshot(through count: Int) throws -> PagedImmutableSnapshot {
-        guard !released, !isCompacted, windowSize == nil, baseOffset == 0, frozenHighWater == 0,
+        guard !released, !isCompacted, !usedApproximatePrefill, windowSize == nil,
+            baseOffset == 0, frozenHighWater == 0,
             groupKey.quantization == nil,
             !pool.usesStepOwnedAttention
                 || (pool.glm5NextPayloadBinding != nil
@@ -939,7 +956,9 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// FULL row. Publication never exposes a partial frontier page: an adopter
     /// must be able to append without copy-on-write.
     func prefixPageHandles(tokens range: Range<Int>) -> [PagedKVPageHandle]? {
-        guard windowSize == nil, !released, !isCompacted else { return nil }
+        guard windowSize == nil, !released, !isCompacted, !usedApproximatePrefill else {
+            return nil
+        }
         let pageSize = pool.config.pageSize
         guard range.lowerBound >= 0, range.upperBound <= writtenHighWater,
             range.lowerBound % pageSize == 0, range.upperBound % pageSize == 0

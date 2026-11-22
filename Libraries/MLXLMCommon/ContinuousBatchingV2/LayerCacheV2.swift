@@ -202,10 +202,20 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    public var supportsCompactedPromptKVWrite: Bool {
+        kind.sharesKVWithLayer == nil
+            && rows.allSatisfy {
+                $0.supportsCompactedPositionDelta && $0.supportsApproximatePrefillProvenance
+            }
+    }
+
     public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(
+            rows.allSatisfy(\.supportsCompactedPositionDelta),
+            "CBv2LayerCache: bound rows must support compacted position deltas")
         precondition(logicalDelta >= 0, "CBv2LayerCache: negative logicalDelta \(logicalDelta)")
         precondition(
             keys.ndim == 4 && values.ndim == 4,
@@ -223,6 +233,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             if logicalDelta > 0 {
                 row.addPositionDelta(logicalDelta)
             }
+            row.markApproximatePrefill()
         }
         let advance = stored + logicalDelta
         if advance > 0 {

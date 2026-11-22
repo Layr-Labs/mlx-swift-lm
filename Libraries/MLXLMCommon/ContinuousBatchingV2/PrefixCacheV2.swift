@@ -267,7 +267,11 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind],
         cacheSalt: String?
     ) {
-        guard state.count == layerKinds.count else { return }
+        guard state.count == layerKinds.count,
+            !state.contains(where: {
+                $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+            })
+        else { return }
         // Snapshot the full-attention storage-owning layers. Windowed layers
         // must not enter full-history prefix reuse (report 10 invariant 6);
         // KV-sharing layers own no storage. Both stay nil.

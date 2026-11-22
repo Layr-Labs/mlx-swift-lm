@@ -18,7 +18,9 @@ extension CBv2CompleteCheckpointCapture {
         allowance: CBv2HistoricalStagingAllowance? = nil,
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) throws -> CBv2CapturedCompleteCheckpoint? {
-        if state.contains(where: { $0?.isCompacted == true }) {
+        if state.contains(where: {
+            $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+        }) {
             return nil
         }
         if codec.contiguousLayout != nil {
@@ -279,7 +281,9 @@ extension EngineLoopV2 {
                 rec.request.multimodal == nil, rec.request.positionState == nil,
                 rec.preemptionCount == 0,
                 let state = kvStates[id],
-                !state.contains(where: { $0?.isCompacted == true })
+                !state.contains(where: {
+                    $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+                })
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             if capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical {

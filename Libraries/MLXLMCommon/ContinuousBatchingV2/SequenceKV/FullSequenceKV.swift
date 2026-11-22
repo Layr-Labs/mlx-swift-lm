@@ -84,8 +84,16 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
 
     public private(set) var absoluteOffset: Int = 0
     private var positionDelta: Int = 0
+    private var _usedApproximatePrefill = false
     public var ropePositionOffset: Int { absoluteOffset + positionDelta }
     public var retainedCount: Int { absoluteOffset }
+    public var usedApproximatePrefill: Bool { _usedApproximatePrefill || isCompacted }
+    public var supportsCompactedPositionDelta: Bool { true }
+    public var supportsApproximatePrefillProvenance: Bool { true }
+
+    public func markApproximatePrefill() {
+        _usedApproximatePrefill = true
+    }
 
     public func addPositionDelta(_ delta: Int) {
         precondition(delta >= 0, "CBv2FullSequenceKV: negative position delta \(delta)")

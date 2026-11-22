@@ -104,6 +104,9 @@ extension EngineLoopV2 {
             var cursor = residentPrefixCursorByID[requestID],
             let rec = scheduler.record(for: requestID),
             let state = explicitState ?? kvStates[requestID],
+            !state.contains(where: {
+                $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+            }),
             rec.request.prefixCacheEnabled,
             rec.request.multimodal == nil
         else { return }

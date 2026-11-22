@@ -59,7 +59,15 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// Absolute position of the next token to be written.
     public private(set) var absoluteOffset: Int
     private var positionDelta: Int = 0
+    private var _usedApproximatePrefill = false
     public var ropePositionOffset: Int { absoluteOffset + positionDelta }
+    public var usedApproximatePrefill: Bool { _usedApproximatePrefill || isCompacted }
+    public var supportsCompactedPositionDelta: Bool { true }
+    public var supportsApproximatePrefillProvenance: Bool { true }
+
+    public func markApproximatePrefill() {
+        _usedApproximatePrefill = true
+    }
 
     public func addPositionDelta(_ delta: Int) {
         precondition(delta >= 0, "CBv2WindowedSequenceKV: negative position delta \(delta)")

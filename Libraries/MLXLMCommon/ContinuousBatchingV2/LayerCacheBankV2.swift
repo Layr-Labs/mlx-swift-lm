@@ -199,6 +199,10 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is any CBv2MTPRectangularSerializing }
     }
 
+    public var supportsCompactedPromptKVWrite: Bool {
+        !caches.isEmpty && caches.allSatisfy(\.supportsCompactedPromptKVWrite)
+    }
+
     /// Builds one MTP verification forward (`body`, a `[B, 1 + k]` call per
     /// layer) with every cache attending rectangular calls one query column
     /// at a time, and clears the flags again whatever `body` does. This is

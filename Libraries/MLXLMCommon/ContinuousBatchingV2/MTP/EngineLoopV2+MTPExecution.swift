@@ -452,7 +452,8 @@ extension EngineLoopV2 {
                 } else {
                     output = try prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                        requirement: requirement,
+                        disableCompaction: rec.request.disablePrefillCompaction)
                 }
             } else if mtp.tracksPersistentHistory,
                 let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
@@ -513,7 +514,8 @@ extension EngineLoopV2 {
             } else {
                 output = try prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                    requirement: requirement,
+                    disableCompaction: rec.request.disablePrefillCompaction)
             }
             if let observedHidden,
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden),

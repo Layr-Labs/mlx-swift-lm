@@ -279,6 +279,8 @@ public final class SchedulerV2 {
     public var admissionHoldActive: Bool { admissionHeld && !running.isEmpty }
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
+    /// Disables solo whole-prompt widening when model, backend, or caches refuse compaction.
+    public var soloCompactionSupported = true
 
     /// Starvation guard for block-sized vision chunks (PR#63 review): the id
     /// of a row whose next multimodal block fits a FULL step budget (submit
@@ -363,7 +365,7 @@ public final class SchedulerV2 {
     ///   allow; chunked prefill admits with a partial token count.
     /// - `numComputedTokens` advances optimistically at plan time; use
     ///   `rollback(_:)` if the planned step is never executed.
-    public func plan() -> CBv2StepPlan {
+    public func plan(compactionSupported: Bool = true) -> CBv2StepPlan {
         // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
         // Armed ONLY when this plan cannot delay anyone else's work: exactly
         // one live request exists across running+waiting (paused rows count —
@@ -374,7 +376,9 @@ public final class SchedulerV2 {
         let soloStripe: (tokens: Int, id: CBv2RequestID, isCompaction: Bool)? = {
             let hasStripe =
                 (config.soloPrefillStripeTokens ?? 0) > config.prefillChunkSize
-            let hasCompaction = (config.soloCompactionMinPromptTokens ?? 0) > 0
+            let hasCompaction =
+                compactionSupported && soloCompactionSupported
+                && (config.soloCompactionMinPromptTokens ?? 0) > 0
             guard hasStripe || hasCompaction else { return nil }
             let liveRunning = running.filter {
                 !$0.cancelRequested && $0.remainingTokens > 0
@@ -407,8 +411,10 @@ public final class SchedulerV2 {
             // fresh cold text prompts at or above the configured floor so the
             // model observes the complete prompt in one pass without inflating
             // paged sliding-window rings or splitting at demanded checkpoints.
-            if let minCompaction = config.soloCompactionMinPromptTokens,
+            if hasCompaction,
+                let minCompaction = config.soloCompactionMinPromptTokens,
                 minCompaction > 0,
+                !solo.request.disablePrefillCompaction,
                 solo.request.multimodal == nil,
                 solo.numComputedTokens == 0,
                 solo.prefixReusePlan == nil,

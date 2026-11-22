@@ -41,6 +41,19 @@ public enum CBv2PrefillRequirement: Sendable, Equatable {
     case lastPositionLogits
 }
 
+/// Synchronous forward scope allowing the engine to veto prompt compaction
+/// per request while keeping prefill output narrowing intact.
+public enum CBv2PrefillCompactionScope {
+    @TaskLocal public static var isDisabled = false
+
+    public static func withDisabled<Result>(
+        _ disabled: Bool, operation: () throws -> Result
+    ) rethrows -> Result {
+        guard disabled else { return try operation() }
+        return try $isDisabled.withValue(true, operation: operation)
+    }
+}
+
 /// Opt-in prompt-forward refinement for steppable models.
 ///
 /// `inputEmbeddings` is non-nil only for a multimodal chunk whose image
@@ -48,12 +61,19 @@ public enum CBv2PrefillRequirement: Sendable, Equatable {
 /// must then take the same embedding path `CBv2MultimodalSteppableModel
 /// .forward(tokens:inputEmbeddings:caches:)` would take.
 public protocol CBv2PrefillSteppableModel: CBv2SteppableModel {
+    /// True when this model can execute compacted/approximate whole-prompt prefill.
+    var supportsCompactedPromptPrefill: Bool { get }
+
     func prefill(
         tokens: MLXArray,
         inputEmbeddings: MLXArray?,
         caches: [CBv2AttendingLayerCache],
         requirement: CBv2PrefillRequirement
     ) -> MLXArray
+}
+
+extension CBv2PrefillSteppableModel {
+    public var supportsCompactedPromptPrefill: Bool { false }
 }
 
 /// Opt-in refinement for models whose prompt forward keeps per-row
@@ -95,13 +115,16 @@ public protocol CBv2LanguageModelPrefillForwardable {
     /// Stronger claim for rectangular embedding-forward rows with one
     /// optional vision span-mask context per row. Fail-closed default: false.
     var cbv2SupportsPackedMultimodalPrefill: Bool { get }
+
+    /// True when this model has compacted/approximate whole-prompt prefill armed.
+    var cbv2SupportsCompactedPromptPrefill: Bool { get }
 }
 
 extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
+    public var cbv2SupportsCompactedPromptPrefill: Bool { false }
 }
-
 
 /// Recurrent twin of `CBv2PrefillSteppableModel`: the prompt-forward seam for
 /// models whose chunks carry request-owned recurrent state and positions

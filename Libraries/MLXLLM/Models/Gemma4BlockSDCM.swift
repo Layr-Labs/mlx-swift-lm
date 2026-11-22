@@ -16,8 +16,8 @@
 //  - Selects atomic contiguous 32/64-token blocks with symmetric neighbor halos,
 //    mandatory prefix/tail retention, and 4-strata coverage.
 //  - Preserves exact original-position RoPE phases, O(L * W) banded original-position
-//    sliding SDPA, and true-window sliding KV commits (`origPos >= T - W + 1`) so
-//    compacted decode steps never attend to out-of-window sliding keys.
+//    sliding SDPA, and the contiguous trailing sliding window so packed decode rings
+//    evict keys at their original token ages.
 
 import Foundation
 import MLX
@@ -32,6 +32,9 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public enum Mode: String, Sendable, Equatable, CaseIterable {
         /// Disabled: 100% exact unmodified prefill.
         case off
+        /// Zero-deletion full-KV prefill with top-2 interior MoE, sparse early full
+        /// attention (L5/L11/L17), and norm-matched interior skips on late sliding layers.
+        case coherent
         /// Causal-lightcone L12-start compaction (`40/26/20%`, 64-tok blocks) with
         /// energy-tapered early MoE and bilateral frontier + reverse prefix scoring.
         /// ~2.0x faster with near-exact quality across top-instruction and multi-hop suites.
@@ -82,6 +85,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public var prefixKeep: Int
     /// Mandatory tail tokens kept intact and routed at exact top-8 MoE (preserves bottom questions).
     public var tailKeep: Int
+    /// Model window pinned during pruning only. Expert routing and saliency queries use `tailKeep`.
+    var slidingWindowToRetain = 0
     /// Halo weight propagated from a hot block `b` to `b + 1` (preserves function bodies / values).
     public var forwardHalo: Float
     /// Halo weight propagated from a hot block `b` to `b - 1` (preserves function headers / labels).
@@ -115,6 +120,12 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public var earlyPreCompactBlockSize: Int
     /// Number of sharpest MaxSim+2-Hop blocks granted an explicit `±1` neighbor halo at early compaction.
     public var earlyPreCompactTopHaloK: Int
+    /// Full-attention layers using Prefix+Local+FullTail sparse attention.
+    public var sparseFullLayers: Set<Int>
+    /// Contiguous sliding layers whose interior tokens skip compute with RMS norm matching.
+    public var skipInteriorSlidingLayers: Set<Int>
+    /// Minimum retained prompt span in sliding-window units (`windows * W / L`).
+    public var adaptiveRetentionFloorWindows: Float
 
     public init(
         mode: Mode,
@@ -141,7 +152,10 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         earlyPreCompactAfterLayer: Int? = nil,
         earlyPreCompactRatio: Float = 0.55,
         earlyPreCompactBlockSize: Int = 64,
-        earlyPreCompactTopHaloK: Int = 8
+        earlyPreCompactTopHaloK: Int = 8,
+        sparseFullLayers: Set<Int> = [],
+        skipInteriorSlidingLayers: Set<Int> = [],
+        adaptiveRetentionFloorWindows: Float = 0
     ) {
         self.mode = mode
         self.minPromptTokens = max(1, minPromptTokens)
@@ -170,6 +184,11 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
             ? max(0.1, min(1.0, earlyPreCompactRatio)) : 1.0
         self.earlyPreCompactBlockSize = max(1, earlyPreCompactBlockSize)
         self.earlyPreCompactTopHaloK = max(0, earlyPreCompactTopHaloK)
+        self.sparseFullLayers = sparseFullLayers
+        self.skipInteriorSlidingLayers = skipInteriorSlidingLayers
+        self.adaptiveRetentionFloorWindows =
+            adaptiveRetentionFloorWindows.isFinite
+            ? max(0, adaptiveRetentionFloorWindows) : 0
     }
 
     /// Resolve interior MoE top-k for `layerIdx` (tail tokens always run exact full top-k).
@@ -180,8 +199,60 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         return layerIdx < earlyMoEUntilLayer ? earlyMoEK : lateMoEK
     }
 
+    /// True when `layerIdx` uses Prefix+Local+FullTail sparse full attention.
+    public func usesSparseFullAttention(forLayer layerIdx: Int) -> Bool {
+        sparseFullLayers.contains(layerIdx) || earlySparseFullLayer == layerIdx
+    }
+
+    /// Effective retention fraction after applying the `adaptiveRetentionFloorWindows * W / L` floor.
+    public func effectiveTargetFraction(planned: Float, originalLength: Int) -> Float {
+        let base: Float = planned.isFinite ? max(0, min(1, planned)) : 1
+        guard adaptiveRetentionFloorWindows.isFinite,
+            adaptiveRetentionFloorWindows > 0,
+            slidingWindowToRetain > 0,
+            originalLength > 0
+        else {
+            return base
+        }
+        let floor = min(
+            Float(1),
+            adaptiveRetentionFloorWindows * Float(slidingWindowToRetain) / Float(originalLength))
+        return floor.isFinite ? max(base, floor) : base
+    }
+
+    /// True when this config enables at least one prefill optimization.
+    public var hasActiveOptimizations: Bool {
+        !keepSchedule.isEmpty
+            || !skipInteriorSlidingLayers.isEmpty
+            || !sparseFullLayers.isEmpty
+            || earlySparseFullLayer != nil
+            || earlyMoEK < 8
+            || lateMoEK < 8
+            || layerMoEK.values.contains(where: { $0 < 8 })
+            || earlyPreCompactAfterLayer != nil
+    }
+
     public static let off = Gemma4BlockSDCMConfig(
         mode: .off, keepSchedule: [:], earlySparseFullLayer: nil)
+
+    public static let coherent = Gemma4BlockSDCMConfig(
+        mode: .coherent,
+        minPromptTokens: 1536,
+        keepSchedule: [:],
+        earlyMoEK: 2,
+        lateMoEK: 2,
+        earlyMoEUntilLayer: 29,
+        layerMoEK: [:],
+        blockSize: 64,
+        prefixKeep: 128,
+        tailKeep: 1024,
+        earlySparseFullLayer: nil,
+        sparsePrefixTokens: 256,
+        sparseLocalWindow: 1024,
+        sparseTailTokens: 1024,
+        sparseFullLayers: [5, 11, 17],
+        skipInteriorSlidingLayers: [24, 25, 26, 27]
+    )
 
     public static let lightcone = Gemma4BlockSDCMConfig(
         mode: .lightcone,
@@ -204,7 +275,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         earlySparseFullLayer: 5,
         sparsePrefixTokens: 256,
         sparseLocalWindow: 1024,
-        sparseTailTokens: 256
+        sparseTailTokens: 256,
+        adaptiveRetentionFloorWindows: 2.0
     )
 
     public static let balanced = Gemma4BlockSDCMConfig(
@@ -228,7 +300,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         earlySparseFullLayer: 5,
         sparsePrefixTokens: 256,
         sparseLocalWindow: 1024,
-        sparseTailTokens: 256
+        sparseTailTokens: 256,
+        adaptiveRetentionFloorWindows: 2.0
     )
 
     public static let fast = Gemma4BlockSDCMConfig(
@@ -286,6 +359,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public static func preset(for mode: Mode) -> Gemma4BlockSDCMConfig {
         switch mode {
         case .off: return .off
+        case .coherent: return .coherent
         case .lightcone: return .lightcone
         case .balanced: return .balanced
         case .fast: return .fast
@@ -298,6 +372,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "", "0", "false", "no", "off", "disabled":
             return .off
+        case "coherent", "fullkv", "full":
+            return .coherent
         case "1", "true", "yes", "on", "lightcone", "l12":
             return .lightcone
         case "balanced", "bal":
@@ -329,6 +405,9 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
             let value = Int(rawK), (1 ... 8).contains(value)
         {
             config.earlyMoEK = value
+            if config.mode == .coherent {
+                config.lateMoEK = value
+            }
             // Explicit early-k override applies uniformly across early layers.
             config.layerMoEK = config.layerMoEK.filter { $0.key >= config.earlyMoEUntilLayer }
         }
@@ -468,15 +547,46 @@ public enum Gemma4BlockSDCM {
             && modelConfig.enableMoeBlock
     }
 
-    /// True when a cache instance supports writing compacted prompt K/V with a
-    /// logical RoPE position delta without corrupting physical cursors.
-    static func supportsCache(_ cache: KVCache) -> Bool {
-        if cache is any CBv2AttendingLayerCache || cache is KVCacheSimple {
-            return true
+    /// True when `cache` supports compacted prompt K/V writes for a layer with the given role.
+    static func supportsCache(
+        _ cache: KVCache, isSliding: Bool, slidingWindow: Int
+    ) -> Bool {
+        if let v2Cache = cache as? any CBv2AttendingLayerCache {
+            guard v2Cache.supportsCompactedPromptKVWrite else { return false }
+            if isSliding {
+                return slidingWindow > 0 && v2Cache.kind.attention == .slidingWindow(slidingWindow)
+            }
+            return v2Cache.kind.attention == .full
         }
-        // `CompilableRotatingKVCache` inherits from `RotatingKVCache` but reads
-        // `offsetArray` instead of `offset`, so it cannot accept host offset deltas.
-        return cache is RotatingKVCache && !(cache is CompilableRotatingKVCache)
+        if isSliding {
+            guard slidingWindow > 0,
+                type(of: cache) == RotatingKVCache.self,
+                let rotating = cache as? RotatingKVCache
+            else {
+                return false
+            }
+            return rotating.preservedPrefixTokens == 0
+                && rotating.maxSize == slidingWindow
+                && rotating.rewindCapacity == 0
+        }
+        return type(of: cache) == KVCacheSimple.self
+    }
+
+    /// True when every non-nil layer cache supports compacted writes for its layer role.
+    static func supportsCaches(
+        _ caches: [KVCache?], modelConfig: Gemma4TextConfiguration
+    ) -> Bool {
+        guard caches.count <= modelConfig.layerTypes.count else { return false }
+        for (idx, cache) in caches.enumerated() {
+            guard let cache else { continue }
+            let isSliding = modelConfig.layerTypes[idx] == "sliding_attention"
+            if !supportsCache(
+                cache, isSliding: isSliding, slidingWindow: modelConfig.slidingWindow)
+            {
+                return false
+            }
+        }
+        return true
     }
 
     /// Check whether a Gemma 4 prefill call qualifies for Block-SDCM.
@@ -486,6 +596,7 @@ public enum Gemma4BlockSDCM {
         sdcm: Gemma4BlockSDCMConfig,
         modelConfig: Gemma4TextConfiguration,
         schedulePrefill: Bool,
+        allowsBlockSDCM: Bool,
         batchSize: Int,
         sequenceLength: Int,
         hasInputEmbedding: Bool,
@@ -495,22 +606,24 @@ public enum Gemma4BlockSDCM {
     ) -> Bool {
         sdcm.mode != .off
             && schedulePrefill
+            && allowsBlockSDCM
             && batchSize == 1
             && sequenceLength >= sdcm.minPromptTokens
-            && sequenceLength > sdcm.prefixKeep + sdcm.tailKeep
+            && sequenceLength > max(0, sdcm.prefixKeep)
+            && sequenceLength - max(0, sdcm.prefixKeep) > max(1, sdcm.tailKeep)
             && !hasInputEmbedding
             && !hasImageMask
             && !hasCaptureHook
             && initialOffset == 0
             && supportsModelConfig(modelConfig)
-            && !sdcm.keepSchedule.isEmpty
+            && sdcm.hasActiveOptimizations
     }
 
     /// Number of contiguous blocks covering `originalLength` (always `>= 1`).
     fileprivate static func blockCount(originalLength: Int, blockSize: Int) -> Int {
         let effectiveBlockSize = max(1, blockSize)
         guard originalLength > 0 else { return 1 }
-        return (originalLength + effectiveBlockSize - 1) / effectiveBlockSize
+        return 1 + (originalLength - 1) / effectiveBlockSize
     }
 
     /// Map an original token position to its block index in `0 ..< nBlocks`, or `nil` if out of range.
@@ -524,14 +637,13 @@ public enum Gemma4BlockSDCM {
 
     /// Block boundaries for mandatory pinned prefix (`..< prefBlocks`) and tail (`tailStartBlock...`).
     private static func pinnedBlockBounds(
-        nBlocks: Int, blockSize: Int, config: Gemma4BlockSDCMConfig
+        originalLength: Int, blockSize: Int, config: Gemma4BlockSDCMConfig
     ) -> (prefBlocks: Int, tailStartBlock: Int) {
-        let prefixKeep = max(0, config.prefixKeep)
-        let tailKeep = max(1, config.tailKeep)
-        let prefBlocks = prefixKeep > 0 ? (prefixKeep + blockSize - 1) / blockSize : 0
-        let tailBlocks = max(1, (tailKeep + blockSize - 1) / blockSize)
-        let tailStartBlock = max(0, nBlocks - tailBlocks)
-        return (prefBlocks, tailStartBlock)
+        let prefixKeep = min(originalLength, max(0, config.prefixKeep))
+        let prefBlocks = prefixKeep > 0 ? 1 + (prefixKeep - 1) / blockSize : 0
+        let tailKeep = max(1, config.tailKeep, config.slidingWindowToRetain)
+        // A partial last block ends at the real prompt end, not at nBlocks * blockSize.
+        return (prefBlocks, max(0, originalLength - tailKeep) / blockSize)
     }
 
     /// Rank block indices by descending score with deterministic ascending-index tie-breaking
@@ -802,7 +914,7 @@ public enum Gemma4BlockSDCM {
             }
         }
         let (prefBlocks, tailStartBlock) = pinnedBlockBounds(
-            nBlocks: nBlocks, blockSize: blockSize, config: config)
+            originalLength: originalLength, blockSize: blockSize, config: config)
         let interiorStart = min(prefBlocks, nBlocks)
         let interiorEnd = max(interiorStart, tailStartBlock)
         var interiorBlocks: [Int] = []
@@ -912,8 +1024,11 @@ public enum Gemma4BlockSDCM {
         // 3. Pure Log-Odds Reverse Causal Prefix Resonance (`doc -> prefix[4..<P]` vs sink `[0..<4)`).
         var revScores: [Float]? = nil
         let reversePrefixEnd = max(0, config.reversePrefixEnd)
-        if reverseQuotaFraction.isFinite, reverseQuotaFraction > 0,
-            L > reversePrefixEnd + 256, interiorBlocks.count > 4
+        if willComputeReverseScores(
+            positions: positionsHost,
+            interiorBlockCount: interiorBlocks.count,
+            reverseQuotaFraction: reverseQuotaFraction,
+            config: config)
         {
             let sinkEnd = lowerBound(positionsHost, target: 4)
             let prefEnd = lowerBound(positionsHost, target: Int64(reversePrefixEnd))
@@ -1041,31 +1156,42 @@ public enum Gemma4BlockSDCM {
         }
     }
 
-    /// Quota-partitioned deterministic block-atomic token selection with symmetric halos,
-    /// mandatory prefix/tail retention, stratified macro-segment floor, and dedicated
-    /// Reverse Causal Prefix Resonance quota.
-    public static func selectCompactedIndices(
-        boundaryScores: Gemma4SDCMBoundaryScores,
+    private struct CompactionBudget {
+        let pinnedBlocks: Set<Int>
+        let interiorBlocks: [Int]
+        let needInteriorBlocks: Int
+    }
+
+    private static func willComputeReverseScores(
+        positions: [Int32],
+        interiorBlockCount: Int,
+        reverseQuotaFraction: Float,
+        config: Gemma4BlockSDCMConfig
+    ) -> Bool {
+        let reversePrefixEnd = max(0, config.reversePrefixEnd)
+        guard reverseQuotaFraction.isFinite, reverseQuotaFraction > 0,
+            positions.count > reversePrefixEnd + 256,
+            interiorBlockCount > 4
+        else { return false }
+        let sinkEnd = lowerBound(positions, target: 4)
+        let prefEnd = lowerBound(positions, target: Int64(reversePrefixEnd))
+        return sinkEnd >= 1 && max(0, prefEnd - sinkEnd) >= 4
+    }
+
+    private static func compactionBudget(
         positions: [Int32],
         originalLength: Int,
         targetFraction: Float,
+        includeReverseQuota: Bool?,
+        reverseQuotaFraction: Float,
         config: Gemma4BlockSDCMConfig
-    ) -> [Int32] {
+    ) -> CompactionBudget? {
         let count = positions.count
-        guard count > 0, originalLength > 0 else { return [] }
+        guard count > 0, originalLength > 0 else { return nil }
         let blockSize = max(1, config.blockSize)
         let nBlocks = blockCount(originalLength: originalLength, blockSize: blockSize)
-        precondition(
-            boundaryScores.forwardBlockScores.count == nBlocks,
-            "Block-SDCM forward block score count mismatch")
-        if let revRaw = boundaryScores.reverseBlockScores {
-            precondition(
-                revRaw.count == nBlocks,
-                "Block-SDCM reverse block score count mismatch")
-        }
-
         let (prefBlocks, tailStartBlock) = pinnedBlockBounds(
-            nBlocks: nBlocks, blockSize: blockSize, config: config)
+            originalLength: originalLength, blockSize: blockSize, config: config)
 
         var blockAlive = [Bool](repeating: false, count: nBlocks)
         var aliveBlockList: [Int] = []
@@ -1095,19 +1221,103 @@ public enum Gemma4BlockSDCM {
             }
         }
 
+        guard interiorBlocks.count > 4 else { return nil }
         let clampedFraction = targetFraction.isFinite ? max(0, min(1, targetFraction)) : 1
         let minKeptTokens = max(0, config.prefixKeep) + max(1, config.tailKeep)
         let desiredTokens = max(
             minKeptTokens,
             Int((Float(originalLength) * clampedFraction).rounded()))
-        if desiredTokens >= count {
-            return (0 ..< count).map { Int32($0) }
-        }
+        guard desiredTokens < count else { return nil }
         let needInteriorBlocks = max(
             4, (max(0, desiredTokens - pinnedTokens) + blockSize - 1) / blockSize)
-        if needInteriorBlocks >= interiorBlocks.count {
+        guard needInteriorBlocks < interiorBlocks.count else { return nil }
+
+        var strataPicks = 0
+        if config.strataCount > 0 {
+            let strataPerSegment = max(
+                1, Int(Float(needInteriorBlocks) * 0.10) / config.strataCount)
+            for s in 0 ..< config.strataCount {
+                let lo = s * interiorBlocks.count / config.strataCount
+                let hi = (s + 1) * interiorBlocks.count / config.strataCount
+                strataPicks += min(max(0, hi - lo), strataPerSegment)
+            }
+        }
+        let hasReverse =
+            includeReverseQuota
+            ?? willComputeReverseScores(
+                positions: positions,
+                interiorBlockCount: interiorBlocks.count,
+                reverseQuotaFraction: reverseQuotaFraction,
+                config: config)
+        let revPicks: Int
+        if hasReverse, reverseQuotaFraction.isFinite, reverseQuotaFraction > 0 {
+            let clampedRev = max(0, min(1, reverseQuotaFraction))
+            revPicks = max(2, Int((Float(needInteriorBlocks) * clampedRev).rounded()))
+        } else {
+            revPicks = 0
+        }
+        guard strataPicks + revPicks < interiorBlocks.count else { return nil }
+
+        return CompactionBudget(
+            pinnedBlocks: pinnedBlocks,
+            interiorBlocks: interiorBlocks,
+            needInteriorBlocks: needInteriorBlocks)
+    }
+
+    /// True when `selectCompactedIndices` will drop at least one interior block.
+    public static func willCompact(
+        positions: [Int32],
+        originalLength: Int,
+        targetFraction: Float,
+        reverseQuotaFraction: Float = 0,
+        config: Gemma4BlockSDCMConfig
+    ) -> Bool {
+        compactionBudget(
+            positions: positions,
+            originalLength: originalLength,
+            targetFraction: targetFraction,
+            includeReverseQuota: nil,
+            reverseQuotaFraction: reverseQuotaFraction,
+            config: config) != nil
+    }
+
+    /// Quota-partitioned deterministic block-atomic token selection with symmetric halos,
+    /// mandatory prefix/tail retention, stratified macro-segment floor, and dedicated
+    /// Reverse Causal Prefix Resonance quota.
+    public static func selectCompactedIndices(
+        boundaryScores: Gemma4SDCMBoundaryScores,
+        positions: [Int32],
+        originalLength: Int,
+        targetFraction: Float,
+        config: Gemma4BlockSDCMConfig
+    ) -> [Int32] {
+        let count = positions.count
+        guard count > 0, originalLength > 0 else { return [] }
+        let blockSize = max(1, config.blockSize)
+        let nBlocks = blockCount(originalLength: originalLength, blockSize: blockSize)
+        precondition(
+            boundaryScores.forwardBlockScores.count == nBlocks,
+            "Block-SDCM forward block score count mismatch")
+        if let revRaw = boundaryScores.reverseBlockScores {
+            precondition(
+                revRaw.count == nBlocks,
+                "Block-SDCM reverse block score count mismatch")
+        }
+
+        guard
+            let budget = compactionBudget(
+                positions: positions,
+                originalLength: originalLength,
+                targetFraction: targetFraction,
+                includeReverseQuota: boundaryScores.reverseBlockScores != nil,
+                reverseQuotaFraction: boundaryScores.reverseQuotaFraction,
+                config: config)
+        else {
             return (0 ..< count).map { Int32($0) }
         }
+        let pinnedBlocks = budget.pinnedBlocks
+        let interiorBlocks = budget.interiorBlocks
+        let needInteriorBlocks = budget.needInteriorBlocks
 
         // Propagate halos strictly among alive interior blocks so pinned prefix sinks and
         // tail self-attention scores never bleed into adjacent boilerplate interior blocks.
@@ -1263,7 +1473,7 @@ public enum Gemma4BlockSDCM {
         let bs = max(1, blockSize)
         let nBlocks = blockCount(originalLength: T, blockSize: bs)
         let (prefBlocks, tailStartBlock) = pinnedBlockBounds(
-            nBlocks: nBlocks, blockSize: bs, config: config)
+            originalLength: T, blockSize: bs, config: config)
         let interiorStart = min(prefBlocks, nBlocks)
         let interiorEnd = max(interiorStart, tailStartBlock)
         let interiorBlocks = Array(interiorStart ..< interiorEnd)
@@ -1711,8 +1921,8 @@ public enum Gemma4BlockSDCM {
         return concatenated(chunks, axis: 2)
     }
 
-    /// Compute the true-window start index in `positionsHost` for committing a sliding layer's
-    /// KV cache so decode never attends to out-of-window compacted keys (`origPos < T - W + 1`).
+    /// Start of prompt history for the next sliding decode query. Pruning must keep that history
+    /// contiguous so later packed ring evictions still track logical token age.
     /// Returns `positionsHost.count` when `slidingWindow <= 0` or no token lies within the window.
     public static func trueSlidingWindowStart(
         positionsHost: [Int32],
@@ -1758,6 +1968,43 @@ extension Gemma4DecoderLayer {
         return selfAttn.oProj(attnOut)
     }
 
+    /// Write pre-sliced prompt K/V to `cache` with its logical RoPE delta.
+    private func writePreparedCompactedKV(
+        keys kStore: MLXArray,
+        values vStore: MLXArray,
+        originalLength: Int,
+        cache: KVCache
+    ) {
+        let attn = selfAttn
+        let stored = kStore.dim(2)
+        let logicalDelta = originalLength - stored
+        if let v2Cache = cache as? (any CBv2AttendingLayerCache) {
+            precondition(
+                v2Cache.supportsCompactedPromptKVWrite,
+                "Block-SDCM requires a CBv2 cache supporting compacted prompt KV writes")
+            v2Cache.writeCompactedPromptKV(
+                keys: kStore, values: vStore, logicalDelta: logicalDelta)
+        } else if !attn.isSliding, type(of: cache) == KVCacheSimple.self,
+            let simpleCache = cache as? KVCacheSimple
+        {
+            if stored > 0 {
+                _ = simpleCache.update(keys: kStore, values: vStore)
+            }
+            simpleCache.positionDelta += logicalDelta
+        } else if attn.isSliding, type(of: cache) == RotatingKVCache.self,
+            let rotCache = cache as? RotatingKVCache
+        {
+            if stored > 0 {
+                _ = rotCache.update(keys: kStore, values: vStore)
+            }
+            rotCache.offset += logicalDelta
+        } else {
+            preconditionFailure(
+                "Block-SDCM requires a cache supporting logical position deltas, got \(type(of: cache))"
+            )
+        }
+    }
+
     /// Commit compacted K/V to the layer cache with logical RoPE delta.
     /// Sliding layers store ONLY tokens inside the true original-position sliding window
     /// (`origPos >= originalLength - slidingWindow + 1` when compacted) so decode queries
@@ -1789,26 +2036,114 @@ extension Gemma4DecoderLayer {
             kStore = k
             vStore = v
         }
-        let stored = kStore.dim(2)
-        let logicalDelta = originalLength - stored
-        if let v2Cache = cache as? (any CBv2AttendingLayerCache) {
-            v2Cache.writeCompactedPromptKV(
-                keys: kStore, values: vStore, logicalDelta: logicalDelta)
-        } else if let simpleCache = cache as? KVCacheSimple {
-            if stored > 0 {
-                _ = simpleCache.update(keys: kStore, values: vStore)
-            }
-            simpleCache.positionDelta += logicalDelta
-        } else if let rotCache = cache as? RotatingKVCache, !(cache is CompilableRotatingKVCache) {
-            if stored > 0 {
-                _ = rotCache.update(keys: kStore, values: vStore)
-            }
-            rotCache.offset += logicalDelta
-        } else {
-            preconditionFailure(
-                "Block-SDCM requires a cache supporting logical position deltas, got \(type(of: cache))"
-            )
+        writePreparedCompactedKV(
+            keys: kStore, values: vStore, originalLength: originalLength, cache: cache)
+    }
+
+    /// Skip interior compute on a contiguous sliding layer while computing the
+    /// exact trailing sliding window and RMS-matching the skipped interior.
+    private func forwardSkippedInteriorSlidingLayer(
+        _ x: MLXArray,
+        positions: MLXArray,
+        originalLength: Int,
+        exactTailLength: Int,
+        chunkSize: Int,
+        cache: KVCache?,
+        isExpertPrefill: Bool
+    ) -> (hidden: MLXArray, nextLayerScores: Gemma4SDCMBoundaryScores?) {
+        let attn = selfAttn
+        guard let kProj = attn.kProj, let kNorm = attn.kNorm, let vNorm = attn.vNorm else {
+            preconditionFailure("Block-SDCM requires non-shared attention layers")
         }
+        let L = x.dim(1)
+        let window = attn.config.slidingWindow
+        let tailLen = max(window, exactTailLength)
+        let cut = L - tailLen
+        let k0 = max(0, cut - window + 1)
+        let kvLen = L - k0
+        let tailOffset = cut - k0
+        let kvCommitOffset = (L - window) - k0
+
+        let normedSub = inputLayernorm(x[0..., k0..., 0...])
+
+        let kRawSub = kProj(normedSub).reshaped(1, kvLen, attn.nKvHeads, attn.effectiveHeadDim)
+        var kSub = kNorm(kRawSub).transposed(0, 2, 1, 3)
+        kSub = gemma4ApplyRotaryPosition(attn.rope, to: kSub, offset: .scalar(k0))
+
+        var vSub: MLXArray
+        if let vProj = attn.vProj {
+            vSub = vProj(normedSub).reshaped(1, kvLen, attn.nKvHeads, attn.effectiveHeadDim)
+        } else {
+            vSub = kRawSub
+        }
+        vSub = vNorm(vSub).transposed(0, 2, 1, 3)
+
+        if let cache {
+            let kTail = kSub[0..., 0..., kvCommitOffset..., 0...]
+            let vTail = vSub[0..., 0..., kvCommitOffset..., 0...]
+            writePreparedCompactedKV(
+                keys: kTail, values: vTail, originalLength: originalLength, cache: cache)
+        }
+
+        let normedTail = normedSub[0..., tailOffset..., 0...]
+        var qTail = attn.qProj(normedTail).reshaped(1, tailLen, attn.nHeads, attn.effectiveHeadDim)
+        qTail = attn.qNorm(qTail).transposed(0, 2, 1, 3)
+        qTail = gemma4ApplyRotaryPosition(attn.rope, to: qTail, offset: .scalar(cut))
+
+        let outDType = kSub.dtype
+        let attnQ = outDType == .float16 ? qTail.asType(.float32) : qTail
+        let attnK = outDType == .float16 ? kSub.asType(.float32) : kSub
+        let attnV = outDType == .float16 ? vSub.asType(.float32) : vSub
+
+        let effectiveChunk = max(64, chunkSize)
+        let attnResult: MLXArray
+        if tailLen <= effectiveChunk {
+            let qPos = positions[cut...].expandedDimensions(axis: 1)
+            let kPos = positions[k0...].expandedDimensions(axis: 0)
+            let diff = qPos - kPos
+            let mask = (diff .>= Int32(0)) .&& (diff .< Int32(window))
+            attnResult = MLXFast.scaledDotProductAttention(
+                queries: attnQ, keys: attnK, values: attnV, scale: attn.scale, mask: .array(mask))
+        } else {
+            var chunks: [MLXArray] = []
+            chunks.reserveCapacity((tailLen + effectiveChunk - 1) / effectiveChunk)
+            var qStart = 0
+            while qStart < tailLen {
+                let qEnd = min(tailLen, qStart + effectiveChunk)
+                let qOrigStart = cut + qStart
+                let qOrigEnd = cut + qEnd
+                let kvLocalStart = max(0, (qOrigStart - window + 1) - k0)
+                let kvLocalEnd = qOrigEnd - k0
+                let qChunk = attnQ[0..., 0..., qStart ..< qEnd, 0...]
+                let kChunk = attnK[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...]
+                let vChunk = attnV[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...]
+                let qPos = positions[qOrigStart ..< qOrigEnd].expandedDimensions(axis: 1)
+                let kPos = positions[(k0 + kvLocalStart) ..< (k0 + kvLocalEnd)]
+                    .expandedDimensions(axis: 0)
+                let diff = qPos - kPos
+                let mask = (diff .>= Int32(0)) .&& (diff .< Int32(window))
+                chunks.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: qChunk, keys: kChunk, values: vChunk,
+                        scale: attn.scale, mask: .array(mask)))
+                qStart = qEnd
+            }
+            attnResult = concatenated(chunks, axis: 2)
+        }
+        let attnOut = finishAttentionOutput(attnResult, length: tailLen, outDType: outDType)
+
+        let xTail = x[0..., cut..., 0...]
+        let ffTail = xTail + postAttentionLayernorm(attnOut)
+        var hTailOut = feedforward(ffTail, isExpertPrefill: isExpertPrefill)
+        hTailOut = hTailOut * layerScalar
+
+        let rmsIn = MLX.sqrt((xTail.asType(.float32) * xTail.asType(.float32)).mean())
+        let rmsOut = MLX.sqrt((hTailOut.asType(.float32) * hTailOut.asType(.float32)).mean())
+        let safeRmsIn = MLX.maximum(rmsIn, MLXArray(Float(1e-4)))
+        let rawBeta = MLX.clip(rmsOut / safeRmsIn, min: Float(0.25), max: Float(4.0))
+        let beta = MLX.which(rmsIn .> Float(1e-4), rawBeta, MLXArray(Float(1.0))).asType(x.dtype)
+        let hIntOut = x[0..., ..<cut, 0...] * beta
+        return (concatenated([hIntOut, hTailOut], axis: 1), nil)
     }
 
     /// Execute one decoder layer inside the Block-SDCM prefill trunk.
@@ -1826,6 +2161,23 @@ extension Gemma4DecoderLayer {
         let L = x.dim(1)
         let isContiguous = L == originalLength
         let attn = selfAttn
+        let exactTailLength = max(attn.config.slidingWindow, sdcm.tailKeep)
+        if attn.isSliding,
+            !isFinalLayer,
+            sdcm.skipInteriorSlidingLayers.contains(attn.layerIdx),
+            isContiguous,
+            attn.config.slidingWindow > 0,
+            L > exactTailLength
+        {
+            return forwardSkippedInteriorSlidingLayer(
+                x,
+                positions: positions,
+                originalLength: originalLength,
+                exactTailLength: exactTailLength,
+                chunkSize: sdcm.slidingChunkSize,
+                cache: cache,
+                isExpertPrefill: isExpertPrefill)
+        }
         guard let kProj = attn.kProj, let kNorm = attn.kNorm, let vNorm = attn.vNorm else {
             preconditionFailure("Block-SDCM requires non-shared attention layers")
         }
@@ -1905,7 +2257,7 @@ extension Gemma4DecoderLayer {
                 scale: attn.scale,
                 chunkSize: sdcm.slidingChunkSize)
         } else {
-            if sdcm.earlySparseFullLayer == attn.layerIdx {
+            if sdcm.usesSparseFullAttention(forLayer: attn.layerIdx) {
                 attnResult = Gemma4BlockSDCM.prefixLocalFullTailAttention(
                     queries: attnQ,
                     keys: attnK,
@@ -2019,6 +2371,16 @@ extension Gemma4TextModelInner {
         captureCheckpointAtLayer: Int? = nil
     ) -> (postNorm: MLXArray, checkpoint: Gemma4SDCMCheckpoint?) {
         let originalLength = initialHidden.dim(1)
+        // Mark bound CBv2 rows so approximate prefills never donate exact prefixes.
+        for layerCache in fullCache {
+            if let v2Cache = layerCache as? (any CBv2AttendingLayerCache) {
+                v2Cache.markApproximatePrefill()
+            }
+        }
+        var sdcm = sdcm
+        if lastSlidingAttentionNonSharedIdx >= 0 {
+            sdcm.slidingWindowToRetain = config.slidingWindow
+        }
         var h = initialHidden
         let earlyCompactLayer: Int? = sdcm.earlyPreCompactAfterLayer.flatMap {
             (0 ..< max(0, layers.count - 1)).contains($0) ? $0 : nil
@@ -2030,27 +2392,50 @@ extension Gemma4TextModelInner {
         var checkpoint: Gemma4SDCMCheckpoint? = nil
 
         for (idx, layer) in layers.enumerated() {
-            if let targetFraction = sdcm.keepSchedule[idx], let scores = pendingScores {
-                let keepIndices = Gemma4BlockSDCM.selectCompactedIndices(
-                    boundaryScores: scores,
-                    positions: positionsHost,
-                    originalLength: originalLength,
-                    targetFraction: targetFraction,
-                    config: sdcm)
-                if keepIndices.count < h.dim(1) && !keepIndices.isEmpty {
-                    let idxArray = MLXArray(keepIndices)
-                    h = h.take(idxArray, axis: 1)
-                    positionsHost = keepIndices.map { positionsHost[Int($0)] }
-                    positions = MLXArray(positionsHost)
-                    asyncEval(h, positions)
+            if let plannedFraction = sdcm.keepSchedule[idx], let scores = pendingScores {
+                let targetFraction = sdcm.effectiveTargetFraction(
+                    planned: plannedFraction, originalLength: originalLength)
+                if targetFraction < 1.0 {
+                    let keepIndices = Gemma4BlockSDCM.selectCompactedIndices(
+                        boundaryScores: scores,
+                        positions: positionsHost,
+                        originalLength: originalLength,
+                        targetFraction: targetFraction,
+                        config: sdcm)
+                    if keepIndices.count < h.dim(1) && !keepIndices.isEmpty {
+                        let idxArray = MLXArray(keepIndices)
+                        h = h.take(idxArray, axis: 1)
+                        positionsHost = keepIndices.map { positionsHost[Int($0)] }
+                        positions = MLXArray(positionsHost)
+                        asyncEval(h, positions)
+                    }
                 }
                 pendingScores = nil
             }
 
             let isFinalLayer = idx == layers.count - 1
-            let nextReverseQuota: Float? =
-                sdcm.keepSchedule[idx + 1] != nil
-                ? (sdcm.reversePrefixQuota[idx + 1] ?? 0) : nil
+            let nextReverseQuota: Float?
+            if !isFinalLayer,
+                let nextPlanned = sdcm.keepSchedule[idx + 1]
+            {
+                let nextTarget = sdcm.effectiveTargetFraction(
+                    planned: nextPlanned, originalLength: originalLength)
+                let plannedRevQuota = sdcm.reversePrefixQuota[idx + 1] ?? 0
+                if nextTarget < 1.0,
+                    Gemma4BlockSDCM.willCompact(
+                        positions: positionsHost,
+                        originalLength: originalLength,
+                        targetFraction: nextTarget,
+                        reverseQuotaFraction: plannedRevQuota,
+                        config: sdcm)
+                {
+                    nextReverseQuota = plannedRevQuota
+                } else {
+                    nextReverseQuota = nil
+                }
+            } else {
+                nextReverseQuota = nil
+            }
             let (out, nextScores) = layer.forwardBlockSDCM(
                 h,
                 positions: positions,
@@ -2068,12 +2453,14 @@ extension Gemma4TextModelInner {
             if let earlyLayer = earlyCompactLayer, idx == earlyLayer,
                 let embHidden = earlyEmbeddingHidden
             {
-                if h.dim(1) == originalLength {
+                let earlyTarget = sdcm.effectiveTargetFraction(
+                    planned: sdcm.earlyPreCompactRatio, originalLength: originalLength)
+                if h.dim(1) == originalLength, earlyTarget < 1.0 {
                     let keepEarly = Gemma4BlockSDCM.selectEarlyTriSignalIndices(
                         tokenIDs: inputTokenIDs,
                         embeddingHidden: embHidden,
                         layerHidden: h,
-                        targetFraction: sdcm.earlyPreCompactRatio,
+                        targetFraction: earlyTarget,
                         blockSize: sdcm.earlyPreCompactBlockSize,
                         topHaloK: sdcm.earlyPreCompactTopHaloK,
                         config: sdcm)

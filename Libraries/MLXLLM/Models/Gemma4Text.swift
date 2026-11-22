@@ -1806,11 +1806,13 @@ public class Gemma4TextModelInner: Module {
     fileprivate func cbv2Prefill(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        inputEmbedding: MLXArray?
+        inputEmbedding: MLXArray?,
+        allowsBlockSDCM: Bool
     ) -> MLXArray {
         forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
-            inputEmbedding: inputEmbedding, schedulePrefill: true
+            inputEmbedding: inputEmbedding, schedulePrefill: true,
+            allowsBlockSDCM: allowsBlockSDCM
         ).postNorm
     }
 
@@ -1839,7 +1841,8 @@ public class Gemma4TextModelInner: Module {
         capturePreNorm: Bool,
         inputEmbedding: MLXArray? = nil,
         imageTokenMask: MLXArray? = nil,
-        schedulePrefill: Bool = false
+        schedulePrefill: Bool = false,
+        allowsBlockSDCM: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         let shapeCall =
             CBv2ForwardShapeObservation.isActive
@@ -1911,53 +1914,56 @@ public class Gemma4TextModelInner: Module {
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
 
-        // Block-Atomic Causal-Adjoint Multigrid (Block-SDCM) prefill fast path.
-        // Engages only for solo cold text prefills above `minPromptTokens` when
-        // enabled; all short prompts, packed batches, vision spans, prefix-cache
-        // suffixes, MTP captures, unsupported caches, and tensor-parallel ranks
-        // keep the exact path.
-        let initialOffset: Int = {
-            for layerCache in fullCache {
-                if let v2 = layerCache as? (any CBv2AttendingLayerCache),
-                    let row = v2.rows.first
-                {
-                    return row.ropePositionOffset
-                }
-                if let layerCache {
-                    if case .scalar(let value) = layerCache.ropeOffset {
-                        return value
+        // Block-SDCM prefill fast path for authorized solo cold text prompts.
+        if blockSDCMConfig.mode != .off,
+            allowsBlockSDCM,
+            schedulePrefill,
+            layers.first?.selfAttn.tensorParallel == nil,
+            Gemma4BlockSDCM.supportsCaches(fullCache, modelConfig: config)
+        {
+            let initialOffset: Int = {
+                var maxOffset = 0
+                for layerCache in fullCache {
+                    if let v2 = layerCache as? (any CBv2AttendingLayerCache),
+                        let row = v2.rows.first
+                    {
+                        maxOffset = max(maxOffset, row.ropePositionOffset)
+                    } else if let layerCache {
+                        if case .scalar(let value) = layerCache.ropeOffset {
+                            maxOffset = max(maxOffset, value)
+                        } else {
+                            maxOffset = max(maxOffset, layerCache.offset)
+                        }
                     }
-                    return layerCache.offset
                 }
-            }
-            return 0
-        }()
-        if layers.first?.selfAttn.tensorParallel == nil,
-            fullCache.allSatisfy({ $0.map(Gemma4BlockSDCM.supportsCache) ?? true }),
-            Gemma4BlockSDCM.canRun(
+                return maxOffset
+            }()
+            if Gemma4BlockSDCM.canRun(
                 sdcm: blockSDCMConfig,
                 modelConfig: config,
                 schedulePrefill: schedulePrefill,
+                allowsBlockSDCM: allowsBlockSDCM,
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 hasInputEmbedding: inputEmbedding != nil,
                 hasImageMask: imageTokenMask != nil,
                 hasCaptureHook: captureHook != nil,
                 initialOffset: initialOffset)
-        {
-            let earlyTokenIDs: [Int32]? =
-                blockSDCMConfig.earlyPreCompactAfterLayer.map {
-                    (0 ..< max(0, layers.count - 1)).contains($0)
-                } == true
-                ? inputs.asType(.int32).asArray(Int32.self) : nil
-            let (postNorm, _) = forwardBlockSDCMTrunk(
-                h,
-                inputTokenIDs: earlyTokenIDs,
-                fullCache: fullCache,
-                sdcm: blockSDCMConfig,
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill))
-            return (postNorm, nil)
+            {
+                let earlyTokenIDs: [Int32]? =
+                    blockSDCMConfig.earlyPreCompactAfterLayer.map {
+                        (0 ..< max(0, layers.count - 1)).contains($0)
+                    } == true
+                    ? inputs.asType(.int32).asArray(Int32.self) : nil
+                let (postNorm, _) = forwardBlockSDCMTrunk(
+                    h,
+                    inputTokenIDs: earlyTokenIDs,
+                    fullCache: fullCache,
+                    sdcm: blockSDCMConfig,
+                    isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
+                        schedulePrefill: schedulePrefill))
+                return (postNorm, nil)
+            }
         }
 
         // Build masks: one per attention type (legacy path only). "vision"
@@ -2267,11 +2273,16 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefixLength = y.tokens.size - 1
         if supportsBlockSDCM,
             !cache.isEmpty,
-            cache.allSatisfy({ $0.offset == 0 && Gemma4BlockSDCM.supportsCache($0) }),
+            Gemma4BlockSDCM.supportsCaches(cache.map { $0 as KVCache? }, modelConfig: config),
+            cache.allSatisfy({
+                if case .scalar(let value) = $0.ropeOffset { return value == 0 }
+                return $0.offset == 0
+            }),
             Gemma4BlockSDCM.canRun(
                 sdcm: blockSDCMConfig,
                 modelConfig: config,
                 schedulePrefill: true,
+                allowsBlockSDCM: true,
                 batchSize: 1,
                 sequenceLength: prefixLength,
                 hasInputEmbedding: false,
@@ -2281,7 +2292,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         {
             let prefixRange = 0 ..< prefixLength
             let hidden = model.cbv2Prefill(
-                y.tokens[.newAxis, prefixRange], cache: cache, inputEmbedding: nil)
+                y.tokens[.newAxis, prefixRange], cache: cache, inputEmbedding: nil,
+                allowsBlockSDCM: true)
             eval(hidden)
             eval(cache)
             return .tokens(y[prefixLength...])
@@ -2585,6 +2597,9 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
     /// independence before it packs anything.
     public var cbv2SupportsPackedPrefill: Bool { true }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { true }
+    public var cbv2SupportsCompactedPromptPrefill: Bool {
+        supportsBlockSDCM && blockSDCMConfig.mode != .off && blockSDCMConfig.hasActiveOptimizations
+    }
 
     public func cbv2Prefill(
         _ inputs: MLXArray,
@@ -2592,8 +2607,11 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
         cache: [KVCache]?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
+        let allowsBlockSDCM =
+            requirement == .lastPositionLogits && !CBv2PrefillCompactionScope.isDisabled
         let hidden = model.cbv2Prefill(
-            inputs, cache: cache, inputEmbedding: inputEmbedding)
+            inputs, cache: cache, inputEmbedding: inputEmbedding,
+            allowsBlockSDCM: allowsBlockSDCM)
         switch requirement {
         case .evaluationOnly:
             // Small handle whose graph depends on the whole trunk — forcing

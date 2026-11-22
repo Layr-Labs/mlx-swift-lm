@@ -60,6 +60,8 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// rectangular recurrent MTP verification window without cross-column
     /// attention. Stateful Qwen drafting fails closed without this seam.
     var supportsMTPRectangularVerification: Bool { get }
+    /// True when every vended cache supports compacted prompt K/V writes (default: false).
+    var supportsCompactedPromptKVWrite: Bool { get }
 }
 
 extension CBv2LayerCacheProvider {
@@ -67,6 +69,7 @@ extension CBv2LayerCacheProvider {
     public var supportsPackedPrefill: Bool { false }
     public var supportsPackedMultimodalSpans: Bool { false }
     public var supportsMTPRectangularVerification: Bool { false }
+    public var supportsCompactedPromptKVWrite: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
@@ -968,6 +971,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         return paged.pool
     }
     let cacheProvider: CBv2LayerCacheProvider
+    private let supportsCompactedPromptKV: Bool
     let model: CBv2SteppableModel
     let sampler: CBv2StepSampler
     let detokenizerFactory: CBv2DetokenizerFactory
@@ -1346,6 +1350,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.layerKinds = layerKinds
         self.backend = backend
         self.cacheProvider = cacheProvider
+        let modelSupportsCompaction =
+            (model as? CBv2PrefillSteppableModel)?.supportsCompactedPromptPrefill ?? false
+        let supportsCompactedPromptKV =
+            modelSupportsCompaction && backend.supportsCompactedPromptKVWrite
+            && cacheProvider.supportsCompactedPromptKVWrite
+        self.supportsCompactedPromptKV = supportsCompactedPromptKV
+        if !supportsCompactedPromptKV {
+            scheduler.soloCompactionSupported = false
+        }
         self.sampler = sampler
         self.detokenizerFactory = detokenizerFactory
         self.scheduler = scheduler
@@ -3147,7 +3160,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }) ?? true
         {
             beginMTPPlan()
-            let plan = scheduler.plan()
+            let plan = scheduler.plan(compactionSupported: supportsCompactedPromptKV)
             if isPureDecodePlan(plan, matching: ids) {
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
@@ -3307,7 +3320,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // plan moves waiting→running) are distinguishable from continuing
         // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
-        let plan = scheduler.plan()
+        let plan = scheduler.plan(compactionSupported: supportsCompactedPromptKV)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record("v2.plan", seconds: CFAbsoluteTimeGetCurrent() - planStart)
         }
@@ -4080,38 +4093,41 @@ public final class EngineLoopV2: @unchecked Sendable {
         tokens: MLXArray,
         inputEmbeddings: MLXArray?,
         caches: [CBv2AttendingLayerCache],
-        requirement: CBv2PrefillRequirement
+        requirement: CBv2PrefillRequirement,
+        disableCompaction: Bool = false
     ) throws -> MLXArray {
-        if let prefillModel = model as? CBv2PrefillSteppableModel {
-            return try checkedModelForward(phase: .prefill) {
-                prefillModel.prefill(
-                    tokens: tokens,
-                    inputEmbeddings: inputEmbeddings,
-                    caches: caches,
-                    requirement: requirement)
+        try CBv2PrefillCompactionScope.withDisabled(disableCompaction) {
+            if let prefillModel = model as? CBv2PrefillSteppableModel {
+                return try checkedModelForward(phase: .prefill) {
+                    prefillModel.prefill(
+                        tokens: tokens,
+                        inputEmbeddings: inputEmbeddings,
+                        caches: caches,
+                        requirement: requirement)
+                }
             }
-        }
 
-        let logits: MLXArray
-        if let inputEmbeddings {
-            guard let multimodalModel = model as? CBv2MultimodalSteppableModel else {
-                preconditionFailure(
-                    "CBv2 embedding prefill reached a model without embedding-forward support")
+            let logits: MLXArray
+            if let inputEmbeddings {
+                guard let multimodalModel = model as? CBv2MultimodalSteppableModel else {
+                    preconditionFailure(
+                        "CBv2 embedding prefill reached a model without embedding-forward support")
+                }
+                logits = try checkedModelForward(phase: .prefill) {
+                    multimodalModel.forward(
+                        tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+                }
+            } else {
+                logits = try checkedModelForward(phase: .prefill) {
+                    model.forward(tokens: tokens, caches: caches)
+                }
             }
-            logits = try checkedModelForward(phase: .prefill) {
-                multimodalModel.forward(
-                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+            switch requirement {
+            case .evaluationOnly:
+                return logits[0..., -1, 0 ..< 1]
+            case .lastPositionLogits:
+                return logits[0..., -1, 0...]
             }
-        } else {
-            logits = try checkedModelForward(phase: .prefill) {
-                model.forward(tokens: tokens, caches: caches)
-            }
-        }
-        switch requirement {
-        case .evaluationOnly:
-            return logits[0..., -1, 0 ..< 1]
-        case .lastPositionLogits:
-            return logits[0..., -1, 0...]
         }
     }
 
@@ -4821,7 +4837,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 } else {
                     output = try prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                        requirement: requirement,
+                        disableCompaction: group.rows.contains {
+                            $0.rec.request.disablePrefillCompaction
+                        })
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
@@ -4934,7 +4953,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 } else {
                     output = try prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                        requirement: requirement,
+                        disableCompaction: rec.request.disablePrefillCompaction)
                 }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
@@ -5398,7 +5418,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             // releases the pages so the completed prefix remains reusable.
             let detachedState = step.deferredReleases.first { $0.id == id }?.state
             let rowState = detachedState ?? kvStates[id]
-            if rowState?.contains(where: { $0?.isCompacted == true }) != true {
+            if rowState?.contains(where: {
+                $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+            }) != true {
                 publishFinalizedResidentBlocks(
                     requestID: id, safeComputedEnd: range.upperBound,
                     state: detachedState)
@@ -6181,7 +6203,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         var rows: [CBv2SequenceKV] = []
         var bytes = 0
         for row in state {
-            guard let row, !row.isCompacted, row.absoluteOffset >= promptCount,
+            guard let row, !row.isCompacted, !row.usedApproximatePrefill,
+                row.absoluteOffset >= promptCount,
                 let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
             else { return nil }
             let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
@@ -6332,7 +6355,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func stateCoversDonation(
         _ state: [CBv2SequenceKV?], tokenCount: Int
     ) -> Bool {
-        guard tokenCount > 1, !state.contains(where: { $0?.isCompacted == true }) else {
+        guard tokenCount > 1,
+            !state.contains(where: {
+                $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+            })
+        else {
             return false
         }
         var cacheableLayers = 0
