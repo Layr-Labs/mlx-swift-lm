@@ -3156,6 +3156,509 @@ struct Gemma4BlockSDCMTests {
         #expect(rows[5].absoluteOffset == beforeOffset)
         #expect(rows[5].ropePositionOffset == beforeOffset)
     }
+
+    // MARK: - Lossless Mixed-K MoE & Query-Blocked Cached SDPA Parity
+
+    @Test(
+        "weightedExpertUnsortMixedK matches 2-slice scatter and weightedExpertSum in BF16"
+    )
+    func weightedExpertUnsortMixedKParity() {
+        guard Device.defaultDevice().deviceType == .gpu else { return }
+        let hidden = 128
+        let kTail = 8
+        let cut = 19
+        let tailTokens = 12  // L = 31 (odd cut and odd L)
+        let numExperts = 128
+
+        for kInt in [1, 2, 4, 6] {
+            MLXRandom.seed(UInt64(900 + kInt))
+            let aInt = cut * kInt
+            let aTail = tailTokens * kTail
+
+            let intOutputs = MLXRandom.normal([cut, kInt, hidden]).asType(.bfloat16)
+            let tailOutputs = MLXRandom.normal([tailTokens, kTail, hidden]).asType(.bfloat16)
+            let intWeights = MLX.softmax(
+                MLXRandom.normal([cut, kInt]), axis: -1, precise: true
+            ).asType(.bfloat16)
+            let tailWeights = MLX.softmax(
+                MLXRandom.normal([tailTokens, kTail]), axis: -1, precise: true
+            ).asType(.bfloat16)
+
+            let intExperts = MLXArray(
+                (0 ..< aInt).map { UInt32(($0 * 29 + kInt * 7) % numExperts) }
+            ).reshaped(cut, kInt)
+            let tailExperts = MLXArray(
+                (0 ..< aTail).map { UInt32(($0 * 41 + 13) % numExperts) }
+            ).reshaped(tailTokens, kTail)
+
+            let flatExperts = concatenated(
+                [intExperts.flattened(), tailExperts.flattened()], axis: 0)
+            let flatWeights = concatenated(
+                [intWeights.flattened(), tailWeights.flattened()], axis: 0)
+            let allOriginal = concatenated(
+                [
+                    intOutputs.reshaped(aInt, hidden),
+                    tailOutputs.reshaped(aTail, hidden),
+                ], axis: 0)
+
+            let order = argSort(flatExperts)
+            let inverseOrder = argSort(order)
+            let sortedOutputs = allOriginal[order]
+
+            let actual = weightedExpertUnsortMixedK(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: flatWeights,
+                cut: cut,
+                interiorK: kInt,
+                tailTokens: tailTokens,
+                tailK: kTail)
+
+            let unsortAll = sortedOutputs[inverseOrder]
+            let refInt = weightedExpertSum(
+                unsortAll[..<aInt].reshaped(cut, kInt, hidden), intWeights)
+            let refTail = weightedExpertSum(
+                unsortAll[aInt...].reshaped(tailTokens, kTail, hidden), tailWeights)
+            let expected = concatenated([refInt, refTail], axis: 0)
+
+            eval(actual, expected)
+            #expect(actual.shape == [cut + tailTokens, hidden])
+            #expect(actual.dtype == .bfloat16)
+            let maxDiff = MLX.abs(
+                actual.asType(.float32) - expected.asType(.float32)
+            ).max().item(Float.self)
+            #expect(maxDiff == 0, "weightedExpertUnsortMixedK kInt=\(kInt) diff: \(maxDiff)")
+        }
+
+        // Degenerate zero-interior and zero-tail boundaries.
+        let edgeTokens = 9
+        let edgeA = edgeTokens * kTail
+        let edgeOut = MLXRandom.normal([edgeA, hidden]).asType(.bfloat16)
+        let edgeW = MLX.softmax(
+            MLXRandom.normal([edgeTokens, kTail]), axis: -1, precise: true
+        ).asType(.bfloat16)
+        let edgeExperts = MLXArray((0 ..< edgeA).map { UInt32(($0 * 17) % numExperts) })
+        let edgeOrder = argSort(edgeExperts)
+        let edgeInv = argSort(edgeOrder)
+        let edgeSorted = edgeOut[edgeOrder]
+
+        let onlyTail = weightedExpertUnsortMixedK(
+            sortedOutputs: edgeSorted, inverseOrder: edgeInv, weights: edgeW.flattened(),
+            cut: 0, interiorK: 2, tailTokens: edgeTokens, tailK: kTail)
+        let onlyInt = weightedExpertUnsortMixedK(
+            sortedOutputs: edgeSorted, inverseOrder: edgeInv, weights: edgeW.flattened(),
+            cut: edgeTokens, interiorK: kTail, tailTokens: 0, tailK: 2)
+        let refEdge = weightedExpertSum(edgeOut.reshaped(edgeTokens, kTail, hidden), edgeW)
+        eval(onlyTail, onlyInt, refEdge)
+        #expect(
+            MLX.abs(onlyTail.asType(.float32) - refEdge.asType(.float32)).max().item(Float.self)
+                <= 0.01)
+        #expect(
+            MLX.abs(onlyInt.asType(.float32) - refEdge.asType(.float32)).max().item(Float.self)
+                <= 0.01)
+    }
+
+    @Test(
+        "Single-pass mixed-K router, SwitchGLU, and Gemma4Experts match separate calls"
+    )
+    func mixedKMoEDispatchParity() throws {
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 96,
+                "num_attention_heads": 4,
+                "head_dim": 64,
+                "global_head_dim": 64,
+                "vocab_size": 128,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "sliding_window": 32,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "enable_moe_block": true,
+                "num_experts": 16,
+                "top_k_experts": 8,
+                "moe_intermediate_size": 32
+            }
+            """
+        let config = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+
+        func canonicalize(_ indices: MLXArray, _ weights: MLXArray) -> (MLXArray, MLXArray) {
+            let perm = argSort(indices, axis: -1)
+            return (MLX.takeAlong(indices, perm, axis: -1), MLX.takeAlong(weights, perm, axis: -1))
+        }
+
+        // 1. Gemma4Router.routeMixedTopK vs separate routeTopK + callAsFunction.
+        MLXRandom.seed(911)
+        let router = Gemma4Router(config)
+        let cut = 17
+        let tailLen = 10
+        let totalL = cut + tailLen  // 27
+        let xF32 = MLXRandom.normal([1, totalL, 64]).asType(.float32)
+        let (mIntIdx, mIntW, mTailIdx, mTailW) = router.routeMixedTopK(
+            xF32, cut: cut, interiorTopK: 2)
+        let (rIntIdx, rIntW) = router.routeTopK(xF32[0..., ..<cut, 0...], topK: 2)
+        let (rTailIdx, rTailW) = router(xF32[0..., cut..., 0...])
+
+        let (cmIntIdx, cmIntW) = canonicalize(mIntIdx, mIntW)
+        let (crIntIdx, crIntW) = canonicalize(rIntIdx, rIntW)
+        let (cmTailIdx, cmTailW) = canonicalize(mTailIdx, mTailW)
+        let (crTailIdx, crTailW) = canonicalize(rTailIdx, rTailW)
+        eval(cmIntIdx, cmIntW, crIntIdx, crIntW, cmTailIdx, cmTailW, crTailIdx, crTailW)
+        #expect((cmIntIdx .== crIntIdx).all().item(Bool.self))
+        #expect((cmTailIdx .== crTailIdx).all().item(Bool.self))
+        #expect(MLX.abs(cmIntW - crIntW).max().item(Float.self) < 1e-5)
+        #expect(MLX.abs(cmTailW - crTailW).max().item(Float.self) < 1e-5)
+
+        // 2. SwitchGLU.callAndMixedKWeightedReduce: FP32 sorted, BF16 fused GPU, fusedGateUp,
+        //    A < 64 unsorted fallback, subclass hooks, and zero-slice fallbacks.
+        let x2D = xF32.reshaped(totalL, 64)
+        let iIdx = mIntIdx.reshaped(cut, 2)
+        let iW = mIntW.reshaped(cut, 2)
+        let tIdx = mTailIdx.reshaped(tailLen, 8)
+        let tW = mTailW.reshaped(tailLen, 8)
+        for fuseGateUp in [false, true] {
+            let glu = SwitchGLU(
+                inputDims: 64, hiddenDims: 32, numExperts: 16, bias: false, fuseGateUp: fuseGateUp)
+
+            // FP32 sorted fallback (A = 17*2 + 10*8 = 114 >= 64).
+            let mixedF32 = glu.callAndMixedKWeightedReduce(
+                x2D, interiorIndices: iIdx, interiorWeights: iW,
+                tailIndices: tIdx, tailWeights: tW, isProductionPrefill: true)
+            let refIntF32 = weightedExpertSum(glu(x2D[..<cut], iIdx), iW)
+            let refTailF32 = weightedExpertSum(glu(x2D[cut...], tIdx), tW)
+            let refF32 = concatenated([refIntF32, refTailF32], axis: 0)
+            eval(mixedF32, refF32)
+            let diffF32 = MLX.abs(mixedF32 - refF32).max().item(Float.self)
+            #expect(
+                diffF32 < 1e-4,
+                "SwitchGLU FP32 mixed-K (fused=\(fuseGateUp)) diff: \(diffF32)")
+
+            // Unsorted fallback (A = 5*2 + 3*8 = 34 < 64).
+            let smallCut = 5
+            let smallTail = 3
+            let xSmall = x2D[..<(smallCut + smallTail)]
+            let siIdx = iIdx[..<smallCut]
+            let siW = iW[..<smallCut]
+            let stIdx = tIdx[..<smallTail]
+            let stW = tW[..<smallTail]
+            let mixedSmall = glu.callAndMixedKWeightedReduce(
+                xSmall, interiorIndices: siIdx, interiorWeights: siW,
+                tailIndices: stIdx, tailWeights: stW, isProductionPrefill: true)
+            let refSmall = concatenated(
+                [
+                    weightedExpertSum(glu(xSmall[..<smallCut], siIdx), siW),
+                    weightedExpertSum(glu(xSmall[smallCut...], stIdx), stW),
+                ], axis: 0)
+            eval(mixedSmall, refSmall)
+            #expect(MLX.abs(mixedSmall - refSmall).max().item(Float.self) < 1e-4)
+
+            // Zero-interior and zero-tail slice delegation.
+            let emptyIdx = MLXArray.zeros([0, 2], dtype: iIdx.dtype)
+            let emptyW = MLXArray.zeros([0, 2], dtype: iW.dtype)
+            let tailOnly = glu.callAndMixedKWeightedReduce(
+                x2D[cut...], interiorIndices: emptyIdx, interiorWeights: emptyW,
+                tailIndices: tIdx, tailWeights: tW)
+            let intOnly = glu.callAndMixedKWeightedReduce(
+                x2D[..<cut], interiorIndices: iIdx, interiorWeights: iW,
+                tailIndices: MLXArray.zeros([0, 8], dtype: tIdx.dtype),
+                tailWeights: MLXArray.zeros([0, 8], dtype: tW.dtype))
+            eval(tailOnly, intOnly)
+            #expect(MLX.abs(tailOnly - refTailF32).max().item(Float.self) < 1e-4)
+            #expect(MLX.abs(intOnly - refIntF32).max().item(Float.self) < 1e-4)
+
+            // BF16 GPU fused path (fuseSortedReduction=true) vs BF16 fallback (false) vs separate.
+            glu.train(false)
+            glu.update(parameters: glu.parameters().mapValues { $0.asType(.bfloat16) })
+            let xBF16 = x2D.asType(.bfloat16)
+            let iWBF16 = iW.asType(.bfloat16)
+            let tWBF16 = tW.asType(.bfloat16)
+            let fusedBF16 = glu.callAndMixedKWeightedReduce(
+                xBF16, interiorIndices: iIdx, interiorWeights: iWBF16,
+                tailIndices: tIdx, tailWeights: tWBF16,
+                fuseSortedReduction: true, isProductionPrefill: true)
+            let unfusedBF16 = glu.callAndMixedKWeightedReduce(
+                xBF16, interiorIndices: iIdx, interiorWeights: iWBF16,
+                tailIndices: tIdx, tailWeights: tWBF16,
+                fuseSortedReduction: false, isProductionPrefill: true)
+            let sepBF16 = concatenated(
+                [
+                    weightedExpertSum(glu(xBF16[..<cut], iIdx), iWBF16),
+                    weightedExpertSum(glu(xBF16[cut...], tIdx), tWBF16),
+                ], axis: 0)
+            eval(fusedBF16, unfusedBF16, sepBF16)
+            let diffFusedVsUnfused = MLX.abs(
+                fusedBF16.asType(.float32) - unfusedBF16.asType(.float32)
+            ).max().item(Float.self)
+            let diffFusedVsSep = MLX.abs(
+                fusedBF16.asType(.float32) - sepBF16.asType(.float32)
+            ).max().item(Float.self)
+            #expect(
+                diffFusedVsUnfused == 0,
+                "BF16 fused vs unfused diff: \(diffFusedVsUnfused)")
+            #expect(diffFusedVsSep <= 0.05, "BF16 fused vs separate diff: \(diffFusedVsSep)")
+        }
+
+        // Subclass transformInput / transformHidden hooks are preserved.
+        let hookedGLU = ScalingSwitchGLU(inputDims: 64, hiddenDims: 32, numExperts: 16)
+        let hookedMixed = hookedGLU.callAndMixedKWeightedReduce(
+            x2D, interiorIndices: iIdx, interiorWeights: iW,
+            tailIndices: tIdx, tailWeights: tW)
+        let hookedRef = concatenated(
+            [
+                weightedExpertSum(hookedGLU(x2D[..<cut], iIdx), iW),
+                weightedExpertSum(hookedGLU(x2D[cut...], tIdx), tW),
+            ], axis: 0)
+        eval(hookedMixed, hookedRef)
+        #expect(MLX.abs(hookedMixed - hookedRef).max().item(Float.self) < 1e-4)
+
+        // 3. Gemma4Experts.callMixedK vs separate calls (FP32, BF16, and PrefillProjection scope).
+        let experts = Gemma4Experts(config)
+        let expMixedF32 = experts.callMixedK(
+            xF32, interiorIndices: mIntIdx, interiorWeights: mIntW,
+            tailIndices: mTailIdx, tailWeights: mTailW, isExpertPrefill: true)
+        let expRefF32 = concatenated(
+            [
+                experts(
+                    xF32[0..., ..<cut, 0...], topKIndices: mIntIdx, topKWeights: mIntW,
+                    isExpertPrefill: true),
+                experts(
+                    xF32[0..., cut..., 0...], topKIndices: mTailIdx, topKWeights: mTailW,
+                    isExpertPrefill: true),
+            ], axis: 1)
+        eval(expMixedF32, expRefF32)
+        #expect(MLX.abs(expMixedF32 - expRefF32).max().item(Float.self) < 1e-4)
+
+        experts.update(parameters: experts.parameters().mapValues { $0.asType(.bfloat16) })
+        let xBF163D = xF32.asType(.bfloat16)
+        let mIntWBF16 = mIntW.asType(.bfloat16)
+        let mTailWBF16 = mTailW.asType(.bfloat16)
+        let expMixedBF16 = experts.callMixedK(
+            xBF163D, interiorIndices: mIntIdx, interiorWeights: mIntWBF16,
+            tailIndices: mTailIdx, tailWeights: mTailWBF16, isExpertPrefill: true)
+        let expRefBF16 = concatenated(
+            [
+                experts(
+                    xBF163D[0..., ..<cut, 0...], topKIndices: mIntIdx, topKWeights: mIntWBF16,
+                    isExpertPrefill: true),
+                experts(
+                    xBF163D[0..., cut..., 0...], topKIndices: mTailIdx, topKWeights: mTailWBF16,
+                    isExpertPrefill: true),
+            ], axis: 1)
+        eval(expMixedBF16, expRefBF16)
+        #expect(
+            MLX.abs(expMixedBF16.asType(.float32) - expRefBF16.asType(.float32))
+                .max().item(Float.self) <= 0.05)
+
+        let dummyTokens = MLXArray.zeros([1, totalL], dtype: .int32)
+        let scopedMixed = Gemma4PrefillProjectionScope.withPrefillFrame(
+            tokens: dummyTokens, enabled: true
+        ) {
+            experts.callMixedK(
+                xBF163D, interiorIndices: mIntIdx, interiorWeights: mIntWBF16,
+                tailIndices: mTailIdx, tailWeights: mTailWBF16, isExpertPrefill: true)
+        }
+        let scopedRef = Gemma4PrefillProjectionScope.withPrefillFrame(
+            tokens: dummyTokens, enabled: true
+        ) {
+            let hInt = experts(
+                xBF163D[0..., ..<cut, 0...], topKIndices: mIntIdx, topKWeights: mIntWBF16,
+                isExpertPrefill: true)
+            let hTail = experts(
+                xBF163D[0..., cut..., 0...], topKIndices: mTailIdx, topKWeights: mTailWBF16,
+                isExpertPrefill: true)
+            return concatenated([hInt, hTail], axis: 1)
+        }
+        eval(scopedMixed, scopedRef)
+        #expect(
+            MLX.abs(scopedMixed.asType(.float32) - scopedRef.asType(.float32))
+                .max().item(Float.self) <= 0.01)
+    }
+
+    @Test(
+        "slidingAttentionWithPositions q=128 contiguous cached masks match dense mask"
+    )
+    func slidingAttentionBlockedCachedParity() {
+        #expect(Gemma4BlockSDCMConfig.coherent.slidingChunkSize == 128)
+        #expect(Gemma4BlockSDCMConfig.lightcone.slidingChunkSize == 128)
+        #expect(Gemma4BlockSDCMConfig.balanced.slidingChunkSize == 128)
+        #expect(Gemma4BlockSDCMConfig.fast.slidingChunkSize == 128)
+        #expect(Gemma4BlockSDCMConfig.turbo.slidingChunkSize == 128)
+
+        MLXRandom.seed(922)
+        let scale: Float = 1.0 / sqrt(32.0)
+
+        // Window 256 (multiple of 128) and window 200 (non-multiple) both cover cold `.causal`,
+        // transition block, steady cached blocks, and odd remainder block.
+        for (L, window) in [(683, 256), (555, 200)] {
+            let posHost = (0 ..< L).map { Int32($0) }
+            let pos = MLXArray(posHost)
+            let q = MLXRandom.normal([1, 4, L, 32]).asType(.float32)
+            let k = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+            let v = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+
+            let cache = Gemma4SDCMMaskCache()
+            let blocked = Gemma4BlockSDCM.slidingAttentionWithPositions(
+                queries: q, keys: k, values: v, positions: pos, positionsHost: posHost,
+                slidingWindow: window, scale: scale, chunkSize: 128,
+                isContiguous: true, maskCache: cache)
+            let cachedAfterFirst = cache.cachedMaskCount
+            #expect(cachedAfterFirst > 0)
+
+            // Reusing the same cache across layers hits all cached masks without new entries.
+            let blockedReuse = Gemma4BlockSDCM.slidingAttentionWithPositions(
+                queries: q, keys: k, values: v, positions: pos, positionsHost: posHost,
+                slidingWindow: window, scale: scale, chunkSize: 128,
+                isContiguous: true, maskCache: cache)
+            #expect(cache.cachedMaskCount == cachedAfterFirst)
+
+            let diffMat = pos.expandedDimensions(axis: 1) - pos.expandedDimensions(axis: 0)
+            let denseMask = (diffMat .>= Int32(0)) .&& (diffMat .< Int32(window))
+            let ref = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .array(denseMask))
+            eval(blocked, blockedReuse, ref)
+
+            let diff1 = MLX.abs(blocked - ref).max().item(Float.self)
+            let diff2 = MLX.abs(blockedReuse - ref).max().item(Float.self)
+            #expect(diff1 < 1e-5, "Cached q=128 sliding mismatch (L=\(L), W=\(window)): \(diff1)")
+            #expect(diff2 < 1e-5, "Cached reuse sliding mismatch (L=\(L), W=\(window)): \(diff2)")
+        }
+    }
+
+    @Test(
+        "prefixLocalFullTailAttention q=128 contiguous and compacted paths match dense mask"
+    )
+    func prefixLocalFullTailBlockedCachedParity() {
+        MLXRandom.seed(933)
+        let scale: Float = 1.0 / sqrt(32.0)
+
+        func verify(
+            posHost: [Int32], P: Int, W: Int, tail: Int, isContiguous: Bool, label: String
+        ) {
+            let L = posHost.count
+            let pos = MLXArray(posHost)
+            let q = MLXRandom.normal([1, 4, L, 32]).asType(.float32)
+            let k = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+            let v = MLXRandom.normal([1, 2, L, 32]).asType(.float32)
+
+            let cache = Gemma4SDCMMaskCache()
+            let actual = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                queries: q, keys: k, values: v,
+                positions: pos, positionsHost: posHost,
+                prefixTokens: P, localWindow: W, tailTokens: tail,
+                scale: scale, chunkSize: 128, isContiguous: isContiguous, maskCache: cache)
+            if isContiguous {
+                let firstCount = cache.cachedMaskCount
+                let replay = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                    queries: q, keys: k, values: v,
+                    positions: pos, positionsHost: posHost,
+                    prefixTokens: P, localWindow: W, tailTokens: tail,
+                    scale: scale, chunkSize: 128, isContiguous: true, maskCache: cache)
+                #expect(cache.cachedMaskCount == firstCount)
+                eval(replay)
+            }
+
+            let qPos = pos.expandedDimensions(axis: 1)
+            let kPos = pos.expandedDimensions(axis: 0)
+            let qIdx = MLXArray((0 ..< L).map { Int32($0) }).expandedDimensions(axis: 1)
+            let cut = Int32(max(0, L - max(0, tail)))
+            let denseMask =
+                (kPos .<= qPos)
+                .&& ((kPos .< Int32(max(0, P))) .|| ((qPos - kPos) .< Int32(W))
+                    .|| (qIdx .>= cut))
+            let ref = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .array(denseMask))
+            eval(actual, ref)
+            let maxDiff = MLX.abs(actual - ref).max().item(Float.self)
+            #expect(maxDiff < 1e-5, "prefixLocalFullTail q=128 mismatch (\(label)): \(maxDiff)")
+        }
+
+        // Contiguous: P+W=280 (non-multiple of 128), tail=175 > 128 (multi-block .causal tail).
+        let contig700 = (0 ..< 700).map { Int32($0) }
+        verify(
+            posHost: contig700, P: 100, W: 180, tail: 175,
+            isContiguous: true, label: "contig-280")
+        verify(
+            posHost: contig700, P: 0, W: 180, tail: 175,
+            isContiguous: true, label: "contig-P0")
+
+        // Contiguous with W < 128 so block 0 hits s0 < pEnd with s1 - 1 >= P + W (P+W = 104).
+        let contig512 = (0 ..< 512).map { Int32($0) }
+        verify(
+            posHost: contig512, P: 40, W: 64, tail: 160, isContiguous: true, label: "contig-W64")
+
+        // Compacted positions with P+W=280 and multi-block .causal tail (224 > 128).
+        var compacted: [Int32] = []
+        for b in 0 ..< 32 {
+            if b < 4 || b >= 25 || b.isMultiple(of: 2) {
+                for j in 0 ..< 32 { compacted.append(Int32(b * 32 + j)) }
+            }
+        }
+        verify(
+            posHost: compacted, P: 100, W: 180, tail: 224,
+            isContiguous: false, label: "compacted-280")
+    }
+
+    @Test("causalAttentionBlocked matches unblocked causal SDPA for D=512 blocked and D=64 Flash")
+    func causalAttentionBlockedParity() {
+        MLXRandom.seed(944)
+        let L = 307  // 2 full blocks of 128 + remainder 51
+
+        // Gemma 4 global full-attention headDim D=512 takes the q=128 blocked path.
+        let scale512: Float = 1.0 / sqrt(512.0)
+        let q512 = MLXRandom.normal([1, 4, L, 512]).asType(.float32)
+        let k512 = MLXRandom.normal([1, 2, L, 512]).asType(.float32)
+        let v512 = MLXRandom.normal([1, 2, L, 512]).asType(.float32)
+        let blocked512 = Gemma4BlockSDCM.causalAttentionBlocked(
+            queries: q512, keys: k512, values: v512, scale: scale512, blockSize: 128)
+        let ref512 = MLXFast.scaledDotProductAttention(
+            queries: q512, keys: k512, values: v512, scale: scale512, mask: .causal)
+        eval(blocked512, ref512)
+        let diff512 = MLX.abs(blocked512 - ref512).max().item(Float.self)
+        #expect(diff512 < 1e-4, "causalAttentionBlocked D=512 FP32 diff: \(diff512)")
+
+        let blocked512BF16 = Gemma4BlockSDCM.causalAttentionBlocked(
+            queries: q512.asType(.bfloat16), keys: k512.asType(.bfloat16),
+            values: v512.asType(.bfloat16), scale: scale512, blockSize: 128)
+        let ref512BF16 = MLXFast.scaledDotProductAttention(
+            queries: q512.asType(.bfloat16), keys: k512.asType(.bfloat16),
+            values: v512.asType(.bfloat16), scale: scale512, mask: .causal)
+        eval(blocked512BF16, ref512BF16)
+        let diff512BF16 = MLX.abs(
+            blocked512BF16.asType(.float32) - ref512BF16.asType(.float32)
+        ).max().item(Float.self)
+        #expect(diff512BF16 <= 0.01, "causalAttentionBlocked D=512 BF16 diff: \(diff512BF16)")
+
+        // D=64 is inside MLX's fused Flash set and passes straight through.
+        let scale64: Float = 1.0 / sqrt(64.0)
+        let q64 = MLXRandom.normal([1, 4, L, 64]).asType(.float32)
+        let k64 = MLXRandom.normal([1, 2, L, 64]).asType(.float32)
+        let v64 = MLXRandom.normal([1, 2, L, 64]).asType(.float32)
+        let pass64 = Gemma4BlockSDCM.causalAttentionBlocked(
+            queries: q64, keys: k64, values: v64, scale: scale64, blockSize: 128)
+        let ref64 = MLXFast.scaledDotProductAttention(
+            queries: q64, keys: k64, values: v64, scale: scale64, mask: .causal)
+        eval(pass64, ref64)
+        #expect(MLX.abs(pass64 - ref64).max().item(Float.self) == 0)
+
+        // Empty L=0 returns zero-length output cleanly.
+        let emptyOut = Gemma4BlockSDCM.causalAttentionBlocked(
+            queries: MLXArray.zeros([1, 4, 0, 512], dtype: .float32),
+            keys: MLXArray.zeros([1, 2, 0, 512], dtype: .float32),
+            values: MLXArray.zeros([1, 2, 0, 512], dtype: .float32),
+            scale: scale512, blockSize: 128)
+        #expect(emptyOut.shape == [1, 4, 0, 512])
+    }
+}
+
+/// Test-only SwitchGLU subclass verifying `transformInput` / `transformHidden` hooks
+/// run identically on `callAndMixedKWeightedReduce`.
+private final class ScalingSwitchGLU: SwitchGLU {
+    override func transformInput(_ x: MLXArray) -> MLXArray { x * Float(2.0) }
+    override func transformHidden(_ x: MLXArray) -> MLXArray { x * Float(0.5) }
 }
 
 /// Wrapper `CBv2LayerCacheProvider` that deliberately omits

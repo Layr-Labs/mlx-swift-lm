@@ -1239,7 +1239,32 @@ class Gemma4Router: Module {
     ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        return selectTopK(from: expertScores, topK: requestedK)
+    }
 
+    /// Route interior tokens `..<cut` to `interiorTopK` experts and tail tokens `cut...`
+    /// to full `topK` experts while sharing one RMSNorm and router projection.
+    func routeMixedTopK(
+        _ x: MLXArray, cut: Int, interiorTopK: Int
+    ) -> (
+        interiorIndices: MLXArray, interiorWeights: MLXArray,
+        tailIndices: MLXArray, tailWeights: MLXArray
+    ) {
+        precondition(
+            x.ndim == 3 && cut > 0 && cut < x.dim(1),
+            "routeMixedTopK requires 3D input with 0 < cut < sequence length")
+        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        let (interiorIndices, interiorWeights) = selectTopK(
+            from: expertScores[0..., ..<cut, 0...], topK: interiorTopK)
+        let (tailIndices, tailWeights) = selectTopK(
+            from: expertScores[0..., cut..., 0...], topK: topK)
+        return (interiorIndices, interiorWeights, tailIndices, tailWeights)
+    }
+
+    private func selectTopK(
+        from expertScores: MLXArray, topK requestedK: Int
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let activeK = max(1, min(requestedK, expertScores.dim(-1)))
         let kth = expertScores.dim(-1) - activeK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1304,6 +1329,67 @@ class Gemma4Experts: Module {
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
+            isProductionPrefill: isExpertPrefill)
+        return y.reshaped(B, S, H)
+    }
+
+    /// Single-pass mixed-K expert dispatch for `[1, cut + tailLen, H]` prefill inputs.
+    func callMixedK(
+        _ x: MLXArray,
+        interiorIndices: MLXArray,
+        interiorWeights: MLXArray,
+        tailIndices: MLXArray,
+        tailWeights: MLXArray,
+        isExpertPrefill: Bool
+    ) -> MLXArray {
+        precondition(
+            x.ndim == 3 && x.dim(0) == 1
+                && interiorIndices.ndim == 3 && tailIndices.ndim == 3
+                && interiorIndices.dim(0) == 1 && tailIndices.dim(0) == 1
+                && interiorWeights.shape == interiorIndices.shape
+                && tailWeights.shape == tailIndices.shape,
+            "Gemma4Experts.callMixedK requires [1, S, H] and matching 3D routing tensors")
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let cut = interiorIndices.dim(1)
+        let tailLen = tailIndices.dim(1)
+        precondition(
+            cut + tailLen == S,
+            "Gemma4Experts.callMixedK interior + tail lengths must match sequence length")
+        if cut == 0 {
+            return callAsFunction(
+                x, topKIndices: tailIndices, topKWeights: tailWeights,
+                isExpertPrefill: isExpertPrefill)
+        }
+        if tailLen == 0 {
+            return callAsFunction(
+                x, topKIndices: interiorIndices, topKWeights: interiorWeights,
+                isExpertPrefill: isExpertPrefill)
+        }
+
+        let prefillRows =
+            Gemma4PrefillProjection.applies(x) && isExpertPrefill && x.dtype == .bfloat16
+            && interiorIndices.dtype == .uint32 && tailIndices.dtype == .uint32
+            && interiorWeights.dtype == .bfloat16 && tailWeights.dtype == .bfloat16
+            && interiorIndices.dim(2) > 0 && tailIndices.dim(2) > 0
+        if prefillRows || Gemma4BatchDecodeProjection.applies(x) {
+            let hInt = reduceRows(
+                x[0..., ..<cut, 0...],
+                topKIndices: interiorIndices, topKWeights: interiorWeights)
+            let hTail = reduceRows(
+                x[0..., cut..., 0...],
+                topKIndices: tailIndices, topKWeights: tailWeights)
+            return concatenated([hInt, hTail], axis: 1)
+        }
+
+        let kInt = interiorIndices.dim(-1)
+        let kTail = tailIndices.dim(-1)
+        let y = switchGLU.callAndMixedKWeightedReduce(
+            x.reshaped(S, H),
+            interiorIndices: interiorIndices.reshaped(cut, kInt),
+            interiorWeights: interiorWeights.reshaped(cut, kInt),
+            tailIndices: tailIndices.reshaped(tailLen, kTail),
+            tailWeights: tailWeights.reshaped(tailLen, kTail),
+            fuseSortedReduction: fuseWeightedUnsort,
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
     }

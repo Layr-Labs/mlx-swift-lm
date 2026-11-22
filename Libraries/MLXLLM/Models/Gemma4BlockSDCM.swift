@@ -142,7 +142,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         backwardHalo: Float = 0.85,
         strataCount: Int = 4,
         twoHopBlockPeaks: Int = 24,
-        slidingChunkSize: Int = 1024,
+        slidingChunkSize: Int = 128,
         reversePrefixQuota: [Int: Float] = [:],
         reversePrefixEnd: Int = 128,
         earlySparseFullLayer: Int? = 5,
@@ -269,7 +269,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         backwardHalo: 0.85,
         strataCount: 4,
         twoHopBlockPeaks: 24,
-        slidingChunkSize: 1024,
+        slidingChunkSize: 128,
         reversePrefixQuota: [12: 0.25, 18: 0.25, 24: 0.20],
         reversePrefixEnd: 128,
         earlySparseFullLayer: 5,
@@ -294,7 +294,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         backwardHalo: 0.85,
         strataCount: 4,
         twoHopBlockPeaks: 24,
-        slidingChunkSize: 1024,
+        slidingChunkSize: 128,
         reversePrefixQuota: [6: 0.30, 12: 0.25, 18: 0.25, 24: 0.20],
         reversePrefixEnd: 128,
         earlySparseFullLayer: 5,
@@ -319,7 +319,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         backwardHalo: 0.85,
         strataCount: 4,
         twoHopBlockPeaks: 24,
-        slidingChunkSize: 1024,
+        slidingChunkSize: 128,
         reversePrefixQuota: [6: 0.32, 12: 0.28, 18: 0.25, 24: 0.20],
         reversePrefixEnd: 128,
         earlySparseFullLayer: 5,
@@ -343,7 +343,7 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         backwardHalo: 0.85,
         strataCount: 4,
         twoHopBlockPeaks: 24,
-        slidingChunkSize: 1024,
+        slidingChunkSize: 128,
         reversePrefixQuota: [6: 0.32, 12: 0.28, 18: 0.25, 24: 0.20],
         reversePrefixEnd: 128,
         earlySparseFullLayer: 5,
@@ -530,6 +530,71 @@ public struct Gemma4SDCMCheckpoint {
             }
         }
         return wakeIndices
+    }
+}
+
+// MARK: - Translation-Invariant Mask Cache
+
+/// Trunk-scoped cache of boolean masks for contiguous sliding and prefix+local blocks.
+public final class Gemma4SDCMMaskCache {
+    private struct SlidingKey: Hashable {
+        let qCount: Int
+        let kCount: Int
+        let window: Int
+    }
+
+    private struct PrefixLocalKey: Hashable {
+        let qCount: Int
+        let prefixCount: Int
+        let localCount: Int
+        let window: Int
+    }
+
+    private var slidingMasks: [SlidingKey: MLXArray] = [:]
+    private var prefixLocalMasks: [PrefixLocalKey: MLXArray] = [:]
+
+    public init() {}
+
+    internal var cachedMaskCount: Int {
+        slidingMasks.count + prefixLocalMasks.count
+    }
+
+    /// Cached `[qCount, kCount]` sliding mask for contiguous aligned blocks.
+    public func slidingMask(qCount: Int, kCount: Int, window: Int) -> MLXArray {
+        precondition(
+            qCount > 0 && kCount >= qCount && window > 0,
+            "Gemma4SDCMMaskCache slidingMask requires qCount > 0, kCount >= qCount, window > 0")
+        let key = SlidingKey(qCount: qCount, kCount: kCount, window: window)
+        if let cached = slidingMasks[key] {
+            return cached
+        }
+        let offset = Int32(kCount - qCount)
+        let qIdx = MLXArray((0 ..< qCount).map { offset + Int32($0) }).expandedDimensions(axis: 1)
+        let kIdx = MLXArray((0 ..< kCount).map { Int32($0) }).expandedDimensions(axis: 0)
+        let diff = qIdx - kIdx
+        let mask = (diff .>= Int32(0)) .&& (diff .< Int32(clamping: window))
+        slidingMasks[key] = mask
+        return mask
+    }
+
+    /// Cached `[qCount, prefixCount + localCount]` mask with all-true prefix columns
+    /// followed by a contiguous sliding mask over the local columns.
+    public func prefixLocalMask(
+        qCount: Int, prefixCount: Int, localCount: Int, window: Int
+    ) -> MLXArray {
+        if prefixCount <= 0 {
+            return slidingMask(qCount: qCount, kCount: localCount, window: window)
+        }
+        let key = PrefixLocalKey(
+            qCount: qCount, prefixCount: prefixCount, localCount: localCount, window: window)
+        if let cached = prefixLocalMasks[key] {
+            return cached
+        }
+        let prefixPart = MLXArray.ones([qCount, prefixCount], dtype: .bool)
+        let localPart = slidingMask(qCount: qCount, kCount: localCount, window: window)
+        let mask = concatenated([prefixPart, localPart], axis: 1)
+        prefixLocalMasks[key] = mask
+        return mask
     }
 }
 
@@ -1730,6 +1795,50 @@ public enum Gemma4BlockSDCM {
         return selected
     }
 
+    /// Query-blocked causal SDPA for head dimensions outside MLX's fused Flash set
+    /// (`{64, 72, 80, 96, 128}`), avoiding `[B, H, L, L]` score materialization.
+    public static func causalAttentionBlocked(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        blockSize: Int = 128
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        guard L > 0 else {
+            return MLXArray.zeros(
+                [queries.dim(0), queries.dim(1), 0, values.dim(3)], dtype: queries.dtype)
+        }
+        precondition(
+            keys.dim(2) == L && values.dim(2) == L,
+            "Block-SDCM causalAttentionBlocked requires matching Q/K/V sequence lengths")
+        let effectiveBlock = max(1, blockSize)
+        let qDim = queries.dim(3)
+        let vDim = values.dim(3)
+        let usesFusedFlash =
+            qDim == vDim
+            && (qDim == 64 || qDim == 72 || qDim == 80 || qDim == 96 || qDim == 128)
+        if usesFusedFlash || L <= effectiveBlock {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
+        }
+        var chunks: [MLXArray] = []
+        chunks.reserveCapacity((L - 1) / effectiveBlock + 1)
+        var s0 = 0
+        while s0 < L {
+            let s1 = min(L, s0 + effectiveBlock)
+            chunks.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: queries[0..., 0..., s0 ..< s1, 0...],
+                    keys: keys[0..., 0..., ..<s1, 0...],
+                    values: values[0..., 0..., ..<s1, 0...],
+                    scale: scale,
+                    mask: .causal))
+            s0 = s1
+        }
+        return concatenated(chunks, axis: 2)
+    }
+
     /// O(T * (P + W)) Prefix + Local Band + Exact Full-Tail sparse causal attention for
     /// uncompacted early full-attention layers (e.g. layer 5).
     /// - Interior queries attend exactly to `[0 ..< P]` (sinks + top instruction) union
@@ -1753,8 +1862,8 @@ public enum Gemma4BlockSDCM {
         let W = localWindow
         let T = max(0, tailTokens)
         guard W > 0, P < L, T < L, L - P - T > W else {
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
+            return causalAttentionBlocked(
+                queries: queries, keys: keys, values: values, scale: scale, blockSize: 128)
         }
         let positionsHost = (0 ..< L).map { Int32($0) }
         return prefixLocalFullTailAttention(
@@ -1767,7 +1876,8 @@ public enum Gemma4BlockSDCM {
             localWindow: W,
             tailTokens: T,
             scale: scale,
-            chunkSize: W)
+            chunkSize: 128,
+            isContiguous: true)
     }
 
     /// Position-aware O(L * (P + W)) Prefix + Local Band + Exact Full-Tail sparse causal attention
@@ -1784,7 +1894,9 @@ public enum Gemma4BlockSDCM {
         localWindow: Int,
         tailTokens: Int,
         scale: Float,
-        chunkSize: Int = 1024
+        chunkSize: Int = 128,
+        isContiguous: Bool = false,
+        maskCache: Gemma4SDCMMaskCache? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         guard L > 0 else {
@@ -1798,70 +1910,127 @@ public enum Gemma4BlockSDCM {
         let P = max(0, prefixTokens)
         let W = localWindow
         let T = max(0, tailTokens)
+        let effectiveChunk = chunkSize > 0 ? chunkSize : 128
         guard W > 0, T < L else {
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
+            return causalAttentionBlocked(
+                queries: queries, keys: keys, values: values,
+                scale: scale, blockSize: effectiveChunk)
         }
         let pEnd = P > 0 ? lowerBound(positionsHost, target: Int64(P)) : 0
         let cut = L - T
         guard pEnd < cut,
             Int64(positionsHost[cut - 1]) - Int64(positionsHost[pEnd]) >= Int64(W)
         else {
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: .causal)
+            return causalAttentionBlocked(
+                queries: queries, keys: keys, values: values,
+                scale: scale, blockSize: effectiveChunk)
         }
-        let effectiveChunk = chunkSize > 0 ? chunkSize : 1024
+        let cache = isContiguous ? (maskCache ?? Gemma4SDCMMaskCache()) : nil
         let pI32 = Int32(clamping: P)
         let wI32 = Int32(clamping: W)
         let windowSpan = Int64(W - 1)
+        let causalLimit = Int64(P) + Int64(W)
+        let tailBlocks = T > 0 ? (T + effectiveChunk - 1) / effectiveChunk : 0
         var chunks: [MLXArray] = []
-        chunks.reserveCapacity((cut + effectiveChunk - 1) / effectiveChunk + 1)
+        let cutBlocks = cut > 0 ? (cut - 1) / effectiveChunk + 1 : 0
+        chunks.reserveCapacity(cutBlocks + tailBlocks)
 
         var s0 = 0
         while s0 < cut {
             let s1 = min(cut, s0 + effectiveChunk)
             let qChunk = queries[0..., 0..., s0 ..< s1, 0...]
-            let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+            if Int64(positionsHost[s1 - 1]) < causalLimit {
+                chunks.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: qChunk,
+                        keys: keys[0..., 0..., ..<s1, 0...],
+                        values: values[0..., 0..., ..<s1, 0...],
+                        scale: scale,
+                        mask: .causal))
+                s0 = s1
+                continue
+            }
+
             let minPos = Int64(positionsHost[s0]) - windowSpan
             let k0 = min(s0, lowerBound(positionsHost, target: minPos))
             let kChunk: MLXArray
             let vChunk: MLXArray
-            let kPos: MLXArray
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode
             if k0 <= pEnd {
                 kChunk = keys[0..., 0..., ..<s1, 0...]
                 vChunk = values[0..., 0..., ..<s1, 0...]
-                kPos = positions[..<s1].expandedDimensions(axis: 0)
+                if pEnd == 0 {
+                    if Int64(positionsHost[s1 - 1]) - Int64(positionsHost[0]) < Int64(W) {
+                        mask = .causal
+                    } else if let cache {
+                        mask = .array(cache.slidingMask(qCount: s1 - s0, kCount: s1, window: W))
+                    } else {
+                        let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+                        let kPos = positions[..<s1].expandedDimensions(axis: 0)
+                        let diff = qPos - kPos
+                        mask = .array((diff .>= Int32(0)) .&& (diff .< wI32))
+                    }
+                } else if let cache, s0 >= pEnd {
+                    mask = .array(
+                        cache.prefixLocalMask(
+                            qCount: s1 - s0, prefixCount: pEnd,
+                            localCount: s1 - pEnd, window: W))
+                } else {
+                    let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+                    let kPos = positions[..<s1].expandedDimensions(axis: 0)
+                    mask = .array((kPos .<= qPos) .&& ((kPos .< pI32) .|| ((qPos - kPos) .< wI32)))
+                }
             } else if pEnd > 0 {
                 kChunk = concatenated(
                     [keys[0..., 0..., ..<pEnd, 0...], keys[0..., 0..., k0 ..< s1, 0...]], axis: 2)
                 vChunk = concatenated(
                     [values[0..., 0..., ..<pEnd, 0...], values[0..., 0..., k0 ..< s1, 0...]],
                     axis: 2)
-                kPos = concatenated(
-                    [positions[..<pEnd], positions[k0 ..< s1]], axis: 0
-                ).expandedDimensions(axis: 0)
+                if let cache {
+                    mask = .array(
+                        cache.prefixLocalMask(
+                            qCount: s1 - s0, prefixCount: pEnd,
+                            localCount: s1 - k0, window: W))
+                } else {
+                    let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+                    let kPos = concatenated(
+                        [positions[..<pEnd], positions[k0 ..< s1]], axis: 0
+                    ).expandedDimensions(axis: 0)
+                    mask = .array((kPos .<= qPos) .&& ((kPos .< pI32) .|| ((qPos - kPos) .< wI32)))
+                }
             } else {
                 kChunk = keys[0..., 0..., k0 ..< s1, 0...]
                 vChunk = values[0..., 0..., k0 ..< s1, 0...]
-                kPos = positions[k0 ..< s1].expandedDimensions(axis: 0)
+                if Int64(positionsHost[s1 - 1]) - Int64(positionsHost[k0]) < Int64(W) {
+                    mask = .causal
+                } else if let cache {
+                    mask = .array(cache.slidingMask(qCount: s1 - s0, kCount: s1 - k0, window: W))
+                } else {
+                    let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+                    let kPos = positions[k0 ..< s1].expandedDimensions(axis: 0)
+                    let diff = qPos - kPos
+                    mask = .array((diff .>= Int32(0)) .&& (diff .< wI32))
+                }
             }
-            let mask = (kPos .<= qPos) .&& ((kPos .< pI32) .|| ((qPos - kPos) .< wI32))
             chunks.append(
                 MLXFast.scaledDotProductAttention(
-                    queries: qChunk, keys: kChunk, values: vChunk, scale: scale,
-                    mask: .array(mask)))
+                    queries: qChunk, keys: kChunk, values: vChunk, scale: scale, mask: mask))
             s0 = s1
         }
-        if cut < L {
-            let qPos = positions[cut ..< L].expandedDimensions(axis: 1)
-            let kPos = positions.expandedDimensions(axis: 0)
+
+        // Tail queries attend causally to all earlier keys; strictly ascending positions
+        // make bottom-right `.causal` exact for both contiguous and compacted sequences.
+        var t0 = cut
+        while t0 < L {
+            let t1 = min(L, t0 + effectiveChunk)
             chunks.append(
                 MLXFast.scaledDotProductAttention(
-                    queries: queries[0..., 0..., cut ..< L, 0...],
-                    keys: keys,
-                    values: values,
+                    queries: queries[0..., 0..., t0 ..< t1, 0...],
+                    keys: keys[0..., 0..., ..<t1, 0...],
+                    values: values[0..., 0..., ..<t1, 0...],
                     scale: scale,
-                    mask: .array(kPos .<= qPos)))
+                    mask: .causal))
+            t0 = t1
         }
         return chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
     }
@@ -1876,7 +2045,9 @@ public enum Gemma4BlockSDCM {
         positionsHost: [Int32],
         slidingWindow: Int,
         scale: Float,
-        chunkSize: Int = 1024
+        chunkSize: Int = 128,
+        isContiguous: Bool = false,
+        maskCache: Gemma4SDCMMaskCache? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         guard L > 0 else {
@@ -1888,37 +2059,41 @@ public enum Gemma4BlockSDCM {
             positionsHost.count == L && positions.dim(0) == L,
             "Block-SDCM sliding attention positions length mismatch")
         let effectiveChunkSize = max(1, chunkSize)
-        let windowI32 = Int32(slidingWindow)
-        if L <= effectiveChunkSize {
-            let diff =
-                positions.expandedDimensions(axis: 1) - positions.expandedDimensions(axis: 0)
-            let mask = (diff .>= Int32(0)) .&& (diff .< windowI32)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: .array(mask))
-        }
+        let windowI32 = Int32(clamping: slidingWindow)
+        let windowSpan = Int64(slidingWindow - 1)
+        let windowI64 = Int64(slidingWindow)
+        let cache = isContiguous ? (maskCache ?? Gemma4SDCMMaskCache()) : nil
 
         var chunks: [MLXArray] = []
-        chunks.reserveCapacity((L + effectiveChunkSize - 1) / effectiveChunkSize)
-        let windowSpan = Int64(slidingWindow - 1)
+        chunks.reserveCapacity((L - 1) / effectiveChunkSize + 1)
         var s0 = 0
         while s0 < L {
             let s1 = min(L, s0 + effectiveChunkSize)
             let minPos = Int64(positionsHost[s0]) - windowSpan
             let k0 = min(s0, lowerBound(positionsHost, target: minPos))
-            let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
-            let kPos = positions[k0 ..< s1].expandedDimensions(axis: 0)
-            let diff = qPos - kPos
-            let mask = (diff .>= Int32(0)) .&& (diff .< windowI32)
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode
+            if Int64(positionsHost[s1 - 1]) - Int64(positionsHost[k0]) < windowI64 {
+                mask = .causal
+            } else if let cache {
+                mask = .array(
+                    cache.slidingMask(
+                        qCount: s1 - s0, kCount: s1 - k0, window: slidingWindow))
+            } else {
+                let qPos = positions[s0 ..< s1].expandedDimensions(axis: 1)
+                let kPos = positions[k0 ..< s1].expandedDimensions(axis: 0)
+                let diff = qPos - kPos
+                mask = .array((diff .>= Int32(0)) .&& (diff .< windowI32))
+            }
             let out = MLXFast.scaledDotProductAttention(
                 queries: queries[0..., 0..., s0 ..< s1, 0...],
                 keys: keys[0..., 0..., k0 ..< s1, 0...],
                 values: values[0..., 0..., k0 ..< s1, 0...],
                 scale: scale,
-                mask: .array(mask))
+                mask: mask)
             chunks.append(out)
             s0 = s1
         }
-        return concatenated(chunks, axis: 2)
+        return chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
     }
 
     /// Start of prompt history for the next sliding decode query. Pruning must keep that history
@@ -2044,11 +2219,11 @@ extension Gemma4DecoderLayer {
     /// exact trailing sliding window and RMS-matching the skipped interior.
     private func forwardSkippedInteriorSlidingLayer(
         _ x: MLXArray,
-        positions: MLXArray,
         originalLength: Int,
         exactTailLength: Int,
         chunkSize: Int,
         cache: KVCache?,
+        maskCache: Gemma4SDCMMaskCache?,
         isExpertPrefill: Bool
     ) -> (hidden: MLXArray, nextLayerScores: Gemma4SDCMBoundaryScores?) {
         let attn = selfAttn
@@ -2096,40 +2271,34 @@ extension Gemma4DecoderLayer {
         let attnV = outDType == .float16 ? vSub.asType(.float32) : vSub
 
         let effectiveChunk = max(64, chunkSize)
-        let attnResult: MLXArray
-        if tailLen <= effectiveChunk {
-            let qPos = positions[cut...].expandedDimensions(axis: 1)
-            let kPos = positions[k0...].expandedDimensions(axis: 0)
-            let diff = qPos - kPos
-            let mask = (diff .>= Int32(0)) .&& (diff .< Int32(window))
-            attnResult = MLXFast.scaledDotProductAttention(
-                queries: attnQ, keys: attnK, values: attnV, scale: attn.scale, mask: .array(mask))
-        } else {
-            var chunks: [MLXArray] = []
-            chunks.reserveCapacity((tailLen + effectiveChunk - 1) / effectiveChunk)
-            var qStart = 0
-            while qStart < tailLen {
-                let qEnd = min(tailLen, qStart + effectiveChunk)
-                let qOrigStart = cut + qStart
-                let qOrigEnd = cut + qEnd
-                let kvLocalStart = max(0, (qOrigStart - window + 1) - k0)
-                let kvLocalEnd = qOrigEnd - k0
-                let qChunk = attnQ[0..., 0..., qStart ..< qEnd, 0...]
-                let kChunk = attnK[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...]
-                let vChunk = attnV[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...]
-                let qPos = positions[qOrigStart ..< qOrigEnd].expandedDimensions(axis: 1)
-                let kPos = positions[(k0 + kvLocalStart) ..< (k0 + kvLocalEnd)]
-                    .expandedDimensions(axis: 0)
-                let diff = qPos - kPos
-                let mask = (diff .>= Int32(0)) .&& (diff .< Int32(window))
-                chunks.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: qChunk, keys: kChunk, values: vChunk,
-                        scale: attn.scale, mask: .array(mask)))
-                qStart = qEnd
-            }
-            attnResult = concatenated(chunks, axis: 2)
+        let activeMaskCache = maskCache ?? Gemma4SDCMMaskCache()
+        var chunks: [MLXArray] = []
+        chunks.reserveCapacity((tailLen - 1) / effectiveChunk + 1)
+        var qStart = 0
+        while qStart < tailLen {
+            let qEnd = min(tailLen, qStart + effectiveChunk)
+            let qOrigStart = cut + qStart
+            let qOrigEnd = cut + qEnd
+            let kvLocalStart = max(0, (qOrigStart - window + 1) - k0)
+            let kvLocalEnd = qOrigEnd - k0
+            let qCount = qEnd - qStart
+            let kCount = kvLocalEnd - kvLocalStart
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode =
+                kCount <= window
+                ? .causal
+                : .array(
+                    activeMaskCache.slidingMask(
+                        qCount: qCount, kCount: kCount, window: window))
+            chunks.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: attnQ[0..., 0..., qStart ..< qEnd, 0...],
+                    keys: attnK[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...],
+                    values: attnV[0..., 0..., kvLocalStart ..< kvLocalEnd, 0...],
+                    scale: attn.scale,
+                    mask: mask))
+            qStart = qEnd
         }
+        let attnResult = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
         let attnOut = finishAttentionOutput(attnResult, length: tailLen, outDType: outDType)
 
         let xTail = x[0..., cut..., 0...]
@@ -2156,7 +2325,8 @@ extension Gemma4DecoderLayer {
         sdcm: Gemma4BlockSDCMConfig,
         isFinalLayer: Bool,
         nextReverseQuota: Float?,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        maskCache: Gemma4SDCMMaskCache? = nil
     ) -> (hidden: MLXArray, nextLayerScores: Gemma4SDCMBoundaryScores?) {
         let L = x.dim(1)
         let isContiguous = L == originalLength
@@ -2171,11 +2341,11 @@ extension Gemma4DecoderLayer {
         {
             return forwardSkippedInteriorSlidingLayer(
                 x,
-                positions: positions,
                 originalLength: originalLength,
                 exactTailLength: exactTailLength,
                 chunkSize: sdcm.slidingChunkSize,
                 cache: cache,
+                maskCache: maskCache,
                 isExpertPrefill: isExpertPrefill)
         }
         guard let kProj = attn.kProj, let kNorm = attn.kNorm, let vNorm = attn.vNorm else {
@@ -2255,7 +2425,9 @@ extension Gemma4DecoderLayer {
                 positionsHost: positionsHost,
                 slidingWindow: attn.config.slidingWindow,
                 scale: attn.scale,
-                chunkSize: sdcm.slidingChunkSize)
+                chunkSize: sdcm.slidingChunkSize,
+                isContiguous: isContiguous,
+                maskCache: maskCache)
         } else {
             if sdcm.usesSparseFullAttention(forLayer: attn.layerIdx) {
                 attnResult = Gemma4BlockSDCM.prefixLocalFullTailAttention(
@@ -2268,12 +2440,18 @@ extension Gemma4DecoderLayer {
                     localWindow: sdcm.sparseLocalWindow,
                     tailTokens: sdcm.sparseTailTokens,
                     scale: attn.scale,
-                    chunkSize: sdcm.slidingChunkSize)
+                    chunkSize: sdcm.slidingChunkSize,
+                    isContiguous: isContiguous,
+                    maskCache: maskCache)
             } else {
-                // Kept positions are strictly increasing, so `pos[k] <= pos[q]` is identical
-                // to index-causal order -> uses MLX's fused FlashAttention `.causal` kernel.
-                attnResult = MLXFast.scaledDotProductAttention(
-                    queries: attnQ, keys: attnK, values: attnV, scale: attn.scale, mask: .causal)
+                // Kept positions are strictly increasing, so index-causal order is exact;
+                // block non-Flash head dims (e.g. D=512) to avoid [1, H, L, L] score matrices.
+                attnResult = Gemma4BlockSDCM.causalAttentionBlocked(
+                    queries: attnQ,
+                    keys: attnK,
+                    values: attnV,
+                    scale: attn.scale,
+                    blockSize: sdcm.slidingChunkSize)
             }
             if let reverseQuota = nextReverseQuota {
                 nextScores = Gemma4BlockSDCM.computeBilateralBlockScores(
@@ -2332,28 +2510,17 @@ extension Gemma4DecoderLayer {
         h1 = postFeedforwardLayernorm1(h1)
 
         let cut = L - effectiveTailKeep
-        let interiorIn = input[0..., ..<cut, 0...]
-        let tailIn = input[0..., cut..., 0...]
-
-        // Interior tokens: direct top-k argPartition with exact softmax renormalization.
-        let (prunedIndices, prunedWeights) = router.routeTopK(interiorIn, topK: interiorMoEK)
-        let h2IntRaw = experts(
-            preFeedforwardLayernorm2(interiorIn),
-            topKIndices: prunedIndices,
-            topKWeights: prunedWeights,
+        let (prunedIndices, prunedWeights, tailIndices, tailWeights) = router.routeMixedTopK(
+            input, cut: cut, interiorTopK: interiorMoEK)
+        let h2Raw = experts.callMixedK(
+            preFeedforwardLayernorm2(input),
+            interiorIndices: prunedIndices,
+            interiorWeights: prunedWeights,
+            tailIndices: tailIndices,
+            tailWeights: tailWeights,
             isExpertPrefill: isExpertPrefill)
-        let h2Int = postFeedforwardLayernorm2(h2IntRaw)
+        let h2 = postFeedforwardLayernorm2(h2Raw)
 
-        // Tail tokens: exact top-8 MoE (preserves question & frontier representations).
-        let (tailIndices, tailWeights) = router(tailIn)
-        let h2TailRaw = experts(
-            preFeedforwardLayernorm2(tailIn),
-            topKIndices: tailIndices,
-            topKWeights: tailWeights,
-            isExpertPrefill: isExpertPrefill)
-        let h2Tail = postFeedforwardLayernorm2(h2TailRaw)
-
-        let h2 = concatenated([h2Int, h2Tail], axis: 1)
         let out = postFeedforwardLayernorm(h1 + h2)
         return residual2 + out
     }
@@ -2388,6 +2555,7 @@ extension Gemma4TextModelInner {
         var earlyEmbeddingHidden: MLXArray? = earlyCompactLayer != nil ? initialHidden : nil
         var positionsHost = (0 ..< originalLength).map { Int32($0) }
         var positions = MLXArray(positionsHost)
+        let maskCache = Gemma4SDCMMaskCache()
         var pendingScores: Gemma4SDCMBoundaryScores? = nil
         var checkpoint: Gemma4SDCMCheckpoint? = nil
 
@@ -2445,7 +2613,8 @@ extension Gemma4TextModelInner {
                 sdcm: sdcm,
                 isFinalLayer: isFinalLayer,
                 nextReverseQuota: nextReverseQuota,
-                isExpertPrefill: isExpertPrefill)
+                isExpertPrefill: isExpertPrefill,
+                maskCache: maskCache)
             h = out
             if let nextScores {
                 pendingScores = nextScores
