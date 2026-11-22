@@ -1349,17 +1349,56 @@ class Gemma4Router: Module {
     }
 
     /// Route `x` to the top `requestedK` experts with exact softmax renormalization
-    /// over the selected subset (identical to `callAsFunction` when `requestedK == topK`).
+    /// over the selected subset (identical to `callAsFunction` when `requestedK == topK`
+    /// and `batchUnionMaxExperts == nil`).
+    ///
+    /// When `batchUnionMaxExperts` (`M`) is set on a decode batch (`B >= 4, S == 1,
+    /// activeK <= M < numExperts`), scores are first restricted to the batch-union active
+    /// set of `M` experts ranked by max per-row margin below each row's peak
+    /// (`max_b (s_{b,e} - max_{e'} s_{b,e'})`). For `B <= M`, every row's #1 expert
+    /// scores `0.0` and is guaranteed inclusion, while capping unique expert DRAM reads
+    /// across the batch at `M`.
     func routeTopK(
-        _ x: MLXArray, topK requestedK: Int
+        _ x: MLXArray,
+        topK requestedK: Int,
+        batchUnionMaxExperts: Int? = nil
     ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
 
-        let activeK = max(1, min(requestedK, expertScores.dim(-1)))
-        let kth = expertScores.dim(-1) - activeK
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        let numExperts = expertScores.dim(-1)
+        let activeK = max(1, min(requestedK, numExperts))
+        let topKIndices: MLXArray
+        if let maxActive = batchUnionMaxExperts,
+            maxActive >= activeK, maxActive < numExperts,
+            expertScores.ndim == 3,
+            expertScores.dim(0) >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize,
+            expertScores.dim(1) == 1
+        {
+            let batchSize = expertScores.dim(0)
+            let scoresF32 = expertScores.reshaped(batchSize, numExperts).asType(.float32)
+            let rowMax = MLX.max(scoresF32, axis: -1, keepDims: true)
+            let rowMin = MLX.min(scoresF32, axis: -1, keepDims: true)
+            let isDegenerate = (rowMax - rowMin) .<= Float(1e-6)
+            // Mask degenerate/constant rows so they never poison the active-set ranking,
+            // and add a tiny mean-probability tie-breaker so high-demand shared #1 experts
+            // win deterministically when B > M.
+            let centered = MLX.where(
+                isDegenerate, MLXArray(Float(-1e6)), scoresF32 - rowMax)
+            let probs = MLX.softmax(scoresF32, axis: -1)
+            let batchScore =
+                MLX.max(centered, axis: 0) + Float(1e-3) * MLX.mean(probs, axis: 0)
+            let unionKth = numExperts - maxActive
+            let activeExperts = MLX.argPartition(batchScore, kth: unionKth)[unionKth...]
+            let subScores = MLX.take(expertScores, activeExperts, axis: -1)
+            let localKth = maxActive - activeK
+            let localIdx = MLX.argPartition(subScores, kth: localKth, axis: -1)[
+                0..., 0..., localKth...]
+            topKIndices = activeExperts[localIdx]
+        } else {
+            let kth = numExperts - activeK
+            topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)[.ellipsis, kth...]
+        }
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -1671,6 +1710,54 @@ public enum Gemma4DecodeMoETopKPolicy: Equatable, Sendable {
     }
 }
 
+/// Opt-in decode-only batch-union active-set MoE expert cap
+/// (`DARKBLOOM_GEMMA4_DECODE_MOE_BATCH_UNION=off|auto|32|40|48`).
+///
+/// On continuous-batching decode steps (`B >= 4, S == 1`), restricts routing to the
+/// top-`M` experts ranked by max per-row margin below each row's peak score, guaranteeing
+/// every row's #1 expert for `B <= M` while capping unique expert DRAM reads at `M`.
+/// Default is `.off` (exact independent per-row routing).
+public enum Gemma4DecodeMoEBatchUnionPolicy: Equatable, Sendable {
+    case off
+    case activeSet(maxExperts: Int)
+
+    public static let envKey = "DARKBLOOM_GEMMA4_DECODE_MOE_BATCH_UNION"
+    /// Below 4 concurrent decode rows, per-row active experts rarely exceed the cap.
+    static let minimumBatchSize = 4
+
+    public static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Gemma4DecodeMoEBatchUnionPolicy {
+        guard
+            let raw = environment[envKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+            !raw.isEmpty
+        else { return .off }
+        switch raw {
+        case "0", "off", "false", "none":
+            return .off
+        case "auto", "on", "1", "true":
+            return .activeSet(maxExperts: 40)
+        default:
+            if let m = Int(raw), m >= 8 {
+                return .activeSet(maxExperts: m)
+            }
+            return .off
+        }
+    }
+
+    public func maxActiveExperts(numExperts: Int, minTopK: Int) -> Int? {
+        switch self {
+        case .off:
+            return nil
+        case .activeSet(let requested):
+            let clamped = max(minTopK, requested)
+            return clamped < numExperts ? clamped : nil
+        }
+    }
+}
+
 // MARK: - Decoder Layer
 
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
@@ -1726,8 +1813,32 @@ public class Gemma4DecoderLayer: Module {
             }
             guard normalized != _decodeMoETopK else { return }
             _decodeMoETopK = normalized
+            // Re-clamp active-set cap whenever the effective per-row topK floor moves.
+            _decodeMoEBatchUnionMaxExperts = normalizedBatchUnionMaxExperts(
+                _decodeMoEBatchUnionMaxExperts)
             compiledFeedforward.invalidate()
         }
+    }
+
+    private var _decodeMoEBatchUnionMaxExperts: Int?
+    /// Optional decode-only batch-union active-set expert cap
+    /// (`DARKBLOOM_GEMMA4_DECODE_MOE_BATCH_UNION`). `nil` means unbounded routing.
+    var decodeMoEBatchUnionMaxExperts: Int? {
+        get { _decodeMoEBatchUnionMaxExperts }
+        set {
+            let normalized = normalizedBatchUnionMaxExperts(newValue)
+            guard normalized != _decodeMoEBatchUnionMaxExperts else { return }
+            _decodeMoEBatchUnionMaxExperts = normalized
+            compiledFeedforward.invalidate()
+        }
+    }
+
+    private func normalizedBatchUnionMaxExperts(_ requested: Int?) -> Int? {
+        guard let requested, let router, let numExperts = config.numExperts else {
+            return requested
+        }
+        let clamped = max(_decodeMoETopK ?? router.topK, requested)
+        return clamped < numExperts ? clamped : nil
     }
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
@@ -1773,6 +1884,10 @@ public class Gemma4DecoderLayer: Module {
                 numLayers: config.numHiddenLayers,
                 defaultTopK: router.topK)
             self._decodeMoETopK = policyK < router.topK ? policyK : nil
+            if let numExperts = config.numExperts {
+                self._decodeMoEBatchUnionMaxExperts = Gemma4DecodeMoEBatchUnionPolicy.resolve()
+                    .maxActiveExperts(numExperts: numExperts, minTopK: policyK)
+            }
             self._experts.wrappedValue = Gemma4Experts(
                 config,
                 fuseWeightedUnsort: fuseWeightedUnsort)
@@ -1917,7 +2032,7 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool,
         allowDecodeMoETopK: Bool = true
     ) -> MLXArray {
-        if !allowDecodeMoETopK && decodeMoETopK != nil {
+        if !allowDecodeMoETopK && (decodeMoETopK != nil || decodeMoEBatchUnionMaxExperts != nil) {
             return feedforward(input, isExpertPrefill: isExpertPrefill, allowDecodeMoETopK: false)
         }
         return compiledFeedforward(self, input, isExpertPrefill: isExpertPrefill)
@@ -1931,8 +2046,19 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool,
         allowDecodeMoETopK: Bool
     ) -> (MLXArray, MLXArray) {
-        if allowDecodeMoETopK, !isExpertPrefill, input.dim(1) <= 3, let activeTopK = decodeMoETopK {
-            return router.routeTopK(input, topK: activeTopK)
+        let allowDecode = allowDecodeMoETopK && !isExpertPrefill
+        let activeTopK: Int? = (allowDecode && input.dim(1) <= 3) ? decodeMoETopK : nil
+        // Batch-union couples expert selection across rows, so never engage inside
+        // row-independent `Gemma4BatchDecodeProjection` or `Gemma4PrefillProjection` scopes.
+        let batchUnionMax: Int? =
+            (allowDecode && input.dim(1) == 1
+                && input.dim(0) >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize
+                && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active)
+            ? decodeMoEBatchUnionMaxExperts : nil
+        if activeTopK != nil || batchUnionMax != nil {
+            return router.routeTopK(
+                input, topK: activeTopK ?? router.topK,
+                batchUnionMaxExperts: batchUnionMax)
         }
         return router(input)
     }

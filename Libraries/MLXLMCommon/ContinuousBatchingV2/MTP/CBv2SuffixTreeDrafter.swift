@@ -271,7 +271,8 @@ public final class CBv2SuffixTreeDrafter: CBv2TokenOnlyMTPDrafter {
     ) -> Bool {
         guard !rows.isEmpty, maxDraftTokens > 0 else { return false }
         let proposals = collectProposals(for: rows, maxDraftTokens: maxDraftTokens)
-        return isProfitable(proposals: proposals, batchCount: rows.count)
+        return isProfitable(
+            proposals: proposals, batchCount: rows.count, maxDraftTokens: maxDraftTokens)
     }
 
     public func proposeDrafts(
@@ -280,7 +281,10 @@ public final class CBv2SuffixTreeDrafter: CBv2TokenOnlyMTPDrafter {
     ) -> (depth: Int, draftsByRequest: [CBv2RequestID: [Int32]]) {
         guard !rows.isEmpty, maxDraftTokens > 0 else { return (0, [:]) }
         let proposals = collectProposals(for: rows, maxDraftTokens: maxDraftTokens)
-        guard isProfitable(proposals: proposals, batchCount: rows.count) else {
+        guard
+            isProfitable(
+                proposals: proposals, batchCount: rows.count, maxDraftTokens: maxDraftTokens)
+        else {
             return (0, [:])
         }
 
@@ -288,7 +292,8 @@ public final class CBv2SuffixTreeDrafter: CBv2TokenOnlyMTPDrafter {
         for item in proposals where item.draft.count > maxProposed {
             maxProposed = item.draft.count
         }
-        let depth = min(maxDraftTokens, maxProposed)
+        let depth = min(
+            Self.batchDraftCap(batchCount: rows.count, maxDraftTokens: maxDraftTokens), maxProposed)
         guard depth > 0 else { return (0, [:]) }
 
         var draftsByRequest: [CBv2RequestID: [Int32]] = [:]
@@ -378,27 +383,50 @@ public final class CBv2SuffixTreeDrafter: CBv2TokenOnlyMTPDrafter {
         body(&automata[id, default: OnlineSuffixAutomaton()])
     }
 
-    /// Batch profitability gate:
-    /// - `B == 1`: require `matchLen >= minMatchLen` (default 3) and at least 2 drafted
-    ///   tokens so spurious short n-grams never break GPU decode chaining.
-    /// - `B > 1`: require at least `max(1, (B + 3) / 4)` matching rows AND
-    ///   `meanProposed >= 1.5` so non-matching or low-hit batches stay on fast
-    ///   chained decode with 0% speculative overhead.
-    private func isProfitable(proposals: [RowProposal], batchCount: Int) -> Bool {
-        guard batchCount > 0 else { return false }
-        var matchingRows = 0
-        var totalProposed = 0
+    /// Compiled-trace-safe draft depth cap per batch size:
+    /// - `B == 1`: full `maxDraftTokens` (memory-bandwidth bound).
+    /// - `B == 2`: `<= 2` (`width = 3`, `2 * 3 * 8 = 48 < 64` stays on Gemma 4's compiled width-3 trace).
+    /// - `B >= 3`: `<= 1` (`width = 2`, stays on Gemma 4's compiled sorted width-2 trace up to `B = maxRows / 2`).
+    private static func batchDraftCap(batchCount: Int, maxDraftTokens: Int) -> Int {
+        switch batchCount {
+        case ...1:
+            return maxDraftTokens
+        case 2:
+            return min(maxDraftTokens, 2)
+        default:
+            return min(maxDraftTokens, 1)
+        }
+    }
+
+    /// Batch profitability gate evaluated on post-cap effective draft lengths
+    /// so admission stays monotonic across `maxDraftTokens`:
+    /// - `B == 1`: require `matchLen >= minMatchLen` (default 3) and at least
+    ///   `min(2, maxDraftTokens)` drafted tokens so spurious short n-grams never
+    ///   break GPU decode chaining.
+    /// - `B > 1`: require strong matches (`matchLen >= max(minMatchLen, 4)`) on at least
+    ///   half the active batch (`max(2, (B + 1) / 2)`) and post-cap mean drafted tokens
+    ///   `>= 0.5 * Double(batchCap)`.
+    private func isProfitable(
+        proposals: [RowProposal], batchCount: Int, maxDraftTokens: Int
+    ) -> Bool {
+        guard batchCount > 0, maxDraftTokens > 0 else { return false }
+        if batchCount == 1 {
+            guard let first = proposals.first else { return false }
+            return first.matchLen >= minMatchLen && first.draft.count >= min(2, maxDraftTokens)
+        }
+        let cap = Self.batchDraftCap(batchCount: batchCount, maxDraftTokens: maxDraftTokens)
+        let batchMinMatch = max(minMatchLen, 4)
+        var strongMatches = 0
+        var totalEffectiveProposed = 0
         for item in proposals {
-            if item.matchLen >= minMatchLen && !item.draft.isEmpty {
-                matchingRows += 1
-                totalProposed += item.draft.count
+            let effectiveDraftCount = min(item.draft.count, cap)
+            if item.matchLen >= batchMinMatch && effectiveDraftCount > 0 {
+                strongMatches += 1
+                totalEffectiveProposed += effectiveDraftCount
             }
         }
-        if batchCount == 1 {
-            return matchingRows == 1 && totalProposed >= 2
-        }
-        let minMatchingRows = max(1, (batchCount + 3) / 4)
-        let meanProposed = Double(totalProposed) / Double(batchCount)
-        return matchingRows >= minMatchingRows && meanProposed >= 1.5
+        let minMatchingRows = max(2, (batchCount + 1) / 2)
+        let meanEffective = Double(totalEffectiveProposed) / Double(batchCount)
+        return strongMatches >= minMatchingRows && meanEffective >= 0.5 * Double(cap)
     }
 }

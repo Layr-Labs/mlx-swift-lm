@@ -63,10 +63,24 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
     /// environment's) in the calling task.
     @TaskLocal static var sortedOverrideForTesting: Bool?
 
+    private static let maxCompiledRows: Int = resolveMaxCompiledRows(
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_MAX_ROWS"])
+
+    static func resolveMaxCompiledRows(_ raw: String?) -> Int {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+            let parsed = Int(raw)
+        else { return 16 }
+        return max(16, min(64, parsed))
+    }
+
+    /// Tests only: replaces `maxCompiledRows` (nil: the environment's) in the calling task.
+    @TaskLocal static var maxRowsOverrideForTesting: Int?
+
     /// Whether `[rows, width]` decode or verification input may take the trace.
-    /// Up to 7 rows below 64 assignments keep the unsorted expert path. Up to 16
-    /// tokens at 64 or more assignments sort them inside the trace exactly as
-    /// the eager graph does (16 covers c = 8 verification and c = 16 decode).
+    /// Up to 7 rows below 64 assignments keep the unsorted expert path. Up to
+    /// `maxCompiledRows` tokens (default 16, opt-in up to 64 via
+    /// `DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_MAX_ROWS`) at 64 or more assignments
+    /// sort them inside the trace exactly as the eager graph does.
     /// A scoped batch-decode or prompt projection keeps those sorted sizes eager.
     /// Width 3 (two-draft MTP verification) takes the trace only below 64
     /// assignments, outside those scopes.
@@ -78,7 +92,8 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
             return assignments < 64 && unprojected
         }
         if rows <= 7 && assignments < 64 { return true }
-        guard rows * width <= 16, unprojected else { return false }
+        let maxRows = maxRowsOverrideForTesting ?? maxCompiledRows
+        guard rows * width <= maxRows, unprojected else { return false }
         return assignments < 64 || (sortedOverrideForTesting ?? sortedEnabled)
     }
 

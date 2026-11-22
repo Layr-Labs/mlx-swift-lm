@@ -128,21 +128,23 @@ struct Gemma4CompiledFeedforwardTests {
             MLXHardwareInfo.isCompiledDecodeSupported
             && (requested.map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
         print("[Gemma4 FFN sequence2] requested=\(requested ?? "unset") enabled=\(enabled)")
-        for (rows, width, eligible) in [
-            (1, 1, true), (1, 2, true), (2, 2, true), (3, 2, true),
-            (4, 2, true), (8, 2, true), (8, 1, true), (16, 1, true),
-            (1, 3, true), (2, 3, true), (3, 3, false), (1, 4, false),
-            (9, 2, false), (17, 1, false),
-        ] {
-            layer.invalidateCompiledTraces()
-            let x = input(rows: rows, sequenceWidth: width)
-            compare(layer, x)
-            #expect(
-                layer.feedforwardTraceIsCompiled
-                    == expectedCompiled(rows: rows, width: width, eligible: eligible))
-            let changed = x + Float(0.125)
-            eval(changed)
-            compare(layer, changed)
+        Gemma4CompiledFeedforwardCache.$maxRowsOverrideForTesting.withValue(16) {
+            for (rows, width, eligible) in [
+                (1, 1, true), (1, 2, true), (2, 2, true), (3, 2, true),
+                (4, 2, true), (8, 2, true), (8, 1, true), (16, 1, true),
+                (1, 3, true), (2, 3, true), (3, 3, false), (1, 4, false),
+                (9, 2, false), (17, 1, false),
+            ] {
+                layer.invalidateCompiledTraces()
+                let x = input(rows: rows, sequenceWidth: width)
+                compare(layer, x)
+                #expect(
+                    layer.feedforwardTraceIsCompiled
+                        == expectedCompiled(rows: rows, width: width, eligible: eligible))
+                let changed = x + Float(0.125)
+                eval(changed)
+                compare(layer, changed)
+            }
         }
         // Reuse shape-specialized traces across ordinary decode and the
         // original two-column verification layout, without flattening/padding.
@@ -171,21 +173,23 @@ struct Gemma4CompiledFeedforwardTests {
             MLXHardwareInfo.isCompiledDecodeSupported
             && (requested.map({ ["1", "true", "yes", "on"].contains($0.lowercased()) }) ?? true)
         print("[Gemma4 FFN lattice] requested=\(requested ?? "unset") enabled=\(enabled)")
-        for (rows, width, eligible) in [
-            (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
-            (8, 1, true), (4, 2, true), (12, 1, true), (16, 1, true), (8, 2, true),
-            (1, 3, true), (2, 3, true), (3, 3, false),
-            (17, 1, false), (9, 2, false),
-        ] {
-            layer.invalidateCompiledTraces()
-            let x = input(rows: rows, sequenceWidth: width)
-            compare(layer, x)
-            #expect(
-                layer.feedforwardTraceIsCompiled
-                    == expectedCompiled(rows: rows, width: width, eligible: eligible))
-            let changed = x + Float(0.125)
-            eval(changed)
-            compare(layer, changed)
+        Gemma4CompiledFeedforwardCache.$maxRowsOverrideForTesting.withValue(16) {
+            for (rows, width, eligible) in [
+                (1, 1, true), (4, 1, true), (7, 1, true), (1, 2, true), (3, 2, true),
+                (8, 1, true), (4, 2, true), (12, 1, true), (16, 1, true), (8, 2, true),
+                (1, 3, true), (2, 3, true), (3, 3, false),
+                (17, 1, false), (9, 2, false),
+            ] {
+                layer.invalidateCompiledTraces()
+                let x = input(rows: rows, sequenceWidth: width)
+                compare(layer, x)
+                #expect(
+                    layer.feedforwardTraceIsCompiled
+                        == expectedCompiled(rows: rows, width: width, eligible: eligible))
+                let changed = x + Float(0.125)
+                eval(changed)
+                compare(layer, changed)
+            }
         }
         layer.invalidateCompiledTraces()
         compare(layer, input(rows: 2, sequenceWidth: 2), prefill: true)
@@ -321,7 +325,9 @@ struct Gemma4CompiledFeedforwardTests {
 
     @Test func unsupportedInputsAndTrainingKeepEagerExecution() throws {
         let layer = try layer()
-        compare(layer, input(rows: 17))
+        Gemma4CompiledFeedforwardCache.$maxRowsOverrideForTesting.withValue(16) {
+            compare(layer, input(rows: 17))
+        }
         compare(layer, input(rows: 8, dtype: .float32))
         compare(layer, input(rows: 2, dtype: .float32))
         compare(layer, input(rows: 2, dtype: .float16))

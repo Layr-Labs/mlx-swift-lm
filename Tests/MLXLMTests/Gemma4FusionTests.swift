@@ -487,5 +487,76 @@ final class Gemma4FusionTests: XCTestCase {
                     layer.feedforwardTraceIsCompiled, "expected compiled trace for B=\(rows), k=5")
             }
         }
+
+        // Batch-union active-set MoE: policy resolution, exact unique-expert cap,
+        // guaranteed #1 expert inclusion for every row (B <= M), prefill exemption, and compiled parity.
+        XCTAssertEqual(Gemma4DecodeMoEBatchUnionPolicy.resolve(environment: [:]), .off)
+        XCTAssertEqual(
+            Gemma4DecodeMoEBatchUnionPolicy.resolve(
+                environment: [Gemma4DecodeMoEBatchUnionPolicy.envKey: "auto"]),
+            .activeSet(maxExperts: 40))
+        XCTAssertEqual(
+            Gemma4DecodeMoEBatchUnionPolicy.resolve(
+                environment: [Gemma4DecodeMoEBatchUnionPolicy.envKey: "32"]),
+            .activeSet(maxExperts: 32))
+
+        // On 32-expert layer with B = 8, M = 10, k = 5: unique experts <= 10 and every row's #1 kept.
+        let router = try XCTUnwrap(layer.router)
+        let xUnion = MLXRandom.normal([8, 1, 128]).asType(.bfloat16)
+        let (stockIdx, _) = router.routeTopK(xUnion, topK: 1)
+        let (unionIdx, unionW) = router.routeTopK(xUnion, topK: 5, batchUnionMaxExperts: 10)
+        eval(stockIdx, unionIdx, unionW)
+        let uniqueExperts = Set(unionIdx.asArray(UInt32.self))
+        XCTAssertLessThanOrEqual(uniqueExperts.count, 10)
+        let stockTop1 = stockIdx.asArray(UInt32.self)
+        let unionFlat = unionIdx.asArray(UInt32.self)
+        for row in 0 ..< 8 {
+            let rowSlice = Set(unionFlat[(row * 5) ..< ((row + 1) * 5)])
+            XCTAssertTrue(
+                rowSlice.contains(stockTop1[row]),
+                "row \(row) #1 expert \(stockTop1[row]) must be preserved in batch-union active set"
+            )
+        }
+
+        // High-concurrency compiled feedforward (maxRows = 32) with batch-union parity.
+        layer.decodeMoEBatchUnionMaxExperts = 12
+        let prefillWithUnion = layer.feedforward(prefillIn, isExpertPrefill: true)
+        eval(prefillWithUnion)
+        XCTAssertEqual(
+            prefillRef.asData(access: .copy).data,
+            prefillWithUnion.asData(access: .copy).data)
+        Gemma4CompiledFeedforwardCache.$maxRowsOverrideForTesting.withValue(32) {
+            let x24 = MLXRandom.normal([24, 1, 128]).asType(.bfloat16)
+            let eager24 = layer.feedforward(x24, isExpertPrefill: false)
+            let compiled24 = layer.feedforwardWithCompilation(x24, isExpertPrefill: false)
+            eval(eager24, compiled24)
+            XCTAssertEqual(
+                eager24.asData(access: .copy).data, compiled24.asData(access: .copy).data)
+            if MLXHardwareInfo.isCompiledDecodeSupported {
+                XCTAssertTrue(layer.feedforwardTraceIsCompiled)
+            }
+        }
+
+        // Degenerate zero row in batch must not poison sibling rows' #1 expert preservation.
+        let zeroRow = MLXArray.zeros([1, 1, 128], dtype: .bfloat16)
+        let mixedDegenerate = concatenated([zeroRow, xUnion[1 ..< 8]], axis: 0)
+        let (degStockIdx, _) = router.routeTopK(mixedDegenerate, topK: 1)
+        let (degUnionIdx, _) = router.routeTopK(mixedDegenerate, topK: 5, batchUnionMaxExperts: 10)
+        eval(degStockIdx, degUnionIdx)
+        let degStockTop1 = degStockIdx.asArray(UInt32.self)
+        let degUnionFlat = degUnionIdx.asArray(UInt32.self)
+        for row in 1 ..< 8 {
+            let rowSlice = Set(degUnionFlat[(row * 5) ..< ((row + 1) * 5)])
+            XCTAssertTrue(
+                rowSlice.contains(degStockTop1[row]),
+                "degenerate row 0 must not drop row \(row) #1 expert \(degStockTop1[row])")
+        }
+
+        // Setting decodeMoETopK back to nil re-clamps decodeMoEBatchUnionMaxExperts >= router.topK.
+        layer.decodeMoETopK = 4
+        layer.decodeMoEBatchUnionMaxExperts = 6
+        XCTAssertEqual(layer.decodeMoEBatchUnionMaxExperts, 6)
+        layer.decodeMoETopK = nil
+        XCTAssertEqual(layer.decodeMoEBatchUnionMaxExperts, 8)
     }
 }
