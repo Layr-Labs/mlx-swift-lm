@@ -531,6 +531,27 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
+    /// `beginPlan`'s `planDecision` for these rows without its side effects:
+    /// the controller's preview, replaced by the marginal offer exactly when
+    /// `beginPlan` would replace it, then the same verification and serial
+    /// limits.
+    func previewPlanDecision(
+        plannedDecodeRows: Int, canSpeculate: Bool
+    ) -> CBv2MTPDepthDecision {
+        let controller = depthController.preview(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+        let offered =
+            usesMarginalPolicy && canSpeculate && !controller.isExploration
+            ? CBv2MTPDepthDecision(
+                depth: config.maxDraftTokens,
+                decodeRowBucket: controller.decodeRowBucket,
+                reason: "marginal_offer",
+                isExploration: false)
+            : controller
+        return adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
+    }
+
     func previewDecision(
         plannedDecodeRows: Int, canSpeculate: Bool
     ) -> CBv2MTPDepthDecision {
@@ -1047,6 +1068,20 @@ final class CBv2MTPRoundDriver {
         guard count > 0 else { return }
         metricsLock.lock()
         metrics.seedSteps += count
+        metricsLock.unlock()
+    }
+
+    /// One multi-row verify step whose rows committed different widths.
+    func recordRowWidthSplitStep() {
+        metricsLock.lock()
+        metrics.rowWidthSplitSteps += 1
+        metricsLock.unlock()
+    }
+
+    /// One cohort draft step built by the drafter's `draftRowsStep`.
+    func recordBatchedDraftStep() {
+        metricsLock.lock()
+        metrics.batchedDraftSteps += 1
         metricsLock.unlock()
     }
 
