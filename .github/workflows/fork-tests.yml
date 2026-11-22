@@ -398,8 +398,8 @@ jobs:
 
       - name: Check that each test is in exactly one shard
         # Fails when a listed test is in no main run or in more than one.
-        # A test that no shard names runs in the rest run, so this check
-        # fails only when the map itself is wrong.
+        # A test that no shard names runs in one of the rest runs, so this
+        # check fails only when the map itself is wrong.
         run: python3 .github/scripts/test_shards.py check --list "$RUNNER_TEMP/tests.txt"
 
   test:
@@ -457,7 +457,8 @@ jobs:
 
       - name: Run the shard
         # Runs each run of the shard in its own swift test process, also
-        # after an earlier run failed. The runs without the Metal library go
+        # after an earlier run failed. The shard's share of the tests that no
+        # shard names joins its main run. The runs without the Metal library go
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.

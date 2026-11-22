@@ -61,6 +61,31 @@ earlier 16-shard run the 12x32 build was placed after all of its shards
 places jobs round robin, the build of a 16-shard run started 39 s after it
 was queued, before any of its shards (run 44937126105).
 
+Every native shard ends with a rest run. The rest runs share the tests that
+no shard names, which are mostly the new suites of a pull request, until a
+new plan adds them to the map. The map has no durations for them, so
+`test_shards.py` gives their units one at a time, most tests first, to the
+shard with the lowest estimate so far, counting one second per test. Every
+job computes the same split from the build's test list, and "Each test ran
+once" still checks each test. Before, shard 12 ran all of them. Of the 15
+pull request rounds on 16 shards from 2026-11-21 19:40 to 2026-11-22 19:05
+UTC, 13 had such tests, and 10 had 105 to 193 of them (91 to 394 s). Shard
+12 ended 6 of those 10, its "Run the shard" at 331 to 654 s against 195 to
+316 s for the slowest other shard.
+
+A shard runs its share in the same `swift test` process as its main run
+with the default settings, where the planner puts units, as a new plan
+would place them. A rest run of its own cost a second process, about 3 s
+(median "Run the shard" minus test time: 22 s with a share in two processes,
+19 s with one). Replayed on those 15 rounds over all 16 ways to number the
+shards, that cost was the only way the split made a round slower on average
+than when shard 12 ran them all (1 to 3 s on 4 rounds). A shard without such
+a run keeps a process for its share. A round that a late shard ends (a long
+queue, a slow Mac or a rerun) still pays for that shard's share, as it paid
+for all of them when shard 12 was the late one. Every shard partitions the
+whole list to find its share: 0.5 s for the 8,076 tests of run 45046267507
+on a developer Mac.
+
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
 the native build products and remain part of the same exactly-once check
