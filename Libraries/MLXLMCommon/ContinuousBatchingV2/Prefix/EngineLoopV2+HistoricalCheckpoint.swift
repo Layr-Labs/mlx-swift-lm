@@ -18,6 +18,11 @@ extension CBv2CompleteCheckpointCapture {
         allowance: CBv2HistoricalStagingAllowance? = nil,
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) throws -> CBv2CapturedCompleteCheckpoint? {
+        if state.contains(where: {
+            $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+        }) {
+            return nil
+        }
         if codec.contiguousLayout != nil {
             return try prepareContiguous(
                 position: position, chunkSize: chunkSize, state: state,
@@ -275,7 +280,10 @@ extension EngineLoopV2 {
             guard let rec = scheduler.record(for: id), rec.request.prefixCacheEnabled,
                 rec.request.multimodal == nil, rec.request.positionState == nil,
                 rec.preemptionCount == 0,
-                let state = kvStates[id]
+                let state = kvStates[id],
+                !state.contains(where: {
+                    $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+                })
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             if capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical {

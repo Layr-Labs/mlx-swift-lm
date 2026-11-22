@@ -13,6 +13,9 @@ extension EngineLoopV2 {
                 step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
+                kvStates[id]?.contains(where: {
+                    $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+                }) != true,
                 rec.request.permitsHybridCheckpoint(
                     layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
                 rec.preemptionCount == 0,

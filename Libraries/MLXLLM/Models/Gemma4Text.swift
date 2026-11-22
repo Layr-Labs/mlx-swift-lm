@@ -694,8 +694,13 @@ internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.Positi
     } else if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
+    } else if let cache {
+        switch cache.ropeOffset {
+        case .scalar(let value): .scalar(value)
+        case .batch(let values): .batch(values + 0)
+        }
     } else {
-        .scalar(cache?.offset ?? 0)
+        .scalar(0)
     }
 }
 
@@ -1224,10 +1229,44 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        routeTopK(x, topK: topK)
+    }
+
+    /// Route `x` to the top `requestedK` experts with exact softmax renormalization
+    /// over the selected subset (identical to `callAsFunction` when `requestedK == topK`).
+    func routeTopK(
+        _ x: MLXArray, topK requestedK: Int
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        return selectTopK(from: expertScores, topK: requestedK)
+    }
 
-        let kth = expertScores.dim(-1) - topK
+    /// Route interior tokens `..<cut` to `interiorTopK` experts and tail tokens `cut...`
+    /// to full `topK` experts while sharing one RMSNorm and router projection.
+    func routeMixedTopK(
+        _ x: MLXArray, cut: Int, interiorTopK: Int
+    ) -> (
+        interiorIndices: MLXArray, interiorWeights: MLXArray,
+        tailIndices: MLXArray, tailWeights: MLXArray
+    ) {
+        precondition(
+            x.ndim == 3 && cut > 0 && cut < x.dim(1),
+            "routeMixedTopK requires 3D input with 0 < cut < sequence length")
+        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
+        let (interiorIndices, interiorWeights) = selectTopK(
+            from: expertScores[0..., ..<cut, 0...], topK: interiorTopK)
+        let (tailIndices, tailWeights) = selectTopK(
+            from: expertScores[0..., cut..., 0...], topK: topK)
+        return (interiorIndices, interiorWeights, tailIndices, tailWeights)
+    }
+
+    private func selectTopK(
+        from expertScores: MLXArray, topK requestedK: Int
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let activeK = max(1, min(requestedK, expertScores.dim(-1)))
+        let kth = expertScores.dim(-1) - activeK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
@@ -1290,6 +1329,67 @@ class Gemma4Experts: Module {
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
+            isProductionPrefill: isExpertPrefill)
+        return y.reshaped(B, S, H)
+    }
+
+    /// Single-pass mixed-K expert dispatch for `[1, cut + tailLen, H]` prefill inputs.
+    func callMixedK(
+        _ x: MLXArray,
+        interiorIndices: MLXArray,
+        interiorWeights: MLXArray,
+        tailIndices: MLXArray,
+        tailWeights: MLXArray,
+        isExpertPrefill: Bool
+    ) -> MLXArray {
+        precondition(
+            x.ndim == 3 && x.dim(0) == 1
+                && interiorIndices.ndim == 3 && tailIndices.ndim == 3
+                && interiorIndices.dim(0) == 1 && tailIndices.dim(0) == 1
+                && interiorWeights.shape == interiorIndices.shape
+                && tailWeights.shape == tailIndices.shape,
+            "Gemma4Experts.callMixedK requires [1, S, H] and matching 3D routing tensors")
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let cut = interiorIndices.dim(1)
+        let tailLen = tailIndices.dim(1)
+        precondition(
+            cut + tailLen == S,
+            "Gemma4Experts.callMixedK interior + tail lengths must match sequence length")
+        if cut == 0 {
+            return callAsFunction(
+                x, topKIndices: tailIndices, topKWeights: tailWeights,
+                isExpertPrefill: isExpertPrefill)
+        }
+        if tailLen == 0 {
+            return callAsFunction(
+                x, topKIndices: interiorIndices, topKWeights: interiorWeights,
+                isExpertPrefill: isExpertPrefill)
+        }
+
+        let prefillRows =
+            Gemma4PrefillProjection.applies(x) && isExpertPrefill && x.dtype == .bfloat16
+            && interiorIndices.dtype == .uint32 && tailIndices.dtype == .uint32
+            && interiorWeights.dtype == .bfloat16 && tailWeights.dtype == .bfloat16
+            && interiorIndices.dim(2) > 0 && tailIndices.dim(2) > 0
+        if prefillRows || Gemma4BatchDecodeProjection.applies(x) {
+            let hInt = reduceRows(
+                x[0..., ..<cut, 0...],
+                topKIndices: interiorIndices, topKWeights: interiorWeights)
+            let hTail = reduceRows(
+                x[0..., cut..., 0...],
+                topKIndices: tailIndices, topKWeights: tailWeights)
+            return concatenated([hInt, hTail], axis: 1)
+        }
+
+        let kInt = interiorIndices.dim(-1)
+        let kTail = tailIndices.dim(-1)
+        let y = switchGLU.callAndMixedKWeightedReduce(
+            x.reshaped(S, H),
+            interiorIndices: interiorIndices.reshaped(cut, kInt),
+            interiorWeights: interiorWeights.reshaped(cut, kInt),
+            tailIndices: tailIndices.reshaped(tailLen, kTail),
+            tailWeights: tailWeights.reshaped(tailLen, kTail),
+            fuseSortedReduction: fuseWeightedUnsort,
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
     }
@@ -1693,6 +1793,7 @@ public class Gemma4TextModelInner: Module {
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
+    var blockSDCMConfig: Gemma4BlockSDCMConfig = .current
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
@@ -1791,11 +1892,13 @@ public class Gemma4TextModelInner: Module {
     fileprivate func cbv2Prefill(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        inputEmbedding: MLXArray?
+        inputEmbedding: MLXArray?,
+        allowsBlockSDCM: Bool
     ) -> MLXArray {
         forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
-            inputEmbedding: inputEmbedding, schedulePrefill: true
+            inputEmbedding: inputEmbedding, schedulePrefill: true,
+            allowsBlockSDCM: allowsBlockSDCM
         ).postNorm
     }
 
@@ -1824,7 +1927,8 @@ public class Gemma4TextModelInner: Module {
         capturePreNorm: Bool,
         inputEmbedding: MLXArray? = nil,
         imageTokenMask: MLXArray? = nil,
-        schedulePrefill: Bool = false
+        schedulePrefill: Bool = false,
+        allowsBlockSDCM: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         let shapeCall =
             CBv2ForwardShapeObservation.isActive
@@ -1896,12 +2000,67 @@ public class Gemma4TextModelInner: Module {
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
 
+        // Block-SDCM prefill fast path for authorized solo cold text prompts.
+        if blockSDCMConfig.mode != .off,
+            allowsBlockSDCM,
+            schedulePrefill,
+            layers.first?.selfAttn.tensorParallel == nil,
+            Gemma4BlockSDCM.supportsCaches(fullCache, modelConfig: config)
+        {
+            let initialOffset: Int = {
+                var maxOffset = 0
+                for layerCache in fullCache {
+                    if let v2 = layerCache as? (any CBv2AttendingLayerCache),
+                        let row = v2.rows.first
+                    {
+                        maxOffset = max(maxOffset, row.ropePositionOffset)
+                    } else if let layerCache {
+                        if case .scalar(let value) = layerCache.ropeOffset {
+                            maxOffset = max(maxOffset, value)
+                        } else {
+                            maxOffset = max(maxOffset, layerCache.offset)
+                        }
+                    }
+                }
+                return maxOffset
+            }()
+            if Gemma4BlockSDCM.canRun(
+                sdcm: blockSDCMConfig,
+                modelConfig: config,
+                schedulePrefill: schedulePrefill,
+                allowsBlockSDCM: allowsBlockSDCM,
+                batchSize: h.dim(0),
+                sequenceLength: h.dim(1),
+                hasInputEmbedding: inputEmbedding != nil,
+                hasImageMask: imageTokenMask != nil,
+                hasCaptureHook: captureHook != nil,
+                initialOffset: initialOffset)
+            {
+                let earlyTokenIDs: [Int32]? =
+                    blockSDCMConfig.earlyPreCompactAfterLayer.map {
+                        (0 ..< max(0, layers.count - 1)).contains($0)
+                    } == true
+                    ? inputs.asType(.int32).asArray(Int32.self) : nil
+                let (postNorm, _) = forwardBlockSDCMTrunk(
+                    h,
+                    inputTokenIDs: earlyTokenIDs,
+                    fullCache: fullCache,
+                    sdcm: blockSDCMConfig,
+                    isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
+                        schedulePrefill: schedulePrefill))
+                return (postNorm, nil)
+            }
+        }
+
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
         // Gemma4's fully bidirectional prefill by symmetrizing both global and
         // sliding causal masks. Either mode needs a materialized array; ordinary
         // text and single-token decode retain the symbolic causal fast path.
+        // Multi-turn standalone follow-ups on compacted caches build per-layer
+        // masks because deeper sliding layers hold fewer live tokens than layer 0.
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
+        var maskPerLayer: [MLXFast.ScaledDotProductAttentionMaskMode?]? = nil
         if !isCBv2 {
             let useBidirectionalVision =
                 imageTokenMask != nil && config.useBidirectionalAttention == "vision"
@@ -1909,26 +2068,35 @@ public class Gemma4TextModelInner: Module {
             let useBidirectionalAll =
                 config.useBidirectionalAttention == "all" && h.dim(1) > 1
             let forceArrayMask = useBidirectionalVision || useBidirectionalAll
-            for (i, layer) in layers.enumerated() {
-                let lt = layer.layerType
-                if maskByType[lt] == nil {
-                    var mask: MLXFast.ScaledDotProductAttentionMaskMode
-                    if lt == "sliding_attention" {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
-                            returnArray: forceArrayMask)
-                    } else {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: nil,
-                            returnArray: forceArrayMask)
+            let hasCompactedStandaloneCache =
+                h.dim(1) > 1
+                && fullCache.contains { (($0 as? KVCacheSimple)?.positionDelta ?? 0) > 0 }
+
+            func buildLegacyMask(layerType: String, cache: KVCache?)
+                -> MLXFast.ScaledDotProductAttentionMaskMode
+            {
+                var mask = createAttentionMask(
+                    h: h, cache: cache,
+                    windowSize: layerType == "sliding_attention" ? config.slidingWindow : nil,
+                    returnArray: forceArrayMask)
+                if useBidirectionalVision, let imageTokenMask {
+                    mask = gemma4TextOverlayBidirectionalVision(mask, isVision: imageTokenMask)
+                } else if useBidirectionalAll {
+                    mask = gemma4TextSymmetrizeMask(mask)
+                }
+                return mask
+            }
+
+            if hasCompactedStandaloneCache {
+                maskPerLayer = layers.enumerated().map { i, layer in
+                    buildLegacyMask(layerType: layer.layerType, cache: fullCache[i])
+                }
+            } else {
+                for (i, layer) in layers.enumerated() {
+                    let lt = layer.layerType
+                    if maskByType[lt] == nil {
+                        maskByType[lt] = buildLegacyMask(layerType: lt, cache: fullCache[i])
                     }
-                    if useBidirectionalVision, let imageTokenMask {
-                        mask = gemma4TextOverlayBidirectionalVision(
-                            mask, isVision: imageTokenMask)
-                    } else if useBidirectionalAll {
-                        mask = gemma4TextSymmetrizeMask(mask)
-                    }
-                    maskByType[lt] = mask
                 }
             }
         }
@@ -1951,7 +2119,7 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            let mask = maskPerLayer?[idx] ?? maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
@@ -1967,7 +2135,8 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                hasCapableCache: (fullCache[idx] as? (any CBv2LastQueryPrefillLayerCache))?
+                    .supportsLastQueryPrefill ?? false)
             let (out, kvState, positionOffset) = layer.forward(
                 h,
                 mask: mask,
@@ -2132,6 +2301,19 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// keys are decoder-relative use these roots without owning another tower.
     public var decoderLayers: [Module] { model.layers }
 
+    /// Block-SDCM prefill configuration (defaults to `Gemma4BlockSDCMConfig.current`).
+    public var blockSDCMConfig: Gemma4BlockSDCMConfig {
+        get { model.blockSDCMConfig }
+        set { model.blockSDCMConfig = newValue }
+    }
+
+    /// True when this Gemma 4 topology qualifies for Block-SDCM prefill (non-shared KV,
+    /// non-PLE, non-fully-bidirectional MoE without tensor parallelism).
+    public var supportsBlockSDCM: Bool {
+        model.layers.first?.selfAttn.tensorParallel == nil
+            && Gemma4BlockSDCM.supportsModelConfig(config)
+    }
+
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     /// Tensor parallel: the tied head projects this rank's vocabulary rows only.
@@ -2170,9 +2352,41 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             return .tokens(input.text)
         }
 
+        // Block-SDCM whole-prompt prefill for standalone `generate` / `ModelBenchmark`:
+        // evaluate `[0 ..< T-1]` in a single pass so full-attention boundary scoring
+        // observes the full prompt, then hand the final token to TokenIterator.
+        let y = input.text
+        let prefixLength = y.tokens.size - 1
+        if supportsBlockSDCM,
+            !cache.isEmpty,
+            Gemma4BlockSDCM.supportsCaches(cache.map { $0 as KVCache? }, modelConfig: config),
+            cache.allSatisfy({
+                if case .scalar(let value) = $0.ropeOffset { return value == 0 }
+                return $0.offset == 0
+            }),
+            Gemma4BlockSDCM.canRun(
+                sdcm: blockSDCMConfig,
+                modelConfig: config,
+                schedulePrefill: true,
+                allowsBlockSDCM: true,
+                batchSize: 1,
+                sequenceLength: prefixLength,
+                hasInputEmbedding: false,
+                hasImageMask: false,
+                hasCaptureHook: false,
+                initialOffset: 0)
+        {
+            let prefixRange = 0 ..< prefixLength
+            let hidden = model.cbv2Prefill(
+                y.tokens[.newAxis, prefixRange], cache: cache, inputEmbedding: nil,
+                allowsBlockSDCM: true)
+            eval(hidden)
+            eval(cache)
+            return .tokens(y[prefixLength...])
+        }
+
         // A prompt that fits in one chunk goes to the iterator whole.
         let stepSize = prefill.resolvedStepSize()
-        let y = input.text
         guard y.tokens.size > stepSize else { return .tokens(y) }
 
         let processed = try prefill.forEachChunk(
@@ -2469,6 +2683,9 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
     /// independence before it packs anything.
     public var cbv2SupportsPackedPrefill: Bool { true }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { true }
+    public var cbv2SupportsCompactedPromptPrefill: Bool {
+        supportsBlockSDCM && blockSDCMConfig.mode != .off && blockSDCMConfig.hasActiveOptimizations
+    }
 
     public func cbv2Prefill(
         _ inputs: MLXArray,
@@ -2476,8 +2693,11 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
         cache: [KVCache]?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
+        let allowsBlockSDCM =
+            requirement == .lastPositionLogits && !CBv2PrefillCompactionScope.isDisabled
         let hidden = model.cbv2Prefill(
-            inputs, cache: cache, inputEmbedding: inputEmbedding)
+            inputs, cache: cache, inputEmbedding: inputEmbedding,
+            allowsBlockSDCM: allowsBlockSDCM)
         switch requirement {
         case .evaluationOnly:
             // Small handle whose graph depends on the whole trunk — forcing

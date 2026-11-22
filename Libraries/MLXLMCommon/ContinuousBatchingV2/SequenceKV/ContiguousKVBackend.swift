@@ -46,6 +46,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
     public var prefixReuseBackend: CBv2PrefixReuseBackend { .contiguousUnquantized }
+    public var supportsCompactedPromptKVWrite: Bool { true }
 
     private let lock = NSLock()
     private var live: [ObjectIdentifier: CBv2SequenceKV] = [:]

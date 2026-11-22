@@ -216,6 +216,11 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
             .cbv2SupportsPackedMultimodalPrefill ?? false
     }
 
+    public var supportsCompactedPromptPrefill: Bool {
+        (model as? CBv2LanguageModelPrefillForwardable)?
+            .cbv2SupportsCompactedPromptPrefill ?? false
+    }
+
     public func prefill(
         tokens: MLXArray,
         inputEmbeddings: MLXArray?,

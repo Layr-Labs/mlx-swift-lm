@@ -183,6 +183,97 @@ public func weightedExpertUnsort(
     )[0]
 }
 
+/// Fused inverse-permutation + mixed-K weighted reduction for single-pass MoE prefill.
+/// Interior tokens (`token < cut`) reduce `K_INT` slots; tail tokens reduce `K_TAIL` slots.
+private let weightedExpertUnsortMixedKKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "weighted_expert_unsort_mixed_k",
+    inputNames: ["sorted_outputs", "inverse_order", "weights", "cut_tokens"],
+    outputNames: ["output"],
+    source: """
+            const size_t feature = size_t(thread_position_in_grid.x);
+            const size_t token = size_t(thread_position_in_grid.y);
+            const size_t hidden = size_t(threads_per_grid.x);
+            const size_t cut = size_t(cut_tokens[0]);
+
+            T accumulator = (T)0;
+            if (token < cut) {
+                const size_t assignment_base = token * size_t(K_INT);
+                for (size_t slot = 0; slot < size_t(K_INT); ++slot) {
+                    const size_t assignment = assignment_base + slot;
+                    const size_t sorted_row = size_t(inverse_order[assignment]);
+                    const T weighted = (T)(
+                        (float)sorted_outputs[sorted_row * hidden + feature]
+                        * (float)weights[assignment]);
+                    accumulator = accumulator + weighted;
+                }
+            } else {
+                const size_t assignment_base =
+                    cut * size_t(K_INT) + (token - cut) * size_t(K_TAIL);
+                for (size_t slot = 0; slot < size_t(K_TAIL); ++slot) {
+                    const size_t assignment = assignment_base + slot;
+                    const size_t sorted_row = size_t(inverse_order[assignment]);
+                    const T weighted = (T)(
+                        (float)sorted_outputs[sorted_row * hidden + feature]
+                        * (float)weights[assignment]);
+                    accumulator = accumulator + weighted;
+                }
+            }
+            output[token * hidden + feature] = accumulator;
+        """,
+    ensureRowContiguous: true
+)
+
+/// Reduce sorted bfloat16 expert rows into `[cut + tailTokens, hidden]`, using
+/// `interiorK` slots for tokens `< cut` and `tailK` slots for tokens `>= cut`.
+public func weightedExpertUnsortMixedK(
+    sortedOutputs: MLXArray,
+    inverseOrder: MLXArray,
+    weights: MLXArray,
+    cut: Int,
+    interiorK: Int,
+    tailTokens: Int,
+    tailK: Int
+) -> MLXArray {
+    precondition(
+        sortedOutputs.ndim == 2 && sortedOutputs.dtype == .bfloat16,
+        "weightedExpertUnsortMixedK outputs must be 2D bfloat16 [assignments, hidden]")
+    let hidden = sortedOutputs.dim(1)
+    precondition(
+        hidden > 0 && hidden.isMultiple(of: 64),
+        "weightedExpertUnsortMixedK hidden size must be a positive multiple of 64")
+    precondition(
+        inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
+        "weightedExpertUnsortMixedK inverseOrder must be flat uint32")
+    precondition(
+        weights.ndim == 1 && weights.dtype == .bfloat16,
+        "weightedExpertUnsortMixedK weights must be flat bfloat16")
+    let totalTokens = cut + tailTokens
+    precondition(
+        cut >= 0 && tailTokens >= 0 && totalTokens > 0
+            && cut <= Int(UInt32.max) && interiorK >= 1 && tailK >= 1,
+        "weightedExpertUnsortMixedK requires valid token counts and positive K")
+    let totalAssignments = cut * interiorK + tailTokens * tailK
+    precondition(
+        sortedOutputs.dim(0) == totalAssignments
+            && inverseOrder.size == totalAssignments
+            && weights.size == totalAssignments,
+        "weightedExpertUnsortMixedK assignment counts must match")
+
+    let cutBuffer = MLXArray([UInt32(cut)])
+    return weightedExpertUnsortMixedKKernel(
+        [sortedOutputs, inverseOrder, weights, cutBuffer],
+        template: [
+            ("T", sortedOutputs.dtype),
+            ("K_INT", interiorK),
+            ("K_TAIL", tailK),
+        ],
+        grid: (hidden, totalTokens, 1),
+        threadGroup: (64, min(4, totalTokens), 1),
+        outputShapes: [[totalTokens, hidden]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
 /// Approximate (tanh) GELU written with `x * x * x` instead of the Power
@@ -1274,6 +1365,164 @@ open class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// Single-pass mixed-K MoE projection and weighted reduction for `[cut + tailTokens, hidden]`.
+    /// Runs one sort, one expert weight sweep, and fuses the mixed-K reduction on GPU BF16.
+    public func callAndMixedKWeightedReduce(
+        _ x: MLXArray,
+        interiorIndices: MLXArray,
+        interiorWeights: MLXArray,
+        tailIndices: MLXArray,
+        tailWeights: MLXArray,
+        fuseSortedReduction: Bool = false,
+        isProductionPrefill: Bool = true
+    ) -> MLXArray {
+        precondition(x.ndim == 2, "callAndMixedKWeightedReduce requires 2D input [tokens, hidden]")
+        precondition(
+            interiorIndices.ndim == 2 && interiorWeights.shape == interiorIndices.shape,
+            "callAndMixedKWeightedReduce requires matching 2D interior indices and weights")
+        precondition(
+            tailIndices.ndim == 2 && tailWeights.shape == tailIndices.shape,
+            "callAndMixedKWeightedReduce requires matching 2D tail indices and weights")
+        let cut = interiorIndices.dim(0)
+        let kInt = interiorIndices.dim(1)
+        let tailTokens = tailIndices.dim(0)
+        let kTail = tailIndices.dim(1)
+        let totalTokens = cut + tailTokens
+        precondition(
+            totalTokens == x.dim(0),
+            "callAndMixedKWeightedReduce token counts must match x.dim(0)")
+        if totalTokens == 0 {
+            return MLXArray.zeros([0, inputDims], dtype: x.dtype)
+        }
+        if cut == 0 {
+            precondition(kTail >= 1, "callAndMixedKWeightedReduce requires tailK >= 1")
+            return callAndWeightedReduce(
+                x, tailIndices, weights: tailWeights,
+                fuseSortedReduction: false, isProductionPrefill: isProductionPrefill)
+        }
+        if tailTokens == 0 {
+            precondition(kInt >= 1, "callAndMixedKWeightedReduce requires interiorK >= 1")
+            return callAndWeightedReduce(
+                x, interiorIndices, weights: interiorWeights,
+                fuseSortedReduction: false, isProductionPrefill: isProductionPrefill)
+        }
+        precondition(
+            kInt >= 1 && kTail >= 1,
+            "callAndMixedKWeightedReduce requires positive interiorK and tailK")
+
+        let aInt = cut * kInt
+        let aTail = tailTokens * kTail
+        let totalAssignments = aInt + aTail
+        let flatExperts = concatenated(
+            [interiorIndices.flattened(), tailIndices.flattened()], axis: 0)
+        let flatWeights = concatenated(
+            [interiorWeights.flattened(), tailWeights.flattened()], axis: 0)
+
+        let preparedX = transformInput(MLX.expandedDimensions(x, axes: [-2, -3]))
+            .squeezed(axis: -3)
+        let doSort = totalAssignments >= 64
+        let activeExperts: MLXArray
+        let sortedX: MLXArray
+        let inverseOrder: MLXArray?
+        if doSort {
+            let order = argSort(flatExperts)
+            activeExperts = flatExperts[order]
+            let inv = argSort(order)
+            let orderU32 = order.dtype == .uint32 ? order : order.asType(.uint32)
+            let aIntU32 = MLXArray(UInt32(aInt))
+            let isInterior = orderU32 .< aIntU32
+            let intRow = orderU32.floorDivide(MLXArray(UInt32(kInt)))
+            let tailOffset = MLX.maximum(orderU32, aIntU32) - aIntU32
+            let tailRow = MLXArray(UInt32(cut)) + tailOffset.floorDivide(MLXArray(UInt32(kTail)))
+            let sortedRowMap = MLX.where(isInterior, intRow, tailRow)
+            sortedX = preparedX[sortedRowMap]
+            inverseOrder = inv
+        } else {
+            var unsortedRows: [UInt32] = []
+            unsortedRows.reserveCapacity(totalAssignments)
+            for token in 0 ..< cut {
+                for _ in 0 ..< kInt { unsortedRows.append(UInt32(token)) }
+            }
+            for token in 0 ..< tailTokens {
+                for _ in 0 ..< kTail { unsortedRows.append(UInt32(cut + token)) }
+            }
+            activeExperts = flatExperts
+            sortedX = preparedX[MLXArray(unsortedRows)]
+            inverseOrder = nil
+        }
+
+        let xGate: MLXArray
+        let xUp: MLXArray
+        let hostRows = !doSort && suppliesHostRowIndices
+        if let gateUpProj {
+            let xGateUp = projectExpert(
+                gateUpProj, sortedX, activeExperts,
+                sortedIndices: doSort, hostRowIndices: hostRows)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
+        } else {
+            guard let gateProj, let upProj else {
+                preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
+            }
+            xUp = projectExpert(
+                upProj, sortedX, activeExperts, sortedIndices: doSort, hostRowIndices: hostRows)
+            xGate = projectExpert(
+                gateProj, sortedX, activeExperts, sortedIndices: doSort, hostRowIndices: hostRows)
+        }
+
+        var activated: MLXArray
+        if let activationProduct {
+            activated = activationProduct(xGate, xUp)
+        } else if isSiluActivation {
+            activated = compiledSwiGLU(xGate, xUp)
+        } else if isGeluActivation {
+            activated = compiledGeGLU(xGate, xUp)
+        } else {
+            activated = activation(xGate) * xUp
+        }
+        activated = transformHidden(activated)
+
+        let projectedOut = projectExpert(
+            downProj, activated, activeExperts, sortedIndices: doSort, hostRowIndices: hostRows)
+        let sortedOut = MLX.squeezed(projectedOut, axis: -2)
+        let outHidden = sortedOut.dim(-1)
+
+        if fuseSortedReduction,
+            isProductionPrefill,
+            doSort,
+            let inv = inverseOrder,
+            kInt <= 8,
+            kTail <= 8,
+            admitsFusedRoutes,
+            !training,
+            !(downProj is any SwitchLinearPartialSum),
+            Device.defaultDevice().deviceType == .gpu,
+            outHidden > 0,
+            outHidden.isMultiple(of: 64),
+            sortedOut.ndim == 2,
+            sortedOut.dim(0) == totalAssignments,
+            sortedOut.dtype == .bfloat16,
+            flatWeights.dtype == .bfloat16,
+            inv.dtype == .uint32
+        {
+            return weightedExpertUnsortMixedK(
+                sortedOutputs: sortedOut,
+                inverseOrder: inv,
+                weights: flatWeights,
+                cut: cut,
+                interiorK: kInt,
+                tailTokens: tailTokens,
+                tailK: kTail)
+        }
+
+        let unsortedOut = inverseOrder.map { sortedOut[$0] } ?? sortedOut
+        let intOut = weightedExpertSum(
+            unsortedOut[..<aInt].reshaped(cut, kInt, outHidden), interiorWeights)
+        let tailOut = weightedExpertSum(
+            unsortedOut[aInt...].reshaped(tailTokens, kTail, outHidden), tailWeights)
+        return concatenated([intOut, tailOut], axis: 0)
     }
 
     /// `callAndWeightedReduce` for `[rows, hidden]` in which every row keeps the

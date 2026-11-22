@@ -703,6 +703,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 }
             }
         }
+        let modelSupportsCompaction =
+            (model as? CBv2PrefillSteppableModel)?.supportsCompactedPromptPrefill ?? false
+        if !(modelSupportsCompaction && backend.supportsCompactedPromptKVWrite
+            && cacheProvider.supportsCompactedPromptKVWrite)
+        {
+            schedulerConfig.soloCompactionMinPromptTokens = nil
+        }
         self.schedulerConfig = schedulerConfig
         // MiMo target-only EXTRA scratch is independent of the assistant bound.
         // Charge every request conservatively; only a real admitted verification

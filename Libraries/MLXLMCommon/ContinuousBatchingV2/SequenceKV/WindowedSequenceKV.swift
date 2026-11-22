@@ -58,6 +58,21 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// Absolute position of the next token to be written.
     public private(set) var absoluteOffset: Int
+    private var positionDelta: Int = 0
+    private var _usedApproximatePrefill = false
+    public var ropePositionOffset: Int { absoluteOffset + positionDelta }
+    public var usedApproximatePrefill: Bool { _usedApproximatePrefill || isCompacted }
+    public var supportsCompactedPositionDelta: Bool { true }
+    public var supportsApproximatePrefillProvenance: Bool { true }
+
+    public func markApproximatePrefill() {
+        _usedApproximatePrefill = true
+    }
+
+    public func addPositionDelta(_ delta: Int) {
+        precondition(delta >= 0, "CBv2WindowedSequenceKV: negative position delta \(delta)")
+        positionDelta += delta
+    }
 
     /// Absolute position of the oldest entry that is still physically valid.
     /// Monotonically non-decreasing (see rollback discussion above).
@@ -130,7 +145,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// This only drops the row's temporary read aliases, never mutates ring
     /// bytes/cursor or returns the row's allocation/admission reservation.
     func retireBorrowableChunkViews(afterFencedPosition position: Int) {
-        guard absoluteOffset == position, !speculativeWriteArmed, staged == nil else { return }
+        guard absoluteOffset == position || ropePositionOffset == position,
+            !speculativeWriteArmed, staged == nil
+        else { return }
         borrowableChunkViews = nil
     }
 
@@ -250,7 +267,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// Staging always supported: the ring defers its destructive writes to
     /// `commitSpeculativeWrite()`, so speculative rollback is value-exact.
-    public var supportsSpeculativeWrites: Bool { true }
+    public var supportsSpeculativeWrites: Bool { !isCompacted }
 
     public func beginSpeculativeWrite() {
         precondition(

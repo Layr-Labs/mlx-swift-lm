@@ -276,6 +276,7 @@ final class CBv2ContiguousHistoricalCheckpoint {
                 continue
             }
             guard let row = state[i], owners[i]?.row === row,
+                !row.isCompacted, !row.usedApproximatePrefill,
                 seen.insert(ObjectIdentifier(row)).inserted, row.absoluteOffset >= position
             else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -334,7 +335,11 @@ extension CBv2CompleteCheckpointCapture {
     ) throws
         -> CBv2CapturedCompleteCheckpoint?
     {
-        guard !isClosed, codec.contiguousLayout != nil else { return nil }
+        guard !isClosed, codec.contiguousLayout != nil,
+            !state.contains(where: {
+                $0?.isCompacted == true || $0?.usedApproximatePrefill == true
+            })
+        else { return nil }
         do {
             let descriptors = try codec.tensorDescriptors(position: position)
             let bytes = try descriptors.reduce(0) {

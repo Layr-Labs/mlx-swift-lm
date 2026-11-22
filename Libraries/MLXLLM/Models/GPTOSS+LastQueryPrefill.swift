@@ -8,8 +8,10 @@ func gptossLastQueryPrefillEligible(
     sequenceLength: Int, isFinalFullLayer: Bool, cache: KVCache?
 ) -> Bool {
     guard sequenceLength > 1, isFinalFullLayer,
-          let cache = cache as? any CBv2LastQueryPrefillLayerCache else { return false }
-    return cache.kind.attention == .full && cache.kind.sharesKVWithLayer == nil
+        let cache = cache as? any CBv2LastQueryPrefillLayerCache
+    else { return false }
+    return cache.supportsLastQueryPrefill
+        && cache.kind.attention == .full && cache.kind.sharesKVWithLayer == nil
 }
 
 extension AttentionBlock {
@@ -19,9 +21,10 @@ extension AttentionBlock {
     func prefillLastQuery(
         _ x: MLXArray, cache: any CBv2LastQueryPrefillLayerCache
     ) -> MLXArray {
-        let batch = x.dim(0), length = x.dim(1)
+        let batch = x.dim(0)
+        let length = x.dim(1)
         let offsets = cache.positionOffsets + 0
-        let tail = x[0..., (length - 1)..<length, 0...]
+        let tail = x[0..., (length - 1) ..< length, 0...]
         var queries = qProj(tail).reshaped(batch, 1, -1, headDim).swappedAxes(1, 2)
         var keys = kProj(x).reshaped(batch, length, -1, headDim).swappedAxes(1, 2)
         let values = vProj(x).reshaped(batch, length, -1, headDim).swappedAxes(1, 2)
@@ -41,7 +44,7 @@ extension GPTOSSTransformerBlock {
         // Input normalization stays full-shape so every last-layer K/V
         // byte is produced by the unchanged projection input graph.
         let attention = selfAttn.prefillLastQuery(inputLayerNorm(x), cache: cache)
-        let residual = x[0..., (x.dim(1) - 1)..<x.dim(1), 0...] + attention
+        let residual = x[0..., (x.dim(1) - 1) ..< x.dim(1), 0...] + attention
         return residual + mlp(postAttentionLayerNorm(residual))
     }
 }

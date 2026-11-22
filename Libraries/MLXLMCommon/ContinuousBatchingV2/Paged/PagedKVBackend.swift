@@ -57,6 +57,9 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     public var prefixReuseBackend: CBv2PrefixReuseBackend {
         usesQuantizedStorage ? .unknown : .pagedFP16
     }
+    public var supportsCompactedPromptKVWrite: Bool {
+        !pool.usesStepOwnedAttention && !usesQuantizedStorage
+    }
     public let pool: PagedKVPool
     /// Packed rows must retire their confirmed native band before a successor
     /// reads it. Their ordinary decode alternative is therefore unchained.

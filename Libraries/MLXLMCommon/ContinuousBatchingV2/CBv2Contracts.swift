@@ -154,6 +154,8 @@ public struct CBv2Request: Sendable {
     /// queue after actual prefix adoption and prompt computation; it must not block.
     /// Independent of terminal success, output delivery, and billable usage.
     public var onPrefillCompleted: (@Sendable (CBv2Usage) -> Void)? = nil
+    /// Disables approximate prompt compaction (e.g. Gemma 4 Block-SDCM) for this request.
+    public var disablePrefillCompaction: Bool = false
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
@@ -166,7 +168,8 @@ public struct CBv2Request: Sendable {
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
         prefixCheckpointTargetTokens: Int? = nil,
-        stopStringScope: CBv2StopStringScope? = nil
+        stopStringScope: CBv2StopStringScope? = nil,
+        disablePrefillCompaction: Bool = false
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -185,6 +188,7 @@ public struct CBv2Request: Sendable {
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
         self.prefixCheckpointTargetTokens = prefixCheckpointTargetTokens
+        self.disablePrefillCompaction = disablePrefillCompaction
     }
 }
 
@@ -460,9 +464,30 @@ func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
 /// absolute position counter and its storage. There is no shared frontier.
 public protocol CBv2SequenceKV: AnyObject {
     /// Absolute position of the next token to be written (== number of
-    /// tokens processed for this sequence at this layer). Monotonic; never
-    /// mutated by other sequences joining/leaving.
+    /// physical KV tokens written for this sequence at this layer). Monotonic;
+    /// never mutated by other sequences joining/leaving.
     var absoluteOffset: Int { get }
+    /// Logical RoPE position of the next token to be written. Equal to
+    /// `absoluteOffset` for uncompacted sequences; exceeds `absoluteOffset` by
+    /// the omitted-token delta after prompt compaction (e.g. Block-SDCM).
+    var ropePositionOffset: Int { get }
+    /// True when physical KV storage holds a compacted subset of the prompt
+    /// (`ropePositionOffset != absoluteOffset`). Compacted rows never donate
+    /// exact-token prefix checkpoints or enter speculative verify rounds.
+    var isCompacted: Bool { get }
+    /// Sticky flag blocking exact prefix-cache donation after approximate prefill.
+    var usedApproximatePrefill: Bool { get }
+    /// Record that this row ran an approximate prefill pass (non-trapping no-op by default).
+    func markApproximatePrefill()
+    /// True when `addPositionDelta(_:)` accepts non-zero deltas without trapping.
+    var supportsCompactedPositionDelta: Bool { get }
+    /// True when `markApproximatePrefill()` persists into `usedApproximatePrefill`
+    /// even when `isCompacted == false`. Fail-closed default is `false`.
+    var supportsApproximatePrefillProvenance: Bool { get }
+    /// Record `delta >= 0` omitted prompt positions so subsequent decode steps
+    /// compute RoPE at the exact original logical position while physical KV
+    /// writes remain dense at `absoluteOffset`.
+    func addPositionDelta(_ delta: Int)
     /// Number of KV entries physically retained (≤ absoluteOffset for
     /// windowed caches; == absoluteOffset for full caches).
     var retainedCount: Int { get }
@@ -522,6 +547,25 @@ public protocol CBv2SequenceKV: AnyObject {
 }
 
 extension CBv2SequenceKV {
+    /// Default: uncompacted rows use `absoluteOffset` as their RoPE position.
+    public var ropePositionOffset: Int { absoluteOffset }
+    /// Default: compacted iff logical RoPE offset diverges from physical count.
+    public var isCompacted: Bool { ropePositionOffset != absoluteOffset }
+    /// Default: compacted rows are always treated as approximate prefill provenance.
+    public var usedApproximatePrefill: Bool { isCompacted }
+    /// Default: non-trapping no-op for row types that cannot undergo approximate prefill.
+    public func markApproximatePrefill() {}
+    /// Default: fail-closed — only storage types that safely track `positionDelta` opt in.
+    public var supportsCompactedPositionDelta: Bool { false }
+    /// Default: fail-closed — only storage types that persist `markApproximatePrefill()` opt in.
+    public var supportsApproximatePrefillProvenance: Bool { false }
+    /// Default: only storage types that track `positionDelta` accept non-zero deltas.
+    public func addPositionDelta(_ delta: Int) {
+        precondition(
+            delta == 0,
+            "addPositionDelta(\(delta)) is not supported by \(type(of: self))")
+    }
+
     /// Default: only sliding-window storage supports position fast-forward.
     public func fastForward(to offset: Int) {
         preconditionFailure(
@@ -607,6 +651,8 @@ public protocol CBv2KVBackend: AnyObject {
     /// a backend that forgets to declare one over-charges and under-admits
     /// rather than over-committing the device.
     var kvResidency: any CBv2KVResidencyPolicy { get }
+    /// True when cold state supports compacted prompt K/V writes (fail-closed default: false).
+    var supportsCompactedPromptKVWrite: Bool { get }
 }
 
 extension CBv2KVBackend {
@@ -614,6 +660,7 @@ extension CBv2KVBackend {
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
     public var kvResidency: any CBv2KVResidencyPolicy { CBv2ContiguousKVResidency() }
+    public var supportsCompactedPromptKVWrite: Bool { false }
     public func updateBytesCapacity(_ bytes: Int) {}
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
@@ -763,6 +810,30 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// True when this cache supports `writeCompactedPromptKV`.
+    var supportsCompactedPromptKVWrite: Bool { get }
+    /// Sticky marker recording that bound rows were populated by an approximate
+    /// prefill pass (even if zero prompt positions were dropped). Non-trapping.
+    func markApproximatePrefill()
+    /// Commit pre-attended prompt K/V (optionally compacted to fewer tokens than
+    /// the original prompt) and advance logical RoPE offsets by
+    /// `keys.dim(2) + logicalDelta` while physical storage writes only `keys.dim(2)`.
+    func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int)
+}
+
+extension CBv2AttendingLayerCache {
+    public var supportsCompactedPromptKVWrite: Bool { false }
+
+    public func markApproximatePrefill() {
+        for row in rows {
+            row.markApproximatePrefill()
+        }
+    }
+
+    public func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int) {
+        preconditionFailure(
+            "writeCompactedPromptKV is not implemented by \(type(of: self))")
+    }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)
@@ -850,6 +921,12 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Minimum prompt length for solo whole-prompt dispatch when prompt
+    /// compaction (e.g. Gemma 4 Block-SDCM) is enabled. Nil = off.
+    /// Unlike `soloPrefillStripeTokens`, this does NOT widen paged sliding-window
+    /// rings because the model commits only the trailing window (<= window size)
+    /// to sliding caches.
+    public var soloCompactionMinPromptTokens: Int? = nil
     /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
     /// endpoint for a cold text prompt shorter than its armed solo stripe.
     /// Nil preserves the existing range geometry; the caller supplies the

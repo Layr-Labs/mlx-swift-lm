@@ -492,6 +492,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    /// Logical RoPE offset delta when prompt compaction (e.g. Gemma 4 Block-SDCM)
+    /// retains fewer physical KV tokens than the original prompt length.
+    public var positionDelta: Int = 0
+
+    public override var ropeOffset: RoPEOffset { .scalar(offset + positionDelta) }
 
     public override init() {
         super.init()
@@ -625,6 +630,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public override func copy() -> any KVCache {
         let new = KVCacheSimple()
         new.step = self.step
+        new.positionDelta = self.positionDelta
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
