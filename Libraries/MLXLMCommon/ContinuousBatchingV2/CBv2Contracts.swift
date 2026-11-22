@@ -506,6 +506,11 @@ public protocol CBv2SequenceKV: AnyObject {
     /// the engine falls back to plain decode for that row. Default: false
     /// (fail-safe — unknown row classes never speculate).
     var supportsSpeculativeWrites: Bool { get }
+    /// True when this row supports token-only speculative verification (where
+    /// draft proposals do not rely on a neural carry's `kvOffset == absoluteOffset`).
+    /// Defaults to `supportsSpeculativeWrites`; paged compacted rows may override
+    /// to `true` when physical rollback is value-exact.
+    var supportsTokenOnlySpeculativeWrites: Bool { get }
     /// Begin one speculative-write transaction. Storage
     /// whose plain rollback is already value-exact (full, paged-full) may
     /// make this a no-op. Ring storage (contiguous windowed)
@@ -553,6 +558,8 @@ extension CBv2SequenceKV {
 
     /// Default: fail-safe — unknown row classes never speculate.
     public var supportsSpeculativeWrites: Bool { false }
+    /// Default: matches `supportsSpeculativeWrites`.
+    public var supportsTokenOnlySpeculativeWrites: Bool { supportsSpeculativeWrites }
     /// Default: no-op (rows whose plain rollback is already value-exact).
     public func beginSpeculativeWrite() {}
     /// Default: no-op.
@@ -790,6 +797,13 @@ public protocol CBv2AttendingLayerCache: AnyObject {
     /// the original prompt) and advance logical RoPE offsets by
     /// `keys.dim(2) + logicalDelta` while physical storage writes only `keys.dim(2)`.
     func writeCompactedPromptKV(keys: MLXArray, values: MLXArray, logicalDelta: Int)
+    /// Commit pre-attended prompt K/V for a batched `B >= 1` compacted prefill where
+    /// each row may retain a distinct physical count and logical RoPE delta (e.g.
+    /// per-row true sliding-window slices). Each `perRowKeys[b]` / `perRowValues[b]`
+    /// has shape `[nKvHeads, stored_b, headDim]` (or `[1, nKvHeads, stored_b, headDim]`).
+    func writeCompactedPromptKV(
+        perRowKeys: [MLXArray], perRowValues: [MLXArray], logicalDeltas: [Int]
+    )
 }
 
 extension CBv2AttendingLayerCache {
@@ -797,6 +811,52 @@ extension CBv2AttendingLayerCache {
         preconditionFailure(
             "writeCompactedPromptKV is not implemented by \(type(of: self))")
     }
+
+    public func writeCompactedPromptKV(
+        perRowKeys: [MLXArray], perRowValues: [MLXArray], logicalDeltas: [Int]
+    ) {
+        preconditionFailure(
+            "writeCompactedPromptKV(perRowKeys:perRowValues:logicalDeltas:) is not implemented by \(type(of: self))"
+        )
+    }
+}
+
+// MARK: - Bit-Exact Sparse LM-Head Sampling Seam
+
+/// Sampling plan for models implementing bit-exact bit-plane sparse LM-head
+/// evaluation (e.g. Gemma 4 `Hi4/Lo4` Cauchy-Schwarz vocab pruning).
+public enum CBv2SparseHeadSamplingMode {
+    /// Greedy argmax across all rows `[B]` (0-ULP bit-exact).
+    case greedy
+    /// Pure temperature Gumbel-max sampling using `SamplerV2`'s exact keyed
+    /// `Exponential(1)` noise `[B, V]` (`top_p == 1`, no `top_k`/`min_p`).
+    case gumbel(temperatures: MLXArray, expNoise: MLXArray)
+    /// Filtered stochastic sampling (`top_k > 0` and/or `min_p > 0`) with exact
+    /// per-row temperatures, `top_k`, `top_p`, `min_p`, and keyed `Exponential(1)` noise.
+    case filtered(
+        temperatures: MLXArray,
+        topK: [Int],
+        topP: [Float],
+        minP: [Float],
+        expNoise: MLXArray
+    )
+}
+
+/// Optional protocol for models that can execute exact sparse-candidate LM-head
+/// sampling directly from post-norm hidden states without reading the full lower
+/// bit-plane of an 8-bit vocabulary projection.
+public protocol CBv2SparseHeadSampleableModel: AnyObject {
+    var supportsSparseExactHeadSampling: Bool { get }
+    var sparseHeadVocabularySize: Int { get }
+    func forwardHiddenForSparseHead(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray
+    func sparseExactHeadSample(
+        hidden: MLXArray, mode: CBv2SparseHeadSamplingMode
+    ) -> (tokens: MLXArray, nonFinite: MLXArray)?
+    /// Project post-norm `hidden` (`[B, 1, H]` or `[B, H]`) to dense `[B, vocab]`
+    /// logits if `sparseExactHeadSample` declines after the trunk already advanced KV.
+    func applySparseHeadFallbackLogits(hidden: MLXArray) -> MLXArray
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)
@@ -890,6 +950,19 @@ public struct CBv2SchedulerConfig: Sendable {
     /// rings because the model commits only the trailing window (<= window size)
     /// to sliding caches.
     public var soloCompactionMinPromptTokens: Int? = nil
+    /// When true, whole-prompt compaction may run concurrently beside active
+    /// decode rows (Mode A) instead of disarming whenever any decode row exists.
+    public var allowConcurrentCompaction: Bool = false
+    /// Maximum number of equal-length cold compaction prompts packed together in
+    /// one batched compaction wave (Mode B; `1` keeps solo compaction only).
+    public var maxPackedCompactionBatch: Int = 1
+    /// Upper bound on total original prompt tokens packed across a single
+    /// compaction cohort (`cohort.count * promptLength <= maxPackedCompactionTokens`).
+    public var maxPackedCompactionTokens: Int = 32_768
+    /// Optional pure-Swift prompt-level eligibility predicate (e.g. dense-sequence
+    /// safety gate) evaluated BEFORE arming whole-prompt compaction dispatch so
+    /// scheduler and model never disagree on compaction eligibility.
+    public var compactionEligibility: (@Sendable ([Int]) -> Bool)? = nil
     /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
     /// endpoint for a cold text prompt shorter than its armed solo stripe.
     /// Nil preserves the existing range geometry; the caller supplies the

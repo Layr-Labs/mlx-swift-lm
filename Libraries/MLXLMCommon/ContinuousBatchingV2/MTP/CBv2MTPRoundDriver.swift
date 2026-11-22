@@ -134,8 +134,9 @@ final class CBv2MTPRoundInFlight {
         /// into stateful assistant finalization.
         let draftIDs: MLXArray
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
-        /// from it at the finalize sync (index = accepted position).
-        let lastHidden: MLXArray
+        /// from it at the finalize sync (index = accepted position). nil for
+        /// token-only drafters that never compute target hidden states.
+        let lastHidden: MLXArray?
         /// Raw target window retained only when a row has a grammar. Its
         /// committed prefix is sampled with the ordinary sampler at finalize.
         var constraintLogits: MLXArray? = nil
@@ -277,14 +278,35 @@ struct CBv2MTPSeedCostLedger {
 
 // MARK: - Driver
 
+/// Minimal `CBv2MTPSteppableModel` shim used only when a token-only drafter is
+/// paired with a plain `CBv2SteppableModel` that does not conform to
+/// `CBv2MTPSteppableModel`. Token-only verification calls `steppableModel.forward`
+/// directly and never invokes `forwardWithHidden`.
+private final class CBv2TokenOnlySteppableModelShim: CBv2MTPSteppableModel {
+    let base: any CBv2SteppableModel
+    init(_ base: any CBv2SteppableModel) { self.base = base }
+    var mtpCaptureLayers: CBv2MTPCaptureLayers? { nil }
+    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        base.forward(tokens: tokens, caches: caches)
+    }
+    func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+    {
+        preconditionFailure("CBv2 token-only MTP must not call forwardWithHidden")
+    }
+}
+
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.
 final class CBv2MTPRoundDriver {
 
     let config: CBv2MTPConfig
     let drafter: any CBv2MTPDrafter
-    /// The engine's model, downcast once at build (verify forwards go
+    /// The engine's model, downcast once at build (neural verify forwards go
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
+    /// Underlying steppable model used directly for plain `forward(tokens:caches:)`
+    /// by token-only drafters (zero hidden-state capture).
+    let steppableModel: any CBv2SteppableModel
     let captureLayers: CBv2MTPCaptureLayers?
     /// Media requests run target-only beside speculating text. Fixed by the
     /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
@@ -329,6 +351,8 @@ final class CBv2MTPRoundDriver {
     /// Plan-scoped: eligible rows without a valid carry — their decode step
     /// this plan is a SEED step (eager forwardWithHidden, hidden captured).
     private(set) var seedMarks: Set<CBv2RequestID> = []
+    /// Plan-scoped: CPU-proposed token-only drafts for rows offered a round.
+    private var plannedTokenOnlyDrafts: [CBv2RequestID: [Int32]] = [:]
     /// Step-global seed fallback without destroying persistent request
     /// history. Used when one rectangular row lacks a carry.
     private(set) var forceSeedPlan = false
@@ -356,10 +380,19 @@ final class CBv2MTPRoundDriver {
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
-        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?,
+        model: any CBv2MTPSteppableModel, steppableModel: any CBv2SteppableModel,
+        captureLayers: CBv2MTPCaptureLayers?,
         supportsOrdinaryDecodeChaining: Bool
     ) {
         var config = config
+        let isTokenOnly = drafter is any CBv2TokenOnlyMTPDrafter
+        if !isTokenOnly {
+            config.maxSpeculativeBatch = min(
+                config.maxSpeculativeBatch, CBv2MTPConfig.testedMaxSpeculativeBatch)
+        } else {
+            config.maxSpeculativeBatch = min(
+                config.maxSpeculativeBatch, CBv2MTPConfig.maxTokenOnlySpeculativeBatch)
+        }
         if let required = drafter.requiredVerificationMode {
             config.verificationMode = required
             if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
@@ -413,16 +446,24 @@ final class CBv2MTPRoundDriver {
         self.config = config
         self.drafter = drafter
         self.model = model
+        self.steppableModel = steppableModel
         self.captureLayers = captureLayers
         let requestScopedFallback = Self.requestScopedMediaFallback(model: model, drafter: drafter)
         self.supportsRequestScopedMediaFallback = requestScopedFallback
         self.ineligibleRowsDecodeBesideSpeculation =
             requestScopedFallback
             && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
+        // Token-only drafters select their own adaptive depth per step from
+        // suffix match length and enforce a batch profitability gate; skip the
+        // neural warmup/goodput ladder so matching prefixes speculate from step 1.
         self.depthController = CBv2MTPDepthController(
-            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
+            maxDepth: self.config.maxDraftTokens,
+            fixedDepth: isTokenOnly
+                ? (self.config.fixedDraftTokens ?? self.config.maxDraftTokens)
+                : self.config.fixedDraftTokens,
             fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,
-            useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
+            useCommittedDecodeBaseline: !isTokenOnly
+                && supportsOrdinaryDecodeChaining
                 && drafter.supportsTargetPrefixAcceptance
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
@@ -440,6 +481,26 @@ final class CBv2MTPRoundDriver {
         supportsOrdinaryDecodeChaining: Bool = true
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
+        if let tokenOnly = drafter as? any CBv2TokenOnlyMTPDrafter {
+            // Token-only verification uses plain `steppableModel.forward(tokens:caches:)`,
+            // which does not thread recurrent state transactions. Fail safe to
+            // ordinary decode for recurrent models.
+            let recurrent =
+                (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+            guard !recurrent else { return nil }
+            if let drafterTarget = tokenOnly.mtpTargetIdentity {
+                let modelTarget =
+                    (model as? any CBv2MTPSteppableModel)?.mtpTargetIdentity
+                    ?? ObjectIdentifier(model)
+                guard modelTarget == drafterTarget else { return nil }
+            }
+            let mtpModel =
+                (model as? any CBv2MTPSteppableModel) ?? CBv2TokenOnlySteppableModelShim(model)
+            return CBv2MTPRoundDriver(
+                config: config, drafter: drafter, model: mtpModel, steppableModel: model,
+                captureLayers: nil,
+                supportsOrdinaryDecodeChaining: supportsOrdinaryDecodeChaining)
+        }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
         let recurrentTarget = model as? any CBv2RecurrentMTPSteppableModel
@@ -466,7 +527,8 @@ final class CBv2MTPRoundDriver {
             config.maxAutomaticRectangularTokens = 0
         }
         let driver = CBv2MTPRoundDriver(
-            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers,
+            config: config, drafter: drafter, model: mtpModel, steppableModel: mtpModel,
+            captureLayers: captureLayers,
             supportsOrdinaryDecodeChaining: supportsOrdinaryDecodeChaining)
         if driver.usesMarginalPolicy {
             guard mtpModel is any CBv2MTPPolicyTopTwoProviding else { return nil }
@@ -507,6 +569,7 @@ final class CBv2MTPRoundDriver {
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
+        if !plannedTokenOnlyDrafts.isEmpty { plannedTokenOnlyDrafts = [:] }
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
@@ -613,6 +676,9 @@ final class CBv2MTPRoundDriver {
     func clampPlanDepth(to requestedDepth: Int, reason: String) {
         let newDepth = min(max(requestedDepth, 0), planDecision.depth)
         guard newDepth != planDecision.depth else { return }
+        if newDepth == 0 && !plannedTokenOnlyDrafts.isEmpty {
+            plannedTokenOnlyDrafts = [:]
+        }
         let oldDepth = planDecision.depth
         depthController.cancelCommittedWindow(decodeRowBucket: planDecision.decodeRowBucket)
         planDecision = CBv2MTPDepthDecision(
@@ -642,6 +708,16 @@ final class CBv2MTPRoundDriver {
     }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
+
+    func setTokenOnlyDrafts(_ drafts: [CBv2RequestID: [Int32]]) {
+        plannedTokenOnlyDrafts = drafts
+    }
+    func hasPlannedTokenOnlyDrafts(for id: CBv2RequestID) -> Bool {
+        plannedTokenOnlyDrafts[id] != nil
+    }
+    func consumeTokenOnlyDrafts(for id: CBv2RequestID) -> [Int32]? {
+        plannedTokenOnlyDrafts.removeValue(forKey: id)
+    }
 
     func forceSynchronizedSeed() {
         forceSeedPlan = true
@@ -948,6 +1024,14 @@ final class CBv2MTPRoundDriver {
         drafter is any CBv2MTPRequestStatefulDrafter
     }
 
+    var usesTokenOnlyDrafter: Bool {
+        drafter is any CBv2TokenOnlyMTPDrafter
+    }
+
+    var tokenOnlyDrafter: (any CBv2TokenOnlyMTPDrafter)? {
+        drafter as? any CBv2TokenOnlyMTPDrafter
+    }
+
     func hasUnmeasuredAssistantResidency(
         detachedStates: [any CBv2MTPRequestState] = []
     ) -> Bool {
@@ -982,6 +1066,8 @@ final class CBv2MTPRoundDriver {
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
         seedMarks.remove(id)
+        plannedTokenOnlyDrafts.removeValue(forKey: id)
+        tokenOnlyDrafter?.requestDidFinish(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
     }
@@ -1019,13 +1105,16 @@ final class CBv2MTPRoundDriver {
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
         roundMarks.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
+        plannedTokenOnlyDrafts.removeAll(keepingCapacity: false)
+        tokenOnlyDrafter?.removeAllRequestState()
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {
         carries.count + assistantStates.count + requestAcceptance.count
-            + roundMarks.count + seedMarks.count + pendingSeedCosts.count
+            + roundMarks.count + seedMarks.count + plannedTokenOnlyDrafts.count
+            + pendingSeedCosts.count
     }
 
     // MARK: Metrics (lock-protected; polled cross-thread)

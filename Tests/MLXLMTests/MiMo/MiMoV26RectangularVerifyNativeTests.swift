@@ -376,9 +376,13 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
                         guard phase == "beforeMTPFinalization", let verify = step?.mtpRound?.verify
                         else { return }
                         XCTAssertEqual(verify.rows.count, 1)
-                        XCTAssertEqual(verify.lastHidden.shape[0], 1)
-                        XCTAssertEqual(verify.lastHidden.shape[1], 1 + verify.k)
-                        evaluatedWidths.append(verify.lastHidden.shape[1])
+                        guard let lastHidden = verify.lastHidden else {
+                            XCTFail("Expected non-nil lastHidden for neural MTP verify")
+                            return
+                        }
+                        XCTAssertEqual(lastHidden.shape[0], 1)
+                        XCTAssertEqual(lastHidden.shape[1], 1 + verify.k)
+                        evaluatedWidths.append(lastHidden.shape[1])
                     }
                 }
                 let submission = try f.engine.submitWithNativeRetirement(text(1))
@@ -458,7 +462,7 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
                             let loop = engine?.loopForTesting, let driver = loop.mtp
                         else { return }
                         XCTAssertEqual(verify.rows.map(\.id), [ordinary.id])
-                        XCTAssertEqual(verify.lastHidden.shape[0], 1)
+                        XCTAssertEqual(verify.lastHidden?.shape[0], 1)
                         XCTAssertLessThanOrEqual(
                             step.assignments.reduce(0) { $0 + $1.numTokens }, 16)
                         guard step.sampledRows.contains(media.id),
@@ -675,9 +679,13 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
                         // lastHidden is an explicit asyncEval target of THIS
                         // tracked step. The hook follows its actual readback;
                         // no new model call, cache snapshot or injected output.
-                        XCTAssertEqual(verify.lastHidden.shape[0], 1)
-                        XCTAssertEqual(verify.lastHidden.shape[1], verify.k + 1)
-                        completedHidden.append(verify.lastHidden.asData(access: .copy).data)
+                        guard let lastHidden = verify.lastHidden else {
+                            XCTFail("Expected non-nil lastHidden for neural MTP verify")
+                            return
+                        }
+                        XCTAssertEqual(lastHidden.shape[0], 1)
+                        XCTAssertEqual(lastHidden.shape[1], verify.k + 1)
+                        completedHidden.append(lastHidden.asData(access: .copy).data)
                     }
                 }
                 let submission = try f.engine.submitWithNativeRetirement(text(71, budget: 16))
@@ -1130,7 +1138,7 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
             let draftMetadata = try heads(
                 draft.cache, label: "draftHeads", raw: &raw, logical: &logical)
             let features =
-                [state.tail, Optional(verify.lastHidden)] + draft.inputs.map(Optional.some)
+                [state.tail, verify.lastHidden] + draft.inputs.map(Optional.some)
             for (index, array) in features.enumerated() {
                 guard let array else { throw StateWitnessError.layout }
                 let value = try read(array)

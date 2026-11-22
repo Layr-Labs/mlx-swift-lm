@@ -230,6 +230,70 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         }
     }
 
+    public func writeCompactedPromptKV(
+        perRowKeys: [MLXArray], perRowValues: [MLXArray], logicalDeltas: [Int]
+    ) {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage")
+        let b = rows.count
+        precondition(
+            perRowKeys.count == b && perRowValues.count == b && logicalDeltas.count == b,
+            "CBv2LayerCache: per-row compacted K/V count mismatch")
+        var normalized: [(keys: MLXArray, values: MLXArray, stored: Int, delta: Int)] = []
+        normalized.reserveCapacity(b)
+        for i in 0 ..< b {
+            let delta = logicalDeltas[i]
+            precondition(delta >= 0, "CBv2LayerCache: negative logicalDelta \(delta)")
+            let kIn = perRowKeys[i]
+            let vIn = perRowValues[i]
+            let rowK: MLXArray
+            let rowV: MLXArray
+            if kIn.ndim == 3 && vIn.ndim == 3 {
+                rowK = kIn.expandedDimensions(axis: 0)
+                rowV = vIn.expandedDimensions(axis: 0)
+            } else {
+                precondition(
+                    kIn.ndim == 4 && vIn.ndim == 4 && kIn.dim(0) == 1 && vIn.dim(0) == 1,
+                    "CBv2LayerCache: per-row compacted K/V must be [Hkv, L, D] or [1, Hkv, L, D]")
+                rowK = kIn
+                rowV = vIn
+            }
+            let stored = rowK.dim(2)
+            precondition(
+                rowV.dim(2) == stored,
+                "CBv2LayerCache: per-row compacted K/V token count mismatch")
+            normalized.append((keys: rowK, values: rowV, stored: stored, delta: delta))
+        }
+        var advances: [Int32] = []
+        advances.reserveCapacity(b)
+        for (rowIndex, row) in rows.enumerated() {
+            let entry = normalized[rowIndex]
+            if entry.stored > 0 {
+                _ = row.update(keys: entry.keys, values: entry.values)
+            }
+            if entry.delta > 0 {
+                row.addPositionDelta(entry.delta)
+            }
+            advances.append(Int32(entry.stored + entry.delta))
+        }
+        advancePositionOffsets(by: advances)
+    }
+
+    private func advancePositionOffsets(by advances: [Int32]) {
+        precondition(
+            advances.count == rows.count,
+            "CBv2LayerCache: per-row offset advances count \(advances.count) != rows \(rows.count)")
+        guard let first = advances.first else { return }
+        if advances.allSatisfy({ $0 == first }) {
+            if first != 0 {
+                cachedPositionOffsets = cachedPositionOffsets + first
+            }
+            return
+        }
+        cachedPositionOffsets = cachedPositionOffsets + MLXArray(advances)
+    }
+
     public func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?

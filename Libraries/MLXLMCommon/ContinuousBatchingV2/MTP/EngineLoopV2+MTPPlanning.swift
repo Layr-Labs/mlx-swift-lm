@@ -118,14 +118,21 @@ extension EngineLoopV2 {
         }
         return rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
+            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
         }
     }
 
     /// Every storage-owning row must support value-exact multi-token writes
-    /// and rollback. Kept internal for backend contract tests.
-    static func mtpStorageEligible(_ state: [CBv2SequenceKV?]) -> Bool {
-        state.allSatisfy { $0?.supportsSpeculativeWrites ?? true }
+    /// and rollback. Token-only drafters consult `supportsTokenOnlySpeculativeWrites`,
+    /// which allows paged compacted rows whose physical rollback is value-exact.
+    /// Kept internal for backend contract tests.
+    static func mtpStorageEligible(
+        _ state: [CBv2SequenceKV?], tokenOnly: Bool = false
+    ) -> Bool {
+        if tokenOnly {
+            return state.allSatisfy { $0?.supportsTokenOnlySpeculativeWrites ?? true }
+        }
+        return state.allSatisfy { $0?.supportsSpeculativeWrites ?? true }
     }
 
     private enum CBv2MTPPlanAction {
@@ -141,7 +148,7 @@ extension EngineLoopV2 {
         guard mtpHistoryEligible(rec) else { return .none }
         let depth = mtp.planDepth
         guard let state = kvStates[rec.id] else { return .none }
-        guard Self.mtpStorageEligible(state) else {
+        guard Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter) else {
             if recordSkips { mtp.recordSkip("kv_unsupported") }
             return .none
         }
@@ -155,6 +162,15 @@ extension EngineLoopV2 {
         }
         if depth == 0 {
             return mtp.tracksPersistentHistory && remainingToLength > 0 ? .seed : .none
+        }
+
+        if mtp.usesTokenOnlyDrafter {
+            guard remainingToLength >= depth else {
+                if recordSkips { mtp.recordSkip("max_tokens") }
+                return .none
+            }
+            guard mtp.hasPlannedTokenOnlyDrafts(for: rec.id) else { return .none }
+            return .round(k: depth)
         }
 
         // Verify writes 1+k entries at [C-1, C-1+k]. A seed only pays off
@@ -208,9 +224,28 @@ extension EngineLoopV2 {
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
         let eligible = rows.filter { rec in
             guard mtpHistoryEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
+            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
         }
         guard !eligible.isEmpty else { return false }
+        // Token-only drafters break chained decode ONLY when the exact cohort and
+        // exact effective draft cap (`min(decision.depth, tailDepth)`) that
+        // `beginMTPPlan` will evaluate have a profitable candidate match.
+        if let tokenOnly = mtp.tokenOnlyDrafter {
+            guard canSpeculate, decision.depth > 0 else { return false }
+            let tokenOnlyRows = batchRows.filter { rec in
+                (rec.generatedTokenCount + rec.pendingSamples) > 0
+            }
+            guard !tokenOnlyRows.isEmpty else { return false }
+            let effectiveDepth = Self.mtpDepthWithinOutputBudget(
+                offeredDepth: decision.depth,
+                remainingTokens: tokenOnlyRows.map { rec in
+                    rec.request.maxTokens - (rec.generatedTokenCount + rec.pendingSamples)
+                })
+            guard effectiveDepth > 0 else { return false }
+            return tokenOnly.hasCandidateMatch(
+                for: tokenOnlyRows.map { (id: $0.id, tokens: $0.tokens) },
+                maxDraftTokens: effectiveDepth)
+        }
         // Every positive-cap stateful Qwen request owns trusted target
         // history, including fixed-depth requests temporarily forced to k=0
         // by batch/headroom pressure. Route those target-only steps through
@@ -271,7 +306,21 @@ extension EngineLoopV2 {
         }
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
+            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
+        }
+        let tokenOnlyRows: [CBv2ScheduledRequest] =
+            mtp.usesTokenOnlyDrafter
+            ? eligibleRows.filter { rec in
+                rec.pendingSamples == 0 && rec.generatedTokenCount > 0
+                    && rec.tokens.count == rec.numComputedTokens + 1
+            }
+            : []
+        let activeSpeculationRows = mtp.usesTokenOnlyDrafter ? tokenOnlyRows : eligibleRows
+
+        if mtp.usesTokenOnlyDrafter, mtp.planDepth > 0 {
+            if rows.contains(where: { $0.pendingSamples > 0 }) || tokenOnlyRows.isEmpty {
+                mtp.clampPlanDepth(to: 0, reason: "token_only_not_ready")
+            }
         }
 
         if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
@@ -295,16 +344,33 @@ extension EngineLoopV2 {
         if mtp.planDepth > 0 {
             let tailDepth = Self.mtpDepthWithinOutputBudget(
                 offeredDepth: mtp.planDepth,
-                remainingTokens: eligibleRows.map {
+                remainingTokens: activeSpeculationRows.map {
                     $0.request.maxTokens - $0.generatedTokenCount
                 })
             if tailDepth < mtp.planDepth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
         }
+        if let tokenOnly = mtp.tokenOnlyDrafter, mtp.planDepth > 0 {
+            let proposed = tokenOnly.proposeDrafts(
+                for: tokenOnlyRows.map { (id: $0.id, tokens: $0.tokens) },
+                maxDraftTokens: mtp.planDepth)
+            if proposed.depth <= 0
+                || !tokenOnlyRows.allSatisfy({
+                    proposed.draftsByRequest[$0.id]?.count == proposed.depth
+                })
+            {
+                mtp.clampPlanDepth(to: 0, reason: "suffix_no_match")
+            } else {
+                if proposed.depth < mtp.planDepth {
+                    mtp.clampPlanDepth(to: proposed.depth, reason: "suffix_adaptive_depth")
+                }
+                mtp.setTokenOnlyDrafts(proposed.draftsByRequest)
+            }
+        }
         if mtp.planDepth > 0 {
-            let eligibleIDs = Set(eligibleRows.map(\.id))
-            let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
+            let eligibleIDs = Set(activeSpeculationRows.map(\.id))
+            let stepTokens = rows.count + activeSpeculationRows.count * mtp.planDepth
             let capacityTokens = rows.reduce(0) { total, rec in
                 let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
                 return total
@@ -316,7 +382,7 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: 0, reason: "step_kv_headroom")
             }
         }
-        if mtp.planDepth > 0,
+        if !mtp.usesTokenOnlyDrafter, mtp.planDepth > 0,
             eligibleRows.contains(where: { !mtp.hasValidCarry(for: $0) })
         {
             // Seeding is step-global. Keep existing persistent histories
@@ -327,7 +393,10 @@ extension EngineLoopV2 {
         }
 
         for rec in rows {
-            let storageEligible = kvStates[rec.id].map(Self.mtpStorageEligible) ?? false
+            let storageEligible =
+                kvStates[rec.id].map {
+                    Self.mtpStorageEligible($0, tokenOnly: mtp.usesTokenOnlyDrafter)
+                } ?? false
             if mtpBasicEligible(rec), kvStates[rec.id] != nil, !storageEligible {
                 mtp.recordSkip("kv_unsupported")
             }
@@ -347,7 +416,7 @@ extension EngineLoopV2 {
         !rows.isEmpty
             && rows.allSatisfy { rec in
                 guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-                return Self.mtpStorageEligible(state)
+                return Self.mtpStorageEligible(state, tokenOnly: mtp?.usesTokenOnlyDrafter == true)
             }
     }
 
@@ -370,7 +439,7 @@ extension EngineLoopV2 {
             // here is not ineligibility; route them through the hidden-returning
             // MTP prefill path so persistent history starts at prompt position 0.
             guard let state = kvStates[assignment.id] else { return true }
-            return Self.mtpStorageEligible(state)
+            return Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
         }
     }
 
@@ -389,7 +458,7 @@ extension EngineLoopV2 {
                     rec, range: Self.mtpPlannedRange(rec, assignment))
             }
             guard let state = kvStates[assignment.id] else { return false }
-            return !Self.mtpStorageEligible(state)
+            return !Self.mtpStorageEligible(state, tokenOnly: mtp.usesTokenOnlyDrafter)
                 || (assignment.numTokens == 1 && rec.generatedTokenCount > 0
                     && rec.numComputedTokens == rec.tokens.count)
         }

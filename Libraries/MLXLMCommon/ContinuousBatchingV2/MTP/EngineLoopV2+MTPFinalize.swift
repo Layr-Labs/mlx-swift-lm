@@ -105,7 +105,9 @@ extension EngineLoopV2 {
         defer {
             releaseMTPHistoryEvents(
                 round.committedObservationArrays + [round.seedHidden].compactMap { $0 }
-                    + (round.verify.map { [$0.draftIDs, $0.lastHidden] } ?? []))
+                    + (round.verify.map {
+                        [$0.draftIDs] + ($0.lastHidden.map { [$0] } ?? [])
+                    } ?? []))
         }
         var nativeCommitHeld = false
         if let tracking = nativeShutdownState {
@@ -546,7 +548,7 @@ extension EngineLoopV2 {
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
             if confirmed > 0, let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                let state = metadata.assistantState
+                let state = metadata.assistantState, let lastHidden = verify.lastHidden
             {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
@@ -557,7 +559,7 @@ extension EngineLoopV2 {
                     committedDraftTokens: verify.draftIDs[
                         batchIndex ..< batchIndex + 1,
                         0 ..< committedDraftCount],
-                    committedTargetHidden: verify.lastHidden[
+                    committedTargetHidden: lastHidden[
                         batchIndex ..< batchIndex + 1,
                         0 ..< committedDraftCount,
                         0...])
@@ -639,36 +641,39 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
-                // Shortlist coverage gate: hand the accepted position's
-                // target top-K ids to the next draft only when their
-                // probability mass (packet tail, parts-per-million) clears
-                // the threshold; otherwise the draft falls back to the full
-                // head for that round.
-                var carryShortlist: MLXArray?
-                if let shortlistIDs = verify.shortlistIDs {
-                    let massBase = draftCount + verify.rows.count * targetWidth
-                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
-                    if mass >= Self.mtpShortlistMassThresholdPPM {
-                        carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
+                // Token-only drafters hold no neural carry or hidden state.
+                if !mtp.usesTokenOnlyDrafter, let lastHidden = verify.lastHidden {
+                    let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+                        targetOutputIndex: confirmed - 1, draftDepth: k)
+                    // Shortlist coverage gate: hand the accepted position's
+                    // target top-K ids to the next draft only when their
+                    // probability mass (packet tail, parts-per-million) clears
+                    // the threshold; otherwise the draft falls back to the full
+                    // head for that round.
+                    var carryShortlist: MLXArray?
+                    if let shortlistIDs = verify.shortlistIDs {
+                        let massBase = draftCount + verify.rows.count * targetWidth
+                        let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+                        if mass >= Self.mtpShortlistMassThresholdPPM {
+                            carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
+                        }
                     }
+                    let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
+                        let base =
+                            (batchIndex * targetWidth + hiddenColumn) * 2
+                        return Double(values[base] - values[base + 1])
+                    }
+                    mtp.storeCarry(
+                        id: id, token: kept[confirmed - 1],
+                        hidden: lastHidden[
+                            batchIndex ..< (batchIndex + 1),
+                            hiddenColumn ..< (hiddenColumn + 1), 0...],
+                        shortlist: carryShortlist,
+                        previousTopTwoMargin: previousTopTwoMargin,
+                        needsHistoryTransition: mtp.tracksPersistentHistory,
+                        tokensCount: rec.tokens.count,
+                        kvOffset: rec.numComputedTokens)
                 }
-                let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
-                    let base =
-                        (batchIndex * targetWidth + hiddenColumn) * 2
-                    return Double(values[base] - values[base + 1])
-                }
-                mtp.storeCarry(
-                    id: id, token: kept[confirmed - 1],
-                    hidden: verify.lastHidden[
-                        batchIndex ..< (batchIndex + 1),
-                        hiddenColumn ..< (hiddenColumn + 1), 0...],
-                    shortlist: carryShortlist,
-                    previousTopTwoMargin: previousTopTwoMargin,
-                    needsHistoryTransition: mtp.tracksPersistentHistory,
-                    tokensCount: rec.tokens.count,
-                    kvOffset: rec.numComputedTokens)
             }
         }
 

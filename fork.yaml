@@ -431,6 +431,15 @@ def:
             assignments) take the same trace outside scoped batch-decode frames
             (`DARKBLOOM_GEMMA4_COMPILED_FEEDFORWARD_SORTED=0` keeps them eager); outputs keep their bits.
             Two-draft verification rows of three tokens below 64 assignments take the trace too.
+            Opt-in Block-SDCM prefill (`DARKBLOOM_GEMMA4_PREFILL_SDCM`, default off) compacts long cold text
+            prompts (`>= 3072` tokens, gated by an O(N) dense-sequence safety check) for solo and continuous-batching
+            cohorts (concurrent decode + compaction and equal-length packed waves, variable-top-k NAX row-mapped
+            experts inside Block-SDCM). Load-time `prepare()` builds zero-extra-RAM fused QKV projections
+            (`DARKBLOOM_GEMMA4_FUSED_QKV=0` disables) and, for 8-bit group-64 affine tied embeddings,
+            `Gemma4Hi4Lo4Embedding` bit-plane sparse LM-head sampling (`DARKBLOOM_GEMMA4_HI4_LM_HEAD=off|refine|exact`,
+            default off), both invalidating cleanly on parameter or module updates.
+            `CBv2SuffixTreeDrafter` (`CBv2TokenOnlyMTPDrafter`) provides an opt-in zero-draft-cost CPU suffix-automaton
+            speculative drafter for `B = 1..16` with per-row prefix commits and Block-SDCM paged-row composition.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "changelog.d/gemma4-lattice-decode.md"

@@ -49,12 +49,24 @@ enum Gemma4RowMappedNAX {
     /// The caller owns the stock-module and explicit-prefill contract.
     static func tryPair(
         _ x: MLXArray, indices: MLXArray, gate: SwitchLinear, up: SwitchLinear,
-        enabled: Bool = requested
+        enabled: Bool = requested,
+        allowVariableTopK: Bool = false
     ) -> (gate: MLXArray, up: MLXArray, sorted: MLXArray, inverseOrder: MLXArray)? {
         #if canImport(Metal)
+        let tokens = x.ndim == 2 ? x.dim(0) : 0
+        let topK = indices.ndim == 2 ? indices.dim(1) : 0
+        let validShape: Bool
+        if allowVariableTopK {
+            let assignments = tokens * topK
+            validShape =
+                tokens >= 64 && topK >= 1 && topK <= 8
+                && assignments >= 512 && assignments <= 65536
+                && indices.shape == [tokens, topK]
+        } else {
+            validShape = tokens >= 64 && tokens <= 2048 && indices.shape == [tokens, 8]
+        }
         guard enabled, x.ndim == 2, x.dim(1) == 2816, x.dtype == .bfloat16,
-            x.dim(0) >= 64, x.dim(0) <= 2048,
-            indices.shape == [x.dim(0), 8], indices.dtype == .uint32,
+            validShape, indices.dtype == .uint32,
             let gate = gate as? QuantizedSwitchLinear,
             let up = up as? QuantizedSwitchLinear,
             supported(gate), supported(up),
@@ -75,13 +87,14 @@ enum Gemma4RowMappedNAX {
         let flat = indices.flattened()
         let order = argSort(flat)
         let sorted = flat[order]
-        let rowMap = order.floorDivide(8)
+        let rowMap = order.floorDivide(topK)
         let tokenRows = x.reshaped([-1, 1, 2816])
         guard [order, sorted, rowMap, tokenRows].allSatisfy(ordinary) else { return nil }
         let pair = Gemma4RowMappedNAXKernel.pair(
             tokenRows: tokenRows, sortedExperts: sorted, rowMap: rowMap,
             gate: .init(weight: gate.weight, scales: gate.scales, biases: gateBiases),
-            up: .init(weight: up.weight, scales: up.scales, biases: upBiases), kernels: kernels)
+            up: .init(weight: up.weight, scales: up.scales, biases: upBiases),
+            topK: topK, kernels: kernels)
         CBv2StepProfiler.recordEvent("v2.gemma4.nax.row_map")
         return (pair.gate, pair.up, sorted, argSort(order))
         #else

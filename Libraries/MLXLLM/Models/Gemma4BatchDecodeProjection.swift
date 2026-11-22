@@ -51,6 +51,14 @@ enum Gemma4BatchDecodeProjection {
 
     static func embedding(_ embedding: Embedding, _ input: MLXArray) -> MLXArray {
         guard applies(input) else { return embedding.asLinear(input) }
+        if type(of: embedding) == Gemma4Hi4Lo4Embedding.self,
+            let hiLo = embedding as? Gemma4Hi4Lo4Embedding,
+            supports(
+                hiLo.mode, bits: hiLo.bits, groupSize: hiLo.groupSize,
+                input: input, scales: hiLo.scales)
+        {
+            return hiLo.asBatchDecodeLinear(input)
+        }
         guard type(of: embedding) == QuantizedEmbedding.self,
             let packed = embedding as? QuantizedEmbedding,
             supports(

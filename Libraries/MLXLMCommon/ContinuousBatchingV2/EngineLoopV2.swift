@@ -4067,6 +4067,52 @@ public final class EngineLoopV2: @unchecked Sendable {
         )
     }
 
+    /// Bit-exact sparse LM-head decode fast path (e.g. Gemma 4 `Hi4/Lo4`
+    /// Cauchy-Schwarz vocab pruning). Returns `nil` ONLY before mutating sampler
+    /// or KV state; once the trunk runs inside `checkedModelForward`, any rare
+    /// sparse-head refusal projects the already-computed `hidden` to dense logits
+    /// without re-running the trunk or double-writing KV.
+    private func trySparseDecodeSample(
+        rowStates: [[CBv2SequenceKV?]],
+        tokens: MLXArray,
+        ids: [CBv2RequestID],
+        params: [CBv2SamplingParams],
+        pendingSampledTokens: MLXArray?,
+        phase: CBv2ForwardPhase = .decode,
+        rowContext: () -> [CBv2SamplerRow]
+    ) throws -> (tokens: MLXArray, nonFinite: MLXArray, cacheInnerState: [MLXArray])? {
+        guard let sparseModel = model as? any CBv2SparseHeadSampleableModel,
+            sparseModel.supportsSparseExactHeadSampling,
+            let defaultSampler = sampler as? CBv2DefaultSampler,
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
+            logitDiagnostic == nil,
+            attentionMetadata == nil,
+            attentionPacket == nil,
+            ids.allSatisfy({ scheduler.record(for: $0)?.request.positionState == nil })
+        else { return nil }
+        guard
+            let mode = defaultSampler.sparseDecodeSamplingPlan(
+                vocabSize: sparseModel.sparseHeadVocabularySize,
+                params: params,
+                requestIDs: ids,
+                stepIndex: stepCount,
+                pendingSampledTokens: pendingSampledTokens,
+                rowContext: rowContext)
+        else { return nil }
+        let caches = eagerCaches(rowStates: rowStates)
+        let hidden = try checkedModelForward(phase: phase) {
+            sparseModel.forwardHiddenForSparseHead(tokens: tokens, caches: caches)
+        }
+        if let sampled = sparseModel.sparseExactHeadSample(hidden: hidden, mode: mode) {
+            defaultSampler.commitSparseDecodeSample(sampledTokens: sampled.tokens)
+            return (sampled.tokens, sampled.nonFinite, eagerCacheInnerState(caches))
+        }
+        let fallbackLogits = sparseModel.applySparseHeadFallbackLogits(hidden: hidden)
+        let fallbackNonFinite = CBv2NonFiniteLogits.flags(fallbackLogits)
+        let fallbackTokens = defaultSampler.sampleFromPreparedSparseFallback(logits: fallbackLogits)
+        return (fallbackTokens, fallbackNonFinite, eagerCacheInnerState(caches))
+    }
+
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
     /// skip the vocabulary projection for discarded prompt positions;
     /// everything else keeps the established full-logits forward and is
@@ -4427,47 +4473,77 @@ public final class EngineLoopV2: @unchecked Sendable {
             deferredFills.run()
         }
         let historyRows = mtpOrdinaryHistoryRows(ids)
-        let (last, cacheInnerState, recurrent, hidden) = try decodeLogits(
-            rowStates: rowStates, tokens: inputs, ids: ids, chained: true,
-            returnsHidden: !historyRows.isEmpty)  // [B, vocab]
-        deferredFills.close()
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
-        }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // Flag the model's logits before a host sampler can mask them in place.
-        let nonFinite = CBv2NonFiniteLogits.flags(last)
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let sampledReadback = CBv2NonFiniteLogits.readback(tokens: sampled, flags: nonFinite)
-        let stepLogprobs = sampler.takeStepLogprobs()
+        let sampled: MLXArray
+        let nonFinite: MLXArray
+        let cacheInnerState: [MLXArray]
+        let recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+        let hidden: MLXArray?
+        let denseLastLogits: MLXArray?
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
-        if let diagnosticOffsets {
-            for (index, id) in ids.enumerated() {
-                let rec = scheduler.record(for: id)!
-                // This forward consumes one not-yet-confirmed sample. Its
-                // logits select the position AFTER that pending token.
-                if let packet = makeLogitDiagnostic(
-                    logits: last[index], requestID: id,
-                    outputIndex: rec.generatedTokenCount + 1, phase: "chained_decode",
-                    batchIndex: index, batchSize: ids.count, seedToken: nil,
-                    cacheOffset: diagnosticOffsets[index])
-                {
-                    logitDiagnostics.append(packet)
+        let stepLogprobs: CBv2StepLogprobs?
+        if historyRows.isEmpty,
+            let sparse = try trySparseDecodeSample(
+                rowStates: rowStates, tokens: inputs, ids: ids, params: params,
+                pendingSampledTokens: lazyTokens,
+                phase: .decode,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+        {
+            deferredFills.close()
+            sampled = sparse.tokens
+            nonFinite = sparse.nonFinite
+            cacheInnerState = sparse.cacheInnerState
+            recurrent = [:]
+            hidden = nil
+            denseLastLogits = nil
+            stepLogprobs = nil
+        } else {
+            let (last, inner, rec, hid) = try decodeLogits(
+                rowStates: rowStates, tokens: inputs, ids: ids, chained: true,
+                returnsHidden: !historyRows.isEmpty)  // [B, vocab]
+            denseLastLogits = last
+            deferredFills.close()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+            }
+            // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
+            // one launched-but-unconfirmed sample here (the chain invariant).
+            let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            // Flag the model's logits before a host sampler can mask them in place.
+            nonFinite = CBv2NonFiniteLogits.flags(last)
+            sampled = sampler.sample(
+                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            stepLogprobs = sampler.takeStepLogprobs()
+            if let diagnosticOffsets {
+                for (index, id) in ids.enumerated() {
+                    let rec = scheduler.record(for: id)!
+                    // This forward consumes one not-yet-confirmed sample. Its
+                    // logits select the position AFTER that pending token.
+                    if let packet = makeLogitDiagnostic(
+                        logits: last[index], requestID: id,
+                        outputIndex: rec.generatedTokenCount + 1, phase: "chained_decode",
+                        batchIndex: index, batchSize: ids.count, seedToken: nil,
+                        cacheOffset: diagnosticOffsets[index])
+                    {
+                        logitDiagnostics.append(packet)
+                    }
                 }
             }
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+            }
+            cacheInnerState = inner
+            recurrent = rec
+            hidden = hid
         }
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
-        }
+        let sampledReadback = CBv2NonFiniteLogits.readback(tokens: sampled, flags: nonFinite)
         scheduler.markPendingSamples(ids: ids)
         let rawAttention = attentionPacket?.takePendingForward()
         var toEval = [sampled, sampledReadback]
@@ -4524,8 +4600,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrent
         step.chained = true
-        if ids.contains(where: { scheduler.record(for: $0)?.request.tokenConstraint != nil }) {
-            step.constrainedRedraw = (last, nonFinite)
+        if let denseLastLogits,
+            ids.contains(where: { scheduler.record(for: $0)?.request.tokenConstraint != nil })
+        {
+            step.constrainedRedraw = (denseLastLogits, nonFinite)
         }
         if let hidden {
             step.mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
@@ -4631,6 +4709,19 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
+        let minCompactionTokens = scheduler.config.soloCompactionMinPromptTokens ?? 0
+        func isColdCompactionRow(_ row: RowWork) -> Bool {
+            minCompactionTokens > 0
+                && !row.isDecode
+                && row.start == 0
+                && row.samples
+                && row.count >= minCompactionTokens
+                && row.rec.request.multimodal == nil
+                && row.rec.prefixReusePlan == nil
+                && row.rec.request.positionState == nil
+                && (scheduler.config.compactionEligibility?(row.rec.tokens) ?? true)
+        }
+        let hasCompactionPrefill = work.contains(where: isColdCompactionRow)
         var decodeSampled: MLXArray?
         var decodeNonFinite: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
@@ -4655,54 +4746,99 @@ public final class EngineLoopV2: @unchecked Sendable {
                     Self.positionOffset(kvStates[$0.rec.id]!)
                 }
             let historyRows = mtpOrdinaryHistoryRows(decodeIDs)
-            let (last, decodeInnerState, recurrent, hidden) = try decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs,
-                phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill
-                    : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier),
-                returnsHidden: !historyRows.isEmpty)
-            if let hidden {
-                mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
-                    tokens: inputs, hidden: hidden, rows: historyRows)
-            }
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            recurrentEvaluations.merge(recurrent) { _, _ in
-                preconditionFailure("duplicate recurrent evaluation")
-            }
-            // A one-token final prompt chunk is decode-shaped, but still owns
-            // the prompt's pre-sampler frontier. Capture only those rows, never
-            // later generated-token decode logits.
-            if let capture = prefillFrontierCapture() {
-                for (index, row) in decodeRows.enumerated()
-                where row.start < row.rec.request.promptTokens.count {
-                    capture(row.rec.id, last[index])
+            let decodeInnerState: [MLXArray]
+            let decodePhase: CBv2ForwardPhase =
+                decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                ? .prefill
+                : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                    ? .decode : .mixedFrontier)
+            if historyRows.isEmpty,
+                prefillFrontierCapture() == nil,
+                let sparse = try trySparseDecodeSample(
+                    rowStates: decodeRows.map { kvStates[$0.rec.id]! },
+                    tokens: inputs,
+                    ids: decodeIDs,
+                    params: decodeRows.map(\.rec.request.sampling),
+                    pendingSampledTokens: nil,
+                    phase: decodePhase,
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            {
+                decodeInnerState = sparse.cacheInnerState
+                cacheInnerState.append(contentsOf: decodeInnerState)
+                decodeNonFinite = sparse.nonFinite
+                decodeSampled = sparse.tokens
+            } else {
+                let (last, inner, recurrent, hidden) = try decodeLogits(
+                    rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
+                    ids: decodeIDs,
+                    phase: decodePhase,
+                    returnsHidden: !historyRows.isEmpty)
+                decodeInnerState = inner
+                if let hidden {
+                    mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
+                        tokens: inputs, hidden: hidden, rows: historyRows)
+                }
+                cacheInnerState.append(contentsOf: decodeInnerState)
+                recurrentEvaluations.merge(recurrent) { _, _ in
+                    preconditionFailure("duplicate recurrent evaluation")
+                }
+                // A one-token final prompt chunk is decode-shaped, but still owns
+                // the prompt's pre-sampler frontier. Capture only those rows, never
+                // later generated-token decode logits.
+                if let capture = prefillFrontierCapture() {
+                    for (index, row) in decodeRows.enumerated()
+                    where row.start < row.rec.request.promptTokens.count {
+                        capture(row.rec.id, last[index])
+                    }
+                }
+                decodeNonFinite = CBv2NonFiniteLogits.flags(last)
+                decodeSampled = sampler.sample(
+                    logits: last,
+                    params: decodeRows.map(\.rec.request.sampling),
+                    requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
+                if let diagnosticOffsets {
+                    for (index, row) in decodeRows.enumerated() {
+                        let isPromptFrontier = row.start < row.rec.request.promptTokens.count
+                        if let packet = makeLogitDiagnostic(
+                            logits: last[index], requestID: row.rec.id,
+                            outputIndex: row.rec.generatedTokenCount,
+                            phase: isPromptFrontier ? "prefill" : "decode",
+                            batchIndex: index, batchSize: decodeRows.count,
+                            seedToken: row.rec.tokens[row.start],
+                            cacheOffset: diagnosticOffsets[index])
+                        {
+                            logitDiagnostics.append(packet)
+                        }
+                    }
                 }
             }
-            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
-            }
-            if let diagnosticOffsets {
-                for (index, row) in decodeRows.enumerated() {
-                    let isPromptFrontier = row.start < row.rec.request.promptTokens.count
-                    if let packet = makeLogitDiagnostic(
-                        logits: last[index], requestID: row.rec.id,
-                        outputIndex: row.rec.generatedTokenCount,
-                        phase: isPromptFrontier ? "prefill" : "decode",
-                        batchIndex: index, batchSize: decodeRows.count,
-                        seedToken: row.rec.tokens[row.start], cacheOffset: diagnosticOffsets[index])
-                    {
-                        logitDiagnostics.append(packet)
-                    }
+            // Mode A overlap: submit decode KV writes and samples eagerly before
+            // whole-prompt compaction runs synchronous boundary-scoring `eval`s.
+            if hasCompactionPrefill && attentionWork == nil {
+                var decodeTargets: [MLXArray] = []
+                decodeTargets.reserveCapacity(
+                    decodeInnerState.count + 3 + logitDiagnostics.count + logprobSegments.count)
+                if let decodeSampled { decodeTargets.append(decodeSampled) }
+                if let decodeNonFinite { decodeTargets.append(decodeNonFinite) }
+                if let mtpOrdinaryHistory { decodeTargets.append(mtpOrdinaryHistory.hidden) }
+                for packet in logitDiagnostics {
+                    decodeTargets.append(contentsOf: packet.evaluationTargets)
+                }
+                for segment in logprobSegments {
+                    decodeTargets.append(contentsOf: segment.evalTargets)
+                }
+                decodeTargets.append(contentsOf: decodeInnerState)
+                if !decodeTargets.isEmpty {
+                    retainNativeWork(decodeTargets)
+                    try requireNativeWork()
+                    asyncEval(decodeTargets)
+                    try nativeWorkSubmitted()
                 }
             }
         }
@@ -4727,6 +4863,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             struct PackedGroup {
                 let count: Int
                 let samples: Bool
+                let isColdCompaction: Bool
                 var rows: [RowWork]
             }
             var groups: [PackedGroup] = []
@@ -4761,13 +4898,33 @@ public final class EngineLoopV2: @unchecked Sendable {
                 {
                     continue
                 }
+                // Separate cold compaction prompts from ordinary partial prefill
+                // chunks so compaction batches never mix with non-compacting rows,
+                // and honor `maxPackedCompactionBatch` (`<= 1` disables packing).
+                let isColdCompaction = isColdCompactionRow(row)
+                if isColdCompaction && scheduler.config.maxPackedCompactionBatch <= 1 {
+                    continue
+                }
+                let maxCompactionGroupBatch =
+                    isColdCompaction
+                    ? max(
+                        1,
+                        min(
+                            scheduler.config.maxPackedCompactionBatch,
+                            scheduler.config.maxPackedCompactionTokens / max(1, row.count)))
+                    : Int.max
                 if let index = groups.firstIndex(where: {
-                    $0.count == row.count && $0.samples == row.samples
+                    $0.count == row.count
+                        && $0.samples == row.samples
+                        && $0.isColdCompaction == isColdCompaction
+                        && (!isColdCompaction || $0.rows.count < maxCompactionGroupBatch)
                 }) {
                     groups[index].rows.append(row)
                 } else {
                     groups.append(
-                        PackedGroup(count: row.count, samples: row.samples, rows: [row]))
+                        PackedGroup(
+                            count: row.count, samples: row.samples,
+                            isColdCompaction: isColdCompaction, rows: [row]))
                 }
             }
 

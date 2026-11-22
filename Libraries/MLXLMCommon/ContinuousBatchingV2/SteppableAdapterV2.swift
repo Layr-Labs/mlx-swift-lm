@@ -415,11 +415,44 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
     }
 }
 
-extension CBv2SteppableLanguageModelAdapter:
-    CBv2MTPPolicyTopTwoCapabilityProviding
-{
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoCapabilityProviding {
     public var cbv2MTPPolicyTopTwoAvailable: Bool {
         model is any CBv2MTPPolicyTopTwoProviding
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2SparseHeadSampleableModel {
+    public var supportsSparseExactHeadSampling: Bool {
+        (model as? any CBv2SparseHeadSampleableModel)?.supportsSparseExactHeadSampling ?? false
+    }
+
+    public var sparseHeadVocabularySize: Int {
+        (model as? any CBv2SparseHeadSampleableModel)?.sparseHeadVocabularySize ?? 0
+    }
+
+    public func forwardHiddenForSparseHead(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let sparse = model as? any CBv2SparseHeadSampleableModel else {
+            preconditionFailure(
+                "CBv2 sparse head: \(type(of: model)) is not CBv2SparseHeadSampleableModel")
+        }
+        return sparse.forwardHiddenForSparseHead(tokens: tokens, caches: caches)
+    }
+
+    public func sparseExactHeadSample(
+        hidden: MLXArray, mode: CBv2SparseHeadSamplingMode
+    ) -> (tokens: MLXArray, nonFinite: MLXArray)? {
+        (model as? any CBv2SparseHeadSampleableModel)?.sparseExactHeadSample(
+            hidden: hidden, mode: mode)
+    }
+
+    public func applySparseHeadFallbackLogits(hidden: MLXArray) -> MLXArray {
+        guard let sparse = model as? any CBv2SparseHeadSampleableModel else {
+            preconditionFailure(
+                "CBv2 sparse head: \(type(of: model)) is not CBv2SparseHeadSampleableModel")
+        }
+        return sparse.applySparseHeadFallbackLogits(hidden: hidden)
     }
 }
 

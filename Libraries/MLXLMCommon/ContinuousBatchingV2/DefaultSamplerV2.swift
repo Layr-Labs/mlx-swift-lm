@@ -180,6 +180,106 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         return tokens
     }
 
+    /// Build a bit-exact sparse LM-head sampling mode for a decode step when
+    /// none of the rows need dense logits (no logprobs, no logit bias, no
+    /// penalties, no grammar constraints, no reasoning budget). Returns `nil`
+    /// to fall back cleanly to the dense `sample(logits:...)` path.
+    ///
+    /// When non-nil, the caller MUST invoke `commitSparseDecodeSample(sampledTokens:)`
+    /// on the returned tokens so penalty/RNG step counters advance identically
+    /// to `sample(logits:...)`.
+    func sparseDecodeSamplingPlan(
+        vocabSize: Int,
+        params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID],
+        stepIndex: Int,
+        pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
+    ) -> CBv2SparseHeadSamplingMode? {
+        guard !params.isEmpty, params.count == requestIDs.count else { return nil }
+        for p in params {
+            if p.topLogprobs > 0
+                || !p.logitBias.isEmpty
+                || p.repetitionPenalty != 1.0
+                || p.frequencyPenalty != 0.0
+                || p.presencePenalty != 0.0
+            {
+                return nil
+            }
+        }
+        // Reject when any row carries a token constraint or reasoning budget.
+        let needConfigure = requestIDs != configuredIDs || pipeline?.vocabSize != vocabSize
+        let resolvedRows: [CBv2SamplerRow]? = needConfigure ? rowContext() : nil
+        if let resolvedRows {
+            if resolvedRows.contains(where: {
+                $0.tokenConstraint != nil || $0.reasoningBudget != nil
+            }) {
+                return nil
+            }
+        } else if constraintSampler.hasRows(in: requestIDs) || budgetSampler.hasRows {
+            return nil
+        }
+
+        let allGreedy = params.allSatisfy { $0.temperature < LogitsPipelineV2.greedyEpsilon }
+
+        // Configure sampler/pipeline identically to `sample(logits:...)`.
+        sampleObserverForTesting?(requestIDs, stepIndex)
+        if pipeline?.vocabSize != vocabSize {
+            pipeline = LogitsPipelineV2(vocabSize: vocabSize)
+            configuredIDs = []
+        }
+        if let resolvedRows {
+            let pipeline = self.pipeline!
+            pipeline.setRows(resolvedRows)
+            sampler.setRows(resolvedRows)
+            constraintSampler.configure(resolvedRows)
+            budgetSampler.configure(resolvedRows)
+            configuredIDs = requestIDs
+            if let pendingSampledTokens {
+                pipeline.commit(sampledTokens: pendingSampledTokens)
+                sampler.commit()
+            }
+        }
+        speculation = nil
+        pendingStepLogprobs = nil
+
+        if allGreedy {
+            return .greedy
+        }
+        let anyTopK = params.contains { $0.topK > 0 && $0.topK < vocabSize }
+        let anyMinP = params.contains { $0.minP > 0 }
+        // Includes `topP <= 0` (argmax collapse in LogitsPipelineV2) as well as `0 < topP < 1`.
+        let anyTopP = params.contains { $0.topP < 1.0 }
+        let temps = MLXArray(params.map { max(Float(0), $0.temperature) })
+        let noise = sampler.stepExponentialNoise(vocab: vocabSize)
+        if !anyTopK && !anyMinP && !anyTopP {
+            return .gumbel(temperatures: temps, expNoise: noise)
+        }
+        return .filtered(
+            temperatures: temps,
+            topK: params.map(\.topK),
+            topP: params.map(\.topP),
+            minP: params.map(\.minP),
+            expNoise: noise)
+    }
+
+    func commitSparseDecodeSample(sampledTokens: MLXArray) {
+        pipeline?.commit(sampledTokens: sampledTokens)
+        sampler.commit()
+    }
+
+    /// Dense fallback sampling after `sparseDecodeSamplingPlan` already configured
+    /// rows and advanced `pendingSampledTokens` (so we never re-run the trunk or
+    /// double-commit sampler state).
+    func sampleFromPreparedSparseFallback(logits: MLXArray) -> MLXArray {
+        let pipeline = self.pipeline!
+        let processed = pipeline.process(logits)
+        let sampled = sampler.sample(from: processed.sampling)
+        pipeline.commit(sampledTokens: sampled)
+        sampler.commit()
+        return sampled
+    }
+
     public func takeInvalidatedChainedRows() -> [CBv2RequestID] {
         constraintSampler.takeInvalidated()
     }

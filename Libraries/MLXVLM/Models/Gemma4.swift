@@ -748,6 +748,21 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             embDim: config.visionConfig.hiddenSize, textDim: config.textConfig.hiddenSize)
     }
 
+    public func prepare() throws {
+        try languageModel.prepare()
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        try languageModel.restoreQuantizedEmbeddingIfNeeded(for: parameters)
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     public func prepare(
         _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
