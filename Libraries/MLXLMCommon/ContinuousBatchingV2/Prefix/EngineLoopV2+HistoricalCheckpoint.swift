@@ -269,7 +269,9 @@ extension EngineLoopV2 {
         guard let capture = completeCheckpointCapture,
             capture.codec.historicalLayout != nil || capture.codec.contiguousLayout != nil
         else { return [] }
-        let stride = capture.historicalCheckpointStrideTokens
+        // A canonical grid makes every grid multiple a cold-run boundary.
+        let grid = scheduler.config.canonicalPrefillGridTokens
+        let stride = grid ?? capture.historicalCheckpointStrideTokens
         capture.inFlightHistoricalBytes = 0
         for (id, range) in step.computedRanges {
             guard let rec = scheduler.record(for: id), rec.request.prefixCacheEnabled,
@@ -280,18 +282,31 @@ extension EngineLoopV2 {
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             if capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical {
                 guard let cap = step.recurrentCheckpointChunkSizes[id],
-                    cap >= scheduler.config.prefillChunkSize,
+                    cap >= scheduler.config.prefillChunkSize || cap == grid,
                     CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0
                 else { continue }
                 // Preserve the existing uniform complete-chunk rule for the
                 // exact-frontier target/head capture. Upstream recurrent state
-                // can use the newer chunk-agnostic rule independently.
-                let eligible =
-                    geometry.isArmed && !step.packedPrefixRows.contains(id)
-                    && cap > 1 && range.lowerBound == geometry.position
-                    && range.upperBound <= rec.request.promptTokens.count
-                    && range.count == cap && range.lowerBound % cap == 0
-                    && (geometry.chunkSize == nil || geometry.chunkSize == cap)
+                // can use the newer chunk-agnostic rule independently. Under
+                // the canonical partition every range is one canonical cell
+                // (message boundaries cut cells short); captures stay on grid
+                // multiples, whose pages are whole.
+                let promptCount = rec.request.promptTokens.count
+                let eligible: Bool
+                if grid != nil, let partition = rec.canonicalPartition {
+                    eligible =
+                        geometry.isArmed && !step.packedPrefixRows.contains(id)
+                        && cap == partition.grid && range.lowerBound == geometry.position
+                        && range.upperBound
+                            == partition.cellEnd(from: range.lowerBound, limit: promptCount)
+                } else {
+                    eligible =
+                        geometry.isArmed && !step.packedPrefixRows.contains(id)
+                        && cap > 1 && range.lowerBound == geometry.position
+                        && range.upperBound <= promptCount
+                        && range.count == cap && range.lowerBound % cap == 0
+                        && (geometry.chunkSize == nil || geometry.chunkSize == cap)
+                }
                 if eligible {
                     geometry.position = range.upperBound
                     geometry.chunkSize = cap

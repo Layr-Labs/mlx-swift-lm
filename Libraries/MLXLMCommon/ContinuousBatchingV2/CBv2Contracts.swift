@@ -154,6 +154,13 @@ public struct CBv2Request: Sendable {
     /// queue after actual prefix adoption and prompt computation; it must not block.
     /// Independent of terminal success, output delivery, and billable usage.
     public var onPrefillCompleted: (@Sendable (CBv2Usage) -> Void)? = nil
+    /// Exact Turn Continuation: a hidden, prefill-only request that re-prefills
+    /// the next turn's known prefix while the engine is idle, so the exact
+    /// resident bank holds that prefix's state on the canonical grid. Submit it
+    /// through `EngineV2.submitContinuation`, which admits it only when no
+    /// other request is live; any other submission cancels it. A cancelled
+    /// continuation still publishes the grid boundaries it finished.
+    public var isContinuation = false
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
@@ -827,6 +834,114 @@ public enum CBv2SpeculationFallback: Sendable, Equatable {
     case kvHeadroom
 }
 
+/// Where the message-boundary canonical rule puts boundaries: right after an
+/// assistant message's opening sequence (`<|im_start|>assistant\n`,
+/// `<|start|>assistant`), and right after the closing sequence that ends that
+/// assistant message (`<|im_end|>\n`; `<|end|>`, `<|call|>`, `<|return|>`).
+/// A template that writes nothing after an assistant message closes it with
+/// the first token of the next message.
+///
+/// Each boundary is decided from the tokens before it alone, whatever the
+/// patterns are. Two prompts that share their first `p` tokens therefore have
+/// the same boundaries up to `p`, so a prefill that resumes from a state kept
+/// at one runs the same chunks as a cold prefill. A rule that does not fit
+/// the template loses reuse and nothing else.
+public struct CBv2CanonicalBoundaryRule: Sendable, Equatable {
+    public var open: [Int]
+    public var close: [[Int]]
+
+    public init(open: [Int], close: [[Int]]) {
+        self.open = open
+        self.close = close.filter { !$0.isEmpty }
+    }
+
+    /// Sorted, distinct boundary positions in `(0, tokens.count]`.
+    ///
+    /// A position is a boundary when `open` ends there or, inside an assistant
+    /// message, a `close` ends there, and the match starts at or after the
+    /// previous boundary. No decision reads a token at or after the position.
+    public func boundaries(in tokens: [Int]) -> [Int] {
+        guard !open.isEmpty, !tokens.isEmpty else { return [] }
+        var result: [Int] = []
+        var consumed = 0
+        var inAssistant = false
+        func ends(_ pattern: [Int], at end: Int) -> Bool {
+            let start = end - pattern.count
+            guard start >= consumed, tokens[end - 1] == pattern[pattern.count - 1] else {
+                return false
+            }
+            for offset in 0 ..< pattern.count - 1 where tokens[start + offset] != pattern[offset] {
+                return false
+            }
+            return true
+        }
+        for end in 1 ... tokens.count {
+            if ends(open, at: end) {
+                inAssistant = true
+            } else if inAssistant, close.contains(where: { ends($0, at: end) }) {
+                inAssistant = false
+            } else {
+                continue
+            }
+            result.append(end)
+            consumed = end
+        }
+        return result
+    }
+}
+
+/// A prompt's canonical partition: chunk ends at every grid multiple and at
+/// every message boundary. Prefix-stable: the partition below any canonical
+/// position is the same in every prompt that shares the tokens before it.
+struct CBv2CanonicalPartition: Sendable, Equatable {
+    let grid: Int
+    /// Sorted, distinct, positive.
+    let boundaries: [Int]
+
+    /// The first boundary strictly after `position`, if any.
+    private func nextBoundary(after position: Int) -> Int? {
+        var low = 0
+        var high = boundaries.count
+        while low < high {
+            let mid = (low + high) / 2
+            if boundaries[mid] <= position { low = mid + 1 } else { high = mid }
+        }
+        return low < boundaries.count ? boundaries[low] : nil
+    }
+
+    /// Tokens left in the cell that starts or contains `start`.
+    func cellTokens(start: Int) -> Int {
+        let toGrid = grid - start % grid
+        guard let next = nextBoundary(after: start) else { return toGrid }
+        return min(toGrid, next - start)
+    }
+
+    /// The end of the cell that starts at `start`, at most `limit`.
+    func cellEnd(from start: Int, limit: Int) -> Int {
+        min(start + cellTokens(start: start), limit)
+    }
+
+    /// A position some cold prefill's chunk also ends at: a grid multiple or a
+    /// message boundary.
+    func isCanonical(_ position: Int) -> Bool {
+        guard position > 0 else { return false }
+        if position % grid == 0 { return true }
+        return nextBoundary(after: position - 1) == position
+    }
+
+    /// The deepest canonical position in `(0, position]` that is also a
+    /// multiple of `alignment`, or nil.
+    func deepestCanonical(atOrBelow position: Int, multipleOf alignment: Int) -> Int? {
+        guard alignment > 0, position > 0 else { return nil }
+        var candidate = position - position % alignment
+        while candidate > 0 {
+            if isCanonical(candidate) { return candidate }
+            candidate -= alignment
+        }
+        return nil
+    }
+}
+
 public struct CBv2SchedulerConfig: Sendable {
     /// Hard cap on concurrently RUNNING requests, selected by qualified caller policy.
     public var maxConcurrentRequests: Int
@@ -939,6 +1054,22 @@ public struct CBv2SchedulerConfig: Sendable {
     /// finalized work). Off by default; requires a resident paged cache, a
     /// `CBv2PrefixCache` snapshot tier, or both.
     public var enablePrefixCache: Bool
+    /// Canonical prefill grid (opt-in; nil = today's partition). Every text
+    /// prefill chunk is exactly one grid cell `[kG, (k+1)G)`, the prompt's
+    /// last cell possibly shorter, whatever the load, the solo stripe or a
+    /// prefix adoption. The partition is prefix-stable: a prompt's chunks up
+    /// to any grid multiple are the chunks of every longer prompt sharing that
+    /// prefix, so a state kept at a grid multiple continues a cold prefill bit
+    /// for bit (Exact Turn Continuation). A row whose step budget cannot hold
+    /// its whole cell waits for the next step instead of splitting the cell.
+    /// Multimodal rows keep ordinary chunking.
+    public var canonicalPrefillGridTokens: Int? = nil
+    /// Message-boundary canonical rule (with the grid on; nil = the grid
+    /// alone). Every assistant message's opening and closing also end a
+    /// chunk, so a state kept where the model's turn starts or ends continues
+    /// a cold prefill bit for bit and the next turn prefills only its new
+    /// tokens. A boundary depends only on the tokens before it.
+    public var canonicalBoundaryRule: CBv2CanonicalBoundaryRule? = nil
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
         prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
@@ -957,6 +1088,26 @@ public struct CBv2SchedulerConfig: Sendable {
         self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// Tokens left in the canonical cell that starts or contains `start`, or
+    /// nil when the grid is off or the row carries media blocks. A cell ends
+    /// at the next grid multiple or the next message boundary, whichever
+    /// comes first.
+    func canonicalCellTokens(
+        start: Int, hasMultimodalBlocks: Bool, boundaries: [Int] = []
+    ) -> Int? {
+        guard let grid = canonicalPrefillGridTokens, grid > 0, !hasMultimodalBlocks else {
+            return nil
+        }
+        return CBv2CanonicalPartition(grid: grid, boundaries: boundaries).cellTokens(start: start)
+    }
+
+    /// The canonical partition of a text prompt, or nil when the grid is off.
+    func canonicalPartition(for promptTokens: [Int]) -> CBv2CanonicalPartition? {
+        guard let grid = canonicalPrefillGridTokens, grid > 0 else { return nil }
+        return CBv2CanonicalPartition(
+            grid: grid, boundaries: canonicalBoundaryRule?.boundaries(in: promptTokens) ?? [])
     }
 
     /// A request's ordinary chunk cap. First-token projection prices a
