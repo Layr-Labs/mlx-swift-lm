@@ -202,6 +202,11 @@ package func fuseQuantizedLinearProjections(
         bits: first.bits,
         mode: first.mode)
     fused.freeze()
+    // `fused` is a private inference-only projection cache (not registered via
+    // `@ModuleInfo`, so later `model.train(false)` calls never visit it). Keep
+    // it in eval mode permanently while registered `sourceViews` inherit the
+    // live training state of their source modules.
+    fused.train(false)
 
     var start = 0
     let sourceViews = projections.map { projection in
@@ -218,6 +223,7 @@ package func fuseQuantizedLinearProjections(
             bits: first.bits,
             mode: first.mode)
         view.freeze()
+        view.train(projection.training)
         return view
     }
 

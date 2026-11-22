@@ -76,6 +76,19 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     public var qwen4IndexPositionIds: MLXArray?
     public var qwen4PooledIndexKeys: MLXArray?
     public var qwen4PooledIndexBlocks: Int = 0
+    /// Lazily cached per-page mean key centroids `[kvHeads, cachedPages, headDim]`
+    /// in native KV dtype for full-attention sparse decode (`DARKBLOOM_CBV2_PAGE_SPARSE_DECODE`).
+    var sparsePageCentroids: MLXArray?
+    /// Number of complete leading pages (`0 ..< sparseCentroidPages`) summarized in
+    /// `sparsePageCentroids`. Clamped on rollback/COW and cleared on release.
+    var sparseCentroidPages: Int = 0
+    /// Cached device page-table mirrors keyed on `tableVersion` so sparse decode
+    /// avoids per-step O(pages) Swift loops and host-to-GPU array uploads.
+    var sparseTableVersion: Int = -1
+    var sparsePhysTableGPU: MLXArray?
+    var sparseSegIDs: Set<Int> = []
+    var sparseSegRawIDsGPU: MLXArray?
+    var sparseSegLocalsGPU: MLXArray?
     /// Highest absolute position this row has ever WRITTEN. Equal to
     /// `absoluteOffset` for every row that never rolled back, and strictly
     /// greater afterwards: `rollback` retreats the cursor, it does not
@@ -453,6 +466,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         }
         guard n > 0 else { return }
         absoluteOffset -= n
+        truncateSparseCentroids(to: absoluteOffset / pool.config.pageSize)
         if ringPages == nil {
             // Full layer: release pages past the new frontier. Freed pages
             // may hold stale bytes; they are only ever re-read by their NEXT
@@ -941,6 +955,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             }
             table[copy.logicalPage] = replacement
             tableVersion += 1
+            truncateSparseCentroids(to: copy.logicalPage)
             if !deferred { pool.freePages(group: groupKey, pages: [copy.source.page]) }
         }
     }
@@ -1057,6 +1072,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// Return every page to the pool and release the reservation.
     /// O(pages) metadata, no device work. Idempotent.
     ///
+    private func truncateSparseCentroids(to pageLimit: Int) {
+        guard sparseCentroidPages > pageLimit else { return }
+        sparseCentroidPages = pageLimit
+        if pageLimit == 0 {
+            sparsePageCentroids = nil
+        }
+    }
+
     /// RECYCLE INVARIANT: the freed pages may be handed to a new row whose
     /// bulk writes have no graph edge to THIS row's in-flight reads (the
     /// no-write kernel variants and gathers consume fences but never
@@ -1067,6 +1090,13 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     func releaseStorage() {
         guard !released else { return }
         released = true
+        sparsePageCentroids = nil
+        sparseCentroidPages = 0
+        sparseTableVersion = -1
+        sparsePhysTableGPU = nil
+        sparseSegIDs.removeAll()
+        sparseSegRawIDsGPU = nil
+        sparseSegLocalsGPU = nil
         nativeRecentOwner = nil
         retiredNativeRecentOwners.removeAll()
         if speculativeBase != nil {

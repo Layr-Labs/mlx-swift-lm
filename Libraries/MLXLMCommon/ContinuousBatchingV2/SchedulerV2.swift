@@ -368,8 +368,7 @@ public final class SchedulerV2 {
         // Mode B: equal-length cold compaction wave) and solo-prefill stripe.
         struct CompactionCohort {
             let ids: Set<CBv2RequestID>
-            let targetLength: Int
-            var totalTokens: Int { ids.count * targetLength }
+            let totalTokens: Int
         }
         let minCompaction = config.soloCompactionMinPromptTokens ?? 0
         let hasCompaction = minCompaction > 0
@@ -418,7 +417,7 @@ public final class SchedulerV2 {
                     candidate = nil
                 }
                 guard let solo = candidate, isCompactionEligible(solo) else { return nil }
-                return CompactionCohort(ids: [solo.id], targetLength: solo.remainingTokens)
+                return CompactionCohort(ids: [solo.id], totalTokens: solo.remainingTokens)
             }
 
             // Mode A / Mode B: do not compete with a pending deferred multimodal block
@@ -460,29 +459,67 @@ public final class SchedulerV2 {
                 waitingStartIdx = firstIdx
             }
 
-            let targetLen = seed.remainingTokens
-            let tokenBatchCap = max(1, config.maxPackedCompactionTokens / targetLen)
-            var maxCohortSize = min(max(1, config.maxPackedCompactionBatch), tokenBatchCap)
-            if let rowCap = config.maxPrefillRowsPerStep, rowCap > 0 {
-                maxCohortSize = min(maxCohortSize, rowCap)
-            }
-            if let prefillCap = activeDecodePrefillCap {
-                let capBatch = prefillCap / targetLen
-                guard capBatch >= 1 else { return nil }
-                maxCohortSize = min(maxCohortSize, capBatch)
+            let seedLen = seed.remainingTokens
+            let maxBatchCap: Int = {
+                var cap = max(1, config.maxPackedCompactionBatch)
+                if let rowCap = config.maxPrefillRowsPerStep, rowCap > 0 {
+                    cap = min(cap, rowCap)
+                }
+                return cap
+            }()
+            if let prefillCap = activeDecodePrefillCap, seedLen > prefillCap {
+                return nil
             }
 
+            // Pack contiguous FCFS cold prompts within a 20% length band so
+            // heterogeneous batches share Mode B waves with bounded right-padding
+            // (discarded at the first compaction boundary).
             var cohortIDs = Set<CBv2RequestID>()
-            cohortIDs.reserveCapacity(maxCohortSize)
+            cohortIDs.reserveCapacity(maxBatchCap)
+            var cohortMinLen = seedLen
+            var cohortMaxLen = seedLen
+            var cohortTotalTokens = 0
+
+            func canAdmitToCohort(_ rec: CBv2ScheduledRequest) -> Bool {
+                guard cohortIDs.count < maxBatchCap, isCompactionEligible(rec) else { return false }
+                let len = rec.remainingTokens
+                let nextMin = cohortIDs.isEmpty ? len : min(cohortMinLen, len)
+                let nextMax = cohortIDs.isEmpty ? len : max(cohortMaxLen, len)
+                guard cbv2CompactionLengthsWithinBand(minLength: nextMin, maxLength: nextMax) else {
+                    return false
+                }
+                let nextCount = cohortIDs.count + 1
+                // Bound padded rectangular tensor size by `maxPackedCompactionTokens`
+                // (always allowing the single seed prompt to run solo).
+                if nextCount > 1 && nextCount * nextMax > config.maxPackedCompactionTokens {
+                    return false
+                }
+                if let prefillCap = activeDecodePrefillCap,
+                    cohortTotalTokens + len > prefillCap
+                {
+                    return false
+                }
+                return true
+            }
+
+            func admitToCohort(_ rec: CBv2ScheduledRequest) {
+                let len = rec.remainingTokens
+                if cohortIDs.isEmpty {
+                    cohortMinLen = len
+                    cohortMaxLen = len
+                } else {
+                    cohortMinLen = min(cohortMinLen, len)
+                    cohortMaxLen = max(cohortMaxLen, len)
+                }
+                cohortIDs.insert(rec.id)
+                cohortTotalTokens += len
+            }
 
             var runningPrefillsConsumed = 0
             if seededFromRunning {
                 for rec in activeRunningPrefills {
-                    guard cohortIDs.count < maxCohortSize,
-                        rec.remainingTokens == targetLen,
-                        isCompactionEligible(rec)
-                    else { break }
-                    cohortIDs.insert(rec.id)
+                    guard canAdmitToCohort(rec) else { break }
+                    admitToCohort(rec)
                     runningPrefillsConsumed += 1
                 }
             }
@@ -491,12 +528,12 @@ public final class SchedulerV2 {
                 !seededFromRunning
                 || (runningPrefillsConsumed == activeRunningPrefills.count
                     && !admissionHoldActive
-                    && cohortIDs.count < maxCohortSize)
+                    && cohortIDs.count < maxBatchCap)
             if canExtendFromWaiting {
                 let maxWaitingAdditions = max(
                     0,
                     min(
-                        maxCohortSize - cohortIDs.count,
+                        maxBatchCap - cohortIDs.count,
                         config.maxConcurrentRequests - running.count))
                 var waitingAdded = 0
                 var i = waitingStartIdx
@@ -505,16 +542,14 @@ public final class SchedulerV2 {
                     i += 1
                     if rec.isPaused { continue }
                     if rec.cancelRequested || rec.pendingSamples > 0 { break }
-                    guard rec.remainingTokens == targetLen, isCompactionEligible(rec) else {
-                        break
-                    }
-                    cohortIDs.insert(rec.id)
+                    guard canAdmitToCohort(rec) else { break }
+                    admitToCohort(rec)
                     waitingAdded += 1
                 }
             }
 
             guard !cohortIDs.isEmpty else { return nil }
-            return CompactionCohort(ids: cohortIDs, targetLength: targetLen)
+            return CompactionCohort(ids: cohortIDs, totalTokens: cohortTotalTokens)
         }()
 
         // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
@@ -567,7 +602,7 @@ public final class SchedulerV2 {
             if let recurrent = rec.prefixReusePlan?.recurrentChunkSize {
                 cap = recurrent
             } else if let cohort = compactionCohort, cohort.ids.contains(rec.id) {
-                cap = cohort.targetLength
+                cap = rec.remainingTokens
             } else if soloStripe?.id == rec.id {
                 cap = soloStripe!.tokens
             } else {
@@ -938,7 +973,7 @@ public final class SchedulerV2 {
                 prefillRowsAssigned += 1
             }
             if isCohortRow {
-                if n > config.prefillChunkSize {
+                if rec.remainingTokens == 0 {
                     cohortRowsAssigned += 1
                 } else {
                     cohortPrefillStopped = true
@@ -1074,7 +1109,7 @@ public final class SchedulerV2 {
                 prefillTokensAssigned += chunk
                 prefillRowsAssigned += 1
                 if isCohortRow {
-                    if chunk > config.prefillChunkSize {
+                    if rec.remainingTokens == 0 {
                         cohortRowsAssigned += 1
                     } else {
                         cohortPrefillStopped = true

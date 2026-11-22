@@ -795,4 +795,75 @@ struct Gemma4Hi4Lo4EmbeddingTests {
         }
         #expect(bitExactEqual(actual, expected))
     }
+
+    @Test(
+        "Refine mode fastChunkTopKKernel matches exact 8-bit argmax on V=8192 B=8 and detects NaN")
+    func refineFastChunkTopKLargeVocabMatchesAndDetectsNaN() throws {
+        MLXRandom.seed(777)
+        let vocab = 8192
+        let hidden = 128
+        let batch = 8
+        let rawWeight = (MLXRandom.normal([vocab, hidden]) * Float(0.05)).asType(.bfloat16)
+        let stock = QuantizedEmbedding(weight: rawWeight, groupSize: 64, bits: 8, mode: .affine)
+        eval(stock)
+        let hiLo = try #require(Gemma4Hi4Lo4Embedding.from(stock, samplingStrategy: .refine))
+
+        let x = MLXRandom.normal([batch, hidden]).asType(.bfloat16)
+        let denseLogits = stock.asLinear(x).asType(.float32)
+        let exactArgmax = argMax(denseLogits, axis: -1).asType(.int32)
+
+        let greedyDiag = try #require(
+            hiLo.sparseExactHeadSampleWithDiagnostics(
+                hidden: x, mode: .greedy, softcap: 30, candidateCapacity: 64))
+        eval(exactArgmax, greedyDiag.tokens, greedyDiag.nonFinite)
+        #expect(greedyDiag.tokens.asArray(Int32.self) == exactArgmax.asArray(Int32.self))
+        #expect(greedyDiag.nonFinite.asArray(Int32.self).allSatisfy { $0 == 0 })
+
+        // Filtered mode exercises EMIT=4 (128 candidates) on V=8192 B=8.
+        let expNoise = MLXArray.ones([batch, vocab], dtype: .float32)
+        let filteredDiag = try #require(
+            hiLo.sparseExactHeadSampleWithDiagnostics(
+                hidden: x,
+                mode: .filtered(
+                    temperatures: MLXArray(Array(repeating: Float(0.7), count: batch)),
+                    topK: Array(repeating: 64, count: batch),
+                    topP: Array(repeating: Float(0.95), count: batch),
+                    minP: Array(repeating: Float(0), count: batch),
+                    expNoise: expNoise),
+                softcap: 30,
+                candidateCapacity: 64))
+        eval(filteredDiag.tokens, filteredDiag.nonFinite)
+        #expect(filteredDiag.nonFinite.asArray(Int32.self).allSatisfy { $0 == 0 })
+
+        // Inject NaN in row 3 -> must flag row 3 nonFinite without corrupting other rows.
+        var xRows = x.asType(.float32).asArray(Float.self)
+        xRows[3 * hidden] = Float.nan
+        let xNaN = MLXArray(xRows, [batch, hidden]).asType(.bfloat16)
+        let nanDiag = try #require(
+            hiLo.sparseExactHeadSampleWithDiagnostics(
+                hidden: xNaN, mode: .greedy, softcap: 30, candidateCapacity: 64))
+        eval(nanDiag.tokens, nanDiag.nonFinite)
+        let flags = nanDiag.nonFinite.asArray(Int32.self)
+        #expect(flags[3] != 0)
+        for i in 0 ..< batch where i != 3 {
+            #expect(flags[i] == 0)
+            #expect(nanDiag.tokens[i].item(Int32.self) == exactArgmax[i].item(Int32.self))
+        }
+
+        // topK > 128 on V=8192 must not truncate effectiveK below targetK.
+        let wideTopKDiag = try #require(
+            hiLo.sparseExactHeadSampleWithDiagnostics(
+                hidden: x,
+                mode: .filtered(
+                    temperatures: MLXArray(Array(repeating: Float(0.7), count: batch)),
+                    topK: Array(repeating: 200, count: batch),
+                    topP: Array(repeating: Float(0.95), count: batch),
+                    minP: Array(repeating: Float(0), count: batch),
+                    expNoise: expNoise),
+                softcap: 30,
+                candidateCapacity: 64))
+        eval(wideTopKDiag.candidateCounts, wideTopKDiag.nonFinite)
+        #expect(wideTopKDiag.candidateCounts.asArray(Int32.self).allSatisfy { $0 >= 200 })
+        #expect(wideTopKDiag.nonFinite.asArray(Int32.self).allSatisfy { $0 == 0 })
+    }
 }

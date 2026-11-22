@@ -282,11 +282,14 @@ extension Gemma4DecoderLayer {
         _ out: MLXArray, router: Gemma4Router, experts: Gemma4Experts,
         postFeedforwardLayernorm1: RMSNorm, preFeedforwardLayernorm2: RMSNorm,
         postFeedforwardLayernorm2: RMSNorm, context: Gemma4TensorParallelContext,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        allowDecodeMoETopK: Bool = true
     ) -> MLXArray {
         let h1 = preFeedforwardLayernorm(out)
         let densePartial = mlp.tensorParallelPartial(h1)
-        let (topKIndices, topKWeights) = router(out)
+        let (topKIndices, topKWeights) = routeExperts(
+            out, router: router, isExpertPrefill: isExpertPrefill,
+            allowDecodeMoETopK: allowDecodeMoETopK)
         let h2 = preFeedforwardLayernorm2(out)
         let expertOutput: MLXArray
         let denseSum: MLXArray

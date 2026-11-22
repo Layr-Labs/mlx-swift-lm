@@ -502,10 +502,11 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
         }
     }
 
-    /// Fast multi-core 2-pass Hi4 screening + exact 8-bit refinement of `topKBudget`
-    /// candidates (`K = 64` for greedy/gumbel, up to `256` for filtered). Uses MLX's
-    /// multi-core `argPartition` + `gatherInterleave` + native 8-bit `quantizedMM` on
-    /// only `K` rows with zero `[B, V]` intermediate buffers and zero dense fallback.
+    /// Fast single-pass O(V) Hi4 screening + exact 8-bit refinement of `topKBudget`
+    /// candidates (`K = 64` for greedy/gumbel, `128..256` for filtered). For large
+    /// vocabularies (`V >= 8192` with enough 256-token stripes for `targetK`), uses
+    /// a 32-token warp-striped Metal pass (`fastChunkTopK`) that spreads low-ID
+    /// SentencePiece clusters across chunks and merges NaN/Inf scanning into one pass.
     private func runRefineTopKGPU(
         x2D: MLXArray,
         zMidRaw: MLXArray,
@@ -515,23 +516,46 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
     ) -> SparseHeadSampleDiagnostics {
         let batchSize = x2D.dim(0)
         let hasSoftcap = softcap > 0
-        let midNonFinite: MLXArray =
-            hasSoftcap
-            ? MLX.any(isNaN(zMidRaw), axis: -1)
-            : isNaN(sum(zMidRaw.asType(.float32) - zMidRaw.asType(.float32), axis: -1))
         let zeroU8 = MLXArray.zeros([batchSize], dtype: .uint8)
 
-        switch mode {
-        case .greedy:
-            let k = Swift.min(topKBudget, vocabSize)
-            let candIDs: MLXArray
+        func detectNonFinite(_ scores: MLXArray, checkInf: Bool) -> MLXArray {
+            guard checkInf else { return MLX.any(isNaN(scores), axis: -1) }
+            let f32 = scores.dtype == .float32 ? scores : scores.asType(.float32)
+            return isNaN(sum(f32 - f32, axis: -1))
+        }
+
+        func screenCandidates(
+            scores: MLXArray,
+            targetK: Int,
+            checkInf: Bool
+        ) -> (candIDs: MLXArray, effectiveK: Int, midNonFinite: MLXArray) {
+            let k = Swift.min(targetK, vocabSize)
+            let emitPerChunk = k > 64 ? 4 : 2
+            let numChunks = Swift.max(1, (k + emitPerChunk - 1) / emitPerChunk)
+            if vocabSize >= 8192 && k < vocabSize && numChunks <= (vocabSize / 256) {
+                let (ids, bad) = Self.fastChunkTopK(
+                    scores: scores,
+                    numChunks: numChunks,
+                    emitPerChunk: emitPerChunk,
+                    checkInf: checkInf)
+                return (ids, numChunks * emitPerChunk, bad)
+            }
+            let midBad = detectNonFinite(scores, checkInf: checkInf)
+            let ids: MLXArray
             if k < vocabSize {
-                candIDs = argPartition(-zMidRaw, kth: k - 1, axis: -1)[0..., ..<k].asType(.int32)
+                ids = argPartition(-scores, kth: k - 1, axis: -1)[0..., ..<k].asType(.int32)
             } else {
-                candIDs = broadcast(
+                ids = broadcast(
                     MLXArray.arange(vocabSize, dtype: .int32).reshaped([1, vocabSize]),
                     to: [batchSize, vocabSize])
             }
+            return (ids, k, midBad)
+        }
+
+        switch mode {
+        case .greedy:
+            let (candIDs, k, midNonFinite) = screenCandidates(
+                scores: zMidRaw, targetK: topKBudget, checkInf: !hasSoftcap)
             let counts = MLXArray.full([batchSize], values: MLXArray(Int32(k)))
             let (candLogits, _, candNonFinite) = refineCandidates(
                 x2D: x2D, candIDs: candIDs, candCounts: counts,
@@ -547,7 +571,6 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
                 candidateCounts: counts, overflow: zeroU8, needsFallback: zeroU8)
 
         case .gumbel(let temperatures, let expNoise):
-            let k = Swift.min(topKBudget, vocabSize)
             let temps1D = temperatures.asType(.float32).reshaped([batchSize])
             let greedyMask = temps1D .< LogitsPipelineV2.greedyEpsilon
             let greedyMask2D = greedyMask.expandedDimensions(axis: 1)
@@ -555,17 +578,14 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
                 greedyMask2D, MLXArray(Float(1)), temps1D.expandedDimensions(axis: 1))
             let noiseF32 = expNoise.asType(.float32)
             let zMidF32 = zMidRaw.asType(.float32)
+            let midNonFinite = detectNonFinite(zMidF32, checkInf: !hasSoftcap)
             let zMidCapped = hasSoftcap ? (tanh(zMidF32 / softcap) * softcap) : zMidF32
+            // Shift-invariant centering prevents finite logits / tiny temperature from overflowing FP32.
+            let zMidShifted = zMidCapped - MLX.max(zMidCapped, axis: -1, keepDims: true)
             let g = -log(maximum(noiseF32, MLXArray(Float(1e-30))))
-            let scoreMid = which(greedyMask2D, zMidCapped, zMidCapped / safeTemps2D + g)
-            let candIDs: MLXArray
-            if k < vocabSize {
-                candIDs = argPartition(-scoreMid, kth: k - 1, axis: -1)[0..., ..<k].asType(.int32)
-            } else {
-                candIDs = broadcast(
-                    MLXArray.arange(vocabSize, dtype: .int32).reshaped([1, vocabSize]),
-                    to: [batchSize, vocabSize])
-            }
+            let scoreMid = which(greedyMask2D, zMidCapped, zMidShifted / safeTemps2D + g)
+            let (candIDs, k, _) = screenCandidates(
+                scores: scoreMid, targetK: topKBudget, checkInf: false)
             let counts = MLXArray.full([batchSize], values: MLXArray(Int32(k)))
             let (candLogits, _, candNonFinite) = refineCandidates(
                 x2D: x2D, candIDs: candIDs, candCounts: counts,
@@ -585,15 +605,10 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
 
         case .filtered(let temperatures, let topK, let topP, let minP, let expNoise):
             let maxRequestedK = topK.filter { $0 > 0 && $0 < vocabSize }.max() ?? 0
-            let k = Swift.min(Swift.max(topKBudget, Swift.min(maxRequestedK * 2, 256)), vocabSize)
-            let candIDs: MLXArray
-            if k < vocabSize {
-                candIDs = argPartition(-zMidRaw, kth: k - 1, axis: -1)[0..., ..<k].asType(.int32)
-            } else {
-                candIDs = broadcast(
-                    MLXArray.arange(vocabSize, dtype: .int32).reshaped([1, vocabSize]),
-                    to: [batchSize, vocabSize])
-            }
+            let targetK = Swift.min(
+                Swift.max(Swift.max(topKBudget, 128), Swift.min(maxRequestedK * 2, 256)), vocabSize)
+            let (candIDs, k, midNonFinite) = screenCandidates(
+                scores: zMidRaw, targetK: targetK, checkInf: !hasSoftcap)
             let counts = MLXArray.full([batchSize], values: MLXArray(Int32(k)))
             let (candLogits, _, candNonFinite) = refineCandidates(
                 x2D: x2D, candIDs: candIDs, candCounts: counts,
@@ -1618,6 +1633,129 @@ public final class Gemma4Hi4Lo4Embedding: Embedding, Quantized {
             if (tid == 0u) {
                 cand_counts[b] = int(written);
                 overflow[b] = static_cast<uint8_t>(ovf);
+            }
+            """,
+        header: """
+            #include <metal_stdlib>
+            #include <metal_simdgroup>
+            using namespace metal;
+            """,
+        ensureRowContiguous: true
+    )
+
+    private static func fastChunkTopK(
+        scores: MLXArray,
+        numChunks: Int,
+        emitPerChunk: Int,
+        checkInf: Bool
+    ) -> (candIDs: MLXArray, nonFinite: MLXArray) {
+        let b = scores.dim(0)
+        let flags = MLXArray([Int32(checkInf ? 1 : 0), Int32(numChunks)])
+        let out = fastChunkTopKKernel(
+            [scores, flags],
+            template: [
+                ("T", scores.dtype),
+                ("EMIT", emitPerChunk),
+            ],
+            grid: (256, numChunks, b),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[b, numChunks * emitPerChunk], [b, numChunks]],
+            outputDTypes: [.int32, .uint8])
+        let nonFinite = MLX.any(out[1] .!= UInt8(0), axis: -1)
+        return (out[0], nonFinite)
+    }
+
+    private static let fastChunkTopKKernel = MLXFast.metalKernel(
+        name: "gemma4_hi4_fast_chunk_topk",
+        inputNames: ["scores", "flags"],
+        outputNames: ["cand_ids", "chunk_nonfinite"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint chunk = threadgroup_position_in_grid.y;
+            const uint b = threadgroup_position_in_grid.z;
+            const uint B = uint(scores_shape[0]);
+            const uint V = uint(scores_shape[1]);
+            const uint check_inf = uint(flags[0]);
+            const uint C = uint(flags[1]);
+            if (b >= B || chunk >= C) { return; }
+
+            const uint lane = tid & 31u;
+            const uint sg = tid >> 5;
+            const size_t row_base = size_t(b) * size_t(V);
+
+            float tv[EMIT];
+            int ti[EMIT];
+            for (int r = 0; r < EMIT; ++r) {
+                tv[r] = -INFINITY;
+                ti[r] = -1;
+            }
+            uint bad = 0u;
+
+            for (uint block = 0u; block < V; block += C * 256u) {
+                const uint v = block + (sg * C + chunk) * 32u + lane;
+                if (v < V) {
+                    const float val = static_cast<float>(scores[row_base + v]);
+                    if (isnan(val) || (check_inf != 0u && !isfinite(val))) {
+                        bad = 1u;
+                    } else if (ti[EMIT - 1] < 0 || val > tv[EMIT - 1]) {
+                        int pos = EMIT - 1;
+                        while (pos > 0 && (ti[pos - 1] < 0 || val > tv[pos - 1])) {
+                            tv[pos] = tv[pos - 1];
+                            ti[pos] = ti[pos - 1];
+                            pos -= 1;
+                        }
+                        tv[pos] = val;
+                        ti[pos] = int(v);
+                    }
+                }
+            }
+
+            threadgroup float tg_v[8];
+            threadgroup int tg_i[8];
+            threadgroup uint tg_bad[8];
+            threadgroup int winner_idx;
+
+            uint sg_bad = metal::simd_max(bad);
+            if (lane == 0u) { tg_bad[sg] = sg_bad; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                uint any_bad = 0u;
+                for (uint s = 0u; s < 8u; ++s) { any_bad |= tg_bad[s]; }
+                chunk_nonfinite[size_t(b) * size_t(C) + size_t(chunk)] =
+                    static_cast<uint8_t>(any_bad);
+            }
+
+            int cursor = 0;
+            for (int r = 0; r < EMIT; ++r) {
+                float cur_v = (cursor < EMIT) ? tv[cursor] : -INFINITY;
+                int cur_i = (cursor < EMIT) ? ti[cursor] : -1;
+                float sm = metal::simd_max(cur_v);
+                uint match_idx = (cur_v == sm && cur_i >= 0) ? uint(cur_i) : 0xFFFFFFFFu;
+                uint best_lane_idx = metal::simd_min(match_idx);
+                if (lane == 0u) {
+                    tg_v[sg] = sm;
+                    tg_i[sg] = (best_lane_idx == 0xFFFFFFFFu) ? -1 : int(best_lane_idx);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    float bv = -INFINITY;
+                    int bi = -1;
+                    for (uint s = 0u; s < 8u; ++s) {
+                        if (tg_i[s] >= 0
+                            && (tg_v[s] > bv || (tg_v[s] == bv && (bi < 0 || tg_i[s] < bi))))
+                        {
+                            bv = tg_v[s];
+                            bi = tg_i[s];
+                        }
+                    }
+                    winner_idx = bi;
+                    cand_ids[size_t(b) * size_t(C * uint(EMIT)) + size_t(chunk * uint(EMIT) + uint(r))] =
+                        (bi >= 0) ? bi : 0;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (cur_i == winner_idx && winner_idx >= 0) {
+                    cursor += 1;
+                }
             }
             """,
         header: """

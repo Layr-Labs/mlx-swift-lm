@@ -216,6 +216,14 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
             .cbv2SupportsPackedMultimodalPrefill ?? false
     }
 
+    public func canRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], caches: [CBv2AttendingLayerCache]
+    ) -> Bool {
+        (model as? CBv2LanguageModelPrefillForwardable)?
+            .cbv2CanRunHeterogeneousCompaction(
+                tokenRows: tokenRows, cache: asKVCaches(caches)) ?? false
+    }
+
     public func prefill(
         tokens: MLXArray,
         inputEmbeddings: MLXArray?,

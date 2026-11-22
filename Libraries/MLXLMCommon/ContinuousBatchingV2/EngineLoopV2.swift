@@ -4861,7 +4861,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 packedModel.supportsPackedMultimodalPrefill
                 && cacheProvider.supportsPackedMultimodalSpans
             struct PackedGroup {
-                let count: Int
+                var minCount: Int
+                var maxCount: Int
                 let samples: Bool
                 let isColdCompaction: Bool
                 var rows: [RowWork]
@@ -4905,45 +4906,65 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if isColdCompaction && scheduler.config.maxPackedCompactionBatch <= 1 {
                     continue
                 }
-                let maxCompactionGroupBatch =
-                    isColdCompaction
-                    ? max(
-                        1,
-                        min(
-                            scheduler.config.maxPackedCompactionBatch,
-                            scheduler.config.maxPackedCompactionTokens / max(1, row.count)))
-                    : Int.max
-                if let index = groups.firstIndex(where: {
-                    $0.count == row.count
-                        && $0.samples == row.samples
-                        && $0.isColdCompaction == isColdCompaction
-                        && (!isColdCompaction || $0.rows.count < maxCompactionGroupBatch)
+                if let index = groups.firstIndex(where: { g in
+                    guard g.samples == row.samples, g.isColdCompaction == isColdCompaction else {
+                        return false
+                    }
+                    if isColdCompaction {
+                        let nextMin = min(g.minCount, row.count)
+                        let nextMax = max(g.maxCount, row.count)
+                        let nextBatch = g.rows.count + 1
+                        return cbv2CompactionLengthsWithinBand(
+                            minLength: nextMin, maxLength: nextMax)
+                            && nextBatch <= scheduler.config.maxPackedCompactionBatch
+                            && nextBatch * nextMax <= scheduler.config.maxPackedCompactionTokens
+                    }
+                    return g.minCount == row.count && g.maxCount == row.count
                 }) {
+                    groups[index].minCount = min(groups[index].minCount, row.count)
+                    groups[index].maxCount = max(groups[index].maxCount, row.count)
                     groups[index].rows.append(row)
                 } else {
                     groups.append(
                         PackedGroup(
-                            count: row.count, samples: row.samples,
+                            minCount: row.count, maxCount: row.count, samples: row.samples,
                             isColdCompaction: isColdCompaction, rows: [row]))
                 }
             }
 
             for group in groups where group.rows.count > 1 {
+                let isHeterogeneousCompaction =
+                    group.isColdCompaction && group.minCount != group.maxCount
+                let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
+                if isHeterogeneousCompaction {
+                    let tokenRows = group.rows.map { row in
+                        row.rec.tokens[row.start ..< row.start + row.count].map(Int32.init)
+                    }
+                    if !packedModel.canRunHeterogeneousCompaction(
+                        tokenRows: tokenRows, caches: caches)
+                    {
+                        // Fail closed so heterogeneous rows run unpadded solo prefills.
+                        continue
+                    }
+                }
                 var flatTokens: [Int32] = []
-                flatTokens.reserveCapacity(group.rows.count * group.count)
+                flatTokens.reserveCapacity(group.rows.count * group.maxCount)
                 for row in group.rows {
                     flatTokens.append(
                         contentsOf: row.rec.tokens[row.start ..< row.start + row.count]
                             .map(Int32.init))
+                    if row.count < group.maxCount {
+                        flatTokens.append(
+                            contentsOf: repeatElement(Int32(0), count: group.maxCount - row.count))
+                    }
                 }
-                let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.count])
+                let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.maxCount])
                 let diagnosticOffsets =
                     logitDiagnostic == nil
                     ? nil
                     : group.rows.map {
                         Self.positionOffset(kvStates[$0.rec.id]!)
                     }
-                let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
                 let requirement: CBv2PrefillRequirement =
                     group.samples ? .lastPositionLogits : .evaluationOnly
                 let spanContexts = group.rows.map {
@@ -4951,7 +4972,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                         start: $0.start, count: $0.count)
                 }
                 let output: MLXArray
-                if spanContexts.contains(where: { $0 != nil }) {
+                if isHeterogeneousCompaction {
+                    let rowLengths = group.rows.map(\.count)
+                    output = try CBv2CompactionRowLengths.$current.withValue(rowLengths) {
+                        try prefillOutput(
+                            tokens: inputs, inputEmbeddings: nil, caches: caches,
+                            requirement: requirement)
+                    }
+                } else if spanContexts.contains(where: { $0 != nil }) {
                     output = try packedMultimodalChunksForward(
                         tokens: inputs,
                         starts: group.rows.map(\.start),

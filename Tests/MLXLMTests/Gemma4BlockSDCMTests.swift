@@ -2039,7 +2039,8 @@ struct Gemma4BlockSDCMTests {
                 [0, 1, 2, 3, 4, 5, 0, 0],
             ],
             positionsHostRows: [posHost, posHost],
-            originalLength: 128,
+            originalLengths: [128, 128],
+            rowMaxLengths: [128, 128],
             blockSize: 16,
             currentLength: 128)
         #expect(unequal[0].count == 48)
@@ -2264,5 +2265,179 @@ struct Gemma4BlockSDCMTests {
             #expect(noLivelock.assignments[0].numTokens == 2048)
             #expect(schedTightMulti.waiting.map(\.id) == [CBv2RequestID(31)])
         }
+
+        // 4. Mode B heterogeneous right-padded 20%-band cohort packing (`minLen * 5 >= maxLen * 4`).
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 8,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                maxConcurrentPartialPrefills: 1)
+            config.soloCompactionMinPromptTokens = 3072
+            config.allowConcurrentCompaction = true
+            config.maxPackedCompactionBatch = 4
+            config.maxPackedCompactionTokens = 32_768
+            config.compactionEligibility = { tokens in
+                Gemma4BlockSDCM.passesDensityGuard(tokens: tokens, config: .fast)
+            }
+            let sched = SchedulerV2(config: config)
+            let p3800 = Array(codePrompt.prefix(3800))
+            let p4096 = codePrompt
+            let p4500 = codePrompt + Array(codePrompt.prefix(404))
+            let p6400 = codePrompt + Array(codePrompt.prefix(2304))  // > 25% longer than 3800 -> excluded!
+            try sched.enqueue(CBv2Request(id: CBv2RequestID(50), promptTokens: p3800, maxTokens: 8))
+            try sched.enqueue(CBv2Request(id: CBv2RequestID(51), promptTokens: p4096, maxTokens: 8))
+            try sched.enqueue(CBv2Request(id: CBv2RequestID(52), promptTokens: p4500, maxTokens: 8))
+            try sched.enqueue(CBv2Request(id: CBv2RequestID(53), promptTokens: p6400, maxTokens: 8))
+
+            let wave = sched.plan()
+            #expect(
+                wave.assignments.map(\.id) == [
+                    CBv2RequestID(50), CBv2RequestID(51), CBv2RequestID(52),
+                ])
+            #expect(wave.assignments.map(\.numTokens) == [3800, 4096, 4500])
+            #expect(sched.waiting.map(\.id) == [CBv2RequestID(53)])
+        }
+    }
+
+    @Test(
+        "Heterogeneous right-padded B=4 Block-SDCM matches B=1 per-row across fast and turbo with exact KV offsets"
+    )
+    func heterogeneousRightPaddedBlockSDCMParity() throws {
+        let model = try Self.makeSyntheticGemma4MoE()
+        let kinds = model.cbv2LayerKinds
+        let rowLens = [144, 152, 160, 176]
+        let paddedT = rowLens.max()!
+        let B = rowLens.count
+        var rng = CBv2SchedSplitMix64(seed: 0x0BADC_0FFE)
+        var rawTokenRows: [[Int32]] = []
+        var flatPadded: [Int32] = []
+        for b in 0 ..< B {
+            let row = (0 ..< rowLens[b]).map { _ in Int32(4 + rng.next() % 180) }
+            rawTokenRows.append(row)
+            flatPadded.append(contentsOf: row)
+            if rowLens[b] < paddedT {
+                flatPadded.append(contentsOf: repeatElement(Int32(0), count: paddedT - rowLens[b]))
+            }
+        }
+        let tokensPadded = MLXArray(flatPadded, [B, paddedT])
+        let nextTokB4 = MLXArray([Int32(11), 22, 33, 44], [B, 1])
+
+        func configuredForTest(_ base: Gemma4BlockSDCMConfig) -> Gemma4BlockSDCMConfig {
+            var cfg = base
+            cfg.minPromptTokens = 128
+            cfg.blockSize = 8
+            cfg.prefixKeep = 16
+            cfg.tailKeep = 16
+            cfg.sparsePrefixTokens = 16
+            cfg.sparseLocalWindow = 32
+            cfg.sparseTailTokens = 16
+            cfg.densityGuardEnabled = false
+            // Uniform top-8 MoE isolates exact causal right-padding parity (depth-tapered MoE
+            // widens the top-8 tail window by `maxLen - minLen` on padded early layers).
+            cfg.earlyMoEK = 8
+            cfg.layerMoEK = [:]
+            return cfg
+        }
+
+        let fastCfg = configuredForTest(.fast)
+        var turboCfg = configuredForTest(.turbo)
+        turboCfg.earlyPreCompactBlockSize = 8
+
+        for (label, cfg) in [("fast", fastCfg), ("turbo", turboCfg)] {
+            let poolCfg = PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                maxPrefillChunk: paddedT, nominalMaxSequenceLength: 256)
+            let pagedB4 = try PagedKVBackend(layerKinds: kinds, config: poolCfg)
+            var statesB4: [[CBv2SequenceKV?]] = []
+            defer { for s in statesB4 { pagedB4.release(s) } }
+            for b in 0 ..< B {
+                statesB4.append(
+                    try pagedB4.makeSequenceState(
+                        layerKinds: kinds, promptLength: rowLens[b], maxLength: paddedT + 32))
+            }
+            let cachesB4 = pagedB4.makeLayerCaches()
+            let fullCacheB4: [KVCache?] = cachesB4.enumerated().map { layerIdx, cache in
+                cache.setRows(statesB4.map { $0[layerIdx]! })
+                return cache
+            }
+            let embB4 = model.model.embedTokens(tokensPadded) * model.model.embedScale
+            let (postNormB4, _) = model.model.forwardBlockSDCMTrunk(
+                embB4,
+                inputTokenIDRows: rawTokenRows,
+                originalLengths: rowLens,
+                fullCache: fullCacheB4,
+                sdcm: cfg,
+                isExpertPrefill: false)
+            // Verify EVERY layer's ropePositionOffset equals each row's TRUE unpadded length!
+            for layerIdx in 0 ..< kinds.count {
+                for b in 0 ..< B {
+                    #expect(
+                        statesB4[b][layerIdx]!.ropePositionOffset == rowLens[b],
+                        "\(label) layer \(layerIdx) row \(b) rope offset mismatch")
+                }
+            }
+            let decLogitsB4 = model(nextTokB4, cache: cachesB4)
+            eval(postNormB4, decLogitsB4)
+            #expect(!MLX.isNaN(postNormB4).any().item(Bool.self))
+            #expect(!MLX.isNaN(decLogitsB4).any().item(Bool.self))
+
+            // Compare longest row (row 3, T=176, zero equalization padding!) against solo B=1:
+            // must match to < 5e-4 across all 12 layers!
+            let bLong = B - 1
+            let pagedB1 = try PagedKVBackend(layerKinds: kinds, config: poolCfg)
+            let stateB1 = try pagedB1.makeSequenceState(
+                layerKinds: kinds, promptLength: rowLens[bLong], maxLength: paddedT + 32)
+            defer { pagedB1.release(stateB1) }
+            let cachesB1 = pagedB1.makeLayerCaches()
+            let fullCacheB1: [KVCache?] = cachesB1.enumerated().map { layerIdx, cache in
+                cache.setRows([stateB1[layerIdx]!])
+                return cache
+            }
+            let tokB1 = MLXArray(rawTokenRows[bLong], [1, rowLens[bLong]])
+            let embB1 = model.model.embedTokens(tokB1) * model.model.embedScale
+            let (postNormB1, _) = model.model.forwardBlockSDCMTrunk(
+                embB1,
+                inputTokenIDRows: [rawTokenRows[bLong]],
+                fullCache: fullCacheB1,
+                sdcm: cfg,
+                isExpertPrefill: false)
+            let decLogitsB1 = model(nextTokB4[bLong ..< (bLong + 1)], cache: cachesB1)
+            eval(postNormB1, decLogitsB1)
+            let prefillDiff = MLX.abs(postNormB4[bLong ..< (bLong + 1)] - postNormB1)
+                .max().item(Float.self)
+            let decodeDiff = MLX.abs(decLogitsB4[bLong ..< (bLong + 1)] - decLogitsB1)
+                .max().item(Float.self)
+            #expect(
+                prefillDiff < 5e-4,
+                "\(label) hetero longest row prefill diff: \(prefillDiff)")
+            #expect(
+                decodeDiff < 5e-4,
+                "\(label) hetero longest row decode diff: \(decodeDiff)")
+        }
+
+        // Ensure equalizeBatchedCompactedIndices trims rows exceeding minValidRowCap while
+        // preserving each row's frontier tail token.
+        let keepRagged: [[Int32]] = [
+            Array(0 ..< 128).map(Int32.init),
+            Array(0 ..< 160).map(Int32.init),
+        ]
+        let posRows: [[Int32]] = [
+            Array(0 ..< 160).map(Int32.init),
+            Array(0 ..< 160).map(Int32.init),
+        ]
+        let equalized = Gemma4BlockSDCM.equalizeBatchedCompactedIndices(
+            keepRows: keepRagged,
+            rowBlockScores: [[1, 2, 3, 4], [1, 5, 2, 4, 3]],
+            positionsHostRows: posRows,
+            originalLengths: [128, 160],
+            rowMaxLengths: [128, 160],
+            blockSize: 32,
+            currentLength: 160)
+        #expect(equalized.count == 2)
+        #expect(equalized[0].count == 128)
+        #expect(equalized[1].count == 128)
+        #expect(equalized[1].last == 159)
     }
 }

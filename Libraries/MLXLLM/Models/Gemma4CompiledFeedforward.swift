@@ -73,14 +73,13 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
     static func admitsShape(rows: Int, width: Int, topK: Int) -> Bool {
         guard topK > 0, (1 ... 3).contains(width), rows >= 1 else { return false }
         let assignments = rows * width * topK
+        let unprojected = !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
         if width == 3 {
-            return assignments < 64
-                && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
+            return assignments < 64 && unprojected
         }
         if rows <= 7 && assignments < 64 { return true }
-        return (sortedOverrideForTesting ?? sortedEnabled)
-            && assignments >= 64 && rows * width <= 16
-            && !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
+        guard rows * width <= 16, unprojected else { return false }
+        return assignments < 64 || (sortedOverrideForTesting ?? sortedEnabled)
     }
 
     var isCompiled: Bool { lock.withLock { entry != nil } }

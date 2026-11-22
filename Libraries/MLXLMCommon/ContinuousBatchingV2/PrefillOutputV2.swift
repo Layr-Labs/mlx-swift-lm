@@ -70,10 +70,18 @@ public protocol CBv2PrefillSteppableModel: CBv2SteppableModel {
 public protocol CBv2PackedPrefillSteppableModel: CBv2PrefillSteppableModel {
     var supportsPackedPrefill: Bool { get }
     var supportsPackedMultimodalPrefill: Bool { get }
+    func canRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], caches: [CBv2AttendingLayerCache]
+    ) -> Bool
 }
 
 extension CBv2PackedPrefillSteppableModel {
     public var supportsPackedMultimodalPrefill: Bool { false }
+    public func canRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], caches: [CBv2AttendingLayerCache]
+    ) -> Bool {
+        false
+    }
 }
 
 /// Model-level (KVCache-shaped) twin of `CBv2PrefillSteppableModel`, for
@@ -87,21 +95,27 @@ public protocol CBv2LanguageModelPrefillForwardable {
         cache: [KVCache]?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray
-
-    /// Whether this model's prompt forward is safe to run as a rectangular
-    /// `[B, L]` cohort of independent rows. Fail-closed default: false.
+    /// Model-side half of `CBv2PackedPrefillSteppableModel.supportsPackedPrefill`.
+    /// Default is `false` so every model opts in only after its packed
+    /// prefill path is verified.
     var cbv2SupportsPackedPrefill: Bool { get }
-
-    /// Stronger claim for rectangular embedding-forward rows with one
-    /// optional vision span-mask context per row. Fail-closed default: false.
+    /// Model-side half of `supportsPackedMultimodalPrefill`. Default is `false`.
     var cbv2SupportsPackedMultimodalPrefill: Bool { get }
+    /// Model-side half of `canRunHeterogeneousCompaction`. Default is `false`.
+    func cbv2CanRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], cache: [KVCache]?
+    ) -> Bool
 }
 
 extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
+    public func cbv2CanRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], cache: [KVCache]?
+    ) -> Bool {
+        false
+    }
 }
-
 
 /// Recurrent twin of `CBv2PrefillSteppableModel`: the prompt-forward seam for
 /// models whose chunks carry request-owned recurrent state and positions
