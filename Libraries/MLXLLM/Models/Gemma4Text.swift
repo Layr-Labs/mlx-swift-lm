@@ -3566,7 +3566,11 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     }
 }
 
-extension Gemma4TextModel: CBv2MTPPolicyTopTwoProviding {
+extension Gemma4TextModel: CBv2MTPPolicyTopTwoProviding, CBv2MTPPolicyTopTwoCapabilityProviding {
+    public var cbv2MTPPolicyTopTwoAvailable: Bool {
+        cbv2SupportsRequestStatefulMTP
+    }
+
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
         cbv2TopTwoRows(logits)
     }

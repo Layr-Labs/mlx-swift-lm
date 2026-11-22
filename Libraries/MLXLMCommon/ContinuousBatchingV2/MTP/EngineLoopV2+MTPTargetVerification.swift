@@ -368,6 +368,9 @@ extension EngineLoopV2 {
             let windowWork = try nativePagedWork?.prepareWindow()
             let canUseSparseGreedyVerify =
                 recurrentModel == nil && !mtp.usesTokenOnlyDrafter
+                && (mtp.model as? any CBv2SparseHeadSampleableModel)?
+                    .supportsSparseExactHeadSampling
+                    == true
                 && !useTargetPrefix && spanSampler == nil && !hasConstraints
                 && logitDiagnostic == nil && !mtp.usesMarginalPolicy
                 && (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize == nil
@@ -448,9 +451,7 @@ extension EngineLoopV2 {
                 if hasConstraints { constraintLogits = windowLogits }
                 // Flag the model's logits before a host sampler sees them.
                 nonFinite = CBv2NonFiniteLogits.flags(windowLogits, keptAxes: 2)
-                if mtp.usesRequestStatefulDrafter
-                    && (mtp.usesMarginalPolicy || logitDiagnostic != nil)
-                {
+                if mtp.usesRequestStatefulDrafter {
                     guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                         preconditionFailure(
                             "CBv2 request-stateful rectangular MTP target lacks top-two provider")

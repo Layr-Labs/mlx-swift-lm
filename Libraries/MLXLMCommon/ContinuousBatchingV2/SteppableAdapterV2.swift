@@ -98,6 +98,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
 // MARK: - Request-owned recurrent state
 
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
+    var wrapsRecurrentModel: Bool {
+        model is any CBv2RecurrentLanguageModelForwardable
+    }
+
     public var cbv2Capabilities: CBv2ModelCapabilities {
         (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
     }
@@ -461,7 +465,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
 
 extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoCapabilityProviding {
     public var cbv2MTPPolicyTopTwoAvailable: Bool {
-        model is any CBv2MTPPolicyTopTwoProviding
+        if let cap = model as? any CBv2MTPPolicyTopTwoCapabilityProviding {
+            return cap.cbv2MTPPolicyTopTwoAvailable
+        }
+        return model is any CBv2MTPPolicyTopTwoProviding
     }
 }
 

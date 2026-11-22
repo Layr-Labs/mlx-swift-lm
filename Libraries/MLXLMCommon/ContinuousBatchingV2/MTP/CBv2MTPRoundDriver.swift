@@ -508,14 +508,17 @@ final class CBv2MTPRoundDriver {
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
         let recurrentTarget = model as? any CBv2RecurrentMTPSteppableModel
-        let recurrent =
+        let hasRecurrentSpec =
             (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
-        guard
-            !stateful
-                || (mtpModel.supportsRequestStatefulMTP && (!recurrent || recurrentTarget != nil))
-        else { return nil }
+        let isRecurrentModel =
+            (model as? CBv2SteppableLanguageModelAdapter)?.wrapsRecurrentModel
+            ?? (recurrentTarget != nil || hasRecurrentSpec)
         let captureLayers = stateful ? nil : mtpModel.mtpCaptureLayers
-        guard stateful || captureLayers != nil else { return nil }
+        guard
+            (stateful && mtpModel.supportsRequestStatefulMTP
+                && (!isRecurrentModel || (recurrentTarget != nil && hasRecurrentSpec)))
+                || (!stateful && !isRecurrentModel && captureLayers != nil)
+        else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
             modelTarget == drafterTarget
