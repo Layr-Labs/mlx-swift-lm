@@ -176,16 +176,23 @@ final class Inkling2DecoderLayer: Module {
         let attended = attention(
             query: queryInput, key: keyInput, value: valueInput, slot: slot, state: state)
         Inkling2Diagnostics.section?("attention", [attended])
-        let (convolved, attentionState) = postAttentionConvolution(
-            attended, state: state.convState(slot: slot, .postAttention))
-        state.setConvState(slot: slot, .postAttention, attentionState, input: attended)
-
-        var residual = convolved.asType(.float32)
+        var residual: MLXArray
         var mlpBlocks = blocks
-        if isBlockBoundary {
-            mlpBlocks.append(hidden)
+        if isBlockBoundary { mlpBlocks.append(hidden) }
+        // Inkling2StageFusion: the convolution and the residual add in one kernel, same bits.
+        if let fused = Inkling2StageFusion.convolution(
+            postAttentionConvolution, attended, tail: isBlockBoundary ? .widened : .added(hidden),
+            slot: slot, kind: .postAttention, state: state)
+        {
+            residual = fused.output
         } else {
-            residual = hidden.asType(.float32) + residual
+            let (convolved, attentionState) = postAttentionConvolution(
+                attended, state: state.convState(slot: slot, .postAttention))
+            state.setConvState(slot: slot, .postAttention, attentionState, input: attended)
+            residual = convolved.asType(.float32)
+            if !isBlockBoundary {
+                residual = hidden.asType(.float32) + residual
+            }
         }
         var mlpIn = mlpInput(blocks: mlpBlocks, partial: residual)[.ellipsis, 0, 0...]
         if let controllers, let mm = message(3) {
@@ -195,10 +202,20 @@ final class Inkling2DecoderLayer: Module {
         Inkling2Diagnostics.section?("post-attention", [mlpNormed, residual])
         let routed = Self.invariantPrefillExperts(mlp, mlpNormed)
         Inkling2Diagnostics.section?("experts", [routed])
-        let (mixed, mlpState) = postMLPConvolution(
-            routed, state: state.convState(slot: slot, .postMLP))
-        state.setConvState(slot: slot, .postMLP, mlpState, input: routed)
-        let output = (residual + mixed.asType(.float32)).asType(dtype)
+        let output: MLXArray
+        let mlpState: MLXArray
+        if let fused = Inkling2StageFusion.convolution(
+            postMLPConvolution, routed, tail: .residual(residual, dtype), slot: slot,
+            kind: .postMLP, state: state)
+        {
+            (output, mlpState) = (fused.output, fused.next)
+        } else {
+            let mixed: MLXArray
+            (mixed, mlpState) = postMLPConvolution(
+                routed, state: state.convState(slot: slot, .postMLP))
+            state.setConvState(slot: slot, .postMLP, mlpState, input: routed)
+            output = (residual + mixed.asType(.float32)).asType(dtype)
+        }
         Inkling2Diagnostics.section?("post-mlp", [output, mlpState])
         return output
     }

@@ -365,31 +365,45 @@ final class Inkling2Attention: Module {
 
         let project: (Linear, MLXArray) -> MLXArray = { Inkling2RowExact.linear($0, $1) }
         let products = concatenatedProducts(query: x, key: keyInput, value: valueInput)
-        let queries = logScaled(
-            queryClip(
-                (products?.query ?? project(queryProjection, x)).reshaped(b, l, heads, headDim))
-        )
-        .transposed(0, 2, 1, 3)
-        let relativeStates = logScaled(
-            relativeClip(
-                (products?.relative ?? project(relativeLinear, x)).reshaped(b, l, heads, -1)))
+        // Prefill: Inkling2ProjectionFusion computes the same bits in one pass per output.
+        let queryProducts = products?.query ?? project(queryProjection, x)
+        let queries =
+            (Inkling2ProjectionFusion.clip(queryProducts, queryClip, tau: tau)
+            ?? logScaled(queryClip(queryProducts.reshaped(b, l, heads, headDim))))
+            .transposed(0, 2, 1, 3)
+        let relativeProducts = products?.relative ?? project(relativeLinear, x)
+        let relativeStates =
+            Inkling2ProjectionFusion.clip(relativeProducts, relativeClip, tau: tau)
+            ?? logScaled(relativeClip(relativeProducts.reshaped(b, l, heads, -1)))
         let relativeLogits = Inkling2RowExact.matmul(
             relativeStates, transposedWeight: relativeProjection.proj.T
         ).transposed(0, 2, 1, 3)
 
-        let keyStates = convolve(
-            keyConvolution, products?.key ?? project(keyProjection, keyInput), input: keyInput,
-            slot: slot, kind: .key, state: state, projected: products?.keyDynamic)
-        let keys = Inkling2Math.l2Clip(
-            keyStates.reshaped(b, l, kvHeads, headDim), threshold: qkThreshold
-        ).asType(dtype).transposed(0, 2, 1, 3)
-        let valueStates = convolve(
-            valueConvolution, products?.value ?? project(valueProjection, valueInput),
-            input: valueInput, slot: slot, kind: .value, state: state,
-            projected: products?.valueDynamic)
-        let values = Inkling2Math.unweightedRMSNorm(
-            valueStates.reshaped(b, l, kvHeads, headDim), eps: eps
-        ).asType(dtype).transposed(0, 2, 1, 3)
+        let keyProducts = products?.key ?? project(keyProjection, keyInput)
+        let keys =
+            (Inkling2ProjectionFusion.convolution(
+                keyConvolution, keyProducts, input: keyInput, projected: products?.keyDynamic,
+                heads: kvHeads, tail: .clip(qkThreshold), dtype: dtype, slot: slot, kind: .key,
+                state: state)
+            ?? Inkling2Math.l2Clip(
+                convolve(
+                    keyConvolution, keyProducts, input: keyInput, slot: slot, kind: .key,
+                    state: state, projected: products?.keyDynamic
+                ).reshaped(b, l, kvHeads, headDim), threshold: qkThreshold
+            ).asType(dtype)).transposed(0, 2, 1, 3)
+        let valueProducts = products?.value ?? project(valueProjection, valueInput)
+        let values =
+            (Inkling2ProjectionFusion.convolution(
+                valueConvolution, valueProducts, input: valueInput,
+                projected: products?.valueDynamic,
+                heads: kvHeads, tail: .norm(eps), dtype: dtype, slot: slot, kind: .value,
+                state: state)
+            ?? Inkling2Math.unweightedRMSNorm(
+                convolve(
+                    valueConvolution, valueProducts, input: valueInput, slot: slot,
+                    kind: .value, state: state, projected: products?.valueDynamic
+                ).reshaped(b, l, kvHeads, headDim), eps: eps
+            ).asType(dtype)).transposed(0, 2, 1, 3)
         let sinks = (products?.sink ?? project(sinkProjection, x)).transposed(0, 2, 1)
 
         let attended = state.attend(
