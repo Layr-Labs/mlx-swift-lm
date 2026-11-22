@@ -3,7 +3,7 @@
 
 The Fork Tests workflow runs the tests in parallel jobs. .github/test-shards.json
 assigns the tests to the jobs. Each shard is a list of runs, and each run is
-one `swift test --skip-build` process.
+at most one `swift test --skip-build` process.
 
 A run selects tests with --filter and --skip regular expressions. It gets them
 from two sources:
@@ -28,7 +28,8 @@ map. A shard has at most one rest run. When several shards have one, the
 tests split by unit over them (split_rest), so the new suites of a pull
 request do not all wait in one shard. The shard lists the tests, finds its
 share and runs only them, by their full IDs, in the same process as its main
-run with the default settings (rest_host): no second test process starts.
+run with the default settings (rest_host). So a shard with such a run starts
+no second test process for them.
 
 "hosted_tests" records exact temporary runner exceptions. They have their
 own shard with "runner": "hosted"; a new plan preserves those identities
@@ -296,17 +297,15 @@ def rest_host(rest_run: dict, runs: list[dict]) -> dict | None:
 
 
 def shard_selections(runs: list[dict], all_runs: list[dict], listed: list[str]) -> dict[str, tuple]:
-    """Return, for each run of one shard, its own tests, the rest tests that it also runs,
-    and the run that runs its own tests instead (for a rest run).
+    """Return (own tests, rest tests it also runs, host of its share) for each run of one shard.
 
-    A rest run's tests run in its host run (rest_host) when the host selects tests, so the
-    shard starts no second test process for them.
+    A rest run's share runs in its host (rest_host) when the host selects tests of its own.
     """
     own = {run["id"]: selection(run, all_runs, listed) for run in runs}
     rest = {run["id"]: [] for run in runs}
     host_of = {run["id"]: None for run in runs}
     for run in runs:
-        host = rest_host(run, runs) if run["rest"] else None
+        host = rest_host(run, runs) if run["rest"] and own[run["id"]] else None
         if host and own[host["id"]]:
             rest[host["id"]] = own[run["id"]]
             host_of[run["id"]] = host["id"]
@@ -368,7 +367,7 @@ def expand(value: str) -> str:
 
 
 def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None,
-                rest: list[str] = ()) -> list[str]:
+                rest: list[str] | tuple = ()) -> list[str]:
     """Return the swift test command of one attempt of a run.
 
     With `exact`, the command selects these tests by their full IDs. A later
@@ -489,13 +488,12 @@ def command_run(args: argparse.Namespace) -> int:
         attempt = 1
         own, rest, host = selections[run["id"]]
         chosen = own + rest
-        unmapped = rest if not run["rest"] else ([] if host else own)
+        unmapped = own if run["rest"] and not host else rest
         if unmapped:
             print(f"{run['id']} runs {len(unmapped)} tests that are in no shard of the map. "
                   "The shard map check reports them all.", flush=True)
         if host:
-            note = f"{host} runs the {len(own)} tests of this rest run." if own else \
-                "Each listed test is in another run of the map."
+            note = f"{host} runs the {len(own)} tests of this rest run."
             (folder / "log-1.txt").write_text(note + "\n")
             print(note, flush=True)
         elif run["rest"] and not chosen:
@@ -551,7 +549,7 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def run_problems(run: dict, chosen: list[str], folder: Path, listed: list[str],
-                 rest: list[str] = ()) -> list[str]:
+                 rest: list[str] | tuple = ()) -> list[str]:
     """Return the problems of a finished run, other than test failures.
 
     A run fails when it executed none of its tests, or none of the rest tests

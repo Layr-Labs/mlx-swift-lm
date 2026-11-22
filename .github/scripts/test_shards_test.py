@@ -224,45 +224,84 @@ class RestSplitTests(unittest.TestCase):
                              ["the run executed none of the rest tests."])
             self.assertEqual(test_shards.run_problems(k1, ["M.KernelTests/K1/run()"], folder, tests), [])
 
-    def test_every_test_runs_once_and_no_rest_run_starts_a_process(self):
+    def run_shards(self, root, shards, stop=None, drop=()):
+        """Run shards with a stand-in for swift test that executes what its filters select.
+
+        `stop` makes the first attempt stop at that test (started, not ended); `drop` never executes.
+        Returns each command as (run, log, executed tests) and each shard's exit code.
+        """
         tests = TESTS + self.NEW
         commands = []
 
         def fake_stream(command, env, log, timeout):
-            # A stand-in for swift test: execute every listed test that one of its filters selects.
             filters = [command[i + 1] for i, a in enumerate(command) if a == "--filter"]
-            events_path = Path(command[command.index("--event-stream-output-path") + 1])
-            ran = [t for t in tests if any(re.search(f, t) for f in filters)]
-            events_path.write_text(events(*[e for i, t in enumerate(ran) for e in (started(t, i), ended(t, i + 0.5))]))
+            ran = [t for t in tests if any(re.search(f, t) for f in filters) and t not in drop]
+            stopped = log.name == "log-1.txt" and stop in ran
+            if stopped:
+                ran = ran[:ran.index(stop) + 1]
+            records = [e for i, t in enumerate(ran) for e in (started(t, i), ended(t, i + 0.5))]
+            Path(command[command.index("--event-stream-output-path") + 1]).write_text(
+                events(*(records[:-1] if stopped else records)))
             log.write_text("")
-            commands.append((log.parent.name, ran))
-            return 0
+            commands.append((log.parent.name, log.name, ran))
+            return 1 if stopped else 0
 
+        (root / "map.json").write_text(json.dumps(self.data()))
+        (root / "tests.txt").write_text("\n".join(tests) + "\n")
+        done = subprocess.CompletedProcess([], 0, stdout="/bin\n")
+        codes = {}
+        with mock.patch.object(test_shards, "stream", fake_stream), \
+                mock.patch.object(test_shards.subprocess, "run", return_value=done), \
+                mock.patch.object(test_shards, "find_metallibs", return_value=[]), \
+                mock.patch.dict(os.environ, {"RUNNER_TEMP": str(root), "GITHUB_STEP_SUMMARY": ""}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for shard in shards:
+                args = argparse.Namespace(map=root / "map.json", shard=shard, results=root / "results" / str(shard),
+                                          metallib=root / "mlx.metallib", list=root / "tests.txt")
+                codes[shard] = test_shards.command_run(args)
+        return commands, codes
+
+    def verify_results(self, root):
+        return subprocess.run([sys.executable, test_shards.__file__, "--map", str(root / "map.json"), "verify",
+                               "--list", str(root / "tests.txt"), "--results", str(root / "results")],
+                              capture_output=True, text=True, env={**os.environ, "GITHUB_STEP_SUMMARY": ""})
+
+    def test_every_test_runs_once_and_no_rest_run_starts_a_process(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "map.json").write_text(json.dumps(self.data()))
-            (root / "tests.txt").write_text("\n".join(tests) + "\n")
-            done = subprocess.CompletedProcess([], 0, stdout="/bin\n")
-            with mock.patch.object(test_shards, "stream", fake_stream), \
-                    mock.patch.object(test_shards.subprocess, "run", return_value=done), \
-                    mock.patch.object(test_shards, "find_metallibs", return_value=[]), \
-                    mock.patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_STEP_SUMMARY": ""}), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                for shard in (1, 2):
-                    args = argparse.Namespace(map=root / "map.json", shard=shard, results=root / "results" / str(shard),
-                                              metallib=root / "mlx.metallib", list=root / "tests.txt")
-                    self.assertEqual(test_shards.command_run(args), 0)
-            started_runs = [name for name, _ in commands]
+            commands, codes = self.run_shards(root, (1, 2))
+            self.assertEqual(codes, {1: 0, 2: 0})
+            started_runs = [name for name, _, _ in commands]
             self.assertNotIn("shard1-run4", started_runs)
             self.assertNotIn("shard2-run2", started_runs)
             self.assertIn("shard1-run3 runs the 4 tests", (root / "results/1/shard1-run4/log-1.txt").read_text())
-            self.assertEqual(dict(commands)["shard2-run1"], ["M.B/testOne", "M.KernelTests/K1/run()", "M.free()",
-                                                            *self.NEW[3:]])
-            verify = subprocess.run([sys.executable, test_shards.__file__, "--map", str(root / "map.json"), "verify",
-                                     "--list", str(root / "tests.txt"), "--results", str(root / "results")],
-                                    capture_output=True, text=True, env={**os.environ, "GITHUB_STEP_SUMMARY": ""})
+            self.assertIn(("shard2-run1", "log-1.txt", ["M.B/testOne", "M.KernelTests/K1/run()", "M.free()",
+                                                        *self.NEW[3:]]), commands)
+            verify = self.verify_results(root)
             self.assertEqual(verify.returncode, 0, verify.stdout)
             self.assertIn("Each listed test executed exactly once in the main pass.", verify.stdout)
+
+    def test_a_later_attempt_runs_the_own_and_rest_tests_that_did_not_execute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands, codes = self.run_shards(root, (1, 2), stop="M.B/testOne")
+            self.assertEqual(codes, {1: 0, 2: 1})
+            self.assertIn(("shard2-run1", "log-2.txt", ["M.KernelTests/K1/run()", "M.free()", *self.NEW[3:]]),
+                          commands)
+            verify = self.verify_results(root)
+            self.assertEqual(verify.returncode, 0, verify.stdout)
+
+    def test_a_main_run_fails_when_none_of_its_share_executed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, codes = self.run_shards(Path(directory), (2,), drop=("M.B/testOne", "M.free()", *self.NEW[3:]))
+            self.assertEqual(codes, {2: 1})
+
+    def test_a_run_with_its_own_process_or_a_preparation_does_not_run_the_share(self):
+        groups = [{"name": "own", "own_process": True, "filters": [r"^M\.B/"]},
+                  {"name": "prep", "before": [["true"]], "filters": [r"^M\.free\(\)"]}]
+        shards = [{"runs": [{"units": ["M.A"]}, {"groups": ["own"]}, {"groups": ["prep"]}, {"rest": True}]}]
+        runs = test_shards.resolve_runs(make_map(shards, groups))
+        self.assertEqual(test_shards.rest_host(runs[-1], runs)["id"], "shard1-run1")
 
     def test_check_accepts_the_split_and_verify_names_the_rest_run_of_a_missing_test(self):
         with tempfile.TemporaryDirectory() as directory:

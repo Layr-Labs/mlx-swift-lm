@@ -78,11 +78,13 @@ with the default settings, where the planner puts units, as a new plan
 would place them. A rest run of its own cost a second process, about 3 s
 (median "Run the shard" minus test time: 22 s with a share in two processes,
 19 s with one). Replayed on those 15 rounds over all 16 ways to number the
-shards, that cost was the only way the split made a round slower on average.
-A round that a late shard ends (a long queue, a slow Mac or a rerun) still
-pays for that shard's share, as it paid for all of them when shard 12 was
-the late one. Every shard partitions the whole list to find its share: 0.5 s
-for the 8,076 tests of run 45046267507 on a developer Mac.
+shards, that cost was the only way the split made a round slower on average
+than when shard 12 ran them all (1 to 3 s on 4 rounds). A shard without such
+a run keeps a process for its share. A round that a late shard ends (a long
+queue, a slow Mac or a rerun) still pays for that shard's share, as it paid
+for all of them when shard 12 was the late one. Every shard partitions the
+whole list to find its share: 0.5 s for the 8,076 tests of run 45046267507
+on a developer Mac.
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share
