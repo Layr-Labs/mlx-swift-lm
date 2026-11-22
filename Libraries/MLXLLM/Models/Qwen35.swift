@@ -1259,10 +1259,9 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
                         fullAcceptanceRetainedRoots: [tape.convInput],
                         fullAcceptance: {
-                            let detachedConv =
-                                finalConv
-                                + MLXArray.zeros(
-                                    finalConv.shape, dtype: finalConv.dtype)
+                            // A new buffer with the same values (one add of a
+                            // scalar zero; no zero-filled tensor).
+                            let detachedConv = finalConv + MLXArray(0, dtype: finalConv.dtype)
                             // A cohort row's kept state is its own exact copy,
                             // not a view of the cohort's [B, ...] final states.
                             return CBv2RecurrentLayerState(
@@ -1314,15 +1313,29 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
                 out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
             }
 
+            // A cohort (B > 1) builds every row's stacks with one copy each
+            // ([B, S, ...]) and hands each row its own [S, ...] view, instead
+            // of one concatenation per row; the staged values are the same.
+            let cohortConvStacks: MLXArray? =
+                B > 1
+                ? MLX.stacked(
+                    (0 ..< S).map { s in convInput[0..., (s + 1) ..< (s + 1 + nKeep)] },
+                    axis: 1)
+                : nil
+            let cohortSSMStacks: MLXArray? =
+                B > 1 && stacked == nil ? MLX.stacked(ssmStates, axis: 1) : nil
             for (row, evaluation) in recurrentState.enumerated() {
-                let convStack = concatenated(
-                    (0 ..< S).map { s in
-                        convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
-                    }, axis: 0)
+                let convStack =
+                    cohortConvStacks?[row]
+                    ?? concatenated(
+                        (0 ..< S).map { s in
+                            convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
+                        }, axis: 0)
                 // [S, Hv, Dv, Dk] either way: the stacked kernel's row is
                 // already in position-major order.
                 let ssmStack =
                     stacked?.stateStack[row]
+                    ?? cohortSSMStacks?[row]
                     ?? concatenated(ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
                 do {
                     try evaluation.stageCaptured(

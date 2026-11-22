@@ -769,24 +769,43 @@ extension EngineLoopV2 {
                 var stepEvalTargets: [MLXArray] = []
                 nextRows.reserveCapacity(batch)
                 nextHiddens.reserveCapacity(batch)
-                for (index, row) in verifyRows.enumerated() {
+                let requestStates = verifyRows.enumerated().map {
+                    index, row -> any CBv2MTPRequestState in
                     guard let requestState = rowMetadata[index].assistantState else {
                         preconditionFailure(
                             "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
                     }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
+                    return requestState
+                }
+                let shortlists = verifyRows.map { draftIndex == 0 ? $0.carry!.shortlist : nil }
+                // A cohort drafts its rows together when the drafter batches
+                // them (shared launches); otherwise, and for one row, per row.
+                let rowsStep =
+                    batch > 1
+                    ? stateful.draftRowsStep(
+                        tokens: currentTokens, hiddens: currentHidden,
+                        shortlists: shortlists, requestStates: requestStates)
+                    : nil
+                for index in 0 ..< batch {
+                    let result: (tokens: MLXArray, hidden: MLXArray)
+                    if let rowsStep {
+                        result = (rowsStep.tokens[index], rowsStep.hiddens[index])
+                    } else {
+                        result = stateful.draftStep(
+                            tokens: currentTokens[index],
+                            hidden: currentHidden[index],
+                            shortlist: shortlists[index],
+                            requestState: requestStates[index])
+                    }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
                     stepEvalTargets.append(next)
                     stepEvalTargets.append(result.hidden)
                     stepEvalTargets.append(
-                        contentsOf: stateful.evaluationTargets(for: requestState))
+                        contentsOf: stateful.evaluationTargets(for: requestStates[index]))
                 }
+                if rowsStep != nil { mtp.recordBatchedDraftStep() }
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation, and every generation for a
                 // drafter that opts in, so its steps run while the target graph

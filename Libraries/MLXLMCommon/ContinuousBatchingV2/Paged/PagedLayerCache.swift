@@ -1172,6 +1172,43 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
             return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
         }
+        if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count > 1,
+            let keys, let values
+        {
+            // A cohort: each row's window as its own batched-columns call (one
+            // chunk write and one multi-query pass per row instead of one
+            // decode dispatch per column).
+            let groups = rows.map { pool.group($0.groupKey) }
+            let perRow = rows.indices.map { index in
+                (
+                    queries: queries[index ..< (index + 1)],
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)]
+                )
+            }
+            if rows.indices.allSatisfy({
+                PagedMTPBatchedColumns.eligible(
+                    queries: perRow[$0].queries, row: rows[$0], group: groups[$0])
+            }) {
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(rows.count)
+                for index in rows.indices {
+                    mtpBatchedAttentionCalls += 1
+                    let before = PagedMultiQueryAttention.dispatches
+                    outputs.append(
+                        PagedMTPBatchedColumns.attend(
+                            queries: perRow[index].queries, keys: perRow[index].keys,
+                            values: perRow[index].values,
+                            row: rows[index], group: groups[index],
+                            sinks: preparedSinks(sinks),
+                            params: params(scale: scale),
+                            softcap: attentionSoftcap != nil, source: pool.kernelSource,
+                            dispatchCache: segmentDispatchCache))
+                    if PagedMultiQueryAttention.dispatches != before { mtpMultiQueryCalls += 1 }
+                }
+                return concatenated(outputs, axis: 0)
+            }
+        }
         if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
             let keys, let values
         {
