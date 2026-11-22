@@ -27,6 +27,9 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     /// With 2 to 16 rows, `callAsFunction` runs `rowExactForward`: every row
     /// bit-identical to a one-row call (batched decode, verify windows).
     public var rowExactBatches = false
+    /// Work layout of the FP8 one-row and row-exact products. Every schedule
+    /// gives the same bytes; `.standard` keeps the original layout.
+    public var rowExactSchedule = ModelOptRowExact.Schedule.standard
     /// Nil after a failed validation: the graph path then refuses every call.
     var graphConstants: ModelOptCalibratedGraphConstants?
 

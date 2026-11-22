@@ -6,6 +6,49 @@ import Foundation
 /// This is intentionally separate from validation: unconvertible or ambiguous
 /// values keep their original spelling so the caller can reject or inspect them.
 enum ToolArgumentNormalization {
+    /// The most arrays and objects a value read from the model's text opens
+    /// at once. The text is the model's, and a client's prompt can steer it,
+    /// so it is bounded as a client's body is: `JSONSerialization` reads 512
+    /// levels, and reading, encoding, comparing, hashing and releasing a value
+    /// each recurse once per level on a cooperative thread's 512 KiB stack.
+    /// A call's arguments object adds one level, so its arguments nest at most
+    /// 64 deep: the limit d-inference holds a request body and a replayed
+    /// call to.
+    static let maximumValueDepth = 63
+
+    /// Whether `text` opens more than `maximumValueDepth` arrays and objects
+    /// at once, counted without recursion. Brackets inside JSON strings do not
+    /// count; malformed text is left to the parser.
+    static func nestsPastTheBound(_ text: String) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for byte in text.utf8 {
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if byte == UInt8(ascii: "\\") {
+                    escaped = true
+                } else if byte == UInt8(ascii: "\"") {
+                    inString = false
+                }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""):
+                inString = true
+            case UInt8(ascii: "["), UInt8(ascii: "{"):
+                depth += 1
+                if depth > maximumValueDepth { return true }
+            case UInt8(ascii: "]"), UInt8(ascii: "}"):
+                depth -= 1
+            default:
+                break
+            }
+        }
+        return false
+    }
+
     static func normalize(_ call: ToolCall, tools: [[String: any Sendable]]?) -> ToolCall {
         guard !call.function.arguments.isEmpty, let tools,
             let schema = ToolSchemaValidator.parametersSchema(
@@ -68,6 +111,9 @@ enum ToolArgumentNormalization {
                 default: break
                 }
             case "object", "array":
+                // Nested past the bound, the text keeps its spelling, as a
+                // Python literal past 32 levels already does.
+                guard !nestsPastTheBound(trimmed) else { break }
                 let parsed: (any Sendable)? =
                     tryParseJSON(trimmed) ?? tryParsePythonLiteral(trimmed)
                 if let parsed {

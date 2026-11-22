@@ -1,0 +1,435 @@
+// Copyright © 2026 Eigen Labs.
+
+import Foundation
+import MLX
+import MLXNN
+import Testing
+
+@testable import MLXLLM
+@testable import MLXLMCommon
+
+/// The DFlash drafter on a tower with exact verify windows: the engine scores
+/// each round in one rectangular forward, and the output is the target's
+/// alone, drafter on or off, greedy or sampled, cold or restored.
+@Suite(.serialized, .tags(.integration))
+struct MuseGlimmerDFlashExactVerifyTests {
+    typealias Scripted = MuseGlimmerDFlashScriptedDrafter
+    static let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+    static let maxTokens = 32
+    static let taps = [1, 3, 5]
+    static let greedy = CBv2SamplingParams(temperature: 0)
+    static let sampled = CBv2SamplingParams(temperature: 1, topP: 0.95, topK: 64, seed: 99)
+
+    private func target(_ dtype: DType, exact: Bool = true) throws -> MuseGlimmerTextModel {
+        let model = try MuseGlimmerExactWindowTests.mixed(layers: 6, dtype: dtype)
+        model.mtpHiddenLayerIDs = Self.taps
+        try model.setRowExactWindows(exact)
+        return model
+    }
+
+    private func drafter(
+        _ target: MuseGlimmerTextModel, settings: MuseGlimmerDFlashDrafter.Settings? = nil,
+        columnsAsRows: Bool = true
+    ) throws -> MuseGlimmerDFlashDrafter {
+        let configuration = try MuseGlimmerDFlashConfiguration(
+            hiddenSize: MuseGlimmerExactWindowTests.hidden, intermediateSize: 256,
+            hiddenLayers: 2, attentionHeads: 4, kvHeads: 2, headDimensions: 16, blockSize: 16,
+            maskTokenID: 95, targetLayerIDs: Self.taps, slidingWindow: 32, rmsNormEps: 1e-5,
+            ropeTheta: 500_000)
+        return try MuseGlimmerDFlashDrafter(
+            target: target,
+            model: try MuseGlimmerDFlashFixture.model(
+                configuration, seed: 5, dtype: target.activationDType),
+            settings: settings
+                ?? .verifying(
+                    target, maximumSpeculativeRows: 2,
+                    batchesVerifyColumnsAsDecodeRows: columnsAsRows))
+    }
+
+    private func engine(
+        _ m: MuseGlimmerTextModel, drafter: (any CBv2MTPDrafter)?,
+        store: CompleteCheckpointFixtureStore? = nil
+    ) throws -> (EngineV2, PagedKVBackend, [PagedLayerCache]) {
+        m.prefillChunkAlignment = Self.chunk
+        let backend = try PagedKVBackend(
+            layerKinds: m.cbv2LayerKinds,
+            config: .init(
+                capacityBytes: 256 << 20, dtype: m.activationDType, maxPrefillChunk: Self.chunk,
+                nominalMaxSequenceLength: 2048, segmentSizeBytes: 1 << 20,
+                layerDTypes: m.kvStorageDTypes))
+        let caches = backend.makeLayerCaches()
+        let engine = EngineV2(
+            model: MuseGlimmerCBv2Adapter(m), layerKinds: m.cbv2LayerKinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(caches: caches),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: Self.chunk,
+                prefillChunkSize: Self.chunk, soloPrefillStripeTokens: Self.chunk, maxWaiting: 4,
+                enablePrefixCache: store != nil),
+            admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
+            mtpDrafter: drafter,
+            mtpConfig: CBv2MTPConfig(
+                enabled: drafter != nil, maxDraftTokens: 7, maxSpeculativeBatch: 2,
+                fixedDraftTokens: 7, verificationMode: .rectangularExact,
+                maxAutomaticRectangularTokens: 16))
+        if store != nil {
+            engine.loopForTesting.onEngineQueueSync {
+                engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = Self.chunk
+            }
+        }
+        return (engine, backend, caches)
+    }
+
+    /// Layer calls that attended a round as decode rows.
+    private func decodeRowCalls(_ caches: [PagedLayerCache]) -> Int {
+        caches.map(\.mtpColumnsAsRowsCalls).reduce(0, +)
+    }
+
+    private func request(
+        _ prompt: [Int], _ sampling: CBv2SamplingParams, id: UInt64 = 1, receipt: UInt64? = nil
+    ) -> CBv2Request {
+        CBv2Request(
+            id: .init(id), promptTokens: prompt, sampling: sampling, maxTokens: Self.maxTokens,
+            cacheSalt: receipt == nil ? nil : "tenant",
+            prefixCacheReceiptID: receipt.map { .init($0) })
+    }
+
+    private func prompt(_ length: Int, salt: Int) -> [Int] {
+        MuseGlimmerFixture.tokens(length, vocabulary: 96, salt: salt).map(Int.init)
+    }
+
+    private func plain(_ m: MuseGlimmerTextModel, _ request: CBv2Request) async throws -> [Int] {
+        let (engine, _, _) = try engine(m, drafter: nil)
+        let result = await cbv2SchedCollect(try engine.submit(request))
+        await engine.shutdown()
+        #expect(result.tokens.count == Self.maxTokens)
+        return result.tokens
+    }
+
+    /// Tokens, the bit patterns of each token's logprob and top logprobs, and usage.
+    private struct Collected {
+        var tokens: [Int] = []
+        var logprobs: [[UInt32]] = []
+        var usage: CBv2Usage?
+    }
+
+    private func collect(_ stream: AsyncStream<CBv2Event>) async -> Collected {
+        var collected = Collected()
+        for await event in stream {
+            switch event {
+            case .delta(_, let tokens, let logprobs):
+                collected.tokens += tokens
+                for entry in logprobs ?? [] {
+                    let top = entry.topLogprobs.flatMap {
+                        [UInt32($0.token), $0.logprob.bitPattern]
+                    }
+                    collected.logprobs.append(
+                        [UInt32(entry.token), entry.logprob.bitPattern] + top)
+                }
+            case .finished(_, let usage):
+                collected.usage = usage
+                return collected
+            }
+        }
+        return collected
+    }
+
+    /// Target K/V bytes of each saved checkpoint, by position: the prompt's
+    /// bytes below that position.
+    private func promptBytes(_ store: CompleteCheckpointFixtureStore) -> [Int: Data] {
+        var bytes = [Int: Data]()
+        for archive in store.saved {
+            let tensors = archive.manifest.tensors
+            let kv = archive.chunks.filter {
+                [CBv2CheckpointTensorRole.keys, .values].contains(tensors[$0.tensor].role)
+            }.sorted { ($0.tensor, $0.offset) < ($1.tensor, $1.offset) }
+            bytes[archive.manifest.position] = kv.reduce(into: Data()) { $0 += $1.bytes }
+        }
+        return bytes
+    }
+
+    /// Every verification was one rectangular forward. `rounds` counts
+    /// request rounds; one forward verifies the rounds of every row it holds.
+    @discardableResult
+    private func expectRectangular(_ engine: EngineV2) throws -> CBv2MTPMetrics {
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        #expect(metrics.verificationMode == .rectangularExact)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.rectangularVerificationRounds <= metrics.rounds)
+        #expect(metrics.serialVerificationRounds == 0)
+        return metrics
+    }
+
+    @Test func settingsFollowTheTargetAndExactVerificationNeedsAnExactTarget() throws {
+        let plainTower = try target(.bfloat16, exact: false)
+        let serial = MuseGlimmerDFlashDrafter.Settings.verifying(
+            plainTower, maximumSpeculativeRows: 2)
+        #expect(serial.verification == .serialTarget && !serial.commitsAcceptedPrefixPerRow)
+        #expect(serial.maximumSpeculativeRows == 1 && serial.maximumDraftTokens == 7)
+        #expect(throws: MuseGlimmerDFlashError.target("exact verify windows")) {
+            try drafter(plainTower, settings: .init(verification: .rectangularExact))
+        }
+        let exactTower = try target(.bfloat16)
+        let exact = MuseGlimmerDFlashDrafter.Settings.verifying(
+            exactTower, maximumSpeculativeRows: 2)
+        #expect(exact.verification == .rectangularExact && exact.commitsAcceptedPrefixPerRow)
+        #expect(exact.maximumSpeculativeRows == 2)
+        let d = try drafter(exactTower)
+        #expect(d.requiredVerificationMode == .rectangularExact && d.commitsAcceptedPrefixPerRow)
+        // The tower taps other layers of the same count: refused.
+        exactTower.mtpHiddenLayerIDs = [0, 2, 4]
+        #expect(throws: MuseGlimmerDFlashError.target("tapped layers")) { try drafter(exactTower) }
+        exactTower.mtpHiddenLayerIDs = Self.taps
+        // Decode-row attention: on for exact verification unless declined,
+        // never for serial verification, off in a bare `Settings`.
+        #expect(exact.batchesVerifyColumnsAsDecodeRows && d.batchesVerifyColumnsAsDecodeRows)
+        #expect(!serial.batchesVerifyColumnsAsDecodeRows)
+        #expect(!MuseGlimmerDFlashDrafter.Settings().batchesVerifyColumnsAsDecodeRows)
+        #expect(!(try drafter(exactTower, columnsAsRows: false)).batchesVerifyColumnsAsDecodeRows)
+    }
+
+    /// With attention as decode rows and as the column loop.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32], [true, false])
+    func outputEqualsTheTargetAloneGreedyAndSampled(dtype: DType, columnsAsRows: Bool)
+        async throws
+    {
+        let m = try target(dtype)
+        let prompt = prompt(53, salt: 2)
+        for sampling in [Self.greedy, Self.sampled] {
+            let expected = try await plain(m, request(prompt, sampling))
+            for mode in [Scripted.Mode.native, .right, .wrong(at: 0), .wrong(at: 3)] {
+                let scripted = Scripted(
+                    try drafter(m, columnsAsRows: columnsAsRows), mode: mode,
+                    scripts: [prompt + expected], vocabulary: 96)
+                let (engine, backend, caches) = try engine(m, drafter: scripted)
+                let result = await cbv2SchedCollect(try engine.submit(request(prompt, sampling)))
+                #expect(result.tokens == expected, "\(mode) \(sampling.temperature)")
+                try expectRectangular(engine)
+                #expect((decodeRowCalls(caches) > 0) == columnsAsRows)
+                let metrics = try #require(engine.mtpMetricsSnapshot())
+                if mode == .right { #expect(metrics.acceptedTokens == metrics.draftedTokens) }
+                await engine.shutdown()
+                #expect(backend.bytesReserved == 0)
+            }
+        }
+    }
+
+    /// Two requests share each verify forward; each row commits its own prefix.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func twoRequestsVerifiedTogetherEqualTheirSoloOutputs(dtype: DType) async throws {
+        let m = try target(dtype)
+        let prompts = [prompt(53, salt: 2), prompt(29, salt: 7)]
+        for sampling in [Self.greedy, Self.sampled] {
+            var expected = [[Int]]()
+            for (index, prompt) in prompts.enumerated() {
+                expected.append(
+                    try await plain(m, request(prompt, sampling, id: UInt64(index + 1))))
+            }
+            for mode in [Scripted.Mode.right, .wrong(at: 2)] {
+                let scripted = Scripted(
+                    try drafter(m), mode: mode,
+                    scripts: zip(prompts, expected).map { $0 + $1 }, vocabulary: 96)
+                let (engine, backend, caches) = try engine(m, drafter: scripted)
+                let first = try engine.submit(request(prompts[0], sampling, id: 1))
+                let second = try engine.submit(request(prompts[1], sampling, id: 2))
+                async let a = cbv2SchedCollect(first)
+                async let b = cbv2SchedCollect(second)
+                let together = await [a, b]
+                #expect(together.map(\.tokens) == expected, "\(mode) \(sampling.temperature)")
+                // Some forward verified both requests.
+                let metrics = try expectRectangular(engine)
+                #expect(metrics.rectangularVerificationRounds < metrics.rounds)
+                #expect(decodeRowCalls(caches) > 0)
+                await engine.shutdown()
+                #expect(backend.bytesReserved == 0)
+            }
+        }
+    }
+
+    /// A request's decode and verify rows keep their bytes while another
+    /// request's prompt is prefilled beside them and then decodes with them:
+    /// the engine runs each prompt chunk in its own forward (packed prefill is
+    /// off), and decode and verify rows are exact at any row count. Drafter
+    /// off, the logprobs match bit for bit; on, the tokens match.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func decodeAndVerifyRowsKeepTheirBytesBesidePromptChunks(dtype: DType) async throws {
+        let m = try target(dtype)
+        let first = prompt(21, salt: 8)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let (soloEngine, _, _) = try engine(m, drafter: nil)
+        let solo = await collect(try soloEngine.submit(request(first, logged)))
+        await soloEngine.shutdown()
+        #expect(solo.tokens.count == Self.maxTokens && solo.logprobs.count == Self.maxTokens)
+        let greedyTokens = try await plain(m, request(first, Self.greedy))
+        let sampledTokens = try await plain(m, request(first, Self.sampled))
+        #expect(solo.tokens == greedyTokens)
+
+        for length in [3 * Self.chunk + 1, 5 * Self.chunk + 17] {
+            let second = prompt(length, salt: 9)
+            for sampling in [logged, Self.greedy, Self.sampled] {
+                let expected = sampling.temperature == 0 ? greedyTokens : sampledTokens
+                let speculator: (any CBv2MTPDrafter)? =
+                    sampling.topLogprobs > 0
+                    ? nil
+                    : Scripted(
+                        try drafter(m), mode: .wrong(at: 2), scripts: [first + expected],
+                        vocabulary: 96)
+                let (engine, backend, _) = try engine(m, drafter: speculator)
+                let a = try engine.submit(request(first, sampling, id: 1))
+                let b = try engine.submit(request(second, Self.greedy, id: 2))
+                async let ra = collect(a)
+                async let rb = collect(b)
+                let (x, y) = await (ra, rb)
+                let label = "\(length) \(sampling.temperature) \(sampling.topLogprobs)"
+                if speculator == nil {
+                    #expect(x.tokens == solo.tokens && x.logprobs == solo.logprobs, "\(label)")
+                } else {
+                    #expect(x.tokens == expected, "\(label)")
+                    try expectRectangular(engine)
+                }
+                // The first request decoded while the second was prefilling.
+                let (at, bt) = (try #require(x.usage).timing, try #require(y.usage).timing)
+                #expect(at.firstTokenNanos < bt.promptComputedNanos, "\(label)")
+                #expect(bt.prefillChunks >= 3 && bt.packedPrefillChunks == 0, "\(label)")
+                #expect(y.tokens.count == Self.maxTokens, "\(label)")
+                await engine.shutdown()
+                #expect(backend.bytesReserved == 0)
+            }
+        }
+    }
+
+    /// A prompt's bytes depend on the prompt alone. Alone, beside another
+    /// request's decode rows, and beside its verify rows with the drafter on,
+    /// the engine cuts it on the model's grid and runs each cell whole, though
+    /// the step budget holds only one cell: its checkpointed K/V, its tokens
+    /// and its logprobs match bit for bit.
+    @Test(.timeLimit(.minutes(6)), arguments: [DType.bfloat16, .float32])
+    func promptBytesDoNotDependOnLoad(dtype: DType) async throws {
+        let m = try target(dtype)
+        let long = prompt(5 * Self.chunk + 17, salt: 12)
+        let short = prompt(21, salt: 13)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let shortTokens = try await plain(m, request(short, Self.greedy, id: 2))
+
+        func run(beside: Bool, drafting: Bool) async throws -> (Collected, [Int: Data]) {
+            let store = CompleteCheckpointFixtureStore(segmentBytes: 4096)
+            let speculator: (any CBv2MTPDrafter)? =
+                try drafting
+                ? Scripted(
+                    drafter(m), mode: .wrong(at: 2), scripts: [short + shortTokens],
+                    vocabulary: 96)
+                : nil
+            let (engine, backend, _) = try engine(m, drafter: speculator, store: store)
+            let company = try beside ? engine.submit(request(short, Self.greedy, id: 2)) : nil
+            let a = try engine.submit(request(long, logged, id: 1, receipt: 1001))
+            async let ra = collect(a)
+            var other: Collected?
+            if let company { other = await collect(company) }
+            let x = await ra
+            let label = "\(dtype) beside \(beside) drafting \(drafting)"
+            if let other {
+                #expect(other.tokens == shortTokens, "\(label)")
+                // The other request decoded while this prompt was prefilling.
+                let (at, bt) = (try #require(x.usage).timing, try #require(other.usage).timing)
+                #expect(bt.firstTokenNanos < at.promptComputedNanos, "\(label)")
+            }
+            if drafting { try expectRectangular(engine) }
+            #expect(try #require(x.usage).timing.prefillChunks == 6, "\(label)")
+            await engine.shutdown()
+            #expect(backend.bytesReserved == 0)
+            return (x, promptBytes(store))
+        }
+
+        let (solo, soloBytes) = try await run(beside: false, drafting: false)
+        #expect(solo.tokens.count == Self.maxTokens && solo.logprobs.count == Self.maxTokens)
+        #expect(soloBytes.count >= 2 && soloBytes.keys.allSatisfy { $0 % Self.chunk == 0 })
+        for drafting in [false, true] {
+            let (x, bytes) = try await run(beside: true, drafting: drafting)
+            #expect(x.tokens == solo.tokens && x.logprobs == solo.logprobs, "\(drafting)")
+            #expect(bytes == soloBytes, "\(drafting)")
+        }
+    }
+
+    /// A request restored from its shallowest checkpoint equals the cold
+    /// request while another request decodes beside it, drafter off and on:
+    /// the restore continues the cold run's grid, so its tokens, logprobs and
+    /// the checkpoints it captures match the cold run's.
+    @Test(.timeLimit(.minutes(6)))
+    func restoredRequestEqualsColdRequestUnderLoad() async throws {
+        let m = try target(.bfloat16)
+        let long = prompt(5 * Self.chunk + 17, salt: 14)
+        let short = prompt(21, salt: 15)
+        let logged = CBv2SamplingParams(temperature: 0, topLogprobs: 20)
+        let shortTokens = try await plain(m, request(short, Self.greedy, id: 2))
+        for drafting in [false, true] {
+            func speculator() throws -> (any CBv2MTPDrafter)? {
+                try drafting
+                    ? Scripted(
+                        drafter(m), mode: .wrong(at: 2), scripts: [short + shortTokens],
+                        vocabulary: 96)
+                    : nil
+            }
+            let coldStore = CompleteCheckpointFixtureStore(segmentBytes: 4096)
+            let (cold, _, _) = try engine(m, drafter: try speculator(), store: coldStore)
+            let expected = await collect(try cold.submit(request(long, logged, receipt: 1001)))
+            await cold.shutdown()
+            #expect(expected.tokens.count == Self.maxTokens)
+            let coldBytes = promptBytes(coldStore)
+            let first = try #require(
+                coldStore.saved.min { $0.manifest.position < $1.manifest.position })
+            #expect(first.manifest.position <= 2 * Self.chunk)
+
+            let reopened = CompleteCheckpointFixtureStore(archives: [first])
+            let (warm, backend, _) = try engine(m, drafter: try speculator(), store: reopened)
+            let company = try warm.submit(request(short, Self.greedy, id: 2))
+            let warmRequest = request(long, logged, id: 1, receipt: 2002)
+            #expect(try reopened.stage(engine: warm, request: warmRequest))
+            let a = try warm.submit(warmRequest)
+            async let rb = collect(company)
+            let x = await collect(a)
+            let other = await rb
+            #expect(try #require(x.usage?.prefixCachePrefillTokensSaved) > 0, "\(drafting)")
+            #expect(x.tokens == expected.tokens && x.logprobs == expected.logprobs, "\(drafting)")
+            #expect(other.tokens == shortTokens, "\(drafting)")
+            let (at, bt) = (try #require(x.usage).timing, try #require(other.usage).timing)
+            #expect(bt.firstTokenNanos < at.promptComputedNanos, "\(drafting)")
+            if drafting { try expectRectangular(warm) }
+            await warm.shutdown()
+            #expect(backend.bytesReserved == 0)
+            // Checkpoints the restored run captured hold the cold run's bytes.
+            let restored = promptBytes(reopened).filter { $0.key > first.manifest.position }
+            #expect(!restored.isEmpty, "\(drafting)")
+            for (position, bytes) in restored {
+                #expect(coldBytes[position] == nil || coldBytes[position] == bytes, "\(position)")
+            }
+            #expect(restored.keys.contains { coldBytes[$0] != nil }, "\(drafting)")
+        }
+    }
+
+    @Test(.timeLimit(.minutes(6)))
+    func restoredRequestEqualsColdRequestWithTheDrafterOn() async throws {
+        let m = try target(.bfloat16)
+        let prompt = prompt(3 * Self.chunk + 5, salt: 4)
+        for sampling in [Self.greedy, Self.sampled] {
+            let coldStore = CompleteCheckpointFixtureStore(segmentBytes: 4096)
+            let (cold, _, _) = try engine(m, drafter: try drafter(m), store: coldStore)
+            let expected = await cbv2SchedCollect(
+                try cold.submit(request(prompt, sampling, receipt: 1001)))
+            try expectRectangular(cold)
+            await cold.shutdown()
+            #expect(!coldStore.saved.isEmpty)
+            #expect(expected.tokens == (try await plain(m, request(prompt, sampling))))
+
+            let reopened = CompleteCheckpointFixtureStore(archives: coldStore.saved)
+            let scripted = Scripted(
+                try drafter(m), mode: .right, scripts: [prompt + expected.tokens], vocabulary: 96)
+            let (warm, _, _) = try engine(m, drafter: scripted, store: reopened)
+            let warmRequest = request(prompt, sampling, receipt: 2002)
+            #expect(try reopened.stage(engine: warm, request: warmRequest))
+            let restored = await cbv2SchedCollect(try warm.submit(warmRequest))
+            #expect(try #require(restored.usage?.prefixCachePrefillTokensSaved) > 0)
+            #expect(restored.tokens == expected.tokens)
+            try expectRectangular(warm)
+            await warm.shutdown()
+        }
+    }
+}

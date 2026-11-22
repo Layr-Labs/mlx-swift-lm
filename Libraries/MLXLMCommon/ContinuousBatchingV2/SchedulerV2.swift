@@ -280,16 +280,36 @@ public final class SchedulerV2 {
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
 
+    /// The model's prefill grid (`CBv2ModelCapabilities.prefillChunkAlignment`),
+    /// installed by the engine; nil keeps ordinary chunking. A text prompt is
+    /// cut only at multiples of it, at the prompt end and at a boundary its
+    /// prefix plan requires (`prefillGridCell`), and each cell runs whole or
+    /// waits, so load and other requests never move a cut. The solo stripe,
+    /// the plain chunk and the demanded checkpoint ranges do not apply to such
+    /// a row. A step may carry one cell even when `maxBatchedTokensPerStep`
+    /// is smaller.
+    ///
+    /// Fairness: decode rows are planned before prompt rows, so a cell takes
+    /// only what they leave. A cell that does not fit waits, then gets first
+    /// claim on the next step's whole budget through the multimodal block's
+    /// guard (`deferredBlockRequestID`), exempt from the mixed-step quota and
+    /// the prompt-row limits. Only a claim step can leave a decode row
+    /// without a token, and a claim step arms no further claim, so a decode
+    /// row waits at most one step for a cell, and the first cell that did
+    /// not fit runs within two steps; others take claims in running order.
+    var prefillChunkAlignment: Int?
+
     /// Starvation guard for block-sized vision chunks (PR#63 review): the id
-    /// of a row whose next multimodal block fits a FULL step budget (submit
-    /// validates that) but not the budget REMAINING after earlier rows were
-    /// assigned this step. The NEXT `plan()` gives that row first claim on
+    /// of a row whose next multimodal block, or prefill grid cell
+    /// (`prefillChunkAlignment`), fits a FULL step budget (submit validates
+    /// blocks; a step always holds one cell) but not the budget REMAINING
+    /// after earlier rows were assigned this step. The NEXT `plan()` gives that row first claim on
     /// the fresh budget — a running row is moved to the front of `running`,
     /// a waiting row is admitted ahead of the running pass — because
     /// otherwise persistent earlier rows (e.g. long decodes at 1 token/step)
     /// can pin the remaining budget below the block size for the row's whole
     /// deadline and it never progresses.
-    private var deferredBlockRequestID: CBv2RequestID?
+    private(set) var deferredBlockRequestID: CBv2RequestID?
     /// Decode-only plans still owed before the next prompt chunk
     /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`). The
     /// first-token projection starts from it.
@@ -313,6 +333,32 @@ public final class SchedulerV2 {
     public var activeTokens: Int { running.reduce(0) { $0 + $1.effectiveTokenCount } }
 
     public func record(for id: CBv2RequestID) -> CBv2ScheduledRequest? { byID[id] }
+
+    /// The grid cell `[start, start + cell)` of a prompt row, or nil when the
+    /// row is not cut on the grid: no alignment, a row with multimodal blocks
+    /// or a recurrent chunk stride of its own, or a decode row. The cell ends
+    /// at the next multiple of the alignment, the prompt end, `end`, or a
+    /// boundary the prefix plan requires (`CBv2PrefixReusePlan.clampedChunk`),
+    /// whichever comes first. Shared by `plan()` and the deadline projection.
+    static func prefillGridCell(
+        alignment: Int?, start: Int, promptTokens: Int, end: Int,
+        plan: CBv2PrefixReusePlan?, hasBlocks: Bool
+    ) -> Int? {
+        guard let alignment, alignment > 0, !hasBlocks, plan?.recurrentChunkSize == nil,
+            start >= 0, end - start > 1
+        else { return nil }
+        var cellEnd = min((start / alignment + 1) * alignment, end)
+        if start < promptTokens { cellEnd = min(cellEnd, promptTokens) }
+        let cell = cellEnd - start
+        return plan?.clampedChunk(start: start, proposed: cell) ?? cell
+    }
+
+    func prefillGridCell(for rec: CBv2ScheduledRequest) -> Int? {
+        Self.prefillGridCell(
+            alignment: prefillChunkAlignment, start: rec.numComputedTokens,
+            promptTokens: rec.request.promptTokens.count, end: rec.effectiveTokenCount,
+            plan: rec.prefixReusePlan, hasBlocks: !rec.multimodalBlocks.isEmpty)
+    }
 
     // MARK: Submission
 
@@ -415,6 +461,10 @@ public final class SchedulerV2 {
         // chunk delays the striped row's own sample — defeating the very
         // TTFT the stripe exists for.
         func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
+            if let alignment = prefillChunkAlignment, let cell = prefillGridCell(for: rec) {
+                rec.plannedPrefillChunkSize = alignment
+                return cell
+            }
             let cap =
                 rec.prefixReusePlan?.recurrentChunkSize
                 ?? (soloStripe?.id == rec.id
@@ -443,7 +493,9 @@ public final class SchedulerV2 {
             }
             return range.count
         }
-        var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
+        // A step always holds one grid cell (`prefillChunkAlignment`).
+        let stepTokenLimit = max(config.maxBatchedTokensPerStep, prefillChunkAlignment ?? 0)
+        var budget = max(stepTokenLimit, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
         // consumer stays inside the configured step limit, or a successor
         // admitted beside the striped row's final short remainder could
@@ -553,6 +605,25 @@ public final class SchedulerV2 {
             prefillRowsAssigned += 1
         }
 
+        // A claim step arms no further claim, so claim steps never follow
+        // each other (see `prefillChunkAlignment`).
+        let claimStep = deferredRunningID != nil || deferredAdmittedID != nil
+        func armGridClaim(_ rec: CBv2ScheduledRequest) {
+            if !claimStep, deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
+        }
+        // Grid: decode rows are planned first, after only the row holding
+        // the claim; the running order is restored after the plan.
+        let runningOrder: [ObjectIdentifier: Int]? =
+            prefillChunkAlignment == nil
+            ? nil
+            : Dictionary(
+                uniqueKeysWithValues: running.enumerated().map { (ObjectIdentifier($1), $0) })
+        if runningOrder != nil {
+            let claim = running.filter { $0.id == deferredRunningID }
+            let others = running.filter { $0.id != deferredRunningID }
+            running = claim + others.filter(\.isDecodeReady) + others.filter { !$0.isDecodeReady }
+        }
+
         // 1. RUNNING first, in order.
         var idx = 0
         while idx < running.count, budget > 0, !stopScheduling {
@@ -583,6 +654,7 @@ public final class SchedulerV2 {
             }
             var n = rec.remainingTokens
             var speculated = false
+            let gridCell = n > 1 ? prefillGridCell(for: rec) : nil
             if n > 1 {
                 n = min(n, prefillChunkCap(for: rec))  // solo stripe raises ONLY its own row
             } else if let planner = speculationPlanner {
@@ -597,6 +669,17 @@ public final class SchedulerV2 {
                 }
             }
             n = min(n, budget)
+            // A grid cell runs whole: it must fit the budget and the quota
+            // (the row with the claim is exempt from the quota). Otherwise it
+            // waits, untouched, and may arm the first claim.
+            if let gridCell,
+                gridCell > budget
+                    || (rec.id != deferredRunningID && gridCell > prefillHeadroom())
+            {
+                armGridClaim(rec)
+                idx += 1
+                continue
+            }
             // Mixed-step prefill quota: a second budget that binds ONLY on
             // prefill rows. Applied BEFORE snapping/reservation so a skipped
             // row leaves nothing behind: no optimistic advance, no capacity
@@ -639,7 +722,7 @@ public final class SchedulerV2 {
             // block cannot fit this step's remaining budget — skip the row
             // and arm the starvation guard so the NEXT step schedules it
             // first (earlier rows would otherwise starve it indefinitely).
-            n = demandedCheckpointChunk(for: rec, proposed: n)
+            if gridCell == nil { n = demandedCheckpointChunk(for: rec, proposed: n) }
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
             if n <= 0 {
                 if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
@@ -656,7 +739,7 @@ public final class SchedulerV2 {
             // multimodal block.
             var striped =
                 soloStripeTokens != nil && n > config.prefillChunkSize
-                && rec.prefixReusePlan?.recurrentChunkSize == nil
+                && rec.prefixReusePlan?.recurrentChunkSize == nil && gridCell == nil
             var reservationTokens = rec.capacityTokensForChunk(
                 start: rec.numComputedTokens,
                 count: n)
@@ -795,15 +878,22 @@ public final class SchedulerV2 {
                 let normalHeadroom =
                     soloStripe?.id == rec.id
                     ? budget
-                    : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
+                    : max(0, stepTokenLimit - totalAssignedTokens)
                 var chunk = min(
                     rec.remainingTokens, prefillChunkCap(for: rec), budget,
                     normalHeadroom, admissionHeadroom)
+                // A grid cell is admitted whole or the pass ends, arming the
+                // same first claim as a block (FCFS).
+                let gridCell = prefillGridCell(for: rec)
+                if let gridCell, chunk < gridCell {
+                    armGridClaim(rec)
+                    break
+                }
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
                 // block-bearing elder).
-                chunk = demandedCheckpointChunk(for: rec, proposed: chunk)
+                if gridCell == nil { chunk = demandedCheckpointChunk(for: rec, proposed: chunk) }
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
                 guard chunk > 0 else {
@@ -820,7 +910,7 @@ public final class SchedulerV2 {
                     // split) before admission gives up for this step.
                     var striped =
                         soloStripeTokens != nil && chunk > config.prefillChunkSize
-                        && rec.prefixReusePlan?.recurrentChunkSize == nil
+                        && rec.prefixReusePlan?.recurrentChunkSize == nil && gridCell == nil
                     var reservedAdmission = false
                     while !reservedAdmission {
                         let reservationTokens = rec.capacityTokensForChunk(
@@ -861,6 +951,13 @@ public final class SchedulerV2 {
                 assignments.append((id: rec.id, numTokens: chunk))
                 running.append(rec)
             }
+        }
+
+        if let runningOrder {
+            running = running.enumerated().sorted { a, b in
+                (runningOrder[ObjectIdentifier(a.element)] ?? .max, a.offset)
+                    < (runningOrder[ObjectIdentifier(b.element)] ?? .max, b.offset)
+            }.map(\.element)
         }
 
         if !hasDecodeRows {
@@ -918,11 +1015,14 @@ public final class SchedulerV2 {
         guard !rec.isPaused, !rec.cancelRequested, rec.pendingSamples == 0,
             running.count < config.maxConcurrentRequests
         else { return nil }
+        let gridCell = prefillGridCell(for: rec)
         let cap =
-            rec.prefixReusePlan?.recurrentChunkSize
+            gridCell
+            ?? rec.prefixReusePlan?.recurrentChunkSize
             ?? config.plainPrefillChunkSize(hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty)
-        rec.plannedPrefillChunkSize = cap
+        rec.plannedPrefillChunkSize = gridCell != nil ? (prefillChunkAlignment ?? cap) : cap
         var chunk = min(rec.remainingTokens, cap, budget)
+        if let gridCell, chunk < gridCell { return nil }
         chunk = rec.snappedChunkTokens(
             start: rec.numComputedTokens, proposed: chunk, budget: budget)
         guard chunk > 0 else { return nil }
