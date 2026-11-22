@@ -625,6 +625,12 @@ public struct CBv2MTPConfig: Sendable {
     /// ordinary decode semantics (tokens past the match are rolled back).
     /// Off by default; `DARKBLOOM_MTP_STOP_STRING_ROWS=0` overrides an opt-in.
     public var stopStringSpeculation: Bool
+    /// The marginal depth policy picks each row's depth from the measured
+    /// per-depth round costs (`CBv2MTPMarginalDepthPolicy.selectDepthByCost`)
+    /// instead of one linear head-step cost ratio. A family opts in after
+    /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off and `=1`
+    /// turns it on for any family. Tokens are unaffected.
+    public var costCurveDepthSelection: Bool
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")
     /// The opt-in AND the process kill switch.
@@ -667,6 +673,7 @@ public struct CBv2MTPConfig: Sendable {
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
+        costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch
     ) {
         self.enabled = enabled
@@ -678,6 +685,7 @@ public struct CBv2MTPConfig: Sendable {
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
+        self.costCurveDepthSelection = costCurveDepthSelection
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         // A family raises its limit only after measuring that wider rounds pay.

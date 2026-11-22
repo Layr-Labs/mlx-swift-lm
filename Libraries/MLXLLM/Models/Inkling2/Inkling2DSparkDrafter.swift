@@ -576,8 +576,8 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
     /// checkpoint's full block (7 drafts), up to eight speculating rows, one
     /// verify window per round. `adaptive` lets the engine's marginal policy
     /// pick each round's depth from the request's measured acceptance and the
-    /// measured window cost (down to plain decode where drafting does not
-    /// pay); otherwise every round drafts `maxDraftTokens`. The exactness of
+    /// measured cost of each window depth (down to plain decode where drafting
+    /// does not pay); otherwise every round drafts `maxDraftTokens`. The exactness of
     /// the window is the target's claim (`requiredVerificationMode`).
     public static func defaultMTPConfig(
         maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8
@@ -587,6 +587,7 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
             maxSpeculativeBatch: maxSpeculativeRows,
             fixedDraftTokens: adaptive ? nil : maxDraftTokens, verificationMode: .rectangular,
             maxAutomaticRectangularTokens: maxSpeculativeRows * (maxDraftTokens + 1),
+            costCurveDepthSelection: true,
             speculativeBatchLimit: maxSpeculativeRows)
     }
 }

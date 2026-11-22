@@ -197,6 +197,12 @@ struct Inkling2DSparkEngineTests {
         return outputs
     }
 
+    @Test("the shipped configuration picks depths from the measured per-depth costs")
+    func shippedConfigurationUsesTheCostCurve() {
+        #expect(Inkling2DSparkDrafter.defaultMTPConfig().costCurveDepthSelection)
+        #expect(!CBv2MTPConfig(enabled: true).costCurveDepthSelection)
+    }
+
     @Test("resetting the depth policy's cost learning while idle keeps every token")
     func costLearningResetKeepsTokens() async throws {
         let prompts = Self.prompts(2)
