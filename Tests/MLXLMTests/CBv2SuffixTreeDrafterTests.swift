@@ -208,21 +208,43 @@ struct CBv2SuffixTreeDrafterTests {
         #expect(drafter.hasCandidateMatch(for: [(CBv2RequestID(1), matching)]))
         #expect(!drafter.hasCandidateMatch(for: [(CBv2RequestID(2), nonMatching)]))
 
-        // B = 4 with 1 matching row (7 drafts -> mean 1.75 >= 1.5, matching 1 >= 1): profitable.
-        let mixedB4: [(id: CBv2RequestID, tokens: [Int])] = [
+        // B = 4 with only 1 matching row (< 50% of batch): gate suppresses round so
+        // non-repetitive continuous batches never stall on false-positive verification.
+        let sparseB4: [(id: CBv2RequestID, tokens: [Int])] = [
             (CBv2RequestID(1), matching),
             (CBv2RequestID(2), nonMatching),
             (CBv2RequestID(3), nonMatching),
             (CBv2RequestID(4), nonMatching),
         ]
-        #expect(drafter.hasCandidateMatch(for: mixedB4))
-        let proposedB4 = drafter.proposeDrafts(for: mixedB4, maxDraftTokens: 7)
-        #expect(proposedB4.depth == 7)
-        #expect(proposedB4.draftsByRequest[CBv2RequestID(1)] == [7, 8, 9, 10, 11, 12, 1])
-        #expect(
-            proposedB4.draftsByRequest[CBv2RequestID(2)] == Array(repeating: Int32(0), count: 7))
+        #expect(!drafter.hasCandidateMatch(for: sparseB4))
 
-        // B = 12 with only 1 matching row (< max(1, (12+3)/4) == 3): gate suppresses round.
+        // B = 4 with 2 strong-matching rows (>= 50%, matchLen >= 4, post-cap mean >= 0.5):
+        // passes and caps B >= 3 depth at 1 (width 2) for compiled verification, monotonically
+        // across maxDraftTokens = 1..7.
+        let mixedB4: [(id: CBv2RequestID, tokens: [Int])] = [
+            (CBv2RequestID(1), matching),
+            (CBv2RequestID(2), matching),
+            (CBv2RequestID(3), nonMatching),
+            (CBv2RequestID(4), nonMatching),
+        ]
+        #expect(drafter.hasCandidateMatch(for: mixedB4, maxDraftTokens: 7))
+        #expect(drafter.hasCandidateMatch(for: mixedB4, maxDraftTokens: 2))
+        let proposedB4 = drafter.proposeDrafts(for: mixedB4, maxDraftTokens: 7)
+        #expect(proposedB4.depth == 1)
+        #expect(proposedB4.draftsByRequest[CBv2RequestID(1)] == [7])
+        #expect(proposedB4.draftsByRequest[CBv2RequestID(2)] == [7])
+        #expect(proposedB4.draftsByRequest[CBv2RequestID(3)] == [0])
+
+        // B = 2 with 2 strong-matching rows caps depth at 2 (width 3, 2*3*8=48 < 64 compiled).
+        let pairB2: [(id: CBv2RequestID, tokens: [Int])] = [
+            (CBv2RequestID(1), matching),
+            (CBv2RequestID(2), matching),
+        ]
+        let proposedB2 = drafter.proposeDrafts(for: pairB2, maxDraftTokens: 7)
+        #expect(proposedB2.depth == 2)
+        #expect(proposedB2.draftsByRequest[CBv2RequestID(1)] == [7, 8])
+
+        // B = 12 with only 1 matching row (< 50% threshold == 6): gate suppresses round.
         var sparseB12: [(id: CBv2RequestID, tokens: [Int])] = [(CBv2RequestID(1), matching)]
         for i in 2 ... 12 {
             sparseB12.append((CBv2RequestID(UInt64(i)), Array((100 + i * 20) ..< (120 + i * 20))))
