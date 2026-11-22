@@ -140,21 +140,15 @@ public final class SamplerV2 {
                 continue
             }
             let key = MLXRandom.key(Self.mix(seed: row.seed, id: row.id.raw, step: row.step))
-            let u = MLXRandom.uniform(
-                low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
-            // e = -log(1 - u) ~ Exp(1); u ∈ [0, 1) keeps the log argument in
-            // (0, 1]. Clamp away e == 0 (u == 0) so probs/e never divides
-            // by zero.
-            let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
-            perRow.append(e)
+            perRow.append(Self.exponentialNoise(vocab: vocab, key: key))
         }
         return concatenated(perRow, axis: 0)
     }
 
     /// MTP verify pre-sampling noise: one Exp(1) row per (request, window
     /// position), keyed EXACTLY like the step path —
-    /// `mix(seed ?? fallbackSeed, id, step)` with the same uniform→-log(1-u)
-    /// transform and zero clamp — so a verify position's draw is bitwise the
+    /// `mix(seed ?? fallbackSeed, id, step)` with the same noise transform,
+    /// so a verify position's draw is bitwise the
     /// draw the ordinary path would have made at that per-request step.
     /// Greedy rows receive the same constant placeholder as `sample`.
     func verifyExponentialNoise(
@@ -169,12 +163,17 @@ public final class SamplerV2 {
             }
             let key = MLXRandom.key(
                 Self.mix(seed: row.seed ?? fallbackSeed, id: row.id, step: row.step))
-            let u = MLXRandom.uniform(
-                low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
-            let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
-            perRow.append(e)
+            perRow.append(Self.exponentialNoise(vocab: vocab, key: key))
         }
         return concatenated(perRow, axis: 0)
+    }
+
+    private static func exponentialNoise(vocab: Int, key: MLXArray) -> MLXArray {
+        let u = MLXRandom.uniform(
+            low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
+        // Put zero at the midpoint of its 32-bit RNG bucket. log1p preserves
+        // small positive draws that would round 1 - u to 1 in Float32.
+        return -log1p(-maximum(u, Float(0x1p-33)))
     }
 
     /// SplitMix64-style mix of (seed, requestID, step) into one RNG key
