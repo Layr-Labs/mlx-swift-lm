@@ -861,16 +861,31 @@ public enum CBv2SparseHeadSamplingMode {
 /// bit-plane of an 8-bit vocabulary projection.
 public protocol CBv2SparseHeadSampleableModel: AnyObject {
     var supportsSparseExactHeadSampling: Bool { get }
+    var supportsSparseHeadWithMTPHidden: Bool { get }
     var sparseHeadVocabularySize: Int { get }
     func forwardHiddenForSparseHead(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> MLXArray
+    /// Optional combined sparse-head + MTP hidden forward for non-recurrent ordinary
+    /// decode steps carrying persistent drafter history (e.g. DFlash at `B >= 3`).
+    func forwardHiddenForSparseHeadWithMTPHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (postNorm: MLXArray, mtpHidden: MLXArray)?
     func sparseExactHeadSample(
         hidden: MLXArray, mode: CBv2SparseHeadSamplingMode
     ) -> (tokens: MLXArray, nonFinite: MLXArray)?
     /// Project post-norm `hidden` (`[B, 1, H]` or `[B, H]`) to dense `[B, vocab]`
     /// logits if `sparseExactHeadSample` declines after the trunk already advanced KV.
     func applySparseHeadFallbackLogits(hidden: MLXArray) -> MLXArray
+}
+
+extension CBv2SparseHeadSampleableModel {
+    public var supportsSparseHeadWithMTPHidden: Bool { false }
+    public func forwardHiddenForSparseHeadWithMTPHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (postNorm: MLXArray, mtpHidden: MLXArray)? {
+        nil
+    }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)

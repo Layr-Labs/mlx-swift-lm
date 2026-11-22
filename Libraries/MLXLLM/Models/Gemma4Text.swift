@@ -3584,12 +3584,24 @@ extension Gemma4TextModel: CBv2SparseHeadSampleableModel {
             && model.embedTokens is Gemma4Hi4Lo4Embedding
     }
 
+    public var supportsSparseHeadWithMTPHidden: Bool {
+        supportsSparseExactHeadSampling
+    }
+
     public var sparseHeadVocabularySize: Int { vocabularySize }
 
     public func forwardHiddenForSparseHead(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> MLXArray {
         model(tokens, cache: caches.map { $0 as! any KVCache })
+    }
+
+    public func forwardHiddenForSparseHeadWithMTPHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (postNorm: MLXArray, mtpHidden: MLXArray)? {
+        let (postNorm, mtpHidden) = model.callCapturingPreNorm(
+            tokens, cache: caches.map { $0 as! any KVCache }, schedulePrefill: false)
+        return (postNorm, mtpHidden)
     }
 
     public func sparseExactHeadSample(

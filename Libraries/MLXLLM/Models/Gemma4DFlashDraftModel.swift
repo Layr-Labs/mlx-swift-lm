@@ -200,51 +200,347 @@ public enum Gemma4DFlashLoadError: Error, LocalizedError {
 /// (`[1, nKvHeads, T, headDim]`). Ephemeral proposal K/V tokens are never written
 /// into this cache, so trimming/rollback of rejected drafts is unnecessary.
 final class Gemma4DFlashLayerCache {
-    var keys: MLXArray?
-    var values: MLXArray?
+    /// Zero-copy pre-round rollback snapshot for bounded sliding layers (`maxSize != nil`).
+    /// Unbounded full-attention layers (`maxSize == nil`) stage round deltas separately and
+    /// return `nil` from `makeRollbackSnapshot()` so `keys`/`values` retain `use_count == 1`.
+    struct RollbackSnapshot {
+        let keys: MLXArray?
+        let values: MLXArray?
+        let used: Int
+        let offset: Int
+    }
+
+    /// Committed backing storage (`[1, nKvHeads, cap, headDim]`).
+    /// For unbounded full-attention layers (`maxSize == nil`), grown in `step = 256` token
+    /// chunks on `commitStaged()` in `finalizeRound`, keeping `use_count == 1` for in-place
+    /// Metal buffer donation while `discardStaged()` rolls back aborted rounds in O(1) without
+    /// ever aliasing or mutating committed buffers.
+    private(set) var keys: MLXArray?
+    private(set) var values: MLXArray?
+    private(set) var used: Int = 0
     var offset: Int = 0
+    private(set) var stagedKeys: MLXArray?
+    private(set) var stagedValues: MLXArray?
+    private(set) var stagedAdded: Int = 0
     let maxSize: Int?
+    private static let growthStep = 256
 
     init(maxSize: Int?) {
         self.maxSize = maxSize
     }
 
+    private func committedSlice(_ backing: MLXArray?) -> MLXArray? {
+        guard let backing, used > 0 else { return nil }
+        return used == backing.dim(2) ? backing : backing[0..., 0..., 0 ..< used, 0...]
+    }
+
+    private func activeTensor(committed: MLXArray?, staged: MLXArray?) -> MLXArray? {
+        let base = committedSlice(committed)
+        if let base, let staged { return concatenated([base, staged], axis: 2) }
+        return staged ?? base
+    }
+
+    var activeKeys: MLXArray? { activeTensor(committed: keys, staged: stagedKeys) }
+    var activeValues: MLXArray? { activeTensor(committed: values, staged: stagedValues) }
+
     func appendContext(keys newK: MLXArray, values newV: MLXArray) -> (MLXArray, MLXArray) {
         let added = newK.dim(2)
-        var k: MLXArray
-        var v: MLXArray
-        if let existingK = keys, let existingV = values {
-            k = concatenated([existingK, newK], axis: 2)
-            v = concatenated([existingV, newV], axis: 2)
+        if let maxSize {
+            var k: MLXArray
+            var v: MLXArray
+            if let existingK = keys, let existingV = values {
+                k = concatenated([existingK, newK], axis: 2)
+                v = concatenated([existingV, newV], axis: 2)
+            } else {
+                k = newK
+                v = newV
+            }
+            if k.dim(2) > maxSize {
+                let start = k.dim(2) - maxSize
+                k = k[0..., 0..., start..., 0...]
+                v = v[0..., 0..., start..., 0...]
+            }
+            self.keys = k
+            self.values = v
+            self.used = k.dim(2)
+            self.offset += added
+            return (k, v)
+        }
+
+        // Unbounded full-attention layer: stage the active round's delta separately so
+        // committed `keys`/`values` are never mutated prior to `finalizeRound`.
+        let sk: MLXArray
+        let sv: MLXArray
+        if let existingSK = stagedKeys, let existingSV = stagedValues {
+            sk = concatenated([existingSK, newK], axis: 2)
+            sv = concatenated([existingSV, newV], axis: 2)
         } else {
-            k = newK
-            v = newV
+            sk = newK
+            sv = newV
         }
-        if let maxSize, k.dim(2) > maxSize {
-            let start = k.dim(2) - maxSize
-            k = k[0..., 0..., start..., 0...]
-            v = v[0..., 0..., start..., 0...]
+        stagedKeys = sk
+        stagedValues = sv
+        stagedAdded += added
+        offset += added
+        let outK = committedSlice(keys).map { concatenated([$0, sk], axis: 2) } ?? sk
+        let outV = committedSlice(values).map { concatenated([$0, sv], axis: 2) } ?? sv
+        return (outK, outV)
+    }
+
+    /// Commit staged full-attention KV into the stepped backing buffer after a round finalizes.
+    func commitStaged() {
+        guard maxSize == nil, let sk = stagedKeys, let sv = stagedValues else { return }
+        let added = sk.dim(2)
+        guard added > 0 else {
+            clearStaged()
+            return
         }
-        self.keys = k
-        self.values = v
-        self.offset += added
-        return (k, v)
+        let prev = used
+        let next = prev + added
+        if next > (keys?.dim(2) ?? 0) {
+            let b = sk.dim(0)
+            let kvH = sk.dim(1)
+            let d = sk.dim(3)
+            let step = Self.growthStep
+            let newCap = ((next + step - 1) / step) * step
+            let newBufK = MLXArray.zeros([b, kvH, newCap, d], dtype: sk.dtype)
+            let newBufV = MLXArray.zeros([b, kvH, newCap, d], dtype: sv.dtype)
+            if let existingK = keys, let existingV = values, prev > 0 {
+                newBufK[0..., 0..., 0 ..< prev, 0...] = existingK[0..., 0..., 0 ..< prev, 0...]
+                newBufV[0..., 0..., 0 ..< prev, 0...] = existingV[0..., 0..., 0 ..< prev, 0...]
+            }
+            keys = newBufK
+            values = newBufV
+        }
+        keys?[0..., 0..., prev ..< next, 0...] = sk
+        values?[0..., 0..., prev ..< next, 0...] = sv
+        used = next
+        clearStaged()
+    }
+
+    /// Drop staged full-attention KV on `discardRound` without touching committed storage.
+    func discardStaged() {
+        guard maxSize == nil, stagedAdded > 0 || stagedKeys != nil else { return }
+        offset -= stagedAdded
+        clearStaged()
+    }
+
+    func makeRollbackSnapshot() -> RollbackSnapshot? {
+        guard maxSize != nil else { return nil }
+        return RollbackSnapshot(keys: keys, values: values, used: used, offset: offset)
+    }
+
+    func rollback(to snapshot: RollbackSnapshot?) {
+        if let snapshot {
+            keys = snapshot.keys
+            values = snapshot.values
+            used = snapshot.used
+            offset = snapshot.offset
+        } else {
+            discardStaged()
+        }
+    }
+
+    func unsharedBytes(in snapshot: RollbackSnapshot?) -> Int {
+        guard let snapshot else { return 0 }
+        var bytes = 0
+        if let k = snapshot.keys, k !== keys { bytes += k.nbytes }
+        if let v = snapshot.values, v !== values { bytes += v.nbytes }
+        return bytes
+    }
+
+    func appendEvalTargets(to targets: inout [MLXArray]) {
+        if let keys { targets.append(keys) }
+        if let values { targets.append(values) }
+        if let stagedKeys { targets.append(stagedKeys) }
+        if let stagedValues { targets.append(stagedValues) }
     }
 
     func reset() {
         keys = nil
         values = nil
+        used = 0
         offset = 0
+        clearStaged()
     }
 
     var materializedBytes: Int {
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+            + (stagedKeys?.nbytes ?? 0) + (stagedValues?.nbytes ?? 0)
+    }
+
+    private func clearStaged() {
+        stagedKeys = nil
+        stagedValues = nil
+        stagedAdded = 0
     }
 }
 
 // MARK: - DFlash Layers (Matches z-lab/dflash/dflash/model_mlx.py)
 
-final class Gemma4DFlashAttention: Module {
+/// Non-`Module` holder for fused projections so `Module.buildCaches()` Mirror reflection
+/// never exposes fused caches as child modules or parameters.
+private final class DFlashFusedLinearSlot {
+    private let watchedKeys: [String]
+    private(set) var primary: Linear?
+    private(set) var secondary: Linear?
+    private var isPreparing: Bool = false
+
+    init(watchedKeys: [String]) {
+        self.watchedKeys = watchedKeys
+    }
+
+    func invalidate() {
+        guard !isPreparing else { return }
+        primary = nil
+        secondary = nil
+    }
+
+    func invalidateIfNeeded(moduleKey key: String) {
+        if watchedKeys.contains(key) {
+            invalidate()
+        }
+    }
+
+    func invalidateIfNeeded(parameterKeys keys: [String]) {
+        if keys.contains(where: matchesWatchedKey) {
+            invalidate()
+        }
+    }
+
+    private func matchesWatchedKey(_ key: String) -> Bool {
+        let head = key.firstIndex(of: ".").map { key[..<$0] } ?? key[...]
+        return watchedKeys.contains { $0 == head }
+    }
+
+    /// Coalesce `projections` into a single backing `Linear`/`QuantizedLinear` and replace
+    /// the named child modules on `owner` with zero-copy row slices (0 extra RAM).
+    func prepare(
+        on owner: Module,
+        projections: [(key: String, linear: Linear, expectedRows: Int)],
+        secondaryRange: Range<Int>? = nil
+    ) {
+        guard primary == nil else { return }
+        guard
+            projections.allSatisfy({
+                $0.linear.weight.ndim == 2 && $0.linear.weight.dim(0) == $0.expectedRows
+            }),
+            let fused = Self.makeFusedLinear(projections.map(\.linear))
+        else { return }
+
+        let trainingFlags = projections.map(\.linear.training)
+        let secondarySlice = secondaryRange.map {
+            Self.sliceLinear(fused, range: $0, training: false)
+        }
+        if let secondarySlice { eval(secondarySlice) }
+
+        var childModules: [String: Linear] = Dictionary(minimumCapacity: projections.count)
+        var rowOffset = 0
+        for (projection, training) in zip(projections, trainingFlags) {
+            let nextOffset = rowOffset + projection.expectedRows
+            childModules[projection.key] = Self.sliceLinear(
+                fused, range: rowOffset ..< nextOffset, training: training)
+            rowOffset = nextOffset
+        }
+
+        isPreparing = true
+        defer { isPreparing = false }
+        owner.update(modules: ModuleChildren.unflattened(childModules))
+        primary = fused
+        secondary = secondarySlice
+    }
+
+    private static func makeFusedLinear(_ linears: [Linear]) -> Linear? {
+        guard let first = linears.first, linears.count >= 2 else { return nil }
+        guard linears.allSatisfy({ $0.bias == nil && $0.weight.ndim == 2 }) else { return nil }
+        if type(of: first) == QuantizedLinear.self, let q0 = first as? QuantizedLinear {
+            return fuseQuantized(linears, first: q0)
+        }
+        if type(of: first) == Linear.self {
+            return fuseDense(linears, first: first)
+        }
+        return nil
+    }
+
+    private static func fuseQuantized(
+        _ linears: [Linear], first q0: QuantizedLinear
+    ) -> QuantizedLinear? {
+        let qLinears = linears.compactMap { $0 as? QuantizedLinear }
+        guard qLinears.count == linears.count,
+            q0.scales.ndim == 2,
+            qLinears.allSatisfy({
+                type(of: $0) == QuantizedLinear.self
+                    && $0.globalScale == nil
+                    && $0.groupSize == q0.groupSize && $0.bits == q0.bits && $0.mode == q0.mode
+                    && $0.weight.dim(1) == q0.weight.dim(1)
+                    && $0.weight.dtype == q0.weight.dtype
+                    && $0.scales.ndim == 2
+                    && $0.scales.dim(0) == $0.weight.dim(0)
+                    && $0.scales.dim(1) == q0.scales.dim(1)
+                    && $0.scales.dtype == q0.scales.dtype
+                    && ($0.biases == nil) == (q0.biases == nil)
+            })
+        else { return nil }
+        if let b0 = q0.biases {
+            guard b0.ndim == 2,
+                qLinears.allSatisfy({
+                    guard let b = $0.biases else { return false }
+                    return b.ndim == 2 && b.dim(0) == $0.weight.dim(0)
+                        && b.dim(1) == b0.dim(1) && b.dtype == b0.dtype
+                })
+            else { return nil }
+        }
+        let w = concatenated(qLinears.map(\.weight), axis: 0)
+        let s = concatenated(qLinears.map(\.scales), axis: 0)
+        let b: MLXArray? =
+            q0.biases != nil ? concatenated(qLinears.compactMap(\.biases), axis: 0) : nil
+        if let b { eval(w, s, b) } else { eval(w, s) }
+        let fused = QuantizedLinear(
+            weight: w, bias: nil, scales: s, biases: b,
+            groupSize: q0.groupSize, bits: q0.bits, mode: q0.mode)
+        fused.freeze()
+        fused.train(false)
+        return fused
+    }
+
+    private static func fuseDense(_ linears: [Linear], first: Linear) -> Linear? {
+        guard
+            linears.allSatisfy({
+                type(of: $0) == Linear.self
+                    && $0.weight.dim(1) == first.weight.dim(1)
+                    && $0.weight.dtype == first.weight.dtype
+            })
+        else { return nil }
+        let w = concatenated(linears.map(\.weight), axis: 0)
+        eval(w)
+        let fused = Linear(weight: w, bias: nil)
+        fused.train(false)
+        return fused
+    }
+
+    private static func sliceLinear(
+        _ fused: Linear, range: Range<Int>, training: Bool
+    ) -> Linear {
+        if let q = fused as? QuantizedLinear {
+            let view = QuantizedLinear(
+                weight: q.weight[range, 0...],
+                bias: nil,
+                scales: q.scales[range, 0...],
+                biases: q.biases?[range, 0...],
+                groupSize: q.groupSize,
+                bits: q.bits,
+                mode: q.mode)
+            view.freeze()
+            view.train(training)
+            return view
+        }
+        let view = Linear(weight: fused.weight[range, 0...], bias: nil)
+        view.train(training)
+        return view
+    }
+}
+
+final class Gemma4DFlashAttention: Module, ParameterUpdateObserving {
     let nHeads: Int
     let nKvHeads: Int
     let headDim: Int
@@ -259,6 +555,8 @@ final class Gemma4DFlashAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+
+    private let fusedSlot = DFlashFusedLinearSlot(watchedKeys: ["q_proj", "k_proj", "v_proj"])
 
     init(_ config: Gemma4DFlashConfiguration, layerIdx: Int) {
         let dim = config.hiddenSize
@@ -276,6 +574,64 @@ final class Gemma4DFlashAttention: Module {
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
         self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
         super.init()
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters,
+        verify: Module.VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        let keys = parameters.flattened().map(\.0)
+        defer { fusedSlot.invalidateIfNeeded(parameterKeys: keys) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        defer { fusedSlot.invalidateIfNeeded(moduleKey: key) }
+        try super.updateModule(key: key, value)
+    }
+
+    func ancestorDidUpdateParameters(keys: [String]) {
+        fusedSlot.invalidateIfNeeded(parameterKeys: keys)
+    }
+
+    func prepareFusedQKV() {
+        let qDim = nHeads * headDim
+        let kvDim = nKvHeads * headDim
+        fusedSlot.prepare(
+            on: self,
+            projections: [
+                ("q_proj", qProj, qDim),
+                ("k_proj", kProj, kvDim),
+                ("v_proj", vProj, kvDim),
+            ],
+            secondaryRange: qDim ..< (qDim + 2 * kvDim))
+    }
+
+    private func projectProposalQKV(_ x: MLXArray) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let qDim = nHeads * headDim
+        let kvDim = nKvHeads * headDim
+        if let fusedQKV = fusedSlot.primary {
+            let qkv = fusedQKV(x)
+            return (
+                qkv[0..., 0..., 0 ..< qDim],
+                qkv[0..., 0..., qDim ..< (qDim + kvDim)],
+                qkv[0..., 0..., (qDim + kvDim)...]
+            )
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
+    private func projectContextKV(_ ctx: MLXArray) -> (k: MLXArray, v: MLXArray) {
+        let kvDim = nKvHeads * headDim
+        if let fusedKV = fusedSlot.secondary {
+            let kv = fusedKV(ctx)
+            return (kv[0..., 0..., 0 ..< kvDim], kv[0..., 0..., kvDim...])
+        }
+        return (kProj(ctx), vProj(ctx))
     }
 
     private func trimSlidingContext(
@@ -320,29 +676,32 @@ final class Gemma4DFlashAttention: Module {
         let b = x.dim(0)
         let l = x.dim(1)
 
-        var cachedK = cache.keys
-        var cachedV = cache.values
+        let cachedK: MLXArray?
+        let cachedV: MLXArray?
         if let rawCtx = xCtx, rawCtx.dim(1) > 0 {
             let ctx = trimSlidingContext(rawCtx, cache: cache)
             let s = ctx.dim(1)
-            var ctxK = kProj(ctx).reshaped(b, s, nKvHeads, headDim)
+            let (rawCtxK, rawCtxV) = projectContextKV(ctx)
+            var ctxK = rawCtxK.reshaped(b, s, nKvHeads, headDim)
             ctxK = kNorm(ctxK).transposed(0, 2, 1, 3)
             ctxK = rope(ctxK, offset: cache.offset)
-            let ctxV = vProj(ctx).reshaped(b, s, nKvHeads, headDim).transposed(0, 2, 1, 3)
-            let updated = cache.appendContext(keys: ctxK, values: ctxV)
-            cachedK = updated.0
-            cachedV = updated.1
+            let ctxV = rawCtxV.reshaped(b, s, nKvHeads, headDim).transposed(0, 2, 1, 3)
+            (cachedK, cachedV) = cache.appendContext(keys: ctxK, values: ctxV)
+        } else {
+            cachedK = cache.activeKeys
+            cachedV = cache.activeValues
         }
 
         let qOffset = cache.offset
-        var queries = qProj(x).reshaped(b, l, nHeads, headDim)
+        let (rawQ, rawPK, rawPV) = projectProposalQKV(x)
+        var queries = rawQ.reshaped(b, l, nHeads, headDim)
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         queries = rope(queries, offset: qOffset)
 
-        var propK = kProj(x).reshaped(b, l, nKvHeads, headDim)
+        var propK = rawPK.reshaped(b, l, nKvHeads, headDim)
         propK = kNorm(propK).transposed(0, 2, 1, 3)
         propK = rope(propK, offset: qOffset)
-        let propV = vProj(x).reshaped(b, l, nKvHeads, headDim).transposed(0, 2, 1, 3)
+        let propV = rawPV.reshaped(b, l, nKvHeads, headDim).transposed(0, 2, 1, 3)
 
         let ctxLen = cachedK?.dim(2) ?? 0
         let keys = cachedK.map { concatenated([$0, propK], axis: 2) } ?? propK
@@ -368,10 +727,11 @@ final class Gemma4DFlashAttention: Module {
             return self(x, context: contexts[0], rope: rope, cache: caches[0])
         }
 
-        // Batched Q/K/V projections for all B proposal blocks (1 weight read).
-        let qAll = qNorm(qProj(x).reshaped(b, l, nHeads, headDim)).transposed(0, 2, 1, 3)
-        let pKAll = kNorm(kProj(x).reshaped(b, l, nKvHeads, headDim)).transposed(0, 2, 1, 3)
-        let pVAll = vProj(x).reshaped(b, l, nKvHeads, headDim).transposed(0, 2, 1, 3)
+        // Batched fused Q/K/V projection for all B proposal blocks (1 weight read).
+        let (rawQ, rawPK, rawPV) = projectProposalQKV(x)
+        let qAll = qNorm(rawQ.reshaped(b, l, nHeads, headDim)).transposed(0, 2, 1, 3)
+        let pKAll = kNorm(rawPK.reshaped(b, l, nKvHeads, headDim)).transposed(0, 2, 1, 3)
+        let pVAll = rawPV.reshaped(b, l, nKvHeads, headDim).transposed(0, 2, 1, 3)
 
         // Trim over-window pending contexts and concatenate them for 1 batched ctx K/V projection.
         var nonEmptyCtx: [MLXArray] = []
@@ -391,9 +751,10 @@ final class Gemma4DFlashAttention: Module {
         if totalCtxLen > 0 {
             let joinedCtx =
                 nonEmptyCtx.count == 1 ? nonEmptyCtx[0] : concatenated(nonEmptyCtx, axis: 1)
-            let allCtxK = kNorm(kProj(joinedCtx).reshaped(1, totalCtxLen, nKvHeads, headDim))
+            let (rawCtxK, rawCtxV) = projectContextKV(joinedCtx)
+            let allCtxK = kNorm(rawCtxK.reshaped(1, totalCtxLen, nKvHeads, headDim))
                 .transposed(0, 2, 1, 3)
-            let allCtxV = vProj(joinedCtx).reshaped(1, totalCtxLen, nKvHeads, headDim)
+            let allCtxV = rawCtxV.reshaped(1, totalCtxLen, nKvHeads, headDim)
                 .transposed(0, 2, 1, 3)
             for slice in ctxSlices {
                 let lo = slice.start
@@ -407,13 +768,14 @@ final class Gemma4DFlashAttention: Module {
         attnRows.reserveCapacity(b)
         for i in 0 ..< b {
             let cache = caches[i]
-            var cachedK = cache.keys
-            var cachedV = cache.values
+            let cachedK: MLXArray?
+            let cachedV: MLXArray?
             if let rawK = newCtxKByRow[i], let rawV = newCtxVByRow[i] {
                 let rotK = rope(rawK, offset: cache.offset)
-                let updated = cache.appendContext(keys: rotK, values: rawV)
-                cachedK = updated.0
-                cachedV = updated.1
+                (cachedK, cachedV) = cache.appendContext(keys: rotK, values: rawV)
+            } else {
+                cachedK = cache.activeKeys
+                cachedV = cache.activeValues
             }
             let qOffset = cache.offset
             let qi = rope(qAll[i ..< (i + 1), 0..., 0..., 0...], offset: qOffset)
@@ -433,12 +795,16 @@ final class Gemma4DFlashAttention: Module {
     }
 }
 
-final class Gemma4DFlashMLP: Module {
+final class Gemma4DFlashMLP: Module, ParameterUpdateObserving {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    private let intermediateSize: Int
+    private let fusedSlot = DFlashFusedLinearSlot(watchedKeys: ["gate_proj", "up_proj"])
+
     init(_ config: Gemma4DFlashConfiguration) {
+        self.intermediateSize = config.intermediateSize
         self._gateProj.wrappedValue = Linear(
             config.hiddenSize, config.intermediateSize, bias: false)
         self._upProj.wrappedValue = Linear(
@@ -448,8 +814,45 @@ final class Gemma4DFlashMLP: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters,
+        verify: Module.VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        let keys = parameters.flattened().map(\.0)
+        defer { fusedSlot.invalidateIfNeeded(parameterKeys: keys) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        defer { fusedSlot.invalidateIfNeeded(moduleKey: key) }
+        try super.updateModule(key: key, value)
+    }
+
+    func ancestorDidUpdateParameters(keys: [String]) {
+        fusedSlot.invalidateIfNeeded(parameterKeys: keys)
+    }
+
+    func prepareFusedGateUp() {
+        fusedSlot.prepare(
+            on: self,
+            projections: [
+                ("gate_proj", gateProj, intermediateSize),
+                ("up_proj", upProj, intermediateSize),
+            ])
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        if let fusedGateUp = fusedSlot.primary {
+            let gu = fusedGateUp(x)
+            let gate = gu[0..., 0..., 0 ..< intermediateSize]
+            let up = gu[0..., 0..., intermediateSize...]
+            return downProj(silu(gate) * up)
+        }
+        return downProj(silu(gateProj(x)) * upProj(x))
     }
 }
 
@@ -467,6 +870,18 @@ final class Gemma4DFlashDecoderLayer: Module {
         self._postAttentionLayernorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         super.init()
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters,
+        verify: Module.VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     func callAsFunction(
@@ -671,7 +1086,31 @@ public final class Gemma4DFlashDraftModel: Module, @unchecked Sendable {
             eval(model)
             Memory.clearCache()
         }
+        model.prepareFusions()
+        eval(model)
+        Memory.clearCache()
         return model
+    }
+
+    /// Zero-extra-RAM load-time fusion of `q_proj/k_proj/v_proj` and `gate_proj/up_proj`
+    /// across all draft layers (replaces child projections with zero-copy row slices).
+    public func prepareFusions() {
+        for layer in layers {
+            layer.selfAttn.prepareFusedQKV()
+            layer.mlp.prepareFusedGateUp()
+        }
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters,
+        verify: Module.VerifyUpdate,
+        path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 }
 
@@ -694,8 +1133,10 @@ final class Gemma4DFlashRequestState: CBv2MTPRequestState, @unchecked Sendable {
     var bufferedBlockCursor: Int = 0
     /// Evaluation targets from the most recent draft pass.
     var lastEvalTargets: [MLXArray] = []
-    /// Zero-copy pre-round rollback snapshot for `discardRound`.
-    var rollbackCaches: [(keys: MLXArray?, values: MLXArray?, offset: Int)]?
+    /// Zero-copy pre-round rollback snapshots for bounded sliding layers (`maxSize != nil`).
+    /// Unbounded full-attention layers (`maxSize == nil`) stage their active round separately
+    /// on `Gemma4DFlashLayerCache` and leave `nil` here so `keys`/`values` retain `use_count == 1`.
+    var rollbackCaches: [Gemma4DFlashLayerCache.RollbackSnapshot?]?
     var rollbackPendingContext: [MLXArray] = []
     var rollbackNeedsCarryHidden: Bool = false
     var rollbackObservedCount: Int = 0
@@ -716,16 +1157,19 @@ final class Gemma4DFlashRequestState: CBv2MTPRequestState, @unchecked Sendable {
         guard !isReleased else { return 0 }
         let cacheBytes = caches.reduce(0) { $0 + $1.materializedBytes }
         let pendingBytes = pendingContext.reduce(0) { $0 + $1.nbytes }
-        let rollbackCacheBytes = (rollbackCaches ?? []).reduce(0) { sum, snap in
-            sum + (snap.keys?.nbytes ?? 0) + (snap.values?.nbytes ?? 0)
-        }
+        let rollbackCacheBytes =
+            if let snaps = rollbackCaches, snaps.count == caches.count {
+                zip(caches, snaps).reduce(0) { $0 + $1.0.unsharedBytes(in: $1.1) }
+            } else {
+                0
+            }
         let rollbackPendingBytes = rollbackPendingContext.reduce(0) { $0 + $1.nbytes }
         return cacheBytes + pendingBytes + rollbackCacheBytes + rollbackPendingBytes
     }
 
     func beginDraftRound(seedHidden: MLXArray) -> MLXArray? {
         precondition(!roundActive, "Gemma4DFlash: nested draft round")
-        rollbackCaches = caches.map { ($0.keys, $0.values, $0.offset) }
+        rollbackCaches = caches.map { $0.makeRollbackSnapshot() }
         rollbackPendingContext = pendingContext
         rollbackNeedsCarryHidden = needsCarryHidden
         rollbackObservedCount = observedCount
@@ -753,9 +1197,8 @@ final class Gemma4DFlashRequestState: CBv2MTPRequestState, @unchecked Sendable {
             perPos.append(rowTokens[i ..< (i + 1)])
         }
         var evalTargets: [MLXArray] = [rowTokens]
-        for c in caches {
-            if let k = c.keys { evalTargets.append(k) }
-            if let v = c.values { evalTargets.append(v) }
+        for cache in caches {
+            cache.appendEvalTargets(to: &evalTargets)
         }
         lastEvalTargets = evalTargets
         roundActive = true
@@ -1085,15 +1528,18 @@ public final class Gemma4CBv2DFlashDrafter: CBv2MTPRequestStatefulDrafter, @unch
         // round's `carry.hidden` (or in the first `observeCommittedTarget` on ordinary decode).
         state.needsCarryHidden = true
         state.finishRound()
+        // Commit staged full-attention KV after clearing rollback state so backing storage
+        // retains `use_count == 1` for in-place Metal buffer donation.
+        for cache in state.caches {
+            cache.commitStaged()
+        }
     }
 
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let state = checked(requestState)
         if let savedCaches = state.rollbackCaches, savedCaches.count == state.caches.count {
             for (cache, snap) in zip(state.caches, savedCaches) {
-                cache.keys = snap.keys
-                cache.values = snap.values
-                cache.offset = snap.offset
+                cache.rollback(to: snap)
             }
             state.pendingContext = state.rollbackPendingContext
             state.needsCarryHidden = state.rollbackNeedsCarryHidden
