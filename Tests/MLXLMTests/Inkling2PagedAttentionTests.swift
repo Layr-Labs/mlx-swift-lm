@@ -363,16 +363,16 @@ final class Inkling2PagedAttentionTests: XCTestCase {
                 }
             }
         }
-        // Inkling 2 BF16: 5 queries (two blocks, each with its first-half hold)
-        // per split threadgroup on one simdgroup per block, 2 (one block on two
-        // simdgroups) on two, 16 (six simdgroups) per sequential one.
+        // Inkling 2 BF16: a verification window's 8 queries (three blocks
+        // sharing one staged page per half) per split threadgroup on one or
+        // two simdgroups per block, 16 (six simdgroups) per sequential one.
         XCTAssertEqual(
             Attention.queriesPerThreadgroup(
-                split: true, queries: 9, gqa: 3, headDim: 128, elementSize: 2), 5)
+                split: true, queries: 9, gqa: 3, headDim: 128, elementSize: 2), 8)
         XCTAssertEqual(
             Attention.queriesPerThreadgroup(
                 split: true, queries: 9, gqa: 3, headDim: 128, elementSize: 2,
-                simdgroupsPerBlock: 2), 2)
+                simdgroupsPerBlock: 2), 8)
         XCTAssertEqual(
             Attention.queriesPerThreadgroup(
                 split: false, queries: 2048, gqa: 3, headDim: 128, elementSize: 2), 16)

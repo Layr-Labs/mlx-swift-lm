@@ -110,17 +110,22 @@ extension KernelTests {
             return out
         }
 
-        /// Runs `body` with the one-row GEMV version and down rows per lane set.
-        static func withGemv<R>(_ version: Int, downRows: Int = 1, _ body: () throws -> R) rethrows
-            -> R
-        {
-            let (v, d) = (Inkling2Kernels.expertGemvVersion, Inkling2Kernels.expertDownRowsPerLane)
+        /// Runs `body` with the one-row GEMV version and rows per lane set.
+        static func withGemv<R>(
+            _ version: Int, downRows: Int = 1, upRows: Int = 2, _ body: () throws -> R
+        ) rethrows -> R {
+            let (v, d, u) = (
+                Inkling2Kernels.expertGemvVersion, Inkling2Kernels.expertDownRowsPerLane,
+                Inkling2Kernels.expertUpRowsPerLane
+            )
             defer {
                 Inkling2Kernels.expertGemvVersion = v
                 Inkling2Kernels.expertDownRowsPerLane = d
+                Inkling2Kernels.expertUpRowsPerLane = u
             }
             Inkling2Kernels.expertGemvVersion = version
             Inkling2Kernels.expertDownRowsPerLane = downRows
+            Inkling2Kernels.expertUpRowsPerLane = upRows
             return try body()
         }
 
@@ -128,7 +133,7 @@ extension KernelTests {
 
         // MARK: Experts
 
-        /// The version-2 GEMV (1 or 2 down rows per lane) gives the version-1
+        /// The version-2 GEMV (1 or 2 gate/up and down rows per lane) gives the version-1
         /// GEMV's bits, and both give the bits of the same row run by the tiles
         /// next to companions (rows 2, 8 and 33: unplanned and planned tiles).
         @Test(arguments: [Inkling2ExpertFormat.nvfp4, .mxfp8, .dense])
@@ -153,9 +158,15 @@ extension KernelTests {
                     let v2d2 = try Self.withGemv(2, downRows: 2) {
                         try Self.pairOutputs(row, ids, up, down)
                     }
+                    let upOneRow = try Self.withGemv(2, upRows: 1) {
+                        try Self.pairOutputs(row, ids, up, down)
+                    }
                     let v1 = try Self.withGemv(1) { try Self.pairOutputs(row, ids, up, down) }
                     #expect(Self.bitsEqual(v2, v1), "\(format) \(shape) v2 vs v1")
                     #expect(Self.bitsEqual(v2d2, v1), "\(format) \(shape) v2 down 2 vs v1")
+                    #expect(
+                        Self.bitsEqual(upOneRow, v1),
+                        "\(format) \(shape) v2 gate/up one row per lane vs v1")
                     for rows in [2, 8, 33] {
                         let first = max(0, min(target - rows + 1, 33 - rows))
                         let at = target - first
@@ -164,6 +175,50 @@ extension KernelTests {
                         #expect(
                             Self.bitsEqual(tiles[(at * topK) ..< (at * topK + topK)], v2),
                             "\(format) \(shape) rows \(rows)")
+                    }
+                }
+            }
+        }
+
+        /// The grouped GEMVs of 2 to 8 rows (one or two gate/up rows per lane)
+        /// give the tiles' bits for every pair, and each row equals the same row
+        /// alone (one-row GEMV), with experts shared by several rows.
+        @Test(arguments: [Inkling2ExpertFormat.nvfp4, .mxfp8, .dense])
+        func groupedGemvMatchesTheTiles(format: Inkling2ExpertFormat) throws {
+            let topK = 8
+            for (si, shape) in Self.shapes.enumerated() {
+                let (hidden, intermediate) = shape
+                let experts = hidden > 1024 ? 24 : 48
+                let up = Self.randomBank(
+                    format, experts: experts, outputs: 2 * intermediate, inputs: hidden,
+                    seed: UInt64(131 + si))
+                let down = Self.randomBank(
+                    format, experts: experts, outputs: hidden, inputs: intermediate,
+                    seed: UInt64(141 + si))
+                let x = (MLXRandom.normal([8, hidden], key: MLXRandom.key(151)) * 0.5)
+                    .asType(.bfloat16)
+                let (indices, _) = Self.routing(rows: 8, experts: experts, topK: topK, seed: 161)
+                let alone = try (0 ..< 8).map {
+                    try Self.pairOutputs(x[$0 ..< $0 + 1], indices[$0 ..< $0 + 1], up, down)
+                }
+                let saved = Inkling2Kernels.expertGroupGemv
+                defer { Inkling2Kernels.expertGroupGemv = saved }
+                for rows in [2, 3, 4, 5, 8] {
+                    Inkling2Kernels.expertGroupGemv = false
+                    let tiles = try Self.pairOutputs(x[0 ..< rows], indices[0 ..< rows], up, down)
+                    Inkling2Kernels.expertGroupGemv = true
+                    for upRows in [2, 1] {
+                        let grouped = try Self.withGemv(2, upRows: upRows) {
+                            try Self.pairOutputs(x[0 ..< rows], indices[0 ..< rows], up, down)
+                        }
+                        #expect(
+                            Self.bitsEqual(grouped, tiles),
+                            "\(format) \(shape) rows \(rows) gate/up rows/lane \(upRows)")
+                        for r in 0 ..< rows {
+                            #expect(
+                                Self.bitsEqual(grouped[(r * topK) ..< (r * topK + topK)], alone[r]),
+                                "\(format) \(shape) rows \(rows) row \(r)")
+                        }
                     }
                 }
             }
@@ -430,20 +485,32 @@ extension KernelTests {
             #expect(Inkling2Kernels.fusedRouter)
             let router = Self.router(hidden: hidden, seed: UInt64(hidden))
             let x = MLXRandom.normal([33, hidden], key: MLXRandom.key(5)).asType(.bfloat16)
-            let alone = try (0 ..< 33).map { try Self.fused(router, x[$0 ..< $0 + 1]) }
-            for l in [2, 3, 4, 5, 6, 7, 8, 33] {
-                let (indices, weights, selection) = try Self.twoLaunch(router, x[0 ..< l])
-                for i in 0 ..< l {
-                    #expect(Self.bitsEqual(alone[i].0, indices[i ..< i + 1]), "L \(l) i \(i)")
-                    #expect(Self.bitsEqual(alone[i].1, weights[i ..< i + 1]), "L \(l) i \(i)")
-                    #expect(Self.bitsEqual(alone[i].2, selection[i ..< i + 1]), "L \(l) i \(i)")
+            let saved = (
+                Inkling2Kernels.fusedRouterRank, Inkling2Kernels.fusedRouterOutputsPerGroup
+            )
+            defer {
+                Inkling2Kernels.fusedRouterRank = saved.0
+                Inkling2Kernels.fusedRouterOutputsPerGroup = saved.1
+            }
+            for (rank, opg) in [(0, 4), (1, 4), (1, 2)] {
+                Inkling2Kernels.fusedRouterRank = rank
+                Inkling2Kernels.fusedRouterOutputsPerGroup = opg
+                let alone = try (0 ..< 33).map { try Self.fused(router, x[$0 ..< $0 + 1]) }
+                for l in [2, 3, 4, 5, 6, 7, 8, 33] {
+                    let (indices, weights, selection) = try Self.twoLaunch(router, x[0 ..< l])
+                    for i in 0 ..< l {
+                        let tag = "rank select \(rank) outputs/group \(opg) L \(l) i \(i)"
+                        #expect(Self.bitsEqual(alone[i].0, indices[i ..< i + 1]), "\(tag)")
+                        #expect(Self.bitsEqual(alone[i].1, weights[i ..< i + 1]), "\(tag)")
+                        #expect(Self.bitsEqual(alone[i].2, selection[i ..< i + 1]), "\(tag)")
+                    }
                 }
             }
         }
 
         /// Many fused routers in one graph (independent launches of one router,
         /// and a chain of dependent ones) all match their two-launch results:
-        /// every launch counts its threadgroups on its own zeroed counter.
+        /// the router's workspace on this stream resets between launches.
         @Test func fusedRouterLaunchesAreIndependent() throws {
             let router = Self.router(hidden: 512, seed: 3)
             let x = MLXRandom.normal([24, 512], key: MLXRandom.key(4)).asType(.bfloat16)
@@ -470,6 +537,45 @@ extension KernelTests {
                 let (idx, w, _) = try Self.twoLaunch(router, h)
                 #expect(Self.bitsEqual(fusedChain[step], idx), "step \(step)")
                 h = (h.asType(.float32) + w.sum() * 0.01).asType(.bfloat16)
+            }
+        }
+
+        /// One router module routing on two MLX streams at once (two engines on
+        /// one loaded model): two chains of dependent one-row launches are in
+        /// flight together and each matches the two-launch router step by step.
+        /// Each stream counts on its own workspace.
+        @Test func fusedRouterOnTwoStreamsAtOnce() throws {
+            let router = Self.router(hidden: 2304, seed: 23)
+            let x = MLXRandom.normal([2, 2304], key: MLXRandom.key(24)).asType(.bfloat16)
+            eval(x)
+            func next(_ h: MLXArray, _ w: MLXArray) -> MLXArray {
+                (h.asType(.float32) + w.sum() * 0.01).asType(.bfloat16)
+            }
+            for round in 0 ..< 4 {
+                var chains: [[MLXArray]] = [[], []]
+                for c in 0 ..< 2 {
+                    Stream.withNewDefaultStream(device: .gpu) {
+                        var h = x[c ..< c + 1]
+                        for _ in 0 ..< 48 {
+                            let (idx, w, _) = Inkling2Kernels.routerSelectOneRow(router, h)!
+                            chains[c] += [idx, w]
+                            h = next(h, w)
+                        }
+                        asyncEval(chains[c])
+                    }
+                }
+                eval(chains[0] + chains[1])
+                for c in 0 ..< 2 {
+                    var h = x[c ..< c + 1]
+                    for step in 0 ..< 48 {
+                        let (idx, w, _) = try Self.twoLaunch(router, h)
+                        #expect(
+                            Self.bitsEqual(chains[c][2 * step], idx)
+                                && Self.bitsEqual(chains[c][2 * step + 1], w),
+                            "round \(round) stream \(c) step \(step)")
+                        h = next(h, w)
+                    }
+                }
             }
         }
 

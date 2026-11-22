@@ -648,6 +648,160 @@ final class Inkling2PagedAttentionBenchmarkTests: XCTestCase {
         }
     }
 
+    /// Attention per layer class for multi-row decode and MTP verify windows
+    /// (`INKLING2_ATTN_MULTIROW=1`): GPU microseconds per call (a dependent
+    /// chain, as layers in a step) for each `B x L` of
+    /// `INKLING2_ATTN_MULTIROW_SHAPES` at each history of
+    /// `INKLING2_ATTN_MULTIROW_CTX`, sliding and full, on segmented storage
+    /// (`INKLING2_ATTN_MULTIROW_SEGMENTS` segments, pages interleaved across
+    /// them as in a shared pool; 0: one slab). Every pass that can run the
+    /// call is timed next to `.automatic`, and the K/V bytes the call must
+    /// read give its achieved GB/s; a read-only and a copy pass over 1 GiB
+    /// give the host's reference bandwidth, and a chain of dependent one-op
+    /// dispatches on a query-sized array the cost of a dependent launch alone.
+    /// Rows 1, 2, 4 and 8 at one query show whether a call is latency bound
+    /// (time flat in rows) or bandwidth bound (time growing with the bytes).
+    func testMultiRowAttention() throws {
+        guard ProcessInfo.processInfo.environment["INKLING2_ATTN_MULTIROW"] == "1" else {
+            throw XCTSkip("set INKLING2_ATTN_MULTIROW=1")
+        }
+        let env = ProcessInfo.processInfo.environment
+        MLX.GPU.set(memoryLimit: 12 << 30)
+        MLX.GPU.set(cacheLimit: 2 << 30)
+        let shapes = (env["INKLING2_ATTN_MULTIROW_SHAPES"] ?? "1x1,2x1,4x1,8x1,1x5,1x8,4x5,4x8")
+            .split(separator: ",").map { shape in
+                let parts = shape.split(separator: "x").compactMap { Int($0) }
+                return (b: parts[0], l: parts[1])
+            }
+        let contexts = (env["INKLING2_ATTN_MULTIROW_CTX"] ?? "4096,8192").split(separator: ",")
+            .compactMap { Int($0) }
+        let kinds = (env["INKLING2_ATTN_MULTIROW_KINDS"] ?? "sliding,full").split(separator: ",")
+        let segmentCount = Int(env["INKLING2_ATTN_MULTIROW_SEGMENTS"] ?? "6")!
+        let pool = makePool(pages: 16_384)
+        let proj = (MLXRandom.normal([16, 1024]) * 0.5).asType(.bfloat16)
+        eval(proj)
+        // Reference bandwidth: 1 GiB read (a sum) and copied (read + write).
+        let big = MLXRandom.normal([1 << 29]).asType(.bfloat16)
+        eval(big)
+        func seconds(_ body: () -> MLXArray) -> Double {
+            var best = Double.infinity
+            for attempt in 0 ... 5 {
+                Stream.gpu.synchronize()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                eval(body())
+                Stream.gpu.synchronize()
+                if attempt > 0 {
+                    best = min(best, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9)
+                }
+            }
+            return best
+        }
+        let readGBs = Double(1 << 30) / seconds { big.sum() } / 1e9
+        let copyGBs = 2 * Double(1 << 30) / seconds { big + 1 } / 1e9
+        // A dependent launch alone: each op reads the previous op's output.
+        let small = MLXRandom.normal([1, 1, qh, d]).asType(.bfloat16)
+        eval(small)
+        let launch = gpuCost { n in
+            var x = small
+            for _ in 0 ..< n { x = x * 1.0001 }
+            return x
+        }
+        record([
+            "phase": "multirow-bandwidth", "read_gbs": (readGBs * 10).rounded() / 10,
+            "copy_gbs": (copyGBs * 10).rounded() / 10, "dependent_launch_us": launch.gpu,
+        ])
+        // Segments: pool page p (p >= 1) lives in segment (p - 1) % n at local
+        // page (p - 1) / n + 1; local page 0 of each segment is inert.
+        var segments: [MLXArray] = []
+        if segmentCount > 0 {
+            for index in 0 ..< segmentCount {
+                let ids =
+                    [Int32(0)]
+                    + stride(from: index + 1, to: pool.pages, by: segmentCount).map { Int32($0) }
+                let pages = MLXArray(ids)
+                segments.append(stacked([pool.k[pages], pool.v[pages]]))
+            }
+            eval(segments)
+        }
+        func storage(_ table: MLXArray) -> Attention.PagedKV {
+            let fence = MLXArray.zeros([1], dtype: .int32)
+            guard segmentCount > 0 else {
+                return .init(keys: pool.k, values: pool.v, tables: table, writeFence: fence)
+            }
+            let entries = table.asArray(Int32.self).map { page -> Int32 in
+                page == 0
+                    ? 0
+                    : Int32((Int(page) - 1) % segmentCount) << 24
+                        | Int32((Int(page) - 1) / segmentCount + 1)
+            }
+            return .init(
+                segments: segments, tables: MLXArray(entries, table.shape), writeFence: fence)
+        }
+        let bytesPerToken = kvh * d * 2 * 2
+        for kind in kinds {
+            let window: Int? = kind == "full" ? nil : 1024
+            for ctx in contexts {
+                for (b, l) in shapes {
+                    let (table, tableLength) = tables(
+                        rows: b, tokens: ctx + l, window: window, pool: pool)
+                    let cache = storage(table)
+                    let q0 = MLXRandom.normal([b, l, qh, d]).asType(.bfloat16)
+                    let kNew = MLXRandom.normal([b, l, kvh, d]).asType(.bfloat16)
+                    let vNew = MLXRandom.normal([b, l, kvh, d]).asType(.bfloat16)
+                    let states = (MLXRandom.normal([b, l, qh, 16]) * 0.5).asType(.bfloat16)
+                    let sinks = MLXRandom.normal([b, l, qh])
+                    let rows = Array(
+                        repeating: Attention.Row(queryStart: ctx, tableLength: tableLength),
+                        count: b)
+                    let plan = Attention.Plan(rows: rows, queries: l, window: window, scale: scale)
+                    eval(table, cache.tables, q0, kNew, vNew, states, sinks, plan.rowInfo)
+                    func run(_ q: MLXArray, _ kernel: Attention.Kernel) -> MLXArray {
+                        Attention.attend(
+                            queries: q, newKeys: kNew, newValues: vNew, relativeStates: states,
+                            proj: proj, sinks: sinks, cache: cache, plan: plan,
+                            layout: .tokenMajor, kernel: kernel
+                        ).output
+                    }
+                    var candidates: [(String, Attention.Kernel)] = [
+                        ("automatic", .automatic), ("split", .split), ("sequential", .sequential),
+                    ]
+                    if plan.maxPartitions <= Attention.fusedMaximumPartitions
+                        && (segmentCount == 0
+                            || segmentCount <= Attention.fusedMaximumSegmentBindings)
+                    {
+                        candidates.append(("fused", .fused))
+                    }
+                    // Every pass gives the automatic pass's bits.
+                    let reference = run(q0, .automatic)
+                    var fields: [String: Any] = [
+                        "phase": "multirow", "kind": String(kind), "ctx": ctx, "B": b, "L": l,
+                        "partitions": plan.maxPartitions, "segments": segmentCount,
+                    ]
+                    // K/V the call must read: the window's keys (sliding) or the
+                    // whole history, plus the call's own tokens, per row.
+                    let tokens = (window.map { min(ctx, $0 - 1) } ?? ctx) + l
+                    let bytes = Double(b * tokens * bytesPerToken)
+                    fields["kv_mb"] = (bytes / 1e6 * 100).rounded() / 100
+                    for (name, kernel) in candidates {
+                        XCTAssertTrue(
+                            arrayEqual(run(q0, kernel), reference).item(Bool.self),
+                            "\(kind) ctx \(ctx) B=\(b) L=\(l) \(name) bits")
+                        let c = gpuCost { n in
+                            var q = q0
+                            for _ in 0 ..< n { q = run(q, kernel).reshaped(b, l, qh, d) }
+                            return q
+                        }
+                        fields["\(name)_gpu_us"] = c.gpu
+                        fields["\(name)_gbs"] =
+                            c.gpu > 0 ? (bytes / c.gpu / 1e3 * 10).rounded() / 10 : 0
+                    }
+                    fields["thermal"] = ProcessInfo.processInfo.thermalState.rawValue
+                    record(fields)
+                }
+            }
+        }
+    }
+
     func testDecodeGPUTime() throws {
         guard ProcessInfo.processInfo.environment["INKLING2_ATTN_LATENCY"] == "1" else {
             throw XCTSkip("set INKLING2_ATTN_LATENCY=1")

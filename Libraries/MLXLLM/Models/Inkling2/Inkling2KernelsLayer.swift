@@ -122,6 +122,74 @@ extension Inkling2Kernels {
             }
             """
 
+    // MARK: Row-state gather
+
+    /// The conv and SSM states of B rows (2 ... 8; each `[1, ...]`, one shape
+    /// and dtype per kind, row-contiguous) packed into `[B, ...]` in one launch:
+    /// a byte copy (16 bytes per thread), the same values as concatenating them.
+    private static let rowStateGatherKernel = MLXFast.metalKernel(
+        name: "inkling2_row_state_gather",
+        inputNames: [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        ],
+        outputNames: ["conv", "ssm"],
+        source: """
+            const uint g = thread_position_in_grid.x;
+            if (g < uint(ROWS * VC)) {
+                const uint r = g / VC;
+                const uint i = g % VC;
+                const device uint4* src = (const device uint4*)(r == 0 ? c0 : r == 1 ? c1
+                    : r == 2 ? c2 : r == 3 ? c3 : r == 4 ? c4 : r == 5 ? c5 : r == 6 ? c6 : c7);
+                ((device uint4*)conv)[g] = src[i];
+            } else if (g < uint(ROWS * (VC + VS))) {
+                const uint h = g - uint(ROWS * VC);
+                const uint r = h / VS;
+                const uint i = h % VS;
+                const device uint4* src = (const device uint4*)(r == 0 ? s0 : r == 1 ? s1
+                    : r == 2 ? s2 : r == 3 ? s3 : r == 4 ? s4 : r == 5 ? s5 : r == 6 ? s6 : s7);
+                ((device uint4*)ssm)[h] = src[i];
+            }
+            """)
+
+    /// `DARKBLOOM_INKLING2_STATE_GATHER=0` keeps the concatenation (A/B runs).
+    static let rowStateGatherEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_STATE_GATHER"] != "0"
+
+    /// `[concatenated(conv, axis: 0), concatenated(ssm, axis: 0)]` in one launch
+    /// for 2 ... 8 rows of `[1, ...]` states (one shape and dtype per kind, whole
+    /// 16-byte rows); nil when not covered (then concatenate).
+    public static func gatherRowStates(conv: [MLXArray], ssm: [MLXArray]) -> [MLXArray]? {
+        let rows = conv.count
+        guard active, rowStateGatherEnabled, rows >= 2, rows <= 8, ssm.count == rows,
+            let c = conv.first, let h = ssm.first, c.ndim >= 2, h.ndim >= 2,
+            c.dim(0) == 1, h.dim(0) == 1,
+            conv.allSatisfy({ $0.shape == c.shape && $0.dtype == c.dtype }),
+            ssm.allSatisfy({ $0.shape == h.shape && $0.dtype == h.dtype })
+        else { return nil }
+        let convBytes = c.size * c.dtype.size
+        let ssmBytes = h.size * h.dtype.size
+        guard convBytes % 16 == 0, ssmBytes % 16 == 0, convBytes > 0, ssmBytes > 0 else {
+            return nil
+        }
+        let vc = convBytes / 16
+        let vs = ssmBytes / 16
+        var key = LaunchKey(kernel: 46, dtype: c.dtype, weightType: h.dtype, a: vc, b: vs, c: rows)
+        key.d = c.size
+        key.e = h.size
+        let launch = launches.launch(key) {
+            rowStateGatherKernel.prepare(
+                template: [("ROWS", rows), ("VC", vc), ("VS", vs)],
+                grid: ((rows * (vc + vs) + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [
+                    [rows] + Array(c.shape.dropFirst()), [rows] + Array(h.shape.dropFirst()),
+                ],
+                outputDTypes: [c.dtype, h.dtype])
+        }
+        let pad = { (list: [MLXArray]) in (0 ..< 8).map { list[min($0, rows - 1)] } }
+        return launch(pad(conv) + pad(ssm))
+    }
+
     // MARK: Segmented products
 
     /// Several products in one launch: segment `s` multiplies input
@@ -436,6 +504,28 @@ extension Inkling2Kernels {
         return [64, 128, 256].contains(v) ? v : 256
     }()
 
+    /// `DARKBLOOM_INKLING2_ROUTER_XLOAD=1`: one-row router logits after a
+    /// message gate take the gate tail's output on load (off by default
+    /// until measured).
+    static let routerTailOnLoad =
+        ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_ROUTER_XLOAD"] == "1"
+
+    /// Threadgroup size of small transformed GEMVs (`DARKBLOOM_INKLING2_SMALL_XTG`:
+    /// 64, 128 or 256; default 256).
+    static let smallTransformedThreadgroup: Int = {
+        let v =
+            Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_SMALL_XTG"] ?? "") ?? 256
+        return [64, 128, 256].contains(v) ? v : 256
+    }()
+    /// Threadgroup size of transformed GEMVs with fewer than
+    /// `transformedMinimumGroups` 256-thread groups (`DARKBLOOM_INKLING2_XTG`:
+    /// 64, 128 or 256; default 256 until measured; each group stages K values).
+    static let transformedThreadgroup: Int = {
+        let v = Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_XTG"] ?? "") ?? 256
+        return [64, 128, 256].contains(v) ? v : 256
+    }()
+    static let transformedMinimumGroups = 160
+
     /// Padding (elements after every 32) of the staged inputs of
     /// `transformedGemvKernel`: `DARKBLOOM_INKLING2_XPAD` (0 or 8, default 8).
     static let stagedInputPadding: Int =
@@ -495,6 +585,13 @@ extension Inkling2Kernels {
             if case .gateTails(_, _, _, let e) = input { return e }
             return 0
         }()
+        // Small grids (router logits) may use smaller threadgroups (each stages K values).
+        // Grids of fewer than `transformedMinimumGroups` 256-thread groups (wo:
+        // 72) use `transformedThreadgroup`-thread groups so more cores share them.
+        let tg =
+            total * sk <= smallGemvThreads
+            ? smallTransformedThreadgroup
+            : total * sk < 256 * transformedMinimumGroups ? transformedThreadgroup : 256
         var key = LaunchKey(kernel: 44, dtype: dtype, weightType: wt, a: k, b: total, c: mode)
         key.d = sizes.enumerated().reduce(0) { $0 &* 131 &+ $1.element &* 7 &+ $1.offset }
         key.e = segments.reduce(0) { $0 * 4 + $1.input } &* 31 &+ go
@@ -503,7 +600,7 @@ extension Inkling2Kernels {
             var template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("WT", wt), ("OT", outType), ("NWT", normType), ("K", k),
                 ("SK", sk), ("NSEG", segments.count), ("NTOT", total), ("OPT", opt),
-                ("XMODE", mode), ("GO", go), ("TG", 256), ("XPAD", stagedInputPadding),
+                ("XMODE", mode), ("GO", go), ("TG", tg), ("XPAD", stagedInputPadding),
                 ("STAGE", stagedInputs),
             ]
             for i in 0 ..< 8 {
@@ -511,8 +608,8 @@ extension Inkling2Kernels {
                 template.append(("X\(i)", i < segments.count ? segments[i].input : 0))
             }
             return transformedGemvKernel.prepare(
-                template: template, grid: ((total * sk + 255) / 256 * 256, 1, 1),
-                threadGroup: (256, 1, 1), outputShapes: [[1, total]], outputDTypes: [outType])
+                template: template, grid: ((total * sk + tg - 1) / tg * tg, 1, 1),
+                threadGroup: (tg, 1, 1), outputShapes: [[1, total]], outputDTypes: [outType])
         }
         let ws = (0 ..< 8).map {
             $0 < segments.count ? segments[$0].weight : layerConstants.dummy(wt)
@@ -645,6 +742,9 @@ extension Inkling2Kernels {
 
     private static let mixPartialConvolved = """
         {
+            // Tokens per row: compile-time 1 for decode rows (LC = 1), else a
+            // runtime value (one library for every verify-window size).
+            const int L = LC > 0 ? LC : int(lp[0]);
             const int b = r / L;
             const int t = r % L;
             const float norm = 1.0f / metal::precise::sqrt(float(KS + 1));
@@ -875,7 +975,7 @@ extension Inkling2Kernels {
             name: "inkling2_layer_mix_\(convolved ? "conv" : "given")_\(gates ? "gates" : "norms")",
             inputNames: partialInputs + [
                 "b0", "b1", "b2", "b3", "b4", "b5", "qy", "nw0", "nw1", "nw2", "m", "prm",
-            ],
+            ] + (convolved ? ["lp"] : []),
             outputNames: outputs,
             source: mixPartial + (convolved ? mixPartialConvolved : mixPartialGiven) + mixBody
                 + (gates ? mixGatePrep : mixNorms),
@@ -977,7 +1077,7 @@ extension Inkling2Kernels {
             inputNames: partialInputs + [
                 "b0", "b1", "b2", "b3", "b4", "b5", "qy", "nw0", "nw1", "nw2", "m", "prm",
                 "dw0", "dw1", "dw2",
-            ],
+            ] + (convolved ? ["lp"] : []),
             outputNames: outputs,
             source: head + (convolved ? conv : mixPartialGiven) + mixBody + body,
             header: rowHeader + stagedLoaderHeader,
@@ -1051,7 +1151,7 @@ extension Inkling2Kernels {
             ]
             if let convolved {
                 template += [
-                    ("L", convolved.tokens), ("KS", convolved.weight.dim(-1)),
+                    ("KS", convolved.weight.dim(-1)), ("LC", convolved.tokens == 1 ? 1 : 0),
                     ("RR", referenceRounding),
                     ("BOUNDARY", convolved.boundary), ("CAP", false),
                 ]
@@ -1082,6 +1182,7 @@ extension Inkling2Kernels {
         inputs.append(messages)
         inputs.append(layerConstants.params([eps]))
         inputs += (0 ..< 3).map { gates[min($0, nn - 1)].down }
+        if let convolved { inputs.append(layerConstants.params([Float(convolved.tokens)])) }
         return launch(inputs)
     }
 
@@ -1122,9 +1223,24 @@ extension Inkling2Kernels {
                 }
                 float fl = 0.0f;
                 float gl = 0.0f;
-                for (int j = 0; j < RANK; j++) {
-                    fl = fma(dv[j], float(fw[size_t(e) * RANK + j]), fl);
-                    gl = fma(dv[j], float(gw[size_t(e) * RANK + j]), gl);
+                if (RANK % 8 == 0) {
+                    // Eight weights per load; the same FMAs in the same order.
+                    for (int j0 = 0; j0 < RANK; j0 += 8) {
+                        const ink2_v8 fv = ink2_load8<GWT>(fw + size_t(e) * RANK + j0);
+                        const ink2_v8 gv = ink2_load8<GWT>(gw + size_t(e) * RANK + j0);
+                        const float fa[8] = {fv.lo.x, fv.lo.y, fv.lo.z, fv.lo.w, fv.hi.x, fv.hi.y, fv.hi.z, fv.hi.w};
+                        const float ga[8] = {gv.lo.x, gv.lo.y, gv.lo.z, gv.lo.w, gv.hi.x, gv.hi.y, gv.hi.z, gv.hi.w};
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            fl = fma(dv[j0 + j], fa[j], fl);
+                            gl = fma(dv[j0 + j], ga[j], gl);
+                        }
+                    }
+                } else {
+                    for (int j = 0; j < RANK; j++) {
+                        fl = fma(dv[j], float(fw[size_t(e) * RANK + j]), fl);
+                        gl = fma(dv[j], float(gw[size_t(e) * RANK + j]), gl);
+                    }
                 }
                 const float h = hg[base + e];
                 const float mm = float(m[(size_t(r) * 4 + MSG0 + g) * H + e]);
@@ -1173,7 +1289,7 @@ extension Inkling2Kernels {
     /// heads, then relative-state heads (the first also copies the sinks).
     private static let attentionPrepKernel = MLXFast.metalKernel(
         name: "inkling2_attention_prep",
-        inputNames: ["p", "qs", "rsc", "kw", "vw", "kp", "vp", "pos", "prm"],
+        inputNames: ["p", "qs", "rsc", "kw", "vw", "kp", "vp", "pos", "prm", "lp"],
         outputNames: ["q", "k", "v", "rs", "sk", "cn"],
         source: """
             constexpr int DPL = (D + 31) / 32;
@@ -1182,6 +1298,9 @@ extension Inkling2Kernels {
             const int lane = int(thread_position_in_threadgroup.x);
             const int u = int(threadgroup_position_in_grid.y);
             const int r = int(threadgroup_position_in_grid.z);
+            // Tokens per row: compile-time 1 for decode rows (LC = 1), else a
+            // runtime value (one library for every verify-window size).
+            const int L = LC > 0 ? LC : int(lp[0]);
             const int b = r / L;
             const int t = r % L;
             const float qkThr = prm[0];
@@ -1349,7 +1468,7 @@ extension Inkling2Kernels {
     /// step. Recomputing earlier tokens' combines keeps one launch for windows.
     private static let postMLPKernel = MLXFast.metalKernel(
         name: "inkling2_post_mlp",
-        inputNames: ["y", "idx", "wts", "mp", "cw", "res", "an"],
+        inputNames: ["y", "idx", "wts", "mp", "cw", "res", "an", "lp"],
         outputNames: ["out", "rt", "sn"],
         source: """
             // One thread per (row, element): no reductions, so the work spreads
@@ -1359,6 +1478,9 @@ extension Inkling2Kernels {
             constexpr int EPT = 1;
             const int tid = int(thread_position_in_grid.x) % HP;
             const int r = int(thread_position_in_grid.x) / HP;
+            // Tokens per row: compile-time 1 for decode rows (LC = 1), else a
+            // runtime value (one library for every verify-window size).
+            const int L = LC > 0 ? LC : int(lp[0]);
             const int b = r / L;
             const int t = r % L;
             const float norm = 1.0f / metal::precise::sqrt(float(KS + 1));
@@ -1392,10 +1514,18 @@ extension Inkling2Kernels {
                     float xv;
                     if (live[j]) {
                         const int row = b * L + src;
+                        // Loads first (they do not depend on the id order), then
+                        // the same products added in expert-id order.
+                        float yl[TOPK];
+                        float wl[TOPK];
+                        for (int s = 0; s < TOPK; s++) {
+                            yl[s] = float(y[size_t(row * TOPK + s) * H + e]);
+                            wl[s] = wts[row * TOPK + s];
+                        }
                         float sum = 0.0f;
                         for (int k = 0; k < TOPK; k++) {
                             const int s = order[j][k];
-                            sum += float(y[size_t(row * TOPK + s) * H + e]) * wts[row * TOPK + s];
+                            sum += yl[s] * wl[s];
                         }
                         xv = float(static_cast<T>(sum));
                     } else {
@@ -1522,7 +1652,7 @@ extension Inkling2Kernels {
             ]
             if let convolved {
                 template += [
-                    ("L", convolved.tokens), ("KS", convolved.weight.dim(-1)),
+                    ("KS", convolved.weight.dim(-1)), ("LC", convolved.tokens == 1 ? 1 : 0),
                     ("RR", referenceRounding),
                     ("BOUNDARY", convolved.boundary), ("CAP", capture),
                 ]
@@ -1547,13 +1677,14 @@ extension Inkling2Kernels {
         inputs += (0 ..< 3).map { norms[min($0, nn - 1)] }
         inputs.append(messages ?? layerConstants.dummy(.float32))
         inputs.append(layerConstants.params([eps]))
+        if let convolved { inputs.append(layerConstants.params([Float(convolved.tokens)])) }
         return launch(inputs)
     }
 
     /// Message gates after the mix: the down projections (one launch), then
     /// `(1 - tanh(f)) h + tanh(g) m` and the weighted norms (one launch).
     /// Values `[nn, rows, H]` (FP32) and per-simdgroup totals `[nn, rows, 32]`
-    /// of the gate tails, before the scale (`messageGates` = these + scale).
+    /// of the gate tails, before the scale (`gateTailScale`).
     private static func messageGatesPartial(
         _ gates: [Inkling2MessageGate], pre: MLXArray?, down precomputed: MLXArray? = nil,
         hg: MLXArray, messages: MLXArray,
@@ -1597,20 +1728,6 @@ extension Inkling2Kernels {
                 outputDTypes: [.float32, .float32])
         }
         return partialLaunch([down, hg, messages] + fg)
-    }
-
-    private static func messageGates(
-        _ gates: [Inkling2MessageGate], pre: MLXArray?, down: MLXArray? = nil, hg: MLXArray,
-        messages: MLXArray,
-        msg0: Int, norms: [MLXArray], eps: Float, dtype: DType, rows: Int, hidden: Int
-    ) -> MLXArray? {
-        guard
-            let partial = messageGatesPartial(
-                gates, pre: pre, down: down, hg: hg, messages: messages, msg0: msg0, norms: norms,
-                dtype: dtype, rows: rows, hidden: hidden)
-        else { return nil }
-        return gateTailScale(
-            partial, norms: norms, eps: eps, dtype: dtype, rows: rows, hidden: hidden)
     }
 
     /// The gate tails' weighted norms in T from their values and totals.
@@ -1815,7 +1932,7 @@ extension Inkling2Kernels {
                 template: [
                     ("T", dtype), ("HEADS", heads), ("KVH", kvHeads), ("D", headDim), ("DR", rel),
                     ("NTOT", ntot), ("QO", qo), ("RO", ro), ("SO", so), ("KO", ko), ("VO", vo),
-                    ("KDO", isFull ? kdo : 0), ("VDO", isFull ? vdo : 0), ("L", l),
+                    ("KDO", isFull ? kdo : 0), ("VDO", isFull ? vdo : 0), ("LC", l == 1 ? 1 : 0),
                     ("FULL", isFull), ("KS", convKernel), ("RR", referenceRounding),
                     ("CAP", capture),
                 ],
@@ -1834,6 +1951,7 @@ extension Inkling2Kernels {
                 attention.qkThreshold, attention.relativeClip.threshold, eps,
                 Float(attention.logScalingFloor), attention.logScalingAlpha,
             ]),
+            layerConstants.params([Float(l)]),
         ])
         if engine == nil {
             state.setConvState(
@@ -1927,15 +2045,19 @@ extension Inkling2Kernels {
                 slot: slot, .postAttention, postAttentionState, input: projected.reshaped(b, l, h))
         }
         var mlpInput = plane(post[0], 0)
+        var mlpTail: [MLXArray]?
         if let mlpGate, let msg {
             guard
-                let tail = messageGates(
+                let partial = messageGatesPartial(
                     [mlpGate], pre: postDown == nil ? post[0] : nil,
                     down: postDown?[1], hg: postDown?[0] ?? post[1], messages: msg, msg0: 3,
-                    norms: [layer.mlpNorm.weight], eps: layer.mlpNorm.eps, dtype: dtype,
-                    rows: rows, hidden: h)
+                    norms: [layer.mlpNorm.weight], dtype: dtype, rows: rows, hidden: h)
             else { preconditionFailure("Inkling2 fused layer: message gate not covered") }
-            mlpInput = plane(tail, 0)
+            mlpTail = partial
+            mlpInput = plane(
+                gateTailScale(
+                    partial, norms: [layer.mlpNorm.weight], eps: layer.mlpNorm.eps, dtype: dtype,
+                    rows: rows, hidden: h), 0)
         }
         Inkling2Diagnostics.section?("post-attention", [mlpInput, residual])
 
@@ -1944,13 +2066,27 @@ extension Inkling2Kernels {
         let indices: MLXArray
         let routeWeights: MLXArray
         let selection: MLXArray
-        if rows == 1, let fused = routerSelectOneRow(router, mlpInput) {
+        // One row after a message gate: the router logits take the gate tail's
+        // output on load (the same values), so they need not wait for its
+        // scale launch (the experts' input).
+        let routerOnLoad =
+            rows == 1 && routerTailOnLoad
+            ? mlpTail.flatMap {
+                transformedProduct(
+                    .gateTails(
+                        vals: $0[0], parts: $0[1], norms: [layer.mlpNorm.weight],
+                        eps: layer.mlpNorm.eps),
+                    [Segment(input: 0, weight: halfCopies.copy(router.weight))], k: h,
+                    dtype: dtype, outType: .float32)
+            } : nil
+        if routerOnLoad == nil, rows == 1, let fused = routerSelectOneRow(router, mlpInput) {
             (indices, routeWeights, selection) = fused
         } else {
             guard
-                let logits = segmentedProduct(
-                    [mlpInput], [Segment(input: 0, weight: halfCopies.copy(router.weight))],
-                    outType: .float32)
+                let logits = routerOnLoad
+                    ?? segmentedProduct(
+                        [mlpInput], [Segment(input: 0, weight: halfCopies.copy(router.weight))],
+                        outType: .float32)
             else { preconditionFailure("Inkling2 fused layer: router not covered") }
             (indices, routeWeights, selection) = select(router, logits: logits)
         }
@@ -1974,7 +2110,8 @@ extension Inkling2Kernels {
         let postLaunch = launches.launch(postKey) {
             postMLPKernel.prepare(
                 template: [
-                    ("T", dtype), ("H", h), ("TOPK", topK), ("L", l), ("KS", convKernel),
+                    ("T", dtype), ("H", h), ("TOPK", topK), ("KS", convKernel),
+                    ("LC", l == 1 ? 1 : 0),
                     ("RR", referenceRounding), ("CAP", capture),
                 ],
                 grid: ((h + 255) / 256 * 256 * rows, 1, 1),
@@ -1987,6 +2124,7 @@ extension Inkling2Kernels {
         let finished = postLaunch([
             expertOutputs, indices, routeWeights, postMLPPrevious,
             layer.postMLPConvolution.weight.reshaped(-1), residual, postAttentionState,
+            layerConstants.params([Float(l)]),
         ])
         Inkling2Diagnostics.section?("experts", [finished[1]])
         if let engine {

@@ -706,10 +706,11 @@ public enum Inkling2PagedAttention {
     static let threadgroupMemoryLimit = 32 * 1024
 
     /// Threadgroup bytes of a variant, mirroring the kernels' allocations:
-    /// a staged page per simdgroup (split: keys and values `[S][D + 4]`) or per
-    /// threadgroup (sequential: keys `[D][S + 2]`, values `[S][D + 4]`) in the
-    /// slab dtype, 8 x 24 float bias scratch per simdgroup, and the sequential
-    /// kernel's staged queries (8 x D per simdgroup, slab dtype).
+    /// a staged page per simdgroup (split: keys and values `[S][D + 4]`; one
+    /// per half partition when several blocks share it) or per threadgroup
+    /// (sequential: keys `[D][S + 2]`, values `[S][D + 4]`) in the slab dtype,
+    /// 8 x 24 float bias scratch per simdgroup, and the sequential kernel's
+    /// staged queries (8 x D per simdgroup, slab dtype).
     /// `simdgroupsPerBlock` (split only): 2 stage a page per simdgroup of each
     /// block; 1 also holds a block's first-half state (`(D / 4 + 2) x 32` floats).
     static func threadgroupBytes(
@@ -718,7 +719,16 @@ public enum Inkling2PagedAttention {
         if split {
             let simdgroups = blocks * simdgroupsPerBlock
             let hold = simdgroupsPerBlock == 1 ? blocks * (headDim / 4 + 2) * 32 * 4 : 0
-            return simdgroups * (2 * pageSize * (headDim + 4) * elementSize + 8 * 24 * 4) + hold
+            // Shared pages (several blocks): one per half, also holding every
+            // block's hand-off between halves.
+            let shared = blocks > 1
+            var pages =
+                (shared ? simdgroupsPerBlock : simdgroups) * 2 * pageSize
+                * (headDim + 4) * elementSize
+            if shared && simdgroupsPerBlock == 2 {
+                pages = max(pages, blocks * (headDim / 4 + 2) * 32 * 4)
+            }
+            return pages + simdgroups * 8 * 24 * 4 + hold
         }
         let scratch = blocks * 8 * 24 * 4
         let stage = (headDim * (pageSize + 2) + pageSize * (headDim + 4)) * elementSize
