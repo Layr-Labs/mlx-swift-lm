@@ -395,7 +395,7 @@ final class CBv2MTPRoundDriver {
         }
         if let required = drafter.requiredVerificationMode {
             config.verificationMode = required
-            if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+            if required == .serialTarget { config.maxAutomaticRectangularTokens = 0 }
         }
         if let maximum = drafter.maximumDraftTokens {
             config.maxDraftTokens = min(config.maxDraftTokens, max(0, maximum))
@@ -440,8 +440,9 @@ final class CBv2MTPRoundDriver {
         // Ordinary steps have no committed-observation fence (only MTP steps
         // run `finishStatefulMTPEvaluation`); drafters needing one keep MTP steps.
         let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
+        let requestStateful = stateful != nil && model.supportsRequestStatefulMTP
         self.supportsOrdinaryDecodeHistory =
-            requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
+            requestStateful && stateful?.supportsOrdinaryDecodeHistory == true
             && stateful?.requiresCommittedObservationFence == false
         self.config = config
         self.drafter = drafter
@@ -465,7 +466,10 @@ final class CBv2MTPRoundDriver {
             useCommittedDecodeBaseline: !isTokenOnly
                 && supportsOrdinaryDecodeChaining
                 && drafter.supportsTargetPrefixAcceptance
-                && !(drafter is any CBv2MTPRequestStatefulDrafter))
+                && !(drafter is any CBv2MTPRequestStatefulDrafter),
+            maxAllowedDepth: self.config.allowExtendedBlockDraftDepth
+                ? CBv2MTPConfig.maxBlockDiffusionDraftTokens
+                : CBv2MTPConfig.testedMaxDraftTokens)
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.acceptance = self.config.acceptance
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
@@ -504,12 +508,16 @@ final class CBv2MTPRoundDriver {
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
         let recurrentTarget = model as? any CBv2RecurrentMTPSteppableModel
-        let recurrent = recurrentTarget?.recurrentStateSpec != nil
-        let captureLayers = mtpModel.mtpCaptureLayers
+        let hasRecurrentSpec =
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+        let isRecurrentModel =
+            (model as? CBv2SteppableLanguageModelAdapter)?.wrapsRecurrentModel
+            ?? (recurrentTarget != nil || hasRecurrentSpec)
+        let captureLayers = stateful ? nil : mtpModel.mtpCaptureLayers
         guard
             (stateful && mtpModel.supportsRequestStatefulMTP
-                && (recurrentTarget == nil || recurrent))
-                || (!stateful && !recurrent && captureLayers != nil)
+                && (!isRecurrentModel || (recurrentTarget != nil && hasRecurrentSpec)))
+                || (!stateful && !isRecurrentModel && captureLayers != nil)
         else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,

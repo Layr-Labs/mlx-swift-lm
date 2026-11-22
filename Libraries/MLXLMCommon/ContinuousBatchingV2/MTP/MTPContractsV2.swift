@@ -65,18 +65,43 @@ public struct CBv2MTPCaptureLayers: Sendable, Equatable {
 public protocol CBv2MTPForwardable: AnyObject {
     /// nil when this model cannot drive MTP (no capture layers).
     var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? { get }
-    /// Forward returning (softcapped) logits [B, L, vocab] AND the pre-norm
-    /// last-decoder-layer hidden [B, L, hidden] — the tensor the Gemma-4
-    /// drafter was trained against. Must be numerically identical to the
-    /// plain forward on the logits side.
+    /// True when this attention-only target supports a request-stateful drafter
+    /// (such as Gemma 4 DFlash) consuming tapped hidden features. Default false.
+    var cbv2SupportsRequestStatefulMTP: Bool { get }
+    /// Forward returning (softcapped) logits [B, L, vocab] AND the hidden features
+    /// [B, L, hidden] agreed with the bound drafter. Must be numerically identical
+    /// to the plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Optional prefill refinement projecting only the required vocabulary rows
+    /// (`[B, 1]` for `.evaluationOnly`, `[B, vocab]` for `.lastPositionLogits`)
+    /// while preserving full `[B, L, hidden]` context features for the drafter.
+    func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache], requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)?
+    /// Optional fast greedy verification readout returning `(tokens: [B, L] int32,
+    /// nonFinite: [B, L] int32, lastHidden: [B, L, H])` directly from post-norm hidden
+    /// states (e.g. Gemma 4 `Hi4/Lo4` sparse LM head) without materializing `[B, L, V]`.
+    func cbv2ForwardGreedyVerifyWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)?
 }
 
 extension CBv2MTPForwardable {
     /// Identity may normalize an outer language-model wrapper to the inner
     /// text target that actually owns embeddings, logits, hidden, and KV.
     public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+    public var cbv2SupportsRequestStatefulMTP: Bool { false }
+    public func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache], requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        nil
+    }
+    public func cbv2ForwardGreedyVerifyWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)? {
+        nil
+    }
 }
 
 /// Recurrent target counterpart to `CBv2MTPForwardable`. Hybrid targets must
@@ -147,11 +172,21 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// their original boundary. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Optional fast greedy verification forward returning `(tokens: [B, L] int32,
+    /// nonFinite: [B, L] int32, lastHidden: [B, L, H])` without materializing `[B, L, V]`.
+    func forwardGreedyVerifyWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)?
 }
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
     public var supportsRequestStatefulMTP: Bool { false }
+    public func forwardGreedyVerifyWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (tokens: MLXArray, nonFinite: MLXArray, lastHidden: MLXArray)? {
+        nil
+    }
 }
 
 /// Optional attention-only prefill refinement. Preserve every hidden row needed
@@ -285,6 +320,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this model's paged full-attention layers may represent an
     /// exact rectangular window as independent native decode rows.
     var prefersBatchedRectangularAttention: Bool { get }
+    /// True when this drafter never snapshots target KV pages and therefore
+    /// remains exact over compacted paged rows (e.g. Block-SDCM prefill + DFlash).
+    var supportsCompactedPagedSpeculation: Bool { get }
     /// True only when the bound target's arithmetic for one verify row never
     /// depends on the other rows or on the next step's batch shape (row-exact
     /// products). Each row then commits its own accepted prefix. False keeps
@@ -336,6 +374,7 @@ extension CBv2MTPDrafter {
     public var supportsTargetPrefixAcceptance: Bool { false }
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
+    public var supportsCompactedPagedSpeculation: Bool { false }
     public var commitsAcceptedPrefixPerRow: Bool { false }
 }
 
@@ -427,6 +466,22 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// Optional parallel block-diffusion draft (e.g. Gemma 4 DFlash): produces all
+    /// `depth` draft token `[1]` int32 arrays in one parallel pass over
+    /// `[seedToken, mask, ..., mask]`. Default returns `nil`, keeping sequential
+    /// `draftStep` chaining unchanged.
+    func draftBlock(
+        seedTokens: MLXArray, seedHidden: MLXArray, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray]?
+    /// Optional batched parallel block-diffusion draft over `B` concurrent rows
+    /// (`seedTokens: [B, 1]`, `seedHiddens: [B]` each `[1, 1, H]`), sharing one
+    /// batched projection/MLP/LM-head pass across all `B` rows. Returns `[B][depth]`
+    /// arrays of `[1]` int32 draft ids, or `nil` to fall back to per-row `draftBlock`.
+    func draftBlockBatch(
+        seedTokens: MLXArray, seedHiddens: [MLXArray], depth: Int,
+        requestStates: [any CBv2MTPRequestState]
+    ) -> [[MLXArray]]?
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
@@ -460,6 +515,18 @@ extension CBv2MTPRequestStatefulDrafter {
     public var supportsOrdinaryDecodeHistory: Bool { false }
     public var submitsEveryDraftStepEarly: Bool { false }
     public var draftShortlistSize: Int? { nil }
+    public func draftBlock(
+        seedTokens: MLXArray, seedHidden: MLXArray, depth: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> [MLXArray]? {
+        nil
+    }
+    public func draftBlockBatch(
+        seedTokens: MLXArray, seedHiddens: [MLXArray], depth: Int,
+        requestStates: [any CBv2MTPRequestState]
+    ) -> [[MLXArray]]? {
+        nil
+    }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
@@ -554,6 +621,9 @@ public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
     /// validation matrix (`verify width = 1 + k`, widths 1...8).
     public static let testedMaxDraftTokens = 7
+    /// Maximum draft depth supported by parallel block-diffusion drafters
+    /// (e.g. DFlash `block_size = 16` -> 15 draft tokens per block).
+    public static let maxBlockDiffusionDraftTokens = 15
     /// CBv2's production rectangular batch ceiling for neural drafters.
     public static let testedMaxSpeculativeBatch = 8
     /// Maximum speculative batch ceiling for zero-draft-cost token-only
@@ -564,8 +634,11 @@ public struct CBv2MTPConfig: Sendable {
     /// Master switch. The engine also requires a drafter instance and a
     /// conforming model; `enabled == true` without both is inert.
     public var enabled: Bool
+    /// Opt-in flag permitting `maxDraftTokens` up to `maxBlockDiffusionDraftTokens`
+    /// (`15`) for parallel block-diffusion drafters while preserving the default `7` cap.
+    public var allowExtendedBlockDraftDepth: Bool
     /// Max draft tokens per round (k). Rounds verify 1+k and emit 1...k+1.
-    /// Clamped to the production-tested `0...7` range.
+    /// Clamped to `0...7` by default, or `0...15` when `allowExtendedBlockDraftDepth` is true.
     public var maxDraftTokens: Int
     /// Optional deterministic override. nil selects the adaptive controller;
     /// a value selects a fixed step-global depth, clamped to
@@ -688,9 +761,11 @@ public struct CBv2MTPConfig: Sendable {
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
-        stopStringSpeculation: Bool = false
+        stopStringSpeculation: Bool = false,
+        allowExtendedBlockDraftDepth: Bool = false
     ) {
         self.enabled = enabled
+        self.allowExtendedBlockDraftDepth = allowExtendedBlockDraftDepth
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
         self.ordinaryDecodeHistory = ordinaryDecodeHistory
@@ -699,7 +774,10 @@ public struct CBv2MTPConfig: Sendable {
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
-        let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
+        let upperDraftCap =
+            allowExtendedBlockDraftDepth
+            ? Self.maxBlockDiffusionDraftTokens : Self.testedMaxDraftTokens
+        let resolvedMax = min(max(maxDraftTokens, 0), upperDraftCap)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
             max(maxSpeculativeBatch, 1), Self.maxTokenOnlySpeculativeBatch)

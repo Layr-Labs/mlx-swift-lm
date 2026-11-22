@@ -366,108 +366,132 @@ extension EngineLoopV2 {
             // attention owner; its reads must finish construction before sealing.
             let nativePagedWork = CBv2NativePagedMTPWork.current
             let windowWork = try nativePagedWork?.prepareWindow()
-            let windowLogits: MLXArray
-            let windowHidden: MLXArray?
-            if let recurrentModel {
-                // Capture-verify: ONE transaction per row spans the whole
-                // window; the model stages [1+k, ...] captured stacks per
-                // recurrent layer. Finalize commits the accepted position
-                // (device-side slice) or rolls the transaction back — no
-                // repair forward on either path.
-                let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
-                    guard let state = recurrentStates[row.rec.id] else {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP state missing for \(row.rec.id)")
-                    }
-                    do { return try state.bind() } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
-                    }
-                }
-                let positionIds = CBv2PositionState.decodePositionIds(
-                    states: rows.map(\.rec.request.positionState),
-                    cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
-                    length: tokens.dim(1))
-                let output = try withQwen4PositionScope(
-                    ids: rows.map(\.rec.id), positionIds: positionIds
-                ) {
-                    try checkedModelForward(phase: .mtpVerification) {
-                        recurrentModel.forwardWithHiddenCaptured(
-                            tokens: tokens, caches: caches, recurrentState: evaluations,
-                            positionIds: positionIds)
-                    }
-                }
-                windowLogits = output.logits
-                windowHidden = output.lastHidden
-                for (row, evaluation) in zip(rows, evaluations) {
-                    precondition(
-                        evaluation.isCaptured,
-                        "CBv2 capture-verify forward did not stage captured stacks")
-                    do {
-                        capturedInnerState.append(contentsOf: try evaluation.evaluate())
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP evaluation failed for \(row.rec.id): \(error)")
-                    }
-                    recurrent[row.rec.id] = [evaluation]
-                }
-            } else if mtp.usesTokenOnlyDrafter {
-                windowLogits = try checkedModelForward(phase: .mtpVerification) {
-                    mtp.steppableModel.forward(tokens: tokens, caches: caches)
-                }
-                windowHidden = nil
-            } else {
-                let output = try checkedModelForward(phase: .mtpVerification) {
-                    mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
-                }
-                windowLogits = output.logits
-                windowHidden = output.lastHidden
-            }
-            if let nativePagedWork, let windowWork {
-                try nativePagedWork.closeWindow(windowWork)
-            }
-            if hasConstraints { constraintLogits = windowLogits }
-            // Flag the model's logits before a host sampler sees them.
-            nonFinite = CBv2NonFiniteLogits.flags(windowLogits, keptAxes: 2)
-            if mtp.usesRequestStatefulDrafter {
-                guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
-                    preconditionFailure(
-                        "CBv2 request-stateful rectangular MTP target lacks top-two provider")
-                }
-                let batch = windowLogits.dim(0)
-                let width = windowLogits.dim(1)
-                let vocabulary = windowLogits.dim(2)
-                let flat = windowLogits.reshaped([1, batch * width, vocabulary])
-                let topTwo = provider.cbv2MTPTopTwo(flat)
-                policyTopTwo = (
-                    topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32)
-                )
-            }
-            if useTargetPrefix || spanSampler != nil {
-                let drafts: MLXArray? =
-                    typicalDelta != nil
-                    ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
-                let scored = scoreColumns(windowLogits, columnOffset: 0, drafts: drafts)
-                scores = scored.scores
-                accept = scored.accept
-            } else if let policyTopTwo {
-                scores = policyTopTwo.ids[0..., 0..., 0]
-            } else {
-                scores = argMax(windowLogits, axis: -1).asType(.int32)
-            }
-            captureDiagnostics(
-                windowLogits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
-            hidden = windowHidden
-            // Draft-head shortlist (rectangular only; the serial oracle stays
-            // byte-identical to the shipped path): each verify position's
-            // target top-K ids feed the NEXT round's shortlisted draft, and
-            // the captured probability mass rides the acceptance packet so
-            // finalize can gate coverage without an extra host sync.
-            if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
-                .draftShortlistSize
+            let canUseSparseGreedyVerify =
+                recurrentModel == nil && !mtp.usesTokenOnlyDrafter
+                && (mtp.model as? any CBv2SparseHeadSampleableModel)?
+                    .supportsSparseExactHeadSampling
+                    == true
+                && !useTargetPrefix && spanSampler == nil && !hasConstraints
+                && logitDiagnostic == nil && !mtp.usesMarginalPolicy
+                && (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize == nil
+            if canUseSparseGreedyVerify,
+                let sparseVerify = try checkedModelForward(
+                    phase: .mtpVerification,
+                    {
+                        mtp.model.forwardGreedyVerifyWithHidden(tokens: tokens, caches: caches)
+                    })
             {
-                shortlist = Self.mtpDraftShortlist(logits: windowLogits, size: size)
+                if let nativePagedWork, let windowWork {
+                    try nativePagedWork.closeWindow(windowWork)
+                }
+                scores = sparseVerify.tokens
+                nonFinite = sparseVerify.nonFinite
+                hidden = sparseVerify.lastHidden
+            } else {
+                let windowLogits: MLXArray
+                let windowHidden: MLXArray?
+                if let recurrentModel {
+                    // Capture-verify: ONE transaction per row spans the whole
+                    // window; the model stages [1+k, ...] captured stacks per
+                    // recurrent layer. Finalize commits the accepted position
+                    // (device-side slice) or rolls the transaction back — no
+                    // repair forward on either path.
+                    let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
+                        guard let state = recurrentStates[row.rec.id] else {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP state missing for \(row.rec.id)")
+                        }
+                        do { return try state.bind() } catch {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
+                        }
+                    }
+                    let positionIds = CBv2PositionState.decodePositionIds(
+                        states: rows.map(\.rec.request.positionState),
+                        cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
+                        length: tokens.dim(1))
+                    let output = try withQwen4PositionScope(
+                        ids: rows.map(\.rec.id), positionIds: positionIds
+                    ) {
+                        try checkedModelForward(phase: .mtpVerification) {
+                            recurrentModel.forwardWithHiddenCaptured(
+                                tokens: tokens, caches: caches, recurrentState: evaluations,
+                                positionIds: positionIds)
+                        }
+                    }
+                    windowLogits = output.logits
+                    windowHidden = output.lastHidden
+                    for (row, evaluation) in zip(rows, evaluations) {
+                        precondition(
+                            evaluation.isCaptured,
+                            "CBv2 capture-verify forward did not stage captured stacks")
+                        do {
+                            capturedInnerState.append(contentsOf: try evaluation.evaluate())
+                        } catch {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP evaluation failed for \(row.rec.id): \(error)")
+                        }
+                        recurrent[row.rec.id] = [evaluation]
+                    }
+                } else if mtp.usesTokenOnlyDrafter {
+                    windowLogits = try checkedModelForward(phase: .mtpVerification) {
+                        mtp.steppableModel.forward(tokens: tokens, caches: caches)
+                    }
+                    windowHidden = nil
+                } else {
+                    let output = try checkedModelForward(phase: .mtpVerification) {
+                        mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                    }
+                    windowLogits = output.logits
+                    windowHidden = output.lastHidden
+                }
+                if let nativePagedWork, let windowWork {
+                    try nativePagedWork.closeWindow(windowWork)
+                }
+                if hasConstraints { constraintLogits = windowLogits }
+                // Flag the model's logits before a host sampler sees them.
+                nonFinite = CBv2NonFiniteLogits.flags(windowLogits, keptAxes: 2)
+                if mtp.usesRequestStatefulDrafter {
+                    guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
+                        preconditionFailure(
+                            "CBv2 request-stateful rectangular MTP target lacks top-two provider")
+                    }
+                    let batch = windowLogits.dim(0)
+                    let width = windowLogits.dim(1)
+                    let vocabulary = windowLogits.dim(2)
+                    let flat = windowLogits.reshaped([1, batch * width, vocabulary])
+                    let topTwo = provider.cbv2MTPTopTwo(flat)
+                    policyTopTwo = (
+                        topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
+                        topTwo.values.reshaped([batch, width, 2]).asType(.float32)
+                    )
+                }
+                if useTargetPrefix || spanSampler != nil {
+                    let drafts: MLXArray? =
+                        typicalDelta != nil
+                        ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
+                    let scored = scoreColumns(windowLogits, columnOffset: 0, drafts: drafts)
+                    scores = scored.scores
+                    accept = scored.accept
+                } else if let policyTopTwo {
+                    scores = policyTopTwo.ids[0..., 0..., 0]
+                } else {
+                    scores = argMax(windowLogits, axis: -1).asType(.int32)
+                }
+                captureDiagnostics(
+                    windowLogits, columnOffset: 0, phase: "rectangular_verify",
+                    topTwo: policyTopTwo)
+                hidden = windowHidden
+                // Draft-head shortlist (rectangular only; the serial oracle stays
+                // byte-identical to the shipped path): each verify position's
+                // target top-K ids feed the NEXT round's shortlisted draft, and
+                // the captured probability mass rides the acceptance packet so
+                // finalize can gate coverage without an extra host sync.
+                if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
+                    .draftShortlistSize
+                {
+                    shortlist = Self.mtpDraftShortlist(logits: windowLogits, size: size)
+                }
             }
         }
 

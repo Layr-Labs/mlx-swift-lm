@@ -84,14 +84,23 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
     /// A scoped batch-decode or prompt projection keeps those sorted sizes eager.
     /// Width 3 (two-draft MTP verification) takes the trace only below 64
     /// assignments, outside those scopes.
-    static func admitsShape(rows: Int, width: Int, topK: Int) -> Bool {
-        guard topK > 0, (1 ... 3).contains(width), rows >= 1 else { return false }
+    static func admitsShape(
+        rows: Int, width: Int, topK: Int, allowExtendedVerificationWidth: Bool = false,
+        hasBatchUnion: Bool = false
+    ) -> Bool {
+        let maxWidth = allowExtendedVerificationWidth ? 16 : 3
+        guard topK > 0, (1 ... maxWidth).contains(width), rows >= 1 else { return false }
         let assignments = rows * width * topK
         let unprojected = !Gemma4BatchDecodeProjection.active && !Gemma4PrefillProjection.active
-        if width == 3 {
+        if hasBatchUnion && rows * width >= Gemma4DecodeMoEBatchUnionPolicy.minimumBatchSize
+            && !unprojected
+        {
+            return false
+        }
+        if !allowExtendedVerificationWidth && width == 3 {
             return assignments < 64 && unprojected
         }
-        if rows <= 7 && assignments < 64 { return true }
+        if rows <= 7 && width <= 2 && assignments < 64 { return true }
         let maxRows = maxRowsOverrideForTesting ?? maxCompiledRows
         guard rows * width <= maxRows, unprojected else { return false }
         return assignments < 64 || (sortedOverrideForTesting ?? sortedEnabled)
@@ -124,7 +133,10 @@ final class Gemma4CompiledFeedforwardCache: CompiledTraceInvalidating {
             Device.defaultDevice().deviceType == .gpu
             && !isExpertPrefill && input.ndim == 3 && input.dtype == .bfloat16
             && input.dim(2) == owner.config.hiddenSize
-            && Self.admitsShape(rows: input.dim(0), width: input.dim(1), topK: state.topK)
+            && Self.admitsShape(
+                rows: input.dim(0), width: input.dim(1), topK: state.topK,
+                allowExtendedVerificationWidth: owner.compiledExtendedVerificationWidth,
+                hasBatchUnion: owner.decodeMoEBatchUnionMaxExperts != nil)
             // Preserve existing per-invocation component receipts.
             && !CBv2ForwardShapeObservation.isActive
 

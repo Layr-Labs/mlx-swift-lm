@@ -40,7 +40,8 @@ extension EngineLoopV2 {
         guard mtpFeedsHistoryFromOrdinaryDecode else { return [] }
         return ids.enumerated().compactMap { index, id in
             guard let rec = scheduler.record(for: id), mtpHistoryEligible(rec),
-                let state = kvStates[id], Self.mtpStorageEligible(state)
+                let state = kvStates[id],
+                Self.mtpStorageEligible(state, tokenOnly: mtpAllowsCompactedPagedStorage)
             else { return nil }
             return (id, index, rec.preemptionCount)
         }

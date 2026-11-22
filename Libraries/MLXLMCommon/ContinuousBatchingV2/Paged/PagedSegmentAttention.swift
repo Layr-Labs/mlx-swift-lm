@@ -325,54 +325,78 @@ enum PagedMTPBatchedColumns {
         ProcessInfo.processInfo.environment[
             "DARKBLOOM_NEMOTRON35_MTP_BATCHED_ATTENTION"] != "0"
 
-    static func eligible(queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup) -> Bool {
-        queries.dim(0) == 1 && (2 ... 8).contains(queries.dim(2))
-            && row.windowSize == nil && group.segmentLayout != nil
-            && row.absoluteOffset >= row.frozenHighWater
-            && PagedAttentionKernel.partitionTargetThreadgroups == 0
+    static func eligible(
+        queries: MLXArray, rows: [PagedSequenceKV], group: PagedKVGroup
+    ) -> Bool {
+        let count = queries.dim(2)
+        guard !rows.isEmpty, queries.dim(0) == rows.count,
+            (2 ... 16).contains(count),
+            group.segmentLayout != nil,
+            !group.key.isAsymmetric,
+            PagedAttentionKernel.partitionTargetThreadgroups == 0
+        else { return false }
+        return rows.allSatisfy { row in
+            row.groupKey == group.key
+                && row.absoluteOffset >= row.frozenHighWater
+                && (row.windowSize == nil
+                    || (row.speculativeHeadroom >= count
+                        && count <= row.pool.config.maxPrefillChunk))
+        }
     }
 
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        row: PagedSequenceKV, group: PagedKVGroup,
+        rows: [PagedSequenceKV], group: PagedKVGroup,
         sinks: MLXArray?, params: MLXArray, softcap: Bool,
         source: String, dispatchCache: PagedSegmentDispatchCache
     ) -> MLXArray {
-        precondition(eligible(queries: queries, row: row, group: group))
+        precondition(eligible(queries: queries, rows: rows, group: group))
+        let batchSize = rows.count
         let count = queries.dim(2)
         let heads = queries.dim(1)
         let width = queries.dim(3)
-        // One ordinary chunk write, followed by independent causal query rows.
-        row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
-        if PagedMultiQueryAttention.enabled,
+        // One ordinary chunk write per row, followed by independent causal query rows.
+        for (b, row) in rows.enumerated() {
+            row.write(
+                keys: keys[b ..< (b + 1), 0..., 0..., 0...].squeezed(axis: 0),
+                values: values[b ..< (b + 1), 0..., 0..., 0...].squeezed(axis: 0))
+        }
+        if batchSize == 1, rows[0].windowSize == nil,
+            PagedMultiQueryAttention.enabled,
             PagedMultiQueryAttention.eligible(
                 columns: count, queryHeads: heads, headDim: width, group: group)
         {
             // Item 24: the window's columns share ONE pass over the context.
             let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
             let result = PagedMultiQueryAttention.attend(
-                queries: batch, row: row, group: group, sinks: sinks, params: params,
+                queries: batch, row: rows[0], group: group, sinks: sinks, params: params,
                 softcap: softcap, source: source, dispatchCache: dispatchCache)
             let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
             return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
         }
-        let descriptors = (0 ..< count).map { position in
-            let end = row.absoluteOffset - count + position + 1
-            return PagedSegmentDispatchPlan.Row(
-                pages: row.table,
-                info: row.seqInfoRow(
-                    attending: (
-                        start: row.baseOffset,
-                        length: end - row.baseOffset
-                    )),
-                identity: .init(serial: row.serial, tableVersion: row.tableVersion))
+        var descriptors: [PagedSegmentDispatchPlan.Row] = []
+        descriptors.reserveCapacity(batchSize * count)
+        for row in rows {
+            for position in 0 ..< count {
+                let end = row.absoluteOffset - count + position + 1
+                let start = row.windowSize.map { max(row.baseOffset, end - $0) } ?? row.baseOffset
+                descriptors.append(
+                    PagedSegmentDispatchPlan.Row(
+                        pages: row.table,
+                        info: row.seqInfoRow(
+                            attending: (
+                                start: start,
+                                length: max(1, end - start)
+                            )),
+                        identity: .init(serial: row.serial, tableVersion: row.tableVersion)))
+            }
         }
-        let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
+        let batch = queries.transposed(0, 2, 1, 3).reshaped(batchSize * count, heads, width)
         let result = PagedSegmentAttention.decode(
             queries: batch, newKeys: nil, newValues: nil,
             group: group, rows: descriptors, sinks: sinks, params: params, softcap: softcap,
-            source: source, dispatchCache: dispatchCache)
-        let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
+            source: source, dispatchCache: dispatchCache, zeroFilledScratch: true)
+        let output = result.reshaped(batchSize, count, heads, width).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }
 }
@@ -411,7 +435,7 @@ enum PagedMultiQueryAttention {
         else { return false }
         // One simdgroup per (column, query head of the kv head), at least one
         // column per threadgroup.
-        return (2 ... 8).contains(columns)
+        return (2 ... 16).contains(columns)
             && queryHeads / kvh
                 <= maximumPairs(
                     headDim: headDim,
