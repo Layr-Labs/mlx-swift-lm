@@ -455,11 +455,15 @@ def:
             `1` for `B >= 3`) with post-cap profitability gating, and Block-SDCM paged-row composition.
             `Gemma4DFlashDraftModel` and `Gemma4CBv2DFlashDrafter` add parallel block-diffusion speculative decoding
             (`DARKBLOOM_DFLASH_QUANT_4BIT`, `DARKBLOOM_DFLASH_MAX_DRAFT_TOKENS`, `DARKBLOOM_DFLASH_MAX_BATCH`) with lock-guarded
-            owner-scoped 6-layer target context tapping, batched parallel drafting (`draftBlockBatch`), unbiased `Hi4/Lo4`
-            `draftArgMax` and sparse greedy target verification (`forwardGreedyVerifyWithHidden`), extended batched rectangular
-            paged attention (`PagedMTPBatchedColumns` up to 16 columns, `B >= 1`, and sliding windows with `zeroFilledScratch`),
-            extended compiled feedforward widths (`width = 1...16`) while attached, segmented-pool `requestStateAllocationSpecs`,
-            `temperature > 0` target-prefix acceptance, and lockstep tap compaction with Block-SDCM (including opt-in `hyper` mode).
+            owner-scoped 6-layer target context tapping, zero-extra-RAM `QKV`/`KV` and `GateUp` fusion (`DFlashFusedLinearSlot`
+            with `ParameterUpdateObserving` invalidation), staged stepped (`step = 256`) full-attention KV cache (avoiding
+            `O(T^2)` copies while preserving O(1) `discardRound` rollback and `use_count == 1` Metal donation), batched parallel
+            drafting (`draftBlockBatch`), unbiased `Hi4/Lo4` `draftArgMax`, sparse greedy target verification
+            (`forwardGreedyVerifyWithHidden`), `Hi4/Lo4` sparse ordinary decode history (`forwardHiddenForSparseHeadWithMTPHidden`),
+            extended batched rectangular paged attention (`PagedMTPBatchedColumns` up to 16 columns, `B >= 1`, and sliding
+            windows with `zeroFilledScratch`), extended compiled feedforward widths (`width = 1...16`) while attached,
+            segmented-pool `requestStateAllocationSpecs`, `temperature > 0` target-prefix acceptance, and lockstep tap
+            compaction with Block-SDCM (including Pre-Layer-0 `hyper` mode with 32-token blocks).
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "changelog.d/gemma4-lattice-decode.md"

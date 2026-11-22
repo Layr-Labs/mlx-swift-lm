@@ -4088,11 +4088,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         ids: [CBv2RequestID],
         params: [CBv2SamplingParams],
         pendingSampledTokens: MLXArray?,
-        phase: CBv2ForwardPhase = .decode,
+        phase: CBv2ForwardPhase,
+        returnsHidden: Bool = false,
         rowContext: () -> [CBv2SamplerRow]
-    ) throws -> (tokens: MLXArray, nonFinite: MLXArray, cacheInnerState: [MLXArray])? {
+    ) throws -> (
+        tokens: MLXArray, nonFinite: MLXArray, cacheInnerState: [MLXArray], hidden: MLXArray?
+    )? {
         guard let sparseModel = model as? any CBv2SparseHeadSampleableModel,
             sparseModel.supportsSparseExactHeadSampling,
+            !returnsHidden || sparseModel.supportsSparseHeadWithMTPHidden,
             let defaultSampler = sampler as? CBv2DefaultSampler,
             (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             logitDiagnostic == nil,
@@ -4110,17 +4114,33 @@ public final class EngineLoopV2: @unchecked Sendable {
                 rowContext: rowContext)
         else { return nil }
         let caches = eagerCaches(rowStates: rowStates)
-        let hidden = try checkedModelForward(phase: phase) {
-            sparseModel.forwardHiddenForSparseHead(tokens: tokens, caches: caches)
+        let hidden: MLXArray
+        let mtpHidden: MLXArray?
+        if returnsHidden {
+            let pair = try checkedModelForward(phase: phase) {
+                sparseModel.forwardHiddenForSparseHeadWithMTPHidden(
+                    tokens: tokens, caches: caches)
+            }
+            guard let pair else {
+                preconditionFailure(
+                    "CBv2 sparse head: supportsSparseHeadWithMTPHidden promised non-nil hidden")
+            }
+            hidden = pair.postNorm
+            mtpHidden = pair.mtpHidden
+        } else {
+            hidden = try checkedModelForward(phase: phase) {
+                sparseModel.forwardHiddenForSparseHead(tokens: tokens, caches: caches)
+            }
+            mtpHidden = nil
         }
         if let sampled = sparseModel.sparseExactHeadSample(hidden: hidden, mode: mode) {
             defaultSampler.commitSparseDecodeSample(sampledTokens: sampled.tokens)
-            return (sampled.tokens, sampled.nonFinite, eagerCacheInnerState(caches))
+            return (sampled.tokens, sampled.nonFinite, eagerCacheInnerState(caches), mtpHidden)
         }
         let fallbackLogits = sparseModel.applySparseHeadFallbackLogits(hidden: hidden)
         let fallbackNonFinite = CBv2NonFiniteLogits.flags(fallbackLogits)
         let fallbackTokens = defaultSampler.sampleFromPreparedSparseFallback(logits: fallbackLogits)
-        return (fallbackTokens, fallbackNonFinite, eagerCacheInnerState(caches))
+        return (fallbackTokens, fallbackNonFinite, eagerCacheInnerState(caches), mtpHidden)
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -4491,21 +4511,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         let denseLastLogits: MLXArray?
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
         let stepLogprobs: CBv2StepLogprobs?
-        if historyRows.isEmpty,
-            let sparse = try trySparseDecodeSample(
-                rowStates: rowStates, tokens: inputs, ids: ids, params: params,
-                pendingSampledTokens: lazyTokens,
-                phase: .decode,
-                rowContext: { [scheduler] in
-                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-                })
+        if let sparse = try trySparseDecodeSample(
+            rowStates: rowStates, tokens: inputs, ids: ids, params: params,
+            pendingSampledTokens: lazyTokens,
+            phase: .decode,
+            returnsHidden: !historyRows.isEmpty,
+            rowContext: { [scheduler] in
+                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+            })
         {
             deferredFills.close()
             sampled = sparse.tokens
             nonFinite = sparse.nonFinite
             cacheInnerState = sparse.cacheInnerState
             recurrent = [:]
-            hidden = nil
+            hidden = sparse.hidden
             denseLastLogits = nil
             stepLogprobs = nil
         } else {
@@ -4757,13 +4777,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
             let historyRows = mtpOrdinaryHistoryRows(decodeIDs)
             let decodeInnerState: [MLXArray]
+            let decodeHidden: MLXArray?
             let decodePhase: CBv2ForwardPhase =
                 decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
                 ? .prefill
                 : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
                     ? .decode : .mixedFrontier)
-            if historyRows.isEmpty,
-                prefillFrontierCapture() == nil,
+            if prefillFrontierCapture() == nil,
                 let sparse = try trySparseDecodeSample(
                     rowStates: decodeRows.map { kvStates[$0.rec.id]! },
                     tokens: inputs,
@@ -4771,10 +4791,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                     params: decodeRows.map(\.rec.request.sampling),
                     pendingSampledTokens: nil,
                     phase: decodePhase,
+                    returnsHidden: !historyRows.isEmpty,
                     rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
             {
                 decodeInnerState = sparse.cacheInnerState
-                cacheInnerState.append(contentsOf: decodeInnerState)
+                decodeHidden = sparse.hidden
                 decodeNonFinite = sparse.nonFinite
                 decodeSampled = sparse.tokens
             } else {
@@ -4784,11 +4805,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     phase: decodePhase,
                     returnsHidden: !historyRows.isEmpty)
                 decodeInnerState = inner
-                if let hidden {
-                    mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
-                        tokens: inputs, hidden: hidden, rows: historyRows)
-                }
-                cacheInnerState.append(contentsOf: decodeInnerState)
+                decodeHidden = hidden
                 recurrentEvaluations.merge(recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
@@ -4828,6 +4845,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                     }
                 }
             }
+            if let decodeHidden {
+                mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
+                    tokens: inputs, hidden: decodeHidden, rows: historyRows)
+            }
+            cacheInnerState.append(contentsOf: decodeInnerState)
             // Mode A overlap: submit decode KV writes and samples eagerly before
             // whole-prompt compaction runs synchronous boundary-scoring `eval`s.
             if hasCompactionPrefill && attentionWork == nil {

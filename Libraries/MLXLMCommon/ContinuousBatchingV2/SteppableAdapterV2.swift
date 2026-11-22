@@ -477,6 +477,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2SparseHeadSampleableModel {
         (model as? any CBv2SparseHeadSampleableModel)?.supportsSparseExactHeadSampling ?? false
     }
 
+    public var supportsSparseHeadWithMTPHidden: Bool {
+        (model as? any CBv2SparseHeadSampleableModel)?.supportsSparseHeadWithMTPHidden ?? false
+    }
+
     public var sparseHeadVocabularySize: Int {
         (model as? any CBv2SparseHeadSampleableModel)?.sparseHeadVocabularySize ?? 0
     }
@@ -489,6 +493,13 @@ extension CBv2SteppableLanguageModelAdapter: CBv2SparseHeadSampleableModel {
                 "CBv2 sparse head: \(type(of: model)) is not CBv2SparseHeadSampleableModel")
         }
         return sparse.forwardHiddenForSparseHead(tokens: tokens, caches: caches)
+    }
+
+    public func forwardHiddenForSparseHeadWithMTPHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (postNorm: MLXArray, mtpHidden: MLXArray)? {
+        guard let sparse = model as? any CBv2SparseHeadSampleableModel else { return nil }
+        return sparse.forwardHiddenForSparseHeadWithMTPHidden(tokens: tokens, caches: caches)
     }
 
     public func sparseExactHeadSample(

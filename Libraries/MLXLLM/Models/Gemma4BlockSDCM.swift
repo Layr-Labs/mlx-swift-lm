@@ -50,10 +50,10 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         /// sparse L5 attention. ~3.8-4.1x faster (>10,500 tok/s on M3 Ultra) while preserving ~90%
         /// accuracy across 9K-16K code and natural-language prose suites.
         case turbo
-        /// High-compression L1 Tri-Signal Pre-Compaction (`34%` after Layer 0) + aggressive
-        /// bilateral schedule (`18/11/9/8%`, 32-tok blocks) + low-k early MoE (`k = 2` on L0..L2,
-        /// `k = 3` on L3..L5, `k = 4` on L6..L11, `k = 6` on L12..L28, exact `k = 8` on L29 & tail 160).
-        /// Targets 5.5-7.5x prefill speedup on long contexts.
+        /// High-compression Pre-L0 Tri-Signal Pre-Compaction (`30%` before Layer 0, 32-tok blocks)
+        /// + aggressive bilateral schedule (`16/10/8/7%`, 32-tok blocks) + low-k early MoE
+        /// (`k = 2` on L0..L2, `k = 3` on L3..L4, `k = 4` on L5..L11, `k = 6` on L12..L28,
+        /// exact `k = 8` on L29 & tail 160). Targets 5.5-7.5x prefill speedup on long contexts.
         case hyper
     }
 
@@ -114,8 +114,8 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public var sparseLocalWindow: Int
     /// Trailing tokens receiving exact full-sequence causal attention in `earlySparseFullLayer`.
     public var sparseTailTokens: Int
-    /// Optional early sliding-layer index after which to run Tri-Signal Pre-Compaction (e.g. `0`
-    /// compacts right after Layer 0 before Layer 1). `nil` disables early pre-compaction.
+    /// Optional early layer boundary after which to run Tri-Signal Pre-Compaction (`-1` compacts
+    /// initial embeddings before Layer 0; `0` compacts after Layer 0). `nil` disables it.
     public var earlyPreCompactAfterLayer: Int?
     /// Target fraction of original prompt length retained by early Tri-Signal Pre-Compaction.
     public var earlyPreCompactRatio: Float
@@ -307,13 +307,13 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public static let hyper = Gemma4BlockSDCMConfig(
         mode: .hyper,
         minPromptTokens: 3072,
-        keepSchedule: [6: 0.18, 12: 0.11, 18: 0.09, 24: 0.08],
+        keepSchedule: [6: 0.16, 12: 0.10, 18: 0.08, 24: 0.07],
         earlyMoEK: 4,
         lateMoEK: 6,
         earlyMoEUntilLayer: 12,
         layerMoEK: [
             0: 2, 1: 2, 2: 2,
-            3: 3, 4: 3, 5: 3,
+            3: 3, 4: 3, 5: 4,
             6: 4, 7: 4, 8: 4, 9: 4, 10: 4, 11: 4,
         ],
         blockSize: 32,
@@ -330,10 +330,10 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
         sparsePrefixTokens: 192,
         sparseLocalWindow: 1024,
         sparseTailTokens: 192,
-        earlyPreCompactAfterLayer: 0,
-        earlyPreCompactRatio: 0.34,
-        earlyPreCompactBlockSize: 64,
-        earlyPreCompactTopHaloK: 8
+        earlyPreCompactAfterLayer: -1,
+        earlyPreCompactRatio: 0.30,
+        earlyPreCompactBlockSize: 32,
+        earlyPreCompactTopHaloK: 10
     )
 
     public static func preset(for mode: Mode) -> Gemma4BlockSDCMConfig {
@@ -419,7 +419,10 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
     public static let current: Gemma4BlockSDCMConfig = resolve()
 
     func resolvedEarlyCompactLayer(layerCount: Int) -> Int? {
-        earlyPreCompactAfterLayer.flatMap { (0 ..< max(0, layerCount - 1)).contains($0) ? $0 : nil }
+        guard layerCount > 0 else { return nil }
+        return earlyPreCompactAfterLayer.flatMap {
+            (-1 ..< (layerCount - 1)).contains($0) ? $0 : nil
+        }
     }
 }
 
@@ -2735,6 +2738,61 @@ extension Gemma4TextModelInner {
             asyncEval(h, positions)
         }
 
+        func runEarlyPreCompaction() {
+            guard let embHidden = earlyEmbeddingHidden else { return }
+            earlyEmbeddingHidden = nil
+            guard h.dim(1) == paddedLength else { return }
+            let rawKeepEarly: [[Int32]]
+            let unionScores: [[Float]]
+            if !hasActiveRightPad {
+                (rawKeepEarly, unionScores) =
+                    Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
+                        tokenIDRows: resolvedTokenIDRows,
+                        embeddingHidden: embHidden,
+                        layerHidden: h,
+                        targetFraction: sdcm.earlyPreCompactRatio,
+                        blockSize: sdcm.earlyPreCompactBlockSize,
+                        topHaloK: sdcm.earlyPreCompactTopHaloK,
+                        config: sdcm)
+            } else {
+                var keeps: [[Int32]] = []
+                var scores: [[Float]] = []
+                keeps.reserveCapacity(B)
+                scores.reserveCapacity(B)
+                for b in 0 ..< B {
+                    let rowLen = origLens[b]
+                    let (kRow, sRow) =
+                        Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
+                            tokenIDRows: [resolvedTokenIDRows[b]],
+                            embeddingHidden: embHidden[b ..< (b + 1), 0 ..< rowLen, 0...],
+                            layerHidden: h[b ..< (b + 1), 0 ..< rowLen, 0...],
+                            targetFraction: sdcm.earlyPreCompactRatio,
+                            blockSize: sdcm.earlyPreCompactBlockSize,
+                            topHaloK: sdcm.earlyPreCompactTopHaloK,
+                            config: sdcm)
+                    keeps.append(kRow[0])
+                    scores.append(sRow[0])
+                }
+                rawKeepEarly = keeps
+                unionScores = scores
+            }
+            let keepEarly = Gemma4BlockSDCM.equalizeBatchedCompactedIndices(
+                keepRows: rawKeepEarly,
+                rowBlockScores: unionScores,
+                positionsHostRows: positionsHostRows,
+                originalLengths: origLens,
+                rowMaxLengths: origLens,
+                blockSize: sdcm.earlyPreCompactBlockSize,
+                currentLength: h.dim(1))
+            applyCompaction(keepRows: keepEarly)
+        }
+
+        // Pre-Layer-0 embedding Tri-Signal compaction (`earlyCompactLayer == -1`):
+        // prunes filler blocks and right-padding before Layer 0 runs.
+        if earlyCompactLayer == -1 {
+            runEarlyPreCompaction()
+        }
+
         for (idx, layer) in layers.enumerated() {
             if let targetFraction = sdcm.keepSchedule[idx], let scoresList = pendingScores {
                 let curLen = h.dim(1)
@@ -2783,56 +2841,8 @@ extension Gemma4TextModelInner {
             if let nextScores {
                 pendingScores = nextScores
             }
-            if let earlyLayer = earlyCompactLayer, idx == earlyLayer,
-                let embHidden = earlyEmbeddingHidden
-            {
-                if h.dim(1) == paddedLength {
-                    let rawKeepEarly: [[Int32]]
-                    let unionScores: [[Float]]
-                    if !hasActiveRightPad {
-                        (rawKeepEarly, unionScores) =
-                            Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
-                                tokenIDRows: resolvedTokenIDRows,
-                                embeddingHidden: embHidden,
-                                layerHidden: h,
-                                targetFraction: sdcm.earlyPreCompactRatio,
-                                blockSize: sdcm.earlyPreCompactBlockSize,
-                                topHaloK: sdcm.earlyPreCompactTopHaloK,
-                                config: sdcm)
-                    } else {
-                        var keeps: [[Int32]] = []
-                        var scores: [[Float]] = []
-                        keeps.reserveCapacity(B)
-                        scores.reserveCapacity(B)
-                        for b in 0 ..< B {
-                            let rowLen = origLens[b]
-                            let (kRow, sRow) =
-                                Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
-                                    tokenIDRows: [resolvedTokenIDRows[b]],
-                                    embeddingHidden: embHidden[
-                                        b ..< (b + 1), 0 ..< rowLen, 0...],
-                                    layerHidden: h[b ..< (b + 1), 0 ..< rowLen, 0...],
-                                    targetFraction: sdcm.earlyPreCompactRatio,
-                                    blockSize: sdcm.earlyPreCompactBlockSize,
-                                    topHaloK: sdcm.earlyPreCompactTopHaloK,
-                                    config: sdcm)
-                            keeps.append(kRow[0])
-                            scores.append(sRow[0])
-                        }
-                        rawKeepEarly = keeps
-                        unionScores = scores
-                    }
-                    let keepEarly = Gemma4BlockSDCM.equalizeBatchedCompactedIndices(
-                        keepRows: rawKeepEarly,
-                        rowBlockScores: unionScores,
-                        positionsHostRows: positionsHostRows,
-                        originalLengths: origLens,
-                        rowMaxLengths: origLens,
-                        blockSize: sdcm.earlyPreCompactBlockSize,
-                        currentLength: h.dim(1))
-                    applyCompaction(keepRows: keepEarly)
-                }
-                earlyEmbeddingHidden = nil
+            if earlyCompactLayer == idx {
+                runEarlyPreCompaction()
             }
             dflashAccumulator?.record(layerIdx: idx, hidden: h)
             if let ckptLayer = captureCheckpointAtLayer, idx == ckptLayer, B == 1 {
