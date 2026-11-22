@@ -169,12 +169,13 @@ def resolve_runs(data: dict) -> list[dict]:
                 if len(values) > 1:
                     raise SystemExit(f"error: {run_id} mixes groups or units with different {key}.")
             first = members[0] if members else {}
-            parts = [{"name": m["name"], "filters": m.get("filters", []), "skips": m.get("skips", []),
-                      "strict": bool(m.get("strict"))} for m in members]
-            parts += [{"name": unit, "filters": [unit_pattern(unit)], "skips": [], "strict": False}
-                      for unit in run.get("units", [])]
-            parts += [{"name": test, "filters": [exact_pattern(test)], "skips": [], "strict": False}
+            group_parts = [{"name": m["name"], "filters": m.get("filters", []), "skips": m.get("skips", []),
+                            "strict": bool(m.get("strict"))} for m in members]
+            named = [{"name": unit, "filters": [unit_pattern(unit)], "skips": [], "strict": False}
+                     for unit in run.get("units", [])]
+            named += [{"name": test, "filters": [exact_pattern(test)], "skips": [], "strict": False}
                       for test in run.get("tests", [])]
+            parts = group_parts + named
             if not parts and not run.get("rest"):
                 raise SystemExit(f"error: {run_id} selects nothing.")
             runs.append({
@@ -186,6 +187,8 @@ def resolve_runs(data: dict) -> list[dict]:
                 "tests": run.get("tests", []),
                 "rest": bool(run.get("rest")),
                 "parts": parts,
+                "group_parts": group_parts,
+                "named_pattern": "|".join(part["filters"][0] for part in named),
                 "strict": [part["name"] for part in parts if part["strict"]],
                 "extra": bool(first.get("extra", False)),
                 "metallib": bool(first.get("metallib", True)),
@@ -213,17 +216,23 @@ def part_selects(part: dict, test_id: str) -> bool:
 
 
 def selects(run: dict, test_id: str) -> bool:
-    """Return whether a run that is not a rest run selects a test."""
-    return any(part_selects(part, test_id) for part in run["parts"])
+    """Return whether a run that is not a rest run selects a test.
+
+    The unit and test parts have one escaped pattern each and no skips, so
+    one alternation of them matches the same tests. Every shard partitions
+    the whole list for its rest run; one search per run keeps that fast.
+    """
+    if run["named_pattern"] and compiled(run["named_pattern"]).search(test_id):
+        return True
+    return any(part_selects(part, test_id) for part in run["group_parts"])
 
 
 def split_rest(rest_runs: list[dict], rest: list[str], tests: list[str]) -> list[list[str]]:
     """Split the tests that no other main run selects over the rest runs.
 
-    The map has no durations for these tests. Their units (unit_of), most
-    tests first, go one at a time to the rest run whose shard has the
-    lowest estimated seconds, counting one second for each test it got.
-    Every job computes the same split from the same list and map.
+    Units (unit_of), most tests first, go one at a time to the rest run whose
+    shard has the lowest estimate, plus one second per test it got. The split
+    must depend only on the list and the map: every job computes it.
     """
     containers = containers_of(tests)
     units: dict[str, list[str]] = {}
@@ -270,7 +279,7 @@ def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]],
 
 
 def selection(run: dict, runs: list[dict], tests: list[str]) -> list[str]:
-    """Return the listed tests that a run selects."""
+    """Return the listed tests that a run selects. `runs` must be every run of the map."""
     if run["rest"]:
         owners, _ = partition(runs, tests)
         return [test for test, owned in owners.items() if run["id"] in owned]
@@ -290,10 +299,10 @@ def command_check(args: argparse.Namespace) -> int:
     for run in runs:
         kind = "extra" if run["extra"] else ("rest" if run["rest"] else "main")
         print(f"{run['id']}: {kind}, {run['selected']} tests")
-    rest = [run["selected"] for run in runs if run["rest"] and run["selected"]]
-    if rest:
-        where = "the rest run of 1 shard runs" if len(rest) == 1 else f"the rest runs of {len(rest)} shards run"
-        print(f"::warning::{sum(rest)} tests are in no shard of the map, so {where} them. "
+    shares = [run["selected"] for run in runs if run["rest"] and run["selected"]]
+    if shares:
+        where = "the rest run of 1 shard runs" if len(shares) == 1 else f"the rest runs of {len(shares)} shards run"
+        print(f"::warning::{sum(shares)} tests are in no shard of the map, so {where} them. "
               "Run test_shards.py plan to add them to the map.")
     print(f"{len(tests)} tests in the list.")
     for problem in problems[:200]:
@@ -450,8 +459,8 @@ def command_run(args: argparse.Namespace) -> int:
         attempt = 1
         chosen = selection(run, all_runs, listed)
         if run["rest"] and chosen:
-            print(f"::warning::This shard's rest run runs {len(chosen)} tests that are in no shard of the "
-                  "map. Run test_shards.py plan to add them to the map.", flush=True)
+            print(f"This shard's rest run runs {len(chosen)} tests that are in no shard of the map. "
+                  "The shard map check reports them all.", flush=True)
         if run["rest"] and not chosen:
             (folder / "log-1.txt").write_text("Each listed test is in another run of the map.\n")
             print("Each listed test is in another run of the map.", flush=True)

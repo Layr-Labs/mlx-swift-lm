@@ -64,16 +64,18 @@ was queued, before any of its shards (run 44937126105).
 Every native shard ends with a rest run. The rest runs share the tests that
 no shard names, which are mostly the new suites of a pull request, until a
 new plan adds them to the map. The map has no durations for them, so
-`test_shards.py` gives their units, most tests first, to the shard with the
-lowest estimate, counting one second per test. Every job computes the same
-split from the build's test list, and "Each test ran once" still checks each
-test. Before, shard 12 ran all of them. Of the 15 pull request rounds on 16
+`test_shards.py` gives their units one at a time, most tests first, to the
+shard with the lowest estimate so far, counting one second per test. Every
+job computes the same split from the build's test list, and "Each test ran
+once" still checks each test. Before, shard 12 ran all of them. Of the 15 pull request rounds on 16
 shards from 2026-11-21 19:40 to 2026-11-22 19:05 UTC, 13 had such tests, and
 10 had 105 to 193 of them (91 to 394 s). Shard 12 ended 6 of those 10, its
 "Run the shard" at 331 to 654 s against 195 to 316 s for the slowest other
-shard. A rest run with no tests starts no process. Beside the shard's own
-process, one more costs about 3 s (median overhead 20 s with one process,
-23 s with two).
+shard. A rest run with tests adds a second process to its shard, about 3 s
+(median overhead 20 s with one process, 23 s with two). A rest run with no
+tests starts no process, but every shard now partitions the whole list to
+find its share: 0.5 s for the 8,076 tests of run 45046267507 on a developer
+Mac, after one combined pattern per run replaced one search per unit (3.9 s).
 
 The shard planner stays hosted. Seven strict audio tests also stay on the
 hosted `xcode-27` image while native decoding is investigated. They share

@@ -108,6 +108,15 @@ class PartitionTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             test_shards.resolve_runs(make_map(shards, groups=[]))
 
+    def test_a_run_selects_what_one_of_its_parts_selects(self):
+        shards = [{"runs": [{"groups": ["paged"], "units": ["M.A", "M.free()"], "tests": ["M.Paged/exclusive()"]},
+                            {"units": ["M.KernelTests/K1"]}, {"rest": True}]}]
+        tests = TESTS + ["M.AB/testOne", "M.free()/F.swift:1:1", "M.KernelTests/K10/run()", "N.A/testOne"]
+        for run in test_shards.resolve_runs(make_map(shards))[:2]:
+            for test in tests:
+                self.assertEqual(test_shards.selects(run, test),
+                                 any(test_shards.part_selects(part, test) for part in run["parts"]), (run["id"], test))
+
     def test_unit_pattern_escapes_the_id(self):
         self.assertEqual(test_shards.unit_pattern("M.KernelTests/K2"), r"^M\.KernelTests/K2/")
         self.assertEqual(test_shards.unit_pattern("M.free()"), r"^M\.free\(\)")
@@ -141,6 +150,11 @@ class RestSplitTests(unittest.TestCase):
         rest = self.rest_owners(owners)
         self.assertEqual(len(rest), 8)
         self.assertEqual({tuple(owned) for owned in rest.values()}, {("shard2-run2",)})
+
+    def test_the_split_does_not_depend_on_the_order_of_the_list(self):
+        tests = TESTS + self.NEW
+        owners, _ = problems_of(self.data(), tests)
+        self.assertEqual(problems_of(self.data(), tests[::-1])[0], owners)
 
     def test_each_rest_run_selects_its_share_and_together_every_test_once(self):
         tests = TESTS + self.NEW
