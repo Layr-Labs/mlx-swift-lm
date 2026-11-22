@@ -260,7 +260,9 @@ struct Inkling2DSparkDepthZeroChainedTests {
     func forcedScheduleChainsExactly(rows: Int) async throws {
         let model = try Inkling2DSparkTargetEngineTests.target(dtype: Self.dtype)
         let drafter = try Inkling2DSparkTargetEngineTests.drafter(target: model, dtype: Self.dtype)
-        let fixed = Inkling2DSparkDrafter.defaultMTPConfig(maxDraftTokens: 4, adaptive: false)
+        // Eight speculating rows, above the shipped limit, so 8 rows draft.
+        let fixed = Inkling2DSparkDrafter.defaultMTPConfig(
+            maxDraftTokens: 4, adaptive: false, maxSpeculativeRows: 8)
         let tokens = 40
 
         let off = try await Self.run(
@@ -313,8 +315,16 @@ struct Inkling2DSparkDepthZeroChainedTests {
         let drafter = try Inkling2DSparkTargetEngineTests.drafter(target: model, dtype: Self.dtype)
         let tokens = 32
         let configs: [(String, CBv2MTPConfig)] = [
-            ("adaptive", Inkling2DSparkDrafter.defaultMTPConfig(adaptive: true)),
-            ("fixed4", Inkling2DSparkDrafter.defaultMTPConfig(maxDraftTokens: 4, adaptive: false)),
+            // Eight speculating rows, above the shipped limit, so 8 rows draft.
+            (
+                "adaptive",
+                Inkling2DSparkDrafter.defaultMTPConfig(adaptive: true, maxSpeculativeRows: 8)
+            ),
+            (
+                "fixed4",
+                Inkling2DSparkDrafter.defaultMTPConfig(
+                    maxDraftTokens: 4, adaptive: false, maxSpeculativeRows: 8)
+            ),
             // Every plan at depth zero: the whole request is a chained stretch.
             (
                 "depth0",

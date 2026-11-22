@@ -572,15 +572,29 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
 }
 
 extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
+    /// Most decode rows that speculate in one step. A step with more decode
+    /// rows runs every row as plain decode (the engine's batch gate), which
+    /// gives the same tokens. Four: at five to eight rows a drafting step cost
+    /// more than the tokens it gained (M5 Max and M5 Ultra, 2026-11-22).
+    /// `DARKBLOOM_INKLING2_MTP_MAX_ROWS` sets another limit (1 to 64).
+    public static let defaultSpeculativeRows: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_MTP_MAX_ROWS"],
+            let rows = Int(raw), rows >= 1
+        else { return 4 }
+        return min(rows, 64)
+    }()
+
     /// The engine configuration the drafter ships with: on, up to the
-    /// checkpoint's full block (7 drafts), up to eight speculating rows, one
-    /// verify window per round. `adaptive` lets the engine's marginal policy
-    /// pick each round's depth from the request's measured acceptance and the
-    /// measured window cost (down to plain decode where drafting does not
-    /// pay); otherwise every round drafts `maxDraftTokens`. The exactness of
-    /// the window is the target's claim (`requiredVerificationMode`).
+    /// checkpoint's full block (7 drafts), up to `defaultSpeculativeRows`
+    /// speculating rows, one verify window per round. `adaptive` lets the
+    /// engine's marginal policy pick each round's depth from the request's
+    /// measured acceptance and the measured window cost (down to plain decode
+    /// where drafting does not pay); otherwise every round drafts
+    /// `maxDraftTokens`. The exactness of the window is the target's claim
+    /// (`requiredVerificationMode`).
     public static func defaultMTPConfig(
-        maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8
+        maxDraftTokens: Int = 7, adaptive: Bool = true,
+        maxSpeculativeRows: Int = defaultSpeculativeRows
     ) -> CBv2MTPConfig {
         CBv2MTPConfig(
             enabled: true, maxDraftTokens: maxDraftTokens,

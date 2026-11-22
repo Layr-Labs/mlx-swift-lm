@@ -197,6 +197,19 @@ struct Inkling2DSparkEngineTests {
         return outputs
     }
 
+    @Test("the shipped configuration speculates on at most the default number of rows")
+    func shippedConfigurationRowLimit() {
+        let config = Inkling2DSparkDrafter.defaultMTPConfig()
+        let rows = Inkling2DSparkDrafter.defaultSpeculativeRows
+        #expect(config.maxSpeculativeBatch == rows)
+        #expect(config.maxAutomaticRectangularTokens == rows * (config.maxDraftTokens + 1))
+        if ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_MTP_MAX_ROWS"] == nil {
+            #expect(rows == 4)
+        }
+        #expect(
+            Inkling2DSparkDrafter.defaultMTPConfig(maxSpeculativeRows: 8).maxSpeculativeBatch == 8)
+    }
+
     @Test(
         "drafter on equals drafter off for 1 to 32 rows (above 8 with a raised limit)",
         arguments: [1, 2, 4, 8, 16, 32])
