@@ -1441,7 +1441,20 @@ class Gemma4Experts: Module {
 
 // MARK: - MLP
 
-class Gemma4MLP: Module {
+class Gemma4MLP: Module, ParameterUpdateObserving {
+    private static let fusedGateUpEnabled: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_GATE_UP"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        else { return true }
+        return raw != "0" && raw != "false" && raw != "off"
+    }()
+
+    private let fusedGateUp = FusedQuantizedLinearProjectionCache()
+    var hasFusedGateUp: Bool { fusedGateUp.isPrepared }
+    var fusedGateUpProjection: QuantizedLinear? { fusedGateUp.fused }
+
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1458,12 +1471,71 @@ class Gemma4MLP: Module {
         super.init()
     }
 
+    @discardableResult
+    func prepareFusedGateUp() throws -> Bool {
+        guard gateProj.shape.0 == upProj.shape.0 else { return false }
+        return try fusedGateUp.prepare(
+            enabled: Self.fusedGateUpEnabled,
+            linears: [gateProj, upProj]
+        ) { views in
+            try self.update(
+                modules: ModuleChildren(values: [
+                    "gate_proj": .value(views[0]),
+                    "up_proj": .value(views[1]),
+                ]),
+                verify: [])
+        }
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let touchesGateUp = Self.touchesGateUpParameters(parameters.flattened().map(\.0))
+        defer {
+            if touchesGateUp {
+                fusedGateUp.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let touchesGateUp = key == "gate_proj" || key == "up_proj"
+        defer {
+            if touchesGateUp {
+                fusedGateUp.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    func ancestorDidUpdateParameters(keys: [String]) {
+        if Self.touchesGateUpParameters(keys) {
+            fusedGateUp.invalidate()
+        }
+    }
+
+    private static func touchesGateUpParameters(_ keys: [String]) -> Bool {
+        keys.contains {
+            $0.hasPrefix("gate_proj.") || $0.hasPrefix("up_proj.")
+                || $0 == "gate_proj" || $0 == "up_proj"
+        }
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         Gemma4BatchDecodeProjection.linear(downProj, activated(x))
     }
 
     private func activated(_ x: MLXArray) -> MLXArray {
-        gemma4GeluProduct(
+        if let fused = fusedGateUp.fused {
+            let combined = Gemma4BatchDecodeProjection.linear(fused, x)
+            let parts = split(combined, parts: 2, axis: -1)
+            return gemma4GeluProduct(parts[0], parts[1])
+        }
+        return gemma4GeluProduct(
             Gemma4BatchDecodeProjection.linear(gateProj, x),
             Gemma4BatchDecodeProjection.linear(upProj, x))
     }
@@ -1472,6 +1544,130 @@ class Gemma4MLP: Module {
     /// projection, without a collective (its zero-padded channels add zero).
     func tensorParallelPartial(_ x: MLXArray) -> MLXArray {
         Gemma4TensorParallelProjection.partial(downProj, activated(x))
+    }
+}
+
+/// Opt-in load-time 8-bit -> 4-bit weight repacking for Gemma 4 non-MoE
+/// linear projections (`DARKBLOOM_GEMMA4_REQUANT_4BIT=off|dense|all`, default `off`).
+/// Runs layer-by-layer in `Gemma4TextModel.prepare()` before QKV and GateUp fusion.
+public enum Gemma4Requant4BitMode: String, Sendable, Equatable {
+    case off
+    case dense
+    case all
+
+    public static let envKey = "DARKBLOOM_GEMMA4_REQUANT_4BIT"
+
+    public static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Gemma4Requant4BitMode {
+        guard
+            let raw = environment[envKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+            !raw.isEmpty
+        else { return .off }
+        switch raw {
+        case "dense", "mlp":
+            return .dense
+        case "all", "dense_qkv", "qkv":
+            return .all
+        default:
+            return .off
+        }
+    }
+
+    static func requantizeLinearTo4Bit(
+        _ linear: Linear, groupSize: Int = 64
+    ) -> QuantizedLinear? {
+        guard let q = linear as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self,
+            q.bits == 8,
+            q.mode == .affine,
+            q.bias == nil,
+            q.weight.ndim == 2,
+            q.weight.dtype == .uint32,
+            q.scales.ndim == 2,
+            let qBiases = q.biases,
+            q.scales.shape == qBiases.shape,
+            q.globalScale == nil
+        else { return nil }
+        let inputDims = q.weight.dim(1) * 4
+        guard inputDims > 0, inputDims % groupSize == 0 else { return nil }
+        let wFP = dequantized(
+            q.weight, scales: q.scales, biases: qBiases,
+            groupSize: q.groupSize, bits: 8, mode: .affine, dtype: q.scales.dtype)
+        let (w4, s4, b4) = quantized(wFP, groupSize: groupSize, bits: 4, mode: .affine)
+        if let b4 {
+            eval(w4, s4, b4)
+        } else {
+            eval(w4, s4)
+        }
+        let packed = QuantizedLinear(
+            weight: w4, bias: nil, scales: s4, biases: b4,
+            groupSize: groupSize, bits: 4, mode: .affine)
+        packed.freeze()
+        packed.train(q.training)
+        return packed
+    }
+}
+
+/// Opt-in decode-only MoE active-expert reduction (`DARKBLOOM_GEMMA4_DECODE_MOE_TOPK`).
+///
+/// Prefill (`isExpertPrefill || sequenceWidth > 3`) keeps full `top_k_experts`;
+/// single-token decode and narrow MTP verification (`sequenceWidth <= 3`) reduce
+/// active experts per the chosen policy (default `.off`).
+public enum Gemma4DecodeMoETopKPolicy: Equatable, Sendable {
+    case off
+    case uniform(Int)
+    case sensitivityMatched
+
+    public static let envKey = "DARKBLOOM_GEMMA4_DECODE_MOE_TOPK"
+
+    /// Layers exhibiting elevated KL sensitivity under per-layer `k=8 -> k=4` ablation
+    /// on 30-layer Gemma 4 26B-A4B mid-generation GPQA decode trajectories.
+    private static let gemma426BSensitiveLayers: Set<Int> = [0, 7, 9, 18, 19, 21, 26, 27, 28]
+
+    public static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Gemma4DecodeMoETopKPolicy {
+        guard
+            let raw = environment[envKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+            !raw.isEmpty
+        else { return .off }
+        switch raw {
+        case "0", "off", "false", "none":
+            return .off
+        case "sens", "sens_6_4", "sensitivity", "adaptive":
+            return .sensitivityMatched
+        default:
+            if let k = Int(raw), k >= 1 {
+                return .uniform(k)
+            }
+            return .off
+        }
+    }
+
+    public func activeTopK(layerIdx: Int, numLayers: Int, defaultTopK: Int) -> Int {
+        guard defaultTopK > 1 else { return defaultTopK }
+        switch self {
+        case .off:
+            return defaultTopK
+        case .uniform(let k):
+            return max(1, min(k, defaultTopK))
+        case .sensitivityMatched:
+            guard numLayers > 1 else { return defaultTopK }
+            if layerIdx == numLayers - 1 {
+                return defaultTopK
+            }
+            if numLayers == 30 {
+                let target = Self.gemma426BSensitiveLayers.contains(layerIdx) ? 6 : 4
+                return max(1, min(target, defaultTopK))
+            }
+            let target = (layerIdx == 0 || layerIdx >= numLayers - 4) ? 6 : 4
+            return max(1, min(target, defaultTopK))
+        }
     }
 }
 
@@ -1515,6 +1711,24 @@ public class Gemma4DecoderLayer: Module {
     /// summed across ranks before their separate post-norms.
     var tensorParallel: Gemma4TensorParallelContext?
     private let compiledFeedforward = Gemma4CompiledFeedforwardCache()
+    private var _decodeMoETopK: Int?
+    /// Optional decode-only MoE top-K override (`DARKBLOOM_GEMMA4_DECODE_MOE_TOPK`).
+    /// `nil` means exact checkpoint `router.topK`.
+    var decodeMoETopK: Int? {
+        get { _decodeMoETopK }
+        set {
+            let normalized: Int?
+            if let requested = newValue, let router {
+                let clamped = max(1, min(requested, router.topK))
+                normalized = clamped < router.topK ? clamped : nil
+            } else {
+                normalized = newValue
+            }
+            guard normalized != _decodeMoETopK else { return }
+            _decodeMoETopK = normalized
+            compiledFeedforward.invalidate()
+        }
+    }
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
 
@@ -1552,7 +1766,13 @@ public class Gemma4DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
         if config.enableMoeBlock {
-            self._router.wrappedValue = Gemma4Router(config)
+            let router = Gemma4Router(config)
+            self._router.wrappedValue = router
+            let policyK = Gemma4DecodeMoETopKPolicy.resolve().activeTopK(
+                layerIdx: layerIdx,
+                numLayers: config.numHiddenLayers,
+                defaultTopK: router.topK)
+            self._decodeMoETopK = policyK < router.topK ? policyK : nil
             self._experts.wrappedValue = Gemma4Experts(
                 config,
                 fuseWeightedUnsort: fuseWeightedUnsort)
@@ -1614,7 +1834,8 @@ public class Gemma4DecoderLayer: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)?,
         outputTailRows: Int?,
         useLastQueryPrefill: Bool,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        allowDecodeMoETopK: Bool = true
     ) -> (MLXArray, Gemma4SharedKVState, Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -1667,7 +1888,9 @@ public class Gemma4DecoderLayer: Module {
             useLastQueryPrefill: useLastQueryPrefill)
         let postAttn = postAttentionLayernorm(attnOut)
         let feedforwardInput = residual + postAttn
-        var out = feedforwardWithCompilation(feedforwardInput, isExpertPrefill: isExpertPrefill)
+        var out = feedforwardWithCompilation(
+            feedforwardInput, isExpertPrefill: isExpertPrefill,
+            allowDecodeMoETopK: allowDecodeMoETopK)
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1689,14 +1912,38 @@ public class Gemma4DecoderLayer: Module {
         return (out, kvPair, attnPositionOffset)
     }
 
-    func feedforwardWithCompilation(_ input: MLXArray, isExpertPrefill: Bool) -> MLXArray {
-        compiledFeedforward(self, input, isExpertPrefill: isExpertPrefill)
-            ?? feedforward(input, isExpertPrefill: isExpertPrefill)
+    func feedforwardWithCompilation(
+        _ input: MLXArray,
+        isExpertPrefill: Bool,
+        allowDecodeMoETopK: Bool = true
+    ) -> MLXArray {
+        if !allowDecodeMoETopK && decodeMoETopK != nil {
+            return feedforward(input, isExpertPrefill: isExpertPrefill, allowDecodeMoETopK: false)
+        }
+        return compiledFeedforward(self, input, isExpertPrefill: isExpertPrefill)
+            ?? feedforward(
+                input, isExpertPrefill: isExpertPrefill, allowDecodeMoETopK: allowDecodeMoETopK)
+    }
+
+    func routeExperts(
+        _ input: MLXArray,
+        router: Gemma4Router,
+        isExpertPrefill: Bool,
+        allowDecodeMoETopK: Bool
+    ) -> (MLXArray, MLXArray) {
+        if allowDecodeMoETopK, !isExpertPrefill, input.dim(1) <= 3, let activeTopK = decodeMoETopK {
+            return router.routeTopK(input, topK: activeTopK)
+        }
+        return router(input)
     }
 
     /// The unchanged token-local FFN body. Attention, PLE, layer scalar and
     /// every cache operation remain in their original caller outside this trace.
-    func feedforward(_ input: MLXArray, isExpertPrefill: Bool) -> MLXArray {
+    func feedforward(
+        _ input: MLXArray,
+        isExpertPrefill: Bool,
+        allowDecodeMoETopK: Bool = true
+    ) -> MLXArray {
         var out = input
 
         let residual2 = out
@@ -1714,7 +1961,8 @@ public class Gemma4DecoderLayer: Module {
                 postFeedforwardLayernorm1: postFeedforwardLayernorm1,
                 preFeedforwardLayernorm2: preFeedforwardLayernorm2,
                 postFeedforwardLayernorm2: postFeedforwardLayernorm2,
-                context: tensorParallel, isExpertPrefill: isExpertPrefill)
+                context: tensorParallel, isExpertPrefill: isExpertPrefill,
+                allowDecodeMoETopK: allowDecodeMoETopK)
         } else if isMoE,
             let router,
             let experts,
@@ -1722,12 +1970,13 @@ public class Gemma4DecoderLayer: Module {
             let preFeedforwardLayernorm2,
             let postFeedforwardLayernorm2
         {
-            // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = routeExperts(
+                out, router: router, isExpertPrefill: isExpertPrefill,
+                allowDecodeMoETopK: allowDecodeMoETopK)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,
@@ -1765,8 +2014,17 @@ public class Gemma4DecoderLayer: Module {
         guard norms.allSatisfy({ type(of: $0) == RMSNorm.self && $0.weight.dtype == .bfloat16 })
         else { return nil }
         var parameters = norms.map(\.weight) + [router.scale, router.perExpertScale]
+        // Include live `@ModuleInfo` children `gateProj`/`upProj` even when
+        // `fusedGateUpProjection` is active so `model.train(_:)` stays authoritative.
         var modules: [Module] = [mlp, router, experts] + norms + expertState.modules
-        for projection in [mlp.gateProj, mlp.upProj, mlp.downProj, router.proj] {
+        let mlpProjections: [Linear]
+        if let fused = mlp.fusedGateUpProjection {
+            modules += [mlp.gateProj, mlp.upProj]
+            mlpProjections = [fused, mlp.downProj, router.proj]
+        } else {
+            mlpProjections = [mlp.gateProj, mlp.upProj, mlp.downProj, router.proj]
+        }
+        for projection in mlpProjections {
             guard let quantized = projection as? QuantizedLinear,
                 type(of: quantized) == QuantizedLinear.self,
                 quantized.mode == .affine, [4, 8].contains(quantized.bits),
@@ -1783,8 +2041,9 @@ public class Gemma4DecoderLayer: Module {
         guard Set(parameters.map(ObjectIdentifier.init)).count == parameters.count else {
             return nil
         }
+        let effectiveTopK = decodeMoETopK.map { max(1, min($0, router.topK)) } ?? router.topK
         return Gemma4FeedforwardCompilationState(
-            parameters: parameters, modules: modules, topK: router.topK,
+            parameters: parameters, modules: modules, topK: effectiveTopK,
             suppliesHostRowIndices: experts.switchGLU.suppliesHostRowIndices)
     }
 }
@@ -2073,20 +2332,16 @@ public class Gemma4TextModelInner: Module {
         // enabled; all short prompts, packed batches, vision spans, prefix-cache
         // suffixes, MTP captures, unsupported caches, and tensor-parallel ranks
         // keep the exact path.
-        let initialOffset: Int = {
-            for layerCache in fullCache {
-                if let v2 = layerCache as? (any CBv2AttendingLayerCache), !v2.rows.isEmpty {
-                    return v2.rows.allSatisfy { $0.ropePositionOffset == 0 } ? 0 : 1
-                }
-                if let layerCache {
-                    if case .scalar(let value) = layerCache.ropeOffset {
-                        return value
-                    }
-                    return layerCache.offset
-                }
-            }
-            return 0
+        let initialOffset = Gemma4BlockSDCM.initialOffset(for: fullCache)
+        let resolvedRowLengths: [Int]? = {
+            guard let lens = CBv2CompactionRowLengths.current,
+                lens.count == h.dim(0),
+                lens.allSatisfy({ $0 > 0 && $0 <= h.dim(1) }),
+                lens.max() == h.dim(1)
+            else { return nil }
+            return lens
         }()
+        let minRowSeqLen = resolvedRowLengths?.min() ?? h.dim(1)
         if layers.first?.selfAttn.tensorParallel == nil,
             fullCache.allSatisfy({ $0.map(Gemma4BlockSDCM.supportsCache) ?? true }),
             Gemma4BlockSDCM.canRun(
@@ -2094,7 +2349,7 @@ public class Gemma4TextModelInner: Module {
                 modelConfig: config,
                 schedulePrefill: schedulePrefill,
                 batchSize: h.dim(0),
-                sequenceLength: h.dim(1),
+                sequenceLength: minRowSeqLen,
                 hasInputEmbedding: inputEmbedding != nil,
                 hasImageMask: imageTokenMask != nil,
                 hasCaptureHook: captureHook != nil,
@@ -2103,9 +2358,7 @@ public class Gemma4TextModelInner: Module {
             let batchSize = h.dim(0)
             let seqLen = h.dim(1)
             let earlyEnabled =
-                blockSDCMConfig.earlyPreCompactAfterLayer.map {
-                    (0 ..< max(0, layers.count - 1)).contains($0)
-                } == true
+                blockSDCMConfig.resolvedEarlyCompactLayer(layerCount: layers.count) != nil
             let needTokenRows = earlyEnabled || blockSDCMConfig.densityGuardEnabled
             var tokenRows: [[Int32]]? = nil
             var densityOK = true
@@ -2116,7 +2369,8 @@ public class Gemma4TextModelInner: Module {
                     rows.reserveCapacity(batchSize)
                     for b in 0 ..< batchSize {
                         let lo = b * seqLen
-                        let row = Array(flat[lo ..< (lo + seqLen)])
+                        let realLen = resolvedRowLengths?[b] ?? seqLen
+                        let row = Array(flat[lo ..< (lo + realLen)])
                         if blockSDCMConfig.densityGuardEnabled
                             && !Gemma4BlockSDCM.passesDensityGuard(
                                 tokens: row, config: blockSDCMConfig)
@@ -2135,6 +2389,7 @@ public class Gemma4TextModelInner: Module {
                 let (postNorm, _) = forwardBlockSDCMTrunk(
                     h,
                     inputTokenIDRows: tokenRows,
+                    originalLengths: resolvedRowLengths,
                     fullCache: fullCache,
                     sdcm: blockSDCMConfig,
                     isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
@@ -2243,7 +2498,8 @@ public class Gemma4TextModelInner: Module {
                 // enabling it there regressed the raw-prefill control without
                 // affecting the serving path selected by the benchmark.
                 isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill)
+                    schedulePrefill: schedulePrefill),
+                allowDecodeMoETopK: !schedulePrefill
             )
             h = out
             intermediates[idx] = (kvState, positionOffset)
@@ -2434,13 +2690,51 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
-    /// Prepare load-time zero-extra-RAM inference fusions (fused QKV projections
-    /// across non-shared attention layers and `Hi4/Lo4` bit-plane Cauchy-Schwarz
-    /// `lm_head` for 8-bit tied embeddings; invoked automatically by
-    /// `materializeModelForInference`).
+    /// Prepare load-time zero-extra-RAM inference optimizations (opt-in 8b->4b
+    /// Dense MLP / QKV+O repacking, fused QKV and GateUp projections, and opt-in
+    /// `Hi4/Lo4` sparse `lm_head`; invoked automatically by `materializeModelForInference`).
     public func prepare() throws {
+        try prepare(requant4BitMode: Gemma4Requant4BitMode.resolve())
+    }
+
+    public func prepare(requant4BitMode: Gemma4Requant4BitMode) throws {
+        if requant4BitMode != .off {
+            func requantizeChildren(_ target: Module, _ children: [(String, Linear?)]) throws {
+                var updates: [String: NestedItem<String, Module>] = [:]
+                for (key, linear) in children {
+                    if let linear,
+                        let packed = Gemma4Requant4BitMode.requantizeLinearTo4Bit(linear)
+                    {
+                        updates[key] = .value(packed)
+                    }
+                }
+                if !updates.isEmpty {
+                    try target.update(modules: ModuleChildren(values: updates), verify: [])
+                }
+            }
+            for layer in model.layers {
+                try requantizeChildren(
+                    layer.mlp,
+                    [
+                        ("gate_proj", layer.mlp.gateProj),
+                        ("up_proj", layer.mlp.upProj),
+                        ("down_proj", layer.mlp.downProj),
+                    ])
+                if requant4BitMode == .all {
+                    try requantizeChildren(
+                        layer.selfAttn,
+                        [
+                            ("q_proj", layer.selfAttn.qProj),
+                            ("k_proj", layer.selfAttn.kProj),
+                            ("v_proj", layer.selfAttn.vProj),
+                            ("o_proj", layer.selfAttn.oProj),
+                        ])
+                }
+            }
+        }
         for layer in model.layers {
             _ = try layer.selfAttn.prepareFusedQKV()
+            _ = try layer.mlp.prepareFusedGateUp()
         }
         let hi4Strategy = Gemma4Hi4Lo4Embedding.resolvedStrategy()
         if config.tieWordEmbeddings,
@@ -2817,6 +3111,37 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
     /// independence before it packs anything.
     public var cbv2SupportsPackedPrefill: Bool { true }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { true }
+
+    public func cbv2CanRunHeterogeneousCompaction(
+        tokenRows: [[Int32]], cache: [KVCache]?
+    ) -> Bool {
+        guard tokenRows.count > 1,
+            let minRowLen = tokenRows.map(\.count).min(),
+            minRowLen > 0,
+            model.layers.first?.selfAttn.tensorParallel == nil
+        else { return false }
+        let fullCache =
+            cache?.map(Optional.some) ?? Array(repeating: nil, count: model.layers.count)
+        guard fullCache.allSatisfy({ $0.map(Gemma4BlockSDCM.supportsCache) ?? true }) else {
+            return false
+        }
+        guard
+            Gemma4BlockSDCM.canRun(
+                sdcm: model.blockSDCMConfig,
+                modelConfig: model.config,
+                schedulePrefill: true,
+                batchSize: tokenRows.count,
+                sequenceLength: minRowLen,
+                hasInputEmbedding: false,
+                hasImageMask: false,
+                hasCaptureHook: false,
+                initialOffset: Gemma4BlockSDCM.initialOffset(for: fullCache))
+        else { return false }
+        guard model.blockSDCMConfig.densityGuardEnabled else { return true }
+        return tokenRows.allSatisfy {
+            Gemma4BlockSDCM.passesDensityGuard(tokens: $0, config: model.blockSDCMConfig)
+        }
+    }
 
     public func cbv2Prefill(
         _ inputs: MLXArray,

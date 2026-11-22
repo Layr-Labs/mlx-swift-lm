@@ -377,6 +377,10 @@ public struct Gemma4BlockSDCMConfig: Sendable, Equatable {
 
     /// Current process-level configuration (resolved once from environment).
     public static let current: Gemma4BlockSDCMConfig = resolve()
+
+    func resolvedEarlyCompactLayer(layerCount: Int) -> Int? {
+        earlyPreCompactAfterLayer.flatMap { (0 ..< max(0, layerCount - 1)).contains($0) ? $0 : nil }
+    }
 }
 
 // MARK: - Bilateral Boundary Scores
@@ -587,6 +591,23 @@ public enum Gemma4BlockSDCM {
         return true
     }
 
+    /// Compute the cold-start `initialOffset` gate for `canRun` (`0` iff all active caches
+    /// start at RoPE offset 0).
+    static func initialOffset(for fullCache: [KVCache?]) -> Int {
+        for layerCache in fullCache {
+            if let v2 = layerCache as? (any CBv2AttendingLayerCache), !v2.rows.isEmpty {
+                return v2.rows.allSatisfy { $0.ropePositionOffset == 0 } ? 0 : 1
+            }
+            if let layerCache {
+                if case .scalar(let value) = layerCache.ropeOffset {
+                    return value
+                }
+                return layerCache.offset
+            }
+        }
+        return 0
+    }
+
     /// Check whether a Gemma 4 prefill call qualifies for Block-SDCM.
     /// Restricts execution to cold text prefills (batch `1...sdcm.maxPackedBatch`) on
     /// non-KV-shared, non-PLE Gemma 4 topologies (e.g. 26B-A4B) above `sdcm.minPromptTokens`.
@@ -602,7 +623,10 @@ public enum Gemma4BlockSDCM {
         initialOffset: Int,
         passesDensityGuard: Bool = true
     ) -> Bool {
-        sdcm.mode != .off
+        let hasReachableCompaction =
+            sdcm.resolvedEarlyCompactLayer(layerCount: modelConfig.numHiddenLayers) != nil
+            || sdcm.keepSchedule.keys.contains { $0 > 0 && $0 < modelConfig.numHiddenLayers }
+        return sdcm.mode != .off
             && schedulePrefill
             && (1 ... max(1, sdcm.maxPackedBatch)).contains(batchSize)
             && sequenceLength >= sdcm.minPromptTokens
@@ -613,7 +637,7 @@ public enum Gemma4BlockSDCM {
             && !hasCaptureHook
             && initialOffset == 0
             && supportsModelConfig(modelConfig)
-            && !sdcm.keepSchedule.isEmpty
+            && hasReachableCompaction
     }
 
     /// Number of contiguous blocks covering `originalLength` (always `>= 1`).
@@ -1452,15 +1476,16 @@ public enum Gemma4BlockSDCM {
     }
 
     /// Ensure every row in a batched `B >= 1` compaction selection retains the exact same
-    /// surviving token count `L_next` so `[B, L_next, D]` stays rectangular. When all rows
-    /// already agree on length (the common case), returns `keepRows` unmodified. Otherwise
-    /// pads shorter rows up to `min(currentLength, maxLen)` using highest-scoring unkept
-    /// blocks/tokens in ascending index order so no selected prefix/tail/hot token is dropped.
+    /// surviving token count `targetLen` (`<= min(currentLength, rowMaxLengths.min())`) so
+    /// `[B, targetLen, D]` stays rectangular without ever selecting right-pad slots. Pads
+    /// shorter rows with highest-scoring unkept tokens and trims longer rows by dropping
+    /// lowest-scoring interior tokens while keeping pinned prefix and frontier tail tokens.
     static func equalizeBatchedCompactedIndices(
         keepRows: [[Int32]],
         rowBlockScores: [[Float]],
         positionsHostRows: [[Int32]],
-        originalLength: Int,
+        originalLengths: [Int],
+        rowMaxLengths: [Int],
         blockSize: Int,
         currentLength: Int
     ) -> [[Int32]] {
@@ -1472,42 +1497,77 @@ public enum Gemma4BlockSDCM {
             if row.count < minLen { minLen = row.count }
             if row.count > maxLen { maxLen = row.count }
         }
-        guard minLen < maxLen else { return keepRows }
-
-        let targetLen = min(currentLength, maxLen)
+        let minValidRowCap = rowMaxLengths.min() ?? currentLength
+        let targetLen = max(1, min(min(currentLength, minValidRowCap), maxLen))
+        if minLen == maxLen && maxLen <= targetLen {
+            return keepRows
+        }
         let bs = max(1, blockSize)
-        let nBlocks = blockCount(originalLength: originalLength, blockSize: bs)
-        var out = keepRows
-        for b in 0 ..< B where out[b].count < targetLen {
-            let need = targetLen - out[b].count
-            let keptSet = Set(out[b])
-            let posHost = positionsHostRows[b]
-            let scores = b < rowBlockScores.count ? rowBlockScores[b] : []
-            var unkept: [(index: Int32, block: Int, score: Float)] = []
-            unkept.reserveCapacity(max(0, currentLength - out[b].count))
-            for i in 0 ..< currentLength {
-                let i32 = Int32(i)
-                guard !keptSet.contains(i32) else { continue }
+
+        func rankByBlockScore<S: Sequence>(
+            _ indices: S,
+            posHost: [Int32],
+            scores: [Float],
+            nBlocks: Int
+        ) -> [Int32] where S.Element == Int32 {
+            var ranked = indices.map { i32 -> (index: Int32, block: Int, score: Float) in
+                let i = Int(i32)
                 let blk =
                     i < posHost.count
                     ? (blockIndex(forPosition: posHost[i], blockSize: bs, nBlocks: nBlocks) ?? -1)
                     : -1
                 let rawScore = (blk >= 0 && blk < scores.count) ? scores[blk] : -Float.infinity
                 let score = rawScore.isFinite ? rawScore : -Float.infinity
-                unkept.append((index: i32, block: blk, score: score))
+                return (index: i32, block: blk, score: score)
             }
-            unkept.sort { lhs, rhs in
+            ranked.sort { lhs, rhs in
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 if lhs.block != rhs.block { return lhs.block < rhs.block }
                 return lhs.index < rhs.index
             }
-            var merged = out[b]
-            merged.reserveCapacity(targetLen)
-            for cand in unkept.prefix(need) {
-                merged.append(cand.index)
+            return ranked.map(\.index)
+        }
+
+        var out = keepRows
+        for b in 0 ..< B {
+            let posHost = positionsHostRows[b]
+            let rowOrigLen = b < originalLengths.count ? originalLengths[b] : currentLength
+            let rowCap = min(
+                currentLength, b < rowMaxLengths.count ? rowMaxLengths[b] : currentLength)
+            let nBlocks = blockCount(originalLength: rowOrigLen, blockSize: bs)
+            let scores = b < rowBlockScores.count ? rowBlockScores[b] : []
+            if out[b].count < targetLen {
+                let need = targetLen - out[b].count
+                let keptSet = Set(out[b])
+                let unkept = (0 ..< rowCap).lazy.map(Int32.init).filter { !keptSet.contains($0) }
+                let ranked = rankByBlockScore(
+                    unkept, posHost: posHost, scores: scores, nBlocks: nBlocks)
+                var merged = out[b]
+                merged.reserveCapacity(targetLen)
+                merged.append(contentsOf: ranked.prefix(need))
+                merged.sort()
+                out[b] = merged
+            } else if out[b].count > targetLen {
+                // Trim lowest-scoring interior tokens while keeping pinned prefix and frontier tail.
+                let rowSorted = out[b].sorted()
+                let tailPin = min(targetLen, max(1, min(rowSorted.count, bs)))
+                let prefixPin = min(targetLen - tailPin, min(rowSorted.count - tailPin, bs))
+                let headSlice = rowSorted.prefix(prefixPin)
+                let tailSlice = rowSorted.suffix(tailPin)
+                let interiorBudget = max(0, targetLen - headSlice.count - tailSlice.count)
+                var trimmed: [Int32] = []
+                trimmed.reserveCapacity(targetLen)
+                trimmed.append(contentsOf: headSlice)
+                if interiorBudget > 0 && rowSorted.count > prefixPin + tailPin {
+                    let rankedInterior = rankByBlockScore(
+                        rowSorted[prefixPin ..< (rowSorted.count - tailPin)],
+                        posHost: posHost, scores: scores, nBlocks: nBlocks)
+                    trimmed.append(contentsOf: rankedInterior.prefix(interiorBudget))
+                }
+                trimmed.append(contentsOf: tailSlice)
+                trimmed.sort()
+                out[b] = trimmed
             }
-            merged.sort()
-            out[b] = merged
         }
         return out
     }
@@ -2144,14 +2204,19 @@ extension Gemma4DecoderLayer {
         keys k: MLXArray,
         values v: MLXArray,
         positionsHostRows: [[Int32]],
-        originalLength: Int,
+        originalLengths: [Int],
+        hasActiveRightPad: Bool,
         cache: KVCache
     ) {
         let attn = selfAttn
         let B = k.dim(0)
         let L = k.dim(2)
+        let hasHeterogeneousLengths =
+            B > 1 && originalLengths.contains { $0 != originalLengths[0] }
 
-        if let v2Cache = cache as? (any CBv2AttendingLayerCache), attn.isSliding, B > 1 {
+        if let v2Cache = cache as? (any CBv2AttendingLayerCache),
+            hasActiveRightPad || hasHeterogeneousLengths || (B > 1 && attn.isSliding)
+        {
             var perRowK: [MLXArray] = []
             var perRowV: [MLXArray] = []
             var deltas: [Int] = []
@@ -2159,23 +2224,35 @@ extension Gemma4DecoderLayer {
             perRowV.reserveCapacity(B)
             deltas.reserveCapacity(B)
             for b in 0 ..< B {
-                let start = Gemma4BlockSDCM.trueSlidingWindowStart(
-                    positionsHost: positionsHostRows[b],
-                    originalLength: originalLength,
-                    slidingWindow: attn.config.slidingWindow)
-                let clampedStart = min(start, L)
-                let rowK = clampedStart > 0 ? k[b, 0..., clampedStart..., 0...] : k[b]
-                let rowV = clampedStart > 0 ? v[b, 0..., clampedStart..., 0...] : v[b]
-                let stored = L - clampedStart
+                let rowOrigLen = originalLengths[b]
+                let rowEnd = hasActiveRightPad ? min(L, rowOrigLen) : L
+                let start: Int
+                if attn.isSliding {
+                    let posSlice =
+                        rowEnd < positionsHostRows[b].count
+                        ? Array(positionsHostRows[b][0 ..< rowEnd]) : positionsHostRows[b]
+                    start = min(
+                        Gemma4BlockSDCM.trueSlidingWindowStart(
+                            positionsHost: posSlice,
+                            originalLength: rowOrigLen,
+                            slidingWindow: attn.config.slidingWindow),
+                        rowEnd)
+                } else {
+                    start = 0
+                }
+                let rowK = (start > 0 || rowEnd < L) ? k[b, 0..., start ..< rowEnd, 0...] : k[b]
+                let rowV = (start > 0 || rowEnd < L) ? v[b, 0..., start ..< rowEnd, 0...] : v[b]
+                let stored = rowEnd - start
                 perRowK.append(rowK)
                 perRowV.append(rowV)
-                deltas.append(originalLength - stored)
+                deltas.append(rowOrigLen - stored)
             }
             v2Cache.writeCompactedPromptKV(
                 perRowKeys: perRowK, perRowValues: perRowV, logicalDeltas: deltas)
             return
         }
 
+        let originalLength = originalLengths[0]
         let v2Cache = cache as? (any CBv2AttendingLayerCache)
         if v2Cache == nil {
             precondition(
@@ -2225,12 +2302,15 @@ extension Gemma4DecoderLayer {
         }
     }
 
-    /// Execute one decoder layer inside the Block-SDCM prefill trunk for `B >= 1` rows.
+    /// Execute one decoder layer inside the Block-SDCM prefill trunk for `B >= 1` rows
+    /// (supporting both equal-length and right-padded heterogeneous cohorts).
     func forwardBlockSDCM(
         _ x: MLXArray,
         positions: MLXArray,
         positionsHostRows: [[Int32]],
-        originalLength: Int,
+        paddedLength: Int,
+        originalLengths: [Int],
+        hasActiveRightPad: Bool,
         cache: KVCache?,
         sdcm: Gemma4BlockSDCMConfig,
         isFinalLayer: Bool,
@@ -2239,7 +2319,7 @@ extension Gemma4DecoderLayer {
     ) -> (hidden: MLXArray, nextLayerScores: [Gemma4SDCMBoundaryScores]?) {
         let B = x.dim(0)
         let L = x.dim(1)
-        let isContiguous = L == originalLength
+        let isContiguous = L == paddedLength
         let attn = selfAttn
         guard let kProj = attn.kProj, let kNorm = attn.kNorm, let vNorm = attn.vNorm else {
             preconditionFailure("Block-SDCM requires non-shared attention layers")
@@ -2278,7 +2358,8 @@ extension Gemma4DecoderLayer {
         if let cache {
             commitCompactedKV(
                 keys: k, values: v, positionsHostRows: positionsHostRows,
-                originalLength: originalLength, cache: cache)
+                originalLengths: originalLengths, hasActiveRightPad: hasActiveRightPad,
+                cache: cache)
         }
 
         let outDType = k.dtype
@@ -2288,6 +2369,9 @@ extension Gemma4DecoderLayer {
         // Final-layer last-query specialization: project Q, attend, O-proj, MLP, and exact
         // top-8 MoE for ONLY the final frontier token across all B rows.
         if isFinalLayer {
+            precondition(
+                !hasActiveRightPad,
+                "Block-SDCM right-padded tokens must be compacted before the final layer")
             let qLast = normalizeQueriesWithRoPE(
                 attn.qProj(normed[0..., (L - 1)..., 0...]),
                 positions: positions[0..., (L - 1)...],
@@ -2314,7 +2398,7 @@ extension Gemma4DecoderLayer {
             let attnOut = finishAttentionOutput(attnResult, length: 1, outDType: outDType)
 
             var h = x[0..., (L - 1)..., 0...] + postAttentionLayernorm(attnOut)
-            h = feedforward(h, isExpertPrefill: false)
+            h = feedforward(h, isExpertPrefill: false, allowDecodeMoETopK: false)
             h = h * layerScalar
             return (h, nil)
         }
@@ -2343,7 +2427,26 @@ extension Gemma4DecoderLayer {
             if sdcm.earlySparseFullLayer == attn.layerIdx {
                 attnResult = Self.attendPerRow(queries: attnQ, keys: attnK, values: attnV) {
                     b, qRow, kRow, vRow in
-                    Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                    if hasActiveRightPad, originalLengths[b] < L {
+                        let realLen = originalLengths[b]
+                        let posB = positions[b, 0 ..< realLen]
+                        let posHostB = Array(positionsHostRows[b][0 ..< realLen])
+                        let realOut = Gemma4BlockSDCM.prefixLocalFullTailAttention(
+                            queries: qRow[0..., 0..., 0 ..< realLen, 0...],
+                            keys: kRow[0..., 0..., 0 ..< realLen, 0...],
+                            values: vRow[0..., 0..., 0 ..< realLen, 0...],
+                            positions: posB,
+                            positionsHost: posHostB,
+                            prefixTokens: sdcm.sparsePrefixTokens,
+                            localWindow: sdcm.sparseLocalWindow,
+                            tailTokens: sdcm.sparseTailTokens,
+                            scale: attn.scale,
+                            chunkSize: sdcm.slidingChunkSize)
+                        let padOut = MLXArray.zeros(
+                            [1, realOut.dim(1), L - realLen, realOut.dim(3)], dtype: realOut.dtype)
+                        return concatenated([realOut, padOut], axis: 2)
+                    }
+                    return Gemma4BlockSDCM.prefixLocalFullTailAttention(
                         queries: qRow,
                         keys: kRow,
                         values: vRow,
@@ -2362,27 +2465,66 @@ extension Gemma4DecoderLayer {
                     queries: attnQ, keys: attnK, values: attnV, scale: attn.scale, mask: .causal)
             }
             if let reverseQuota = nextReverseQuota {
-                nextScores = Gemma4BlockSDCM.computeBilateralBlockScoresBatched(
-                    queries: attnQ,
-                    keys: attnK,
-                    positions: positions,
-                    positionsHostRows: positionsHostRows,
-                    originalLength: originalLength,
-                    scale: attn.scale,
-                    nHeads: attn.nHeads,
-                    nKvHeads: attn.nKvHeads,
-                    reverseQuotaFraction: reverseQuota,
-                    config: sdcm)
+                let hasHeterogeneousLengths =
+                    B > 1 && originalLengths.contains { $0 != originalLengths[0] }
+                if !hasActiveRightPad && !hasHeterogeneousLengths {
+                    nextScores = Gemma4BlockSDCM.computeBilateralBlockScoresBatched(
+                        queries: attnQ,
+                        keys: attnK,
+                        positions: positions,
+                        positionsHostRows: positionsHostRows,
+                        originalLength: originalLengths[0],
+                        scale: attn.scale,
+                        nHeads: attn.nHeads,
+                        nKvHeads: attn.nKvHeads,
+                        reverseQuotaFraction: reverseQuota,
+                        config: sdcm)
+                } else {
+                    nextScores = (0 ..< B).map { b in
+                        let rowEnd = hasActiveRightPad ? min(L, originalLengths[b]) : L
+                        let qSlice =
+                            rowEnd < L
+                            ? attnQ[b ..< (b + 1), 0..., 0 ..< rowEnd, 0...]
+                            : attnQ[b ..< (b + 1)]
+                        let kSlice =
+                            rowEnd < L
+                            ? attnK[b ..< (b + 1), 0..., 0 ..< rowEnd, 0...]
+                            : attnK[b ..< (b + 1)]
+                        let posSlice = rowEnd < L ? positions[b, 0 ..< rowEnd] : positions[b]
+                        let posHostSlice =
+                            rowEnd < positionsHostRows[b].count
+                            ? Array(positionsHostRows[b][0 ..< rowEnd]) : positionsHostRows[b]
+                        return Gemma4BlockSDCM.computeBilateralBlockScores(
+                            queries: qSlice,
+                            keys: kSlice,
+                            positions: posSlice,
+                            positionsHost: posHostSlice,
+                            originalLength: originalLengths[b],
+                            scale: attn.scale,
+                            nHeads: attn.nHeads,
+                            nKvHeads: attn.nKvHeads,
+                            reverseQuotaFraction: reverseQuota,
+                            config: sdcm)
+                    }
+                }
             }
         }
 
         let attnOut = finishAttentionOutput(attnResult, length: L, outDType: outDType)
         let ffIn = x + postAttentionLayernorm(attnOut)
         let interiorMoEK = sdcm.interiorMoEK(forLayer: attn.layerIdx)
+        let effectiveTailKeep: Int
+        if hasActiveRightPad, let minOrig = originalLengths.min(), minOrig < L {
+            // Ensure every shorter row's true tail `[minOrig - tailKeep ..< minOrig)`
+            // stays in the exact top-8 MoE suffix during uncompacted early layers.
+            effectiveTailKeep = min(L, (L - minOrig) + sdcm.tailKeep)
+        } else {
+            effectiveTailKeep = sdcm.tailKeep
+        }
         var h = feedforwardBlockSDCM(
             ffIn,
             interiorMoEK: interiorMoEK,
-            tailKeep: sdcm.tailKeep,
+            tailKeep: effectiveTailKeep,
             isExpertPrefill: isExpertPrefill)
         h = h * layerScalar
         return (h, nextScores)
@@ -2463,23 +2605,29 @@ extension Gemma4DecoderLayer {
 
 extension Gemma4TextModelInner {
     /// Execute the full Gemma 4 trunk using Block-SDCM progressive block compaction for `B >= 1`
-    /// equal-length cold text prompts. Returns `[B, 1, hiddenSize]` (the final frontier positions
-    /// after `norm`).
+    /// equal-length or right-padded heterogeneous cold text prompts. Returns `[B, 1, hiddenSize]`
+    /// (the final frontier positions after `norm`).
     func forwardBlockSDCMTrunk(
         _ initialHidden: MLXArray,
         inputTokenIDs: [Int32]? = nil,
         inputTokenIDRows: [[Int32]]? = nil,
+        originalLengths: [Int]? = nil,
         fullCache: [KVCache?],
         sdcm: Gemma4BlockSDCMConfig,
         isExpertPrefill: Bool,
         captureCheckpointAtLayer: Int? = nil
     ) -> (postNorm: MLXArray, checkpoint: Gemma4SDCMCheckpoint?) {
         let B = initialHidden.dim(0)
-        let originalLength = initialHidden.dim(1)
+        let paddedLength = initialHidden.dim(1)
+        let origLens =
+            if let originalLengths, originalLengths.count == B {
+                originalLengths
+            } else {
+                Array(repeating: paddedLength, count: B)
+            }
+        var hasActiveRightPad = origLens.contains { $0 < paddedLength }
         var h = initialHidden
-        let earlyCompactLayer: Int? = sdcm.earlyPreCompactAfterLayer.flatMap {
-            (0 ..< max(0, layers.count - 1)).contains($0) ? $0 : nil
-        }
+        let earlyCompactLayer = sdcm.resolvedEarlyCompactLayer(layerCount: layers.count)
         var earlyEmbeddingHidden: MLXArray? = earlyCompactLayer != nil ? initialHidden : nil
         let resolvedTokenIDRows: [[Int32]?]
         if let inputTokenIDRows, inputTokenIDRows.count == B {
@@ -2487,9 +2635,9 @@ extension Gemma4TextModelInner {
         } else if let inputTokenIDs {
             if B == 1 {
                 resolvedTokenIDRows = [inputTokenIDs]
-            } else if inputTokenIDs.count == B * originalLength {
+            } else if inputTokenIDs.count == B * paddedLength {
                 resolvedTokenIDRows = (0 ..< B).map { b in
-                    Array(inputTokenIDs[(b * originalLength) ..< ((b + 1) * originalLength)])
+                    Array(inputTokenIDs[(b * paddedLength) ..< (b * paddedLength + origLens[b])])
                 }
             } else {
                 resolvedTokenIDRows = Array(repeating: nil, count: B)
@@ -2498,20 +2646,24 @@ extension Gemma4TextModelInner {
             resolvedTokenIDRows = Array(repeating: nil, count: B)
         }
 
-        let basePositions = (0 ..< originalLength).map { Int32($0) }
+        let basePositions = (0 ..< paddedLength).map { Int32($0) }
         var positionsHostRows = Array(repeating: basePositions, count: B)
         var flatInitPos: [Int32] = []
-        flatInitPos.reserveCapacity(B * originalLength)
+        flatInitPos.reserveCapacity(B * paddedLength)
         for _ in 0 ..< B { flatInitPos.append(contentsOf: basePositions) }
-        var positions = MLXArray(flatInitPos, [B, originalLength])
+        var positions = MLXArray(flatInitPos, [B, paddedLength])
 
         var pendingScores: [Gemma4SDCMBoundaryScores]? = nil
         var checkpoint: Gemma4SDCMCheckpoint? = nil
 
         func applyCompaction(keepRows: [[Int32]]) {
             guard let nextLen = keepRows.first?.count,
-                nextLen > 0, nextLen < h.dim(1)
+                nextLen > 0,
+                keepRows.count == B,
+                keepRows.allSatisfy({ $0.count == nextLen })
             else { return }
+            let mustRewrite = nextLen < h.dim(1) || hasActiveRightPad
+            guard mustRewrite else { return }
             if B == 1 {
                 let idxArray = MLXArray(keepRows[0])
                 h = h.take(idxArray, axis: 1)
@@ -2533,16 +2685,23 @@ extension Gemma4TextModelInner {
                 h = MLX.takeAlong(h, idxArray, axis: 1)
                 positions = MLXArray(flatPos, [B, nextLen])
             }
+            hasActiveRightPad = false
             asyncEval(h, positions)
         }
 
         for (idx, layer) in layers.enumerated() {
             if let targetFraction = sdcm.keepSchedule[idx], let scoresList = pendingScores {
+                let curLen = h.dim(1)
+                let rowMaxLens =
+                    hasActiveRightPad ? origLens : Array(repeating: curLen, count: B)
                 let rawKeepRows = (0 ..< B).map { b in
-                    Gemma4BlockSDCM.selectCompactedIndices(
+                    let posSlice =
+                        rowMaxLens[b] < positionsHostRows[b].count
+                        ? Array(positionsHostRows[b][0 ..< rowMaxLens[b]]) : positionsHostRows[b]
+                    return Gemma4BlockSDCM.selectCompactedIndices(
                         boundaryScores: scoresList[b],
-                        positions: positionsHostRows[b],
-                        originalLength: originalLength,
+                        positions: posSlice,
+                        originalLength: origLens[b],
                         targetFraction: targetFraction,
                         config: sdcm)
                 }
@@ -2550,9 +2709,10 @@ extension Gemma4TextModelInner {
                     keepRows: rawKeepRows,
                     rowBlockScores: scoresList.map(\.forwardBlockScores),
                     positionsHostRows: positionsHostRows,
-                    originalLength: originalLength,
+                    originalLengths: origLens,
+                    rowMaxLengths: rowMaxLens,
                     blockSize: sdcm.blockSize,
-                    currentLength: h.dim(1))
+                    currentLength: curLen)
                 applyCompaction(keepRows: keepRows)
                 pendingScores = nil
             }
@@ -2565,7 +2725,9 @@ extension Gemma4TextModelInner {
                 h,
                 positions: positions,
                 positionsHostRows: positionsHostRows,
-                originalLength: originalLength,
+                paddedLength: paddedLength,
+                originalLengths: origLens,
+                hasActiveRightPad: hasActiveRightPad,
                 cache: fullCache[idx],
                 sdcm: sdcm,
                 isFinalLayer: isFinalLayer,
@@ -2578,21 +2740,48 @@ extension Gemma4TextModelInner {
             if let earlyLayer = earlyCompactLayer, idx == earlyLayer,
                 let embHidden = earlyEmbeddingHidden
             {
-                if h.dim(1) == originalLength {
-                    let (rawKeepEarly, unionScores) =
-                        Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
-                            tokenIDRows: resolvedTokenIDRows,
-                            embeddingHidden: embHidden,
-                            layerHidden: h,
-                            targetFraction: sdcm.earlyPreCompactRatio,
-                            blockSize: sdcm.earlyPreCompactBlockSize,
-                            topHaloK: sdcm.earlyPreCompactTopHaloK,
-                            config: sdcm)
+                if h.dim(1) == paddedLength {
+                    let rawKeepEarly: [[Int32]]
+                    let unionScores: [[Float]]
+                    if !hasActiveRightPad {
+                        (rawKeepEarly, unionScores) =
+                            Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
+                                tokenIDRows: resolvedTokenIDRows,
+                                embeddingHidden: embHidden,
+                                layerHidden: h,
+                                targetFraction: sdcm.earlyPreCompactRatio,
+                                blockSize: sdcm.earlyPreCompactBlockSize,
+                                topHaloK: sdcm.earlyPreCompactTopHaloK,
+                                config: sdcm)
+                    } else {
+                        var keeps: [[Int32]] = []
+                        var scores: [[Float]] = []
+                        keeps.reserveCapacity(B)
+                        scores.reserveCapacity(B)
+                        for b in 0 ..< B {
+                            let rowLen = origLens[b]
+                            let (kRow, sRow) =
+                                Gemma4BlockSDCM.selectEarlyTriSignalIndicesBatched(
+                                    tokenIDRows: [resolvedTokenIDRows[b]],
+                                    embeddingHidden: embHidden[
+                                        b ..< (b + 1), 0 ..< rowLen, 0...],
+                                    layerHidden: h[b ..< (b + 1), 0 ..< rowLen, 0...],
+                                    targetFraction: sdcm.earlyPreCompactRatio,
+                                    blockSize: sdcm.earlyPreCompactBlockSize,
+                                    topHaloK: sdcm.earlyPreCompactTopHaloK,
+                                    config: sdcm)
+                            keeps.append(kRow[0])
+                            scores.append(sRow[0])
+                        }
+                        rawKeepEarly = keeps
+                        unionScores = scores
+                    }
                     let keepEarly = Gemma4BlockSDCM.equalizeBatchedCompactedIndices(
                         keepRows: rawKeepEarly,
                         rowBlockScores: unionScores,
                         positionsHostRows: positionsHostRows,
-                        originalLength: originalLength,
+                        originalLengths: origLens,
+                        rowMaxLengths: origLens,
                         blockSize: sdcm.earlyPreCompactBlockSize,
                         currentLength: h.dim(1))
                     applyCompaction(keepRows: keepEarly)
@@ -2604,7 +2793,7 @@ extension Gemma4TextModelInner {
                     hiddenStates: h,
                     positions: positionsHostRows[0],
                     checkpointLayer: idx,
-                    originalLength: originalLength)
+                    originalLength: origLens[0])
             }
             // Keep Metal command buffers bounded on long prompts without forcing host syncs
             // except at scoring boundaries where `computeBilateralBlockScoresBatched` reads host floats.

@@ -77,82 +77,68 @@ enum PagedSegmentAttention {
         }
     }
 
-    static func decode(
-        queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
-        group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
-        sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
-        dispatchCache: PagedSegmentDispatchCache? = nil,
-        zeroFilledScratch: Bool = false,
-        seqinfoCache: PagedSegmentSeqinfoCache? = nil
+    private struct DispatchBucket {
+        let segments: [PagedKVSegment]
+        let bindingClass: Int
+        let valueOffsets: MLXArray
+        let records: MLXArray
+        let workCount: Int
+    }
+
+    private static func dispatchBuckets(
+        q inputQueries: MLXArray,
+        newKeys: MLXArray?,
+        newValues: MLXArray?,
+        group: PagedKVGroup,
+        buckets: [DispatchBucket],
+        maxPartitions: Int,
+        partitionTokens ptok: Int,
+        seqinfo: MLXArray,
+        sinks: MLXArray?,
+        params: MLXArray,
+        softcap: Bool,
+        source: String,
+        zeroFilledScratch: Bool
     ) -> MLXArray {
-        var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
-        guard !group.writeValidation.isFaulted else { return q }
-        if let newKeys, let newValues {
-            guard
-                group.writeValidation.validate(
-                    keys: newKeys, values: newValues, expected: group.dtype)
-            else { return q }
-        }
-        precondition(q.ndim == 3 && q.dim(0) == rows.count)
-        precondition((newKeys == nil) == (newValues == nil))
         let dtype = group.dtype
-        let b = q.dim(0)
-        let qh = q.dim(1)
-        let d = q.dim(2)
+        let b = inputQueries.dim(0)
+        let qh = inputQueries.dim(1)
+        let d = inputQueries.dim(2)
         let kvh = group.key.kvHeads
         precondition(d == group.key.headDim && qh % kvh == 0)
         let gqa = qh / kvh
         let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)!
         let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
         let splits = gqa / hpt
-        let (seqinfo, maxLength) =
-            seqinfoCache?.seqinfo(rows.map(\.info))
-            ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
-        let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
-            PagedAttentionKernel.partitionTokensForDispatch(
-                maxAttendLength: maxLength, batch: b, kvHeads: kvh,
-                headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
-        let prepared =
-            dispatchCache?.prepare(
-                rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
-            ?? PagedSegmentPreparedDispatch(
-                rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
-        let plan = prepared.plan
-        if q.dtype != dtype { q = q.asType(dtype) }
+        let q = inputQueries.dtype == dtype ? inputQueries : inputQueries.asType(dtype)
         let k = newKeys ?? q
         let v = newValues ?? q
         if newKeys != nil {
             precondition(k.shape == [b, kvh, d] && v.shape == k.shape)
         }
-        let partialsShape = [b, qh, plan.maxPartitions, d]
+        let partialsShape = [b, qh, maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
-        let metaCount = max(8, b * qh * plan.maxPartitions * 2)
-        // No fill dispatch: the first bucket allocates the merge scratch as
-        // uninitialized kernel outputs and later buckets write their disjoint
-        // slots in place. The merge reads only partitions [0, ceil(len / PTOK))
-        // of each row, the plan issues exactly one work record per such
-        // (row, partition), and each record's threadgroups write every query
-        // head's full partial and (m, l) — so no unwritten slot is ever read
-        // and the output bytes cannot change. `zeroFilledScratch` keeps the
-        // original zero fills as the exactness reference for tests.
+        let metaCount = max(8, b * qh * maxPartitions * 2)
+        // No fill dispatch when `zeroFilledScratch == false`: the first bucket allocates
+        // scratch as uninitialized outputs and later buckets write disjoint slots in place.
         var partials: MLXArray? =
             zeroFilledScratch ? MLXArray.zeros(partialsShape, dtype: .float32) : nil
-        var meta: MLXArray? = zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil
+        var meta: MLXArray? =
+            zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
             partitionTokens: ptok, hasWrite: newKeys != nil)
-        for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
-            let segments = bucket.segmentIDs.map { group.segments[$0]! }
+        for bucket in buckets {
             let bindingCount = bucket.bindingClass
-            var backing = segments.map(\.storage)
+            var backing = bucket.segments.map(\.storage)
             // Empty records never select padded bindings. They alias an input,
             // never a separately declared writable output.
             backing.append(
                 contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
             let inputs =
                 [q, k, v] + backing + [
-                    seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
+                    seqinfo, params, group.writeFence, bucket.valueOffsets, bucket.records,
                 ]
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("D", d), ("S", group.pageSize),
@@ -190,6 +176,107 @@ enum PagedSegmentAttention {
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+    }
+
+    static func decode(
+        queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
+        group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
+        sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        zeroFilledScratch: Bool = false,
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil
+    ) -> MLXArray {
+        let q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
+        guard !group.writeValidation.isFaulted else { return q }
+        if let newKeys, let newValues {
+            guard
+                group.writeValidation.validate(
+                    keys: newKeys, values: newValues, expected: group.dtype)
+            else { return q }
+        }
+        precondition(q.ndim == 3 && q.dim(0) == rows.count)
+        precondition((newKeys == nil) == (newValues == nil))
+        let b = q.dim(0)
+        let qh = q.dim(1)
+        let d = q.dim(2)
+        let kvh = group.key.kvHeads
+        precondition(d == group.key.headDim && qh % kvh == 0)
+        let gqa = qh / kvh
+        let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
+        let splits = gqa / hpt
+        let (seqinfo, maxLength) =
+            seqinfoCache?.seqinfo(rows.map(\.info))
+            ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
+        let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
+            PagedAttentionKernel.partitionTokensForDispatch(
+                maxAttendLength: maxLength, batch: b, kvHeads: kvh,
+                headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
+        let prepared =
+            dispatchCache?.prepare(
+                rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
+            ?? PagedSegmentPreparedDispatch(
+                rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
+        let plan = prepared.plan
+        let buckets = zip(plan.buckets, prepared.metadata).map { bucket, metadata in
+            DispatchBucket(
+                segments: bucket.segmentIDs.map { group.segments[$0]! },
+                bindingClass: bucket.bindingClass,
+                valueOffsets: metadata.valueOffsets,
+                records: metadata.records,
+                workCount: bucket.workCount)
+        }
+        return dispatchBuckets(
+            q: q, newKeys: newKeys, newValues: newValues, group: group,
+            buckets: buckets, maxPartitions: plan.maxPartitions,
+            partitionTokens: ptok, seqinfo: seqinfo, sinks: sinks,
+            params: params, softcap: softcap, source: source,
+            zeroFilledScratch: zeroFilledScratch)
+    }
+
+    /// Single-bucket segmented decode over GPU-assembled sparse work `records`
+    /// (zero host syncs; reuses the exact existing segmented part + merge kernels).
+    static func decodeWithCustomRecords(
+        queries: MLXArray,
+        newKeys: MLXArray?,
+        newValues: MLXArray?,
+        group: PagedKVGroup,
+        segments: [PagedKVSegment],
+        bindingClass: Int,
+        records: MLXArray,
+        workCount: Int,
+        maxPartitions: Int,
+        partitionTokens ptok: Int,
+        seqinfo: MLXArray,
+        sinks: MLXArray?,
+        params: MLXArray,
+        softcap: Bool,
+        source: String,
+        zeroFilledScratch: Bool = true
+    ) -> MLXArray {
+        let q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
+        guard !group.writeValidation.isFaulted else { return q }
+        if let newKeys, let newValues {
+            guard
+                group.writeValidation.validate(
+                    keys: newKeys, values: newValues, expected: group.dtype)
+            else { return q }
+        }
+        precondition(q.ndim == 3 && (newKeys == nil) == (newValues == nil))
+        var offsets = segments.map { Int64($0.valueOffset) }
+        offsets.append(
+            contentsOf: repeatElement(offsets[0], count: max(8, bindingClass) - offsets.count))
+        let bucket = DispatchBucket(
+            segments: segments,
+            bindingClass: bindingClass,
+            valueOffsets: MLXArray(offsets),
+            records: records,
+            workCount: workCount)
+        return dispatchBuckets(
+            q: q, newKeys: newKeys, newValues: newValues, group: group,
+            buckets: [bucket], maxPartitions: maxPartitions,
+            partitionTokens: ptok, seqinfo: seqinfo, sinks: sinks,
+            params: params, softcap: softcap, source: source,
+            zeroFilledScratch: zeroFilledScratch)
     }
 }
 

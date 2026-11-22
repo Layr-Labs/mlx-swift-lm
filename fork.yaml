@@ -134,6 +134,7 @@ def:
             core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
             them through `PagedKVBackend` as the engine does.
             A non-native checkpoint import grows its suffix backing as admission does (host-zeroed eligible segments when configured).
+            Opt-in zero-copy page-centroid sparse full-layer decode (`PagedPageCentroidSparse`, `DARKBLOOM_CBV2_PAGE_SPARSE_DECODE=off|32|64|16..256`, default off) caches per-row native-dtype mean key centroids and version-keyed GPU page tables on `PagedSequenceKV`, selecting sink + top-K interior + recent + tail logical pages on GPU and feeding filtered physical block tables or GPU-packed segment records into `pagedattention.metal` (`PagedSegmentAttention.decodeWithCustomRecords`, zero KV copies, zero host syncs, rollback/COW safe).
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
@@ -433,11 +434,17 @@ def:
             Two-draft verification rows of three tokens below 64 assignments take the trace too.
             Opt-in Block-SDCM prefill (`DARKBLOOM_GEMMA4_PREFILL_SDCM`, default off) compacts long cold text
             prompts (`>= 3072` tokens, gated by an O(N) dense-sequence safety check) for solo and continuous-batching
-            cohorts (concurrent decode + compaction and equal-length packed waves, variable-top-k NAX row-mapped
-            experts inside Block-SDCM). Load-time `prepare()` builds zero-extra-RAM fused QKV projections
-            (`DARKBLOOM_GEMMA4_FUSED_QKV=0` disables) and, for 8-bit group-64 affine tied embeddings,
-            `Gemma4Hi4Lo4Embedding` bit-plane sparse LM-head sampling (`DARKBLOOM_GEMMA4_HI4_LM_HEAD=off|refine|exact`,
-            default off), both invalidating cleanly on parameter or module updates.
+            cohorts (concurrent decode + compaction and equal- or heterogeneous-length 20%-band right-padded Mode B waves
+            guarded fail-closed via `canRunHeterogeneousCompaction`, variable-top-k NAX row-mapped experts inside Block-SDCM).
+            Load-time `prepare()` builds zero-extra-RAM fused QKV (`DARKBLOOM_GEMMA4_FUSED_QKV=0` disables) and fused
+            Gate+Up dense MLP projections (`DARKBLOOM_GEMMA4_FUSED_GATE_UP=0` disables), optional layer-by-layer 8-bit to
+            4-bit repacking (`DARKBLOOM_GEMMA4_REQUANT_4BIT=off|dense|all`, default off), and for 8-bit group-64 affine tied
+            embeddings, `Gemma4Hi4Lo4Embedding` bit-plane sparse LM-head sampling (`DARKBLOOM_GEMMA4_HI4_LM_HEAD=off|refine|exact`,
+            default off, with 32-token warp-striped single-pass O(V) `fastChunkTopKKernel` screening in `refine` mode);
+            all fused caches invalidate cleanly on parameter or module updates while preserving live `train(_:)` mode for
+            `Gemma4CompiledFeedforward`. Opt-in decode-only MoE active-expert reduction (`Gemma4DecodeMoETopKPolicy`,
+            `DARKBLOOM_GEMMA4_DECODE_MOE_TOPK=off|6|5|4|sens`, default off) lowers active experts during decode (`sequenceWidth <= 3`)
+            while keeping prefill exact and keeping `Gemma4CompiledFeedforward` active across `B = 1..16`.
             `CBv2SuffixTreeDrafter` (`CBv2TokenOnlyMTPDrafter`) provides an opt-in zero-draft-cost CPU suffix-automaton
             speculative drafter for `B = 1..16` with per-row prefix commits and Block-SDCM paged-row composition.
           globs:

@@ -247,9 +247,245 @@ final class Gemma4FusionTests: XCTestCase {
 
         try fused.prepare()
         XCTAssertTrue(fused.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertTrue(fused.model.layers[0].mlp.hasFusedGateUp)
         try fused.model.layers[0].update(
             parameters: unfused.model.layers[0].parameters(), verify: .all)
         XCTAssertFalse(fused.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertFalse(fused.model.layers[0].mlp.hasFusedGateUp)
         XCTAssertTrue(fused.model.layers[1].selfAttn.hasFusedQKV)
+        XCTAssertTrue(fused.model.layers[1].mlp.hasFusedGateUp)
+    }
+
+    func testFusedGateUpParityAndRequant4BitModes() throws {
+        MLXRandom.seed(77)
+        let json = """
+            {
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_global_key_value_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 64,
+                "vocab_size": 256,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 64,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "attention_k_eq_v": true,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "tie_word_embeddings": true
+            }
+            """
+        let config = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: Data(json.utf8))
+
+        let baseline = Gemma4TextModel(config)
+        quantize(model: baseline, groupSize: 64, bits: 8)
+        eval(baseline)
+
+        let dense4 = Gemma4TextModel(config)
+        quantize(model: dense4, groupSize: 64, bits: 8)
+        try dense4.update(parameters: baseline.parameters(), verify: .all)
+        eval(dense4)
+
+        let all4 = Gemma4TextModel(config)
+        quantize(model: all4, groupSize: 64, bits: 8)
+        try all4.update(parameters: baseline.parameters(), verify: .all)
+        eval(all4)
+
+        let mlpBytesBefore = dense4.parameters().flattened()
+            .filter { $0.0.contains(".mlp.") }.reduce(0) { $0 + $1.1.nbytes }
+        let attnBytesBefore = all4.parameters().flattened()
+            .filter { $0.0.contains(".self_attn.") && $0.0.contains("_proj.") }
+            .reduce(0) { $0 + $1.1.nbytes }
+
+        try dense4.prepare(requant4BitMode: .dense)
+        try all4.prepare(requant4BitMode: .all)
+        eval(dense4, all4)
+
+        let mlpBytesAfter = dense4.parameters().flattened()
+            .filter { $0.0.contains(".mlp.") }.reduce(0) { $0 + $1.1.nbytes }
+        let attnBytesAfter = all4.parameters().flattened()
+            .filter { $0.0.contains(".self_attn.") && $0.0.contains("_proj.") }
+            .reduce(0) { $0 + $1.1.nbytes }
+
+        // Dense MLP weights shrink nearly in half; attn stays 8-bit in .dense and shrinks in .all.
+        XCTAssertLessThan(mlpBytesAfter, mlpBytesBefore * 65 / 100)
+        XCTAssertLessThan(attnBytesAfter, attnBytesBefore * 65 / 100)
+        XCTAssertEqual((dense4.model.layers[0].mlp.gateProj as? QuantizedLinear)?.bits, 4)
+        XCTAssertEqual((dense4.model.layers[0].selfAttn.qProj as? QuantizedLinear)?.bits, 8)
+        XCTAssertEqual((all4.model.layers[0].selfAttn.qProj as? QuantizedLinear)?.bits, 4)
+        // Both QKV and GateUp still fuse cleanly on top of the 4-bit weights.
+        XCTAssertTrue(dense4.model.layers[0].mlp.hasFusedGateUp)
+        XCTAssertTrue(all4.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertTrue(all4.model.layers[0].mlp.hasFusedGateUp)
+
+        // End-to-end forward logits stay closely aligned (cosine similarity > 0.99).
+        let ids = MLXArray([Int32(5), 17, 42, 99]).reshaped([1, 4])
+        let baseLogits = baseline(ids, cache: nil).asType(.float32).flattened()
+        let denseLogits = dense4(ids, cache: nil).asType(.float32).flattened()
+        let allLogits = all4(ids, cache: nil).asType(.float32).flattened()
+        eval(baseLogits, denseLogits, allLogits)
+
+        func cosSim(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let dot = sum(a * b)
+            let denom = sqrt(sum(a * a)) * sqrt(sum(b * b)) + Float(1e-8)
+            return (dot / denom).item(Float.self)
+        }
+        // Verify Fused GateUp alone is 0-ULP bit-exact, and 4-bit requant stays closely aligned.
+        XCTAssertGreaterThan(cosSim(baseLogits, denseLogits), 0.99)
+        XCTAssertGreaterThan(cosSim(baseLogits, allLogits), 0.95)
+
+        // Mode resolution parses off/dense/all cleanly.
+        XCTAssertEqual(Gemma4Requant4BitMode.resolve(environment: [:]), .off)
+        XCTAssertEqual(
+            Gemma4Requant4BitMode.resolve(environment: [Gemma4Requant4BitMode.envKey: "dense"]),
+            .dense)
+        XCTAssertEqual(
+            Gemma4Requant4BitMode.resolve(environment: [Gemma4Requant4BitMode.envKey: "ALL"]), .all)
+
+        // Compiled MoE feedforward stays byte-exact with prepareFusedGateUp() and stays live after update().
+        let moeJson = """
+            {
+                "model_type": "gemma4_text", "vocab_size": 128,
+                "hidden_size": 128, "intermediate_size": 256,
+                "num_hidden_layers": 1, "num_attention_heads": 2,
+                "num_key_value_heads": 1, "head_dim": 64, "global_head_dim": 64,
+                "layer_types": ["full_attention"], "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0, "vocab_size_per_layer_input": 0,
+                "enable_moe_block": true, "num_experts": 16,
+                "top_k_experts": 4, "moe_intermediate_size": 64
+            }
+            """
+        let moeCfg = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: Data(moeJson.utf8))
+        let layer = Gemma4DecoderLayer(moeCfg, layerIdx: 0)
+        let bf16Weights = Dictionary(
+            uniqueKeysWithValues: layer.parameters().flattened().map {
+                ($0.0, $0.1.asType(.bfloat16))
+            }
+        )
+        try layer.update(parameters: .unflattened(bf16Weights), verify: .all)
+        quantize(model: layer) { path, _ in
+            path.hasPrefix("experts.")
+                ? (groupSize: 64, bits: 4, mode: .affine)
+                : (groupSize: 64, bits: 8, mode: .affine)
+        }
+        // Production load order: `prepareFusedGateUp()` runs BEFORE `train(false)`.
+        // Verify compiled feedforward stays active after `train(false)`, disables on `train(true)`,
+        // and re-enables on `train(false)`.
+        eval(layer)
+        XCTAssertTrue(try layer.mlp.prepareFusedGateUp())
+        layer.train(false)
+        XCTAssertNotNil(layer.feedforwardCompilationState())
+        let x = MLXRandom.normal([2, 1, 128]).asType(.bfloat16)
+        let eagerBefore = layer.feedforward(x, isExpertPrefill: false)
+        let compiledBefore = layer.feedforwardWithCompilation(x, isExpertPrefill: false)
+        eval(eagerBefore, compiledBefore)
+        XCTAssertEqual(
+            eagerBefore.asData(access: .copy).data, compiledBefore.asData(access: .copy).data)
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            XCTAssertTrue(layer.feedforwardTraceIsCompiled)
+        }
+        layer.train(true)
+        XCTAssertNil(layer.feedforwardCompilationState())
+        layer.train(false)
+        XCTAssertNotNil(layer.feedforwardCompilationState())
+
+        // Mutating gate_proj invalidates fusedGateUp and must keep compiled feedforward live.
+        let zeroScales = MLXArray.zeros(
+            (layer.mlp.gateProj as! QuantizedLinear).scales.shape, dtype: .bfloat16)
+        try layer.update(
+            parameters: .unflattened(["mlp.gate_proj.scales": zeroScales]), verify: .none)
+        XCTAssertFalse(layer.mlp.hasFusedGateUp)
+        XCTAssertNotNil(layer.feedforwardCompilationState())
+        let eagerAfter = layer.feedforward(x, isExpertPrefill: false)
+        let compiledAfter = layer.feedforwardWithCompilation(x, isExpertPrefill: false)
+        eval(eagerAfter, compiledAfter)
+        XCTAssertEqual(
+            eagerAfter.asData(access: .copy).data, compiledAfter.asData(access: .copy).data)
+    }
+
+    func testDecodeMoETopKPolicyAndCompiledParity() throws {
+        // Policy parsing & per-layer schedules.
+        XCTAssertEqual(Gemma4DecodeMoETopKPolicy.resolve(environment: [:]), .off)
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.resolve(environment: [Gemma4DecodeMoETopKPolicy.envKey: "off"]
+            ),
+            .off)
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.resolve(environment: [Gemma4DecodeMoETopKPolicy.envKey: "5"]),
+            .uniform(5))
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.resolve(environment: [
+                Gemma4DecodeMoETopKPolicy.envKey: "sens"
+            ]),
+            .sensitivityMatched)
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.sensitivityMatched.activeTopK(
+                layerIdx: 29, numLayers: 30, defaultTopK: 8), 8)
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.sensitivityMatched.activeTopK(
+                layerIdx: 0, numLayers: 30, defaultTopK: 8), 6)
+        XCTAssertEqual(
+            Gemma4DecodeMoETopKPolicy.sensitivityMatched.activeTopK(
+                layerIdx: 14, numLayers: 30, defaultTopK: 8), 4)
+
+        // Build a BF16-quantized 1-layer MoE decoder and verify:
+        // 1) decodeMoETopK = 5 compiles cleanly at B = 1, 8, 16 with byte-exact compiled/eager parity;
+        // 2) prefill (isExpertPrefill: true or L > 3) ignores decodeMoETopK and stays bit-exact with k = 8.
+        MLXRandom.seed(123)
+        let moeJson = """
+            {
+                "model_type": "gemma4_text", "vocab_size": 128,
+                "hidden_size": 128, "intermediate_size": 256,
+                "num_hidden_layers": 1, "num_attention_heads": 2,
+                "num_key_value_heads": 1, "head_dim": 64, "global_head_dim": 64,
+                "layer_types": ["full_attention"], "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0, "vocab_size_per_layer_input": 0,
+                "enable_moe_block": true, "num_experts": 32,
+                "top_k_experts": 8, "moe_intermediate_size": 64
+            }
+            """
+        let cfg = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: Data(moeJson.utf8))
+        let layer = Gemma4DecoderLayer(cfg, layerIdx: 0)
+        let bf16Weights = Dictionary(
+            uniqueKeysWithValues: layer.parameters().flattened().map {
+                ($0.0, ($0.1.ndim >= 2 ? $0.1 / Float(8) : $0.1).asType(.bfloat16))
+            })
+        try layer.update(parameters: .unflattened(bf16Weights), verify: .all)
+        quantize(model: layer) { path, _ in
+            path.hasPrefix("experts.")
+                ? (groupSize: 64, bits: 4, mode: .affine)
+                : (groupSize: 64, bits: 8, mode: .affine)
+        }
+        layer.train(false)
+        eval(layer)
+
+        let prefillIn = MLXRandom.normal([1, 8, 128]).asType(.bfloat16)
+        let prefillRef = layer.feedforward(prefillIn, isExpertPrefill: true)
+        eval(prefillRef)
+
+        layer.decodeMoETopK = 5
+        // Prefill must remain bit-exact with k = 8.
+        let prefillWithDecodeK = layer.feedforward(prefillIn, isExpertPrefill: true)
+        eval(prefillWithDecodeK)
+        XCTAssertEqual(
+            prefillRef.asData(access: .copy).data,
+            prefillWithDecodeK.asData(access: .copy).data)
+
+        // Decode at B = 1, 8, 16 must compile cleanly and match eager byte-for-byte.
+        for rows in [1, 8, 16] {
+            let x = MLXRandom.normal([rows, 1, 128]).asType(.bfloat16)
+            let eager = layer.feedforward(x, isExpertPrefill: false)
+            let compiled = layer.feedforwardWithCompilation(x, isExpertPrefill: false)
+            eval(eager, compiled)
+            XCTAssertEqual(eager.asData(access: .copy).data, compiled.asData(access: .copy).data)
+            if MLXHardwareInfo.isCompiledDecodeSupported {
+                XCTAssertTrue(
+                    layer.feedforwardTraceIsCompiled, "expected compiled trace for B=\(rows), k=5")
+            }
+        }
     }
 }

@@ -454,6 +454,20 @@ func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
     !layerKinds.contains(where: \.isBidirectional)
 }
 
+/// Task-local channel carrying true per-row unpadded prompt lengths into
+/// heterogeneous right-padded compaction prefills (e.g. Gemma 4 Block-SDCM
+/// Mode B cohort packing). Nil for equal-length or non-compaction forwards.
+public enum CBv2CompactionRowLengths {
+    @TaskLocal public static var current: [Int]? = nil
+}
+
+/// Whether `[minLength, maxLength]` stays within the 20% right-padding band
+/// (`minLength / maxLength >= 0.8`). Shared by `SchedulerV2` and `EngineLoopV2`
+/// so cohort admission and packing never drift.
+func cbv2CompactionLengthsWithinBand(minLength: Int, maxLength: Int) -> Bool {
+    minLength * 5 >= maxLength * 4
+}
+
 // MARK: - Per-sequence KV state
 
 /// KV storage for ONE sequence at ONE layer. Self-contained: owns its

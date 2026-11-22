@@ -1163,6 +1163,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
 
+    /// Opt-in Page-Centroid Sparse Full-Layer Decode configuration
+    /// (`DARKBLOOM_CBV2_PAGE_SPARSE_DECODE`, default `.off`). Mutable for unit tests.
+    public var pageSparseDecodeConfig: PagedPageCentroidSparseConfig = .current
+
     /// One fused kernel dispatch for the batch. `newKeys`/`newValues`
     /// (`[B, kvHeads, D]`) with per-row `writeTargets` make pass A write
     /// the step's tiles in place before attending; both are nil on the
@@ -1179,7 +1183,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         writeTargets: [(page: Int32, slot: Int)]? = nil,
         rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
         tableProvider: PagedLayerCache? = nil,
-        qPosFromEnd: Int = 0, metadata: CBv2AttentionMetadataObservation? = nil,
+        qPosFromEnd: Int = 0, allowPageSparse: Bool = true,
+        metadata: CBv2AttentionMetadataObservation? = nil,
         packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         precondition((newKeys == nil) == (writeTargets == nil))
@@ -1190,6 +1195,31 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 "asymmetric direct fused dispatch is unqualified", expected: group.dtype,
                 layerIndex: layerIndex)
             return faultOutput(queries)
+        }
+        if allowPageSparse, pageSparseDecodeConfig.enabled, kind.attention == .full,
+            !pool.usesStepOwnedAttention,
+            let sparseOut = PagedPageCentroidSparse.tryDecode(
+                config: pageSparseDecodeConfig,
+                queries: queries,
+                newKeys: newKeys,
+                newValues: newValues,
+                writeTargets: writeTargets,
+                rows: rows,
+                group: group,
+                qPosFromEnd: qPosFromEnd,
+                sinks: preparedSinks(sinks),
+                params: params(scale: scale),
+                softcap: attentionSoftcap != nil,
+                kernelSource: pool.kernelSource,
+                writeValidation: pool.writeValidation)
+        {
+            metadata?.finishPaged(
+                group: group, kernelOutputDType: sparseOut.dtype, output: sparseOut,
+                dispatch: "paged_page_centroid_sparse_decode")
+            packet?.finishPaged(
+                group: group, row: rows[0], kernelOutputDType: sparseOut.dtype, output: sparseOut,
+                dispatch: "paged_page_centroid_sparse_decode")
+            return sparseOut
         }
         if group.segmentLayout != nil {
             let descriptors = rows.enumerated().map { index, row in
@@ -1373,12 +1403,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         newValues: newValues[0..., 0..., t ..< (t + 1), 0...].squeezed(axis: 2),
                         writeTargets: targets,
                         rows: rows, scale: scale, sinks: sinks,
-                        tableProvider: tableProvider))
+                        tableProvider: tableProvider,
+                        allowPageSparse: false))
             } else {
                 outputs.append(
                     dispatchDecode(
                         queries: column, rows: rows, scale: scale, sinks: sinks,
-                        tableProvider: tableProvider, qPosFromEnd: l - 1 - t))
+                        tableProvider: tableProvider, qPosFromEnd: l - 1 - t,
+                        allowPageSparse: false))
             }
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
