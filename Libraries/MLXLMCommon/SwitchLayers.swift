@@ -1210,7 +1210,7 @@ open class SwitchGLU: Module {
     // Subclass hooks, adapters, other activations and every transform retain the
     // complete original projectExperts graph.
     private func projectGemma4RowMappedExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, allowVariableTopK: Bool = false
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool)? {
         guard Gemma4RowMappedNAX.requested, admitsFusedRoutes, !training,
             weightedReductionProfile == .gemma4ProductionGeGLU,
@@ -1219,7 +1219,8 @@ open class SwitchGLU: Module {
             !mimoV26NAXGather, let gateProj, let upProj,
             Gemma4RowMappedNAX.supportsDownProjection(downProj),
             let pair = Gemma4RowMappedNAX.tryPair(
-                x, indices: indices, gate: gateProj, up: upProj)
+                x, indices: indices, gate: gateProj, up: upProj,
+                allowVariableTopK: allowVariableTopK)
         else { return nil }
         let activated = compiledGeGLU(pair.gate, pair.up)
         let output = projectExpert(downProj, activated, pair.sorted, sortedIndices: true)
@@ -1238,9 +1239,13 @@ open class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
-        isProductionPrefill: Bool = true
+        isProductionPrefill: Bool = true,
+        allowVariableTopKRowMap: Bool = false
     ) -> MLXArray {
-        if isProductionPrefill, let projected = projectGemma4RowMappedExperts(x, indices) {
+        if isProductionPrefill,
+            let projected = projectGemma4RowMappedExperts(
+                x, indices, allowVariableTopK: allowVariableTopKRowMap)
+        {
             if fuseSortedReduction, supportsWeightedExpertUnsort(x, indices, weights: weights),
                 projected.sorted, let inverseOrder = projected.inverseOrder,
                 projected.output.ndim == 3, projected.output.dim(-2) == 1,

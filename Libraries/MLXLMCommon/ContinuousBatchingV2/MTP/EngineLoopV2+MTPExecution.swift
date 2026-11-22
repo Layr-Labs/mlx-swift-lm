@@ -12,11 +12,15 @@ struct CBv2MTPRowWork {
     let samples: Bool
     let isDecode: Bool
     let isSeed: Bool
-    /// Non-nil for verify rows: the consumed carry.
+    /// Non-nil for neural verify rows: the consumed carry.
     let carry: CBv2MTPCarry?
     /// Verify-produced carry transition that must prime assistant history
     /// before this target-only row processes the carry token.
     let historyCarry: CBv2MTPCarry?
+    /// Non-nil for token-only verify rows: CPU-proposed draft ids `[k]`.
+    let tokenOnlyDrafts: [Int32]?
+
+    var isVerify: Bool { carry != nil || tokenOnlyDrafts != nil }
 }
 
 struct CBv2MTPGraphBuild {
@@ -111,12 +115,27 @@ extension EngineLoopV2 {
                     } else {
                         mtp.invalidateCarry(id)
                     }
+                    _ = mtp.consumeTokenOnlyDrafts(for: id)
+                } else if mtp.usesTokenOnlyDrafter {
+                    if count == 1 + k, let drafts = mtp.consumeTokenOnlyDrafts(for: id),
+                        drafts.count == k
+                    {
+                        work.append(
+                            CBv2MTPRowWork(
+                                rec: rec, start: rec.numComputedTokens - count, count: count,
+                                samples: true, isDecode: false, isSeed: false,
+                                carry: nil, historyCarry: nil, tokenOnlyDrafts: drafts))
+                        continue
+                    } else if count == 1 + k {
+                        scheduler.rollbackComputed(id: id, tokens: k)
+                        count = 1
+                    }
                 } else if count == 1 + k, let carry = mtp.consumeCarry(for: id) {
                     work.append(
                         CBv2MTPRowWork(
                             rec: rec, start: rec.numComputedTokens - count, count: count,
                             samples: true, isDecode: false, isSeed: false,
-                            carry: carry, historyCarry: nil))
+                            carry: carry, historyCarry: nil, tokenOnlyDrafts: nil))
                     continue
                 } else if count == 1 + k {
                     // A marked assignment without a consumable carry demotes
@@ -142,7 +161,8 @@ extension EngineLoopV2 {
                     isSeed:
                         isDecode && (mtp.isSeedMarked(id) || preserveHistorySeed),
                     carry: nil,
-                    historyCarry: mtp.pendingHistoryCarry(for: id)))
+                    historyCarry: mtp.pendingHistoryCarry(for: id),
+                    tokenOnlyDrafts: nil))
         }
         return work
     }
@@ -241,10 +261,18 @@ extension EngineLoopV2 {
             let hiddenIndex = Dictionary(
                 uniqueKeysWithValues:
                     hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
-            let recurrentTarget = (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap {
-                $0.recurrentStateSpec == nil ? nil : $0
-            }
-            if hiddenSourceIndices.count != decodeRows.count {
+            let recurrentTarget =
+                mtp.usesTokenOnlyDrafter
+                ? nil
+                : (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap {
+                    $0.recurrentStateSpec == nil ? nil : $0
+                }
+            if mtp.usesTokenOnlyDrafter {
+                logits = try checkedModelForward(phase: Self.mtpDecodePhase(decodeRows)) {
+                    mtp.steppableModel.forward(tokens: inputs, caches: caches)
+                }
+                hidden = nil
+            } else if hiddenSourceIndices.count != decodeRows.count {
                 var rowLogits = [MLXArray?](repeating: nil, count: decodeRows.count)
                 if !hiddenSourceIndices.isEmpty {
                     let rows = hiddenSourceIndices.map { decodeRows[$0] }
@@ -402,8 +430,8 @@ extension EngineLoopV2 {
         // plan, where its first round's depth policy reads this margin.
         let prefillCarryMargins =
             mtp.usesMarginalPolicy && decodeRows.isEmpty
-            && work.filter { !$0.isDecode && $0.samples }.count == 1
-        for row in work where !row.isDecode && row.carry == nil {
+            && work.filter { !$0.isDecode && !$0.isVerify && $0.samples }.count == 1
+        for row in work where !row.isDecode && !row.isVerify {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
@@ -562,7 +590,7 @@ extension EngineLoopV2 {
         }
 
         try CBv2NativePagedMTPWork.current?.finishOrdinaryConstruction()
-        let verifyRows = work.filter { $0.carry != nil }
+        let verifyRows = work.filter(\.isVerify)
         let verify = try mtpBuildVerifyGraph(
             verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
 
@@ -602,7 +630,7 @@ extension EngineLoopV2 {
         }
         if let verify {
             asyncEvalTargets.append(verify.acceptancePacket)
-            asyncEvalTargets.append(verify.lastHidden)
+            if let lastHidden = verify.lastHidden { asyncEvalTargets.append(lastHidden) }
             if let logits = verify.constraintLogits { asyncEvalTargets.append(logits) }
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
@@ -676,8 +704,8 @@ extension EngineLoopV2 {
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
-        var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
+        rowMetadata.reserveCapacity(batch)
         var assistantOwnersTransferred = false
         defer {
             if !assistantOwnersTransferred {
@@ -693,142 +721,179 @@ extension EngineLoopV2 {
                 }
             }
         }
-        var seedTokens: [Int32] = []
-        var carryHiddens: [MLXArray] = []
-        // Each capture paired with the row it was gathered from, so
-        // `mtpFreezeCaptures` can fence it against that row's own storage.
-        var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
-        captures.reserveCapacity(batch)
-        captured.reserveCapacity(2 * batch)
-
-        for row in verifyRows {
-            let state = kvStates[row.rec.id]!
-            let carry = row.carry!
-            if let captureLayers = mtp.captureLayers, !mtp.usesRequestStatefulDrafter {
-                // Capture before target verification writes the speculative
-                // columns; paged storage is fenced below before those writes.
-                let fullRow = state[captureLayers.full]!
-                let slidingRow = state[captureLayers.sliding]!
-                precondition(
-                    fullRow.absoluteOffset == carry.kvOffset,
-                    "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
-                )
-                let fullSnapshot = fullRow.snapshot()
-                let slidingSnapshot = slidingRow.snapshot()
-                captures.append(
-                    CBv2MTPRowCapture(
-                        fullKeys: fullSnapshot.keys,
-                        fullValues: fullSnapshot.values,
-                        slidingKeys: slidingSnapshot.keys,
-                        slidingValues: slidingSnapshot.values,
-                        slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
-                        anchor: fullRow.absoluteOffset))
-                captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
-                captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
-            } else {
-                precondition(
-                    state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
-                    "CBv2 request-stateful MTP target KV is not aligned with its carry")
-            }
-            rowMetadata.append(
-                CBv2MTPRoundInFlight.VerifyRow(
-                    id: row.rec.id, storageRows: state.compactMap { $0 },
-                    assistantState:
-                        mtp.usesRequestStatefulDrafter
-                        ? mtp.takeAssistantState(for: row.rec.id) : nil,
-                    freeSpan: mtpFreeSpan(row.rec)))
-            if let assistantState = rowMetadata.last?.assistantState,
-                let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
-            {
-                retainNativeWork([], owners: [assistantState])
-                try mtp.configureAssistantState(
-                    assistantState, id: row.rec.id,
-                    maximumSequenceLength: row.rec.request.promptTokens.count
-                        + max(row.rec.request.maxTokens, 1))
-            }
-            seedTokens.append(Int32(carry.token))
-            carryHiddens.append(carry.hidden)
-        }
-
-        let includesAssistantPrefill = rowMetadata.contains {
-            $0.assistantState?.hasPendingPrefillForCostAccounting == true
-        }
-        try mtpFreezeCaptures(captured)
-        let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
+        let includesAssistantPrefill: Bool
+        let seedColumn: MLXArray
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
-            var currentTokens = (0 ..< batch).map {
-                seedColumn[$0 ..< $0 + 1, 0...]
+
+        if mtp.usesTokenOnlyDrafter {
+            var seedTokens: [Int32] = []
+            seedTokens.reserveCapacity(batch)
+            var draftColumnsHost = Array(repeating: [Int32](), count: k)
+            for col in 0 ..< k { draftColumnsHost[col].reserveCapacity(batch) }
+
+            for row in verifyRows {
+                let state = kvStates[row.rec.id]!
+                let drafts = row.tokenOnlyDrafts!
+                precondition(
+                    drafts.count == k,
+                    "CBv2 token-only MTP draft count \(drafts.count) != depth \(k)")
+                rowMetadata.append(
+                    CBv2MTPRoundInFlight.VerifyRow(
+                        id: row.rec.id,
+                        storageRows: state.compactMap { $0 },
+                        assistantState: nil,
+                        freeSpan: mtpFreeSpan(row.rec)))
+                seedTokens.append(Int32(row.rec.tokens[row.start]))
+                for col in 0 ..< k {
+                    draftColumnsHost[col].append(drafts[col])
+                }
             }
-            var currentHidden = carryHiddens
-            for draftIndex in 0 ..< k {
-                var nextRows: [MLXArray] = []
-                var nextHiddens: [MLXArray] = []
-                var stepEvalTargets: [MLXArray] = []
-                nextRows.reserveCapacity(batch)
-                nextHiddens.reserveCapacity(batch)
-                for (index, row) in verifyRows.enumerated() {
-                    guard let requestState = rowMetadata[index].assistantState else {
-                        preconditionFailure(
-                            "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
-                    }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
-                    let next = result.tokens.reshaped([1])
-                    nextRows.append(next)
-                    nextHiddens.append(result.hidden)
-                    stepEvalTargets.append(next)
-                    stepEvalTargets.append(result.hidden)
-                    stepEvalTargets.append(
-                        contentsOf: stateful.evaluationTargets(for: requestState))
-                }
-                // Publish the first mutable head-cache generation before
-                // constructing a deeper generation, and every generation for a
-                // drafter that opts in, so its steps run while the target graph
-                // is built. This is nonblocking and joins the round's sole
-                // finalize fence.
-                if draftIndex == 0 || stateful.submitsEveryDraftStepEarly {
-                    retainNativeWork(
-                        stepEvalTargets,
-                        owners: rowMetadata.compactMap { $0.assistantState.map { $0 as AnyObject } }
-                    )
-                    try requireNativeWork()
-                    asyncEval(stepEvalTargets)
-                    try nativeWorkSubmitted()
-                    mtp.recordEarlyDraftSubmission()
-                }
-                assistantEvalTargets.append(contentsOf: stepEvalTargets)
-                let stepTokens = concatenated(nextRows, axis: 0)
-                draftSteps.append(stepTokens)
-                currentTokens = nextRows.map { $0.reshaped([1, 1]) }
-                currentHidden = nextHiddens
+            includesAssistantPrefill = false
+            seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
+            for col in 0 ..< k {
+                draftSteps.append(MLXArray(draftColumnsHost[col]))
             }
         } else {
-            let prepared = mtp.drafter.prepare(rows: captures)
-            var draftInput = seedColumn
-            var draftHidden = concatenated(carryHiddens, axis: 0)
-            for draftIndex in 0 ..< k {
-                let (next, nextHidden) = mtp.drafter.draftStep(
-                    tokens: draftInput, hidden: draftHidden, prepared: prepared)
-                // Captures are already fenced. Overlap the read-only draft
-                // with target graph construction; finalization still joins
-                // this token through the acceptance packet. At depth one,
-                // nextHidden is unused and need not be materialized.
-                if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
-                    retainNativeWork([next, nextHidden])
-                    try requireNativeWork()
-                    asyncEval(next)
-                    try nativeWorkSubmitted()
-                    mtp.recordEarlyDraftSubmission()
+            var captures: [CBv2MTPRowCapture] = []
+            var seedTokens: [Int32] = []
+            var carryHiddens: [MLXArray] = []
+            // Each capture paired with the row it was gathered from, so
+            // `mtpFreezeCaptures` can fence it against that row's own storage.
+            var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
+            captures.reserveCapacity(batch)
+            captured.reserveCapacity(2 * batch)
+
+            for row in verifyRows {
+                let state = kvStates[row.rec.id]!
+                let carry = row.carry!
+                if let captureLayers = mtp.captureLayers, !mtp.usesRequestStatefulDrafter {
+                    // Capture before target verification writes the speculative
+                    // columns; paged storage is fenced below before those writes.
+                    let fullRow = state[captureLayers.full]!
+                    let slidingRow = state[captureLayers.sliding]!
+                    precondition(
+                        fullRow.absoluteOffset == carry.kvOffset,
+                        "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
+                    )
+                    let fullSnapshot = fullRow.snapshot()
+                    let slidingSnapshot = slidingRow.snapshot()
+                    captures.append(
+                        CBv2MTPRowCapture(
+                            fullKeys: fullSnapshot.keys,
+                            fullValues: fullSnapshot.values,
+                            slidingKeys: slidingSnapshot.keys,
+                            slidingValues: slidingSnapshot.values,
+                            slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
+                            anchor: fullRow.absoluteOffset))
+                    captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
+                    captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+                } else {
+                    precondition(
+                        state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
+                        "CBv2 request-stateful MTP target KV is not aligned with its carry")
                 }
-                draftSteps.append(next)
-                draftInput = next.reshaped([batch, 1])
-                draftHidden = nextHidden
+                rowMetadata.append(
+                    CBv2MTPRoundInFlight.VerifyRow(
+                        id: row.rec.id, storageRows: state.compactMap { $0 },
+                        assistantState:
+                            mtp.usesRequestStatefulDrafter
+                            ? mtp.takeAssistantState(for: row.rec.id) : nil,
+                        freeSpan: mtpFreeSpan(row.rec)))
+                if let assistantState = rowMetadata.last?.assistantState,
+                    mtp.drafter is any CBv2MTPRequestStatefulDrafter
+                {
+                    retainNativeWork([], owners: [assistantState])
+                    try mtp.configureAssistantState(
+                        assistantState, id: row.rec.id,
+                        maximumSequenceLength: row.rec.request.promptTokens.count
+                            + max(row.rec.request.maxTokens, 1))
+                }
+                seedTokens.append(Int32(carry.token))
+                carryHiddens.append(carry.hidden)
+            }
+
+            includesAssistantPrefill = rowMetadata.contains {
+                $0.assistantState?.hasPendingPrefillForCostAccounting == true
+            }
+            try mtpFreezeCaptures(captured)
+            seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+                var currentTokens = (0 ..< batch).map {
+                    seedColumn[$0 ..< $0 + 1, 0...]
+                }
+                var currentHidden = carryHiddens
+                for draftIndex in 0 ..< k {
+                    var nextRows: [MLXArray] = []
+                    var nextHiddens: [MLXArray] = []
+                    var stepEvalTargets: [MLXArray] = []
+                    nextRows.reserveCapacity(batch)
+                    nextHiddens.reserveCapacity(batch)
+                    for (index, row) in verifyRows.enumerated() {
+                        guard let requestState = rowMetadata[index].assistantState else {
+                            preconditionFailure(
+                                "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)"
+                            )
+                        }
+                        let result = stateful.draftStep(
+                            tokens: currentTokens[index],
+                            hidden: currentHidden[index],
+                            shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                            requestState: requestState)
+                        let next = result.tokens.reshaped([1])
+                        nextRows.append(next)
+                        nextHiddens.append(result.hidden)
+                        stepEvalTargets.append(next)
+                        stepEvalTargets.append(result.hidden)
+                        stepEvalTargets.append(
+                            contentsOf: stateful.evaluationTargets(for: requestState))
+                    }
+                    // Publish the first mutable head-cache generation before
+                    // constructing a deeper generation, and every generation for a
+                    // drafter that opts in, so its steps run while the target graph
+                    // is built. This is nonblocking and joins the round's sole
+                    // finalize fence.
+                    if draftIndex == 0 || stateful.submitsEveryDraftStepEarly {
+                        retainNativeWork(
+                            stepEvalTargets,
+                            owners: rowMetadata.compactMap {
+                                $0.assistantState.map { $0 as AnyObject }
+                            }
+                        )
+                        try requireNativeWork()
+                        asyncEval(stepEvalTargets)
+                        try nativeWorkSubmitted()
+                        mtp.recordEarlyDraftSubmission()
+                    }
+                    assistantEvalTargets.append(contentsOf: stepEvalTargets)
+                    let stepTokens = concatenated(nextRows, axis: 0)
+                    draftSteps.append(stepTokens)
+                    currentTokens = nextRows.map { $0.reshaped([1, 1]) }
+                    currentHidden = nextHiddens
+                }
+            } else {
+                let prepared = mtp.drafter.prepare(rows: captures)
+                var draftInput = seedColumn
+                var draftHidden = concatenated(carryHiddens, axis: 0)
+                for draftIndex in 0 ..< k {
+                    let (next, nextHidden) = mtp.drafter.draftStep(
+                        tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                    // Captures are already fenced. Overlap the read-only draft
+                    // with target graph construction; finalization still joins
+                    // this token through the acceptance packet. At depth one,
+                    // nextHidden is unused and need not be materialized.
+                    if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
+                        retainNativeWork([next, nextHidden])
+                        try requireNativeWork()
+                        asyncEval(next)
+                        try nativeWorkSubmitted()
+                        mtp.recordEarlyDraftSubmission()
+                    }
+                    draftSteps.append(next)
+                    draftInput = next.reshaped([batch, 1])
+                    draftHidden = nextHidden
+                }
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)

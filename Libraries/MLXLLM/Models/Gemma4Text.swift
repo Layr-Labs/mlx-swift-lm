@@ -797,7 +797,16 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
-class Gemma4Attention: Module {
+/// Default-on kill switch for zero-extra-RAM load-time QKV projection fusion
+/// in `Gemma4Attention` (`DARKBLOOM_GEMMA4_FUSED_QKV=0` disables).
+private let gemma4FusedQKVEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_QKV"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw != "0" && raw != "false" && raw != "off"
+}()
+
+class Gemma4Attention: Module, ParameterUpdateObserving {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
     let layerType: String
@@ -811,6 +820,9 @@ class Gemma4Attention: Module {
     /// Tensor parallel: `o_proj` holds this rank's heads' input columns, and
     /// its FP32 partial is summed across ranks before rounding.
     var tensorParallel: Gemma4TensorParallelContext?
+    private let fusedQKV = FusedQuantizedLinearProjectionCache()
+
+    var hasFusedQKV: Bool { fusedQKV.isPrepared }
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -885,6 +897,107 @@ class Gemma4Attention: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let touchesQKV = Self.touchesQKVParameters(parameters.flattened().map(\.0))
+        defer {
+            if touchesQKV {
+                fusedQKV.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let touchesQKV = key == "q_proj" || key == "k_proj" || key == "v_proj"
+        defer {
+            if touchesQKV {
+                fusedQKV.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    func ancestorDidUpdateParameters(keys: [String]) {
+        if Self.touchesQKVParameters(keys) {
+            fusedQKV.invalidate()
+        }
+    }
+
+    private static func touchesQKVParameters(_ keys: [String]) -> Bool {
+        keys.contains {
+            $0.hasPrefix("q_proj.") || $0.hasPrefix("k_proj.") || $0.hasPrefix("v_proj.")
+                || $0 == "q_proj" || $0 == "k_proj" || $0 == "v_proj"
+        }
+    }
+
+    /// Coalesce `q_proj` + `k_proj` (+ `v_proj` when present) into one
+    /// zero-extra-RAM `QuantizedLinear` backed by zero-copy row-slice views.
+    @discardableResult
+    func prepareFusedQKV(enabled: Bool = gemma4FusedQKVEnabled) throws -> Bool {
+        guard !usesSharedKV, let kProj else { return false }
+        if let vProj {
+            return try fusedQKV.prepare(enabled: enabled, linears: [qProj, kProj, vProj]) { views in
+                try self.update(
+                    modules: ModuleChildren(values: [
+                        "q_proj": .value(views[0]),
+                        "k_proj": .value(views[1]),
+                        "v_proj": .value(views[2]),
+                    ]),
+                    verify: [])
+            }
+        }
+        return try fusedQKV.prepare(enabled: enabled, linears: [qProj, kProj]) { views in
+            try self.update(
+                modules: ModuleChildren(values: [
+                    "q_proj": .value(views[0]),
+                    "k_proj": .value(views[1]),
+                ]),
+                verify: [])
+        }
+    }
+
+    /// Project `(qRaw, kRaw, vRaw)` via the fused QKV projection when prepared,
+    /// keeping `k_eq_v` (`vProj == nil`) zero-copy (`vRaw == kRaw`).
+    func projectQKV(
+        _ x: MLXArray, useBatchDecodeProjection: Bool
+    ) -> (qRaw: MLXArray, kRaw: MLXArray, vRaw: MLXArray) {
+        let qDim = nHeads * effectiveHeadDim
+        let kvDim = nKvHeads * effectiveHeadDim
+        if let fused = fusedQKV.fused {
+            let combined =
+                useBatchDecodeProjection
+                ? Gemma4BatchDecodeProjection.linear(fused, x)
+                : fused(x)
+            if vProj != nil {
+                let parts = split(combined, indices: [qDim, qDim + kvDim], axis: -1)
+                return (parts[0], parts[1], parts[2])
+            } else {
+                let parts = split(combined, indices: [qDim], axis: -1)
+                return (parts[0], parts[1], parts[1])
+            }
+        }
+        guard let kProj else {
+            preconditionFailure("Gemma4 non-shared layers require k_proj")
+        }
+        let qRaw =
+            useBatchDecodeProjection ? Gemma4BatchDecodeProjection.linear(qProj, x) : qProj(x)
+        let kRaw =
+            useBatchDecodeProjection ? Gemma4BatchDecodeProjection.linear(kProj, x) : kProj(x)
+        let vRaw: MLXArray
+        if let vProj {
+            vRaw =
+                useBatchDecodeProjection ? Gemma4BatchDecodeProjection.linear(vProj, x) : vProj(x)
+        } else {
+            vRaw = kRaw
+        }
+        return (qRaw, kRaw, vRaw)
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -911,21 +1024,23 @@ class Gemma4Attention: Module {
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
-
         let kvState: Gemma4SharedKVState
         let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
+        var queries: MLXArray
 
         if let sharedKV {
             // KV-shared layers use pre-computed KV from an earlier layer
+            queries = qNorm(qProj(x).reshaped(B, L, nHeads, effectiveHeadDim))
             kvState = sharedKV
         } else {
-            guard let kProj, let kNorm, let vNorm else {
+            guard let kNorm, let vNorm else {
                 preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
             }
 
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let (qRaw, kRawFlat, vRawFlat) = projectQKV(x, useBatchDecodeProjection: false)
+            queries = qNorm(qRaw.reshaped(B, L, nHeads, effectiveHeadDim))
+
+            let kRaw = kRawFlat.reshaped(B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
@@ -934,12 +1049,7 @@ class Gemma4Attention: Module {
             // values reuses the raw key projection (pre-norm), then goes
             // through its own `vNorm` and transpose to land in the same
             // `[B, n_kv_heads, L, D]` layout as keys.
-            var v: MLXArray
-            if let vProj {
-                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-            } else {
-                v = kRaw
-            }
+            var v = vRawFlat.reshaped(B, L, nKvHeads, effectiveHeadDim)
             v = vNorm(v)
             v = v.transposed(0, 2, 1, 3)
 
@@ -1090,11 +1200,6 @@ class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
-        queries = queries.transposed(0, 2, 1, 3)
-
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
             // the source layer's cache at attention time. The RoPE offsets
@@ -1109,6 +1214,9 @@ class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
+            var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
+                B, queryLength, nHeads, effectiveHeadDim)
+            queries = qNorm(queries).transposed(0, 2, 1, 3)
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
             let outputDType = queries.dtype
             let attentionQueries =
@@ -1143,10 +1251,24 @@ class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
+
+        let qRawFlat: MLXArray
+        let kRawFlat: MLXArray
+        let vRawFlat: MLXArray
+        if lastQueryCache == nil {
+            (qRawFlat, kRawFlat, vRawFlat) = projectQKV(x, useBatchDecodeProjection: true)
+        } else {
+            qRawFlat = Gemma4BatchDecodeProjection.linear(qProj, queryInput)
+            kRawFlat = Gemma4BatchDecodeProjection.linear(kProj, x)
+            vRawFlat =
+                vProj.map { Gemma4BatchDecodeProjection.linear($0, x) } ?? kRawFlat
+        }
+
+        var queries = qNorm(qRawFlat.reshaped(B, queryLength, nHeads, effectiveHeadDim))
+            .transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
 
-        let kRaw = Gemma4BatchDecodeProjection.linear(kProj, x).reshaped(
-            B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = kRawFlat.reshaped(B, L, nKvHeads, effectiveHeadDim)
         var k = kNorm(kRaw)
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
@@ -1154,13 +1276,7 @@ class Gemma4Attention: Module {
         // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
         // the raw key projection (pre-norm) through their own vNorm — same as
         // the legacy path.
-        var v: MLXArray
-        if let vProj {
-            v = Gemma4BatchDecodeProjection.linear(vProj, x).reshaped(
-                B, L, nKvHeads, effectiveHeadDim)
-        } else {
-            v = kRaw
-        }
+        var v = vRawFlat.reshaped(B, L, nKvHeads, effectiveHeadDim)
         // The unscaled RMS reduction can select another arithmetic path
         // for several request rows even when their projections are exact.
         // Keep its original per-request head rectangle during batch decode.
@@ -1281,7 +1397,8 @@ class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        allowVariableTopKRowMap: Bool = false
     ) -> MLXArray {
         // Registered prompt frames and independent decode rows keep each row's
         // whole expert block at one-row arithmetic; the rows share each dispatch.
@@ -1304,7 +1421,8 @@ class Gemma4Experts: Module {
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
-            isProductionPrefill: isExpertPrefill)
+            isProductionPrefill: isExpertPrefill,
+            allowVariableTopKRowMap: allowVariableTopKRowMap)
         return y.reshaped(B, S, H)
     }
 
@@ -1399,6 +1517,16 @@ public class Gemma4DecoderLayer: Module {
     private let compiledFeedforward = Gemma4CompiledFeedforwardCache()
 
     var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -1709,6 +1837,35 @@ public class Gemma4TextModelInner: Module {
     let lastSlidingAttentionNonSharedIdx: Int
     var blockSDCMConfig: Gemma4BlockSDCMConfig = .current
 
+    /// Restore `QuantizedEmbedding` before an ancestor or direct parameter update
+    /// writes 8-bit `embed_tokens.*` checkpoint tensors onto a `Gemma4Hi4Lo4Embedding`.
+    func restoreQuantizedEmbeddingIfNeeded(for parameters: ModuleParameters) throws {
+        guard let hi4 = embedTokens as? Gemma4Hi4Lo4Embedding else { return }
+        let touchesEmbed = parameters.flattened().contains { key, _ in
+            key == "embed_tokens"
+                || key.hasPrefix("embed_tokens.")
+                || key.contains(".embed_tokens.")
+                || key.hasSuffix(".embed_tokens")
+        }
+        if touchesEmbed {
+            try update(
+                modules: ModuleChildren(values: ["embed_tokens": .value(hi4.toQuantizedEmbedding())]
+                ),
+                verify: [])
+        }
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        try restoreQuantizedEmbeddingIfNeeded(for: parameters)
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
         fuseWeightedUnsort: Bool = false
@@ -1918,10 +2075,8 @@ public class Gemma4TextModelInner: Module {
         // keep the exact path.
         let initialOffset: Int = {
             for layerCache in fullCache {
-                if let v2 = layerCache as? (any CBv2AttendingLayerCache),
-                    let row = v2.rows.first
-                {
-                    return row.ropePositionOffset
+                if let v2 = layerCache as? (any CBv2AttendingLayerCache), !v2.rows.isEmpty {
+                    return v2.rows.allSatisfy { $0.ropePositionOffset == 0 } ? 0 : 1
                 }
                 if let layerCache {
                     if case .scalar(let value) = layerCache.ropeOffset {
@@ -1945,19 +2100,47 @@ public class Gemma4TextModelInner: Module {
                 hasCaptureHook: captureHook != nil,
                 initialOffset: initialOffset)
         {
-            let earlyTokenIDs: [Int32]? =
+            let batchSize = h.dim(0)
+            let seqLen = h.dim(1)
+            let earlyEnabled =
                 blockSDCMConfig.earlyPreCompactAfterLayer.map {
                     (0 ..< max(0, layers.count - 1)).contains($0)
                 } == true
-                ? inputs.asType(.int32).asArray(Int32.self) : nil
-            let (postNorm, _) = forwardBlockSDCMTrunk(
-                h,
-                inputTokenIDs: earlyTokenIDs,
-                fullCache: fullCache,
-                sdcm: blockSDCMConfig,
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill))
-            return (postNorm, nil)
+            let needTokenRows = earlyEnabled || blockSDCMConfig.densityGuardEnabled
+            var tokenRows: [[Int32]]? = nil
+            var densityOK = true
+            if needTokenRows {
+                let flat = inputs.asType(.int32).asArray(Int32.self)
+                if flat.count == batchSize * seqLen {
+                    var rows: [[Int32]] = []
+                    rows.reserveCapacity(batchSize)
+                    for b in 0 ..< batchSize {
+                        let lo = b * seqLen
+                        let row = Array(flat[lo ..< (lo + seqLen)])
+                        if blockSDCMConfig.densityGuardEnabled
+                            && !Gemma4BlockSDCM.passesDensityGuard(
+                                tokens: row, config: blockSDCMConfig)
+                        {
+                            densityOK = false
+                            break
+                        }
+                        rows.append(row)
+                    }
+                    if densityOK && earlyEnabled {
+                        tokenRows = rows
+                    }
+                }
+            }
+            if densityOK {
+                let (postNorm, _) = forwardBlockSDCMTrunk(
+                    h,
+                    inputTokenIDRows: tokenRows,
+                    fullCache: fullCache,
+                    sdcm: blockSDCMConfig,
+                    isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
+                        schedulePrefill: schedulePrefill))
+                return (postNorm, nil)
+            }
         }
 
         // Build masks: one per attention type (legacy path only). "vision"
@@ -2251,6 +2434,51 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Prepare load-time zero-extra-RAM inference fusions (fused QKV projections
+    /// across non-shared attention layers and `Hi4/Lo4` bit-plane Cauchy-Schwarz
+    /// `lm_head` for 8-bit tied embeddings; invoked automatically by
+    /// `materializeModelForInference`).
+    public func prepare() throws {
+        for layer in model.layers {
+            _ = try layer.selfAttn.prepareFusedQKV()
+        }
+        let hi4Strategy = Gemma4Hi4Lo4Embedding.resolvedStrategy()
+        if config.tieWordEmbeddings,
+            tensorParallelHead == nil,
+            lmHead == nil,
+            hi4Strategy != .off,
+            let quantEmb = model.embedTokens as? QuantizedEmbedding,
+            let hi4 = Gemma4Hi4Lo4Embedding.from(quantEmb, samplingStrategy: hi4Strategy)
+        {
+            try model.update(
+                modules: ModuleChildren(values: ["embed_tokens": .value(hi4)]),
+                verify: [])
+        }
+    }
+
+    /// Configure Block-SDCM prefill settings on the text trunk so scheduler and
+    /// model share the exact same resolved configuration.
+    public func configureBlockSDCM(_ config: Gemma4BlockSDCMConfig) {
+        model.blockSDCMConfig = config
+    }
+
+    /// Restore `QuantizedEmbedding` before an outer wrapper (`MLXVLM.Gemma4` /
+    /// `Gemma4Model`) reloads checkpoint parameters over `embed_tokens`.
+    public func restoreQuantizedEmbeddingIfNeeded(for parameters: ModuleParameters) throws {
+        try model.restoreQuantizedEmbeddingIfNeeded(for: parameters)
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        try model.restoreQuantizedEmbeddingIfNeeded(for: parameters)
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     public func prepare(
         _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
@@ -2277,7 +2505,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 hasInputEmbedding: false,
                 hasImageMask: false,
                 hasCaptureHook: false,
-                initialOffset: 0)
+                initialOffset: 0),
+            !blockSDCMConfig.densityGuardEnabled
+                || Gemma4BlockSDCM.passesDensityGuard(
+                    tokens: y.tokens[0 ..< prefixLength].asType(.int32).asArray(Int32.self),
+                    config: blockSDCMConfig)
         {
             let prefixRange = 0 ..< prefixLength
             let hidden = model.cbv2Prefill(
@@ -2661,6 +2893,36 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+}
+
+extension Gemma4TextModel: CBv2SparseHeadSampleableModel {
+    public var supportsSparseExactHeadSampling: Bool {
+        config.tieWordEmbeddings
+            && tensorParallelHead == nil
+            && lmHead == nil
+            && model.embedTokens is Gemma4Hi4Lo4Embedding
+    }
+
+    public var sparseHeadVocabularySize: Int { vocabularySize }
+
+    public func forwardHiddenForSparseHead(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        model(tokens, cache: caches.map { $0 as! any KVCache })
+    }
+
+    public func sparseExactHeadSample(
+        hidden: MLXArray, mode: CBv2SparseHeadSamplingMode
+    ) -> (tokens: MLXArray, nonFinite: MLXArray)? {
+        guard let hi4 = model.embedTokens as? Gemma4Hi4Lo4Embedding else { return nil }
+        return hi4.sparseExactHeadSample(
+            hidden: hidden, mode: mode, softcap: config.finalLogitSoftcapping)
+    }
+
+    public func applySparseHeadFallbackLogits(hidden: MLXArray) -> MLXArray {
+        let logits = applyLMHead(hidden)
+        return logits.ndim == 3 ? logits[0..., -1, 0...] : logits
     }
 }
 

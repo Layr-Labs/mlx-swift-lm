@@ -364,21 +364,172 @@ public final class SchedulerV2 {
     /// - `numComputedTokens` advances optimistically at plan time; use
     ///   `rollback(_:)` if the planned step is never executed.
     public func plan() -> CBv2StepPlan {
+        // Whole-prompt compaction cohort (Mode A: concurrent beside decode;
+        // Mode B: equal-length cold compaction wave) and solo-prefill stripe.
+        struct CompactionCohort {
+            let ids: Set<CBv2RequestID>
+            let targetLength: Int
+            var totalTokens: Int { ids.count * targetLength }
+        }
+        let minCompaction = config.soloCompactionMinPromptTokens ?? 0
+        let hasCompaction = minCompaction > 0
+        let liveRunning = running.filter {
+            !$0.cancelRequested && $0.remainingTokens > 0
+        }
+        let hasActiveDecode = running.contains {
+            !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
+        }
+        let activeDecodePrefillCap: Int? = {
+            guard let cap = mixedStepPrefillTokenCap else { return nil }
+            return hasActiveDecode ? max(0, cap) : nil
+        }()
+        let activePromptWorkHeld = hasActiveDecode && decodeOnlyStepsOwed > 0
+
+        func isCompactionEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+            guard hasCompaction,
+                !rec.isPaused, !rec.cancelRequested,
+                rec.pendingSamples == 0,
+                rec.request.multimodal == nil,
+                rec.request.positionState == nil,
+                rec.multimodalBlocks.isEmpty,
+                rec.numComputedTokens == 0,
+                rec.prefixReusePlan == nil,
+                rec.remainingTokens > 1,
+                rec.remainingTokens >= minCompaction
+            else { return false }
+            return config.compactionEligibility?(rec.tokens) ?? true
+        }
+
+        let compactionCohort: CompactionCohort? = {
+            guard hasCompaction else { return nil }
+            // Preserve exact legacy solo-compaction behavior when both concurrent
+            // compaction (Mode A) and batched compaction (Mode B) are off.
+            guard config.allowConcurrentCompaction || config.maxPackedCompactionBatch > 1 else {
+                let candidate: CBv2ScheduledRequest?
+                if liveRunning.count + waiting.count == 1 {
+                    candidate = liveRunning.first ?? waiting.first
+                } else if config.maxConcurrentPartialPrefills == 1,
+                    liveRunning.count <= 1,
+                    !liveRunning.contains(where: { $0.isDecodeReady && !$0.isPaused }),
+                    deferredBlockRequestID == nil
+                {
+                    candidate = liveRunning.first ?? waiting.first
+                } else {
+                    candidate = nil
+                }
+                guard let solo = candidate, isCompactionEligible(solo) else { return nil }
+                return CompactionCohort(ids: [solo.id], targetLength: solo.remainingTokens)
+            }
+
+            // Mode A / Mode B: do not compete with a pending deferred multimodal block
+            // or a decode-only interleave hold, and disarm beside decode unless Mode A is on
+            // (or when a speculative planner lacks an explicit draft upper bound).
+            guard deferredBlockRequestID == nil, !activePromptWorkHeld else { return nil }
+            if hasActiveDecode {
+                guard config.allowConcurrentCompaction else { return nil }
+                if speculationPlanner != nil && speculationDraftTokenUpperBound == nil {
+                    return nil
+                }
+            }
+
+            let activeRunningPrefills = liveRunning.filter { !$0.isPaused && !$0.isDecodeReady }
+            let seed: CBv2ScheduledRequest
+            let seededFromRunning: Bool
+            var waitingStartIdx = 0
+
+            if let runningSeed = activeRunningPrefills.first {
+                guard isCompactionEligible(runningSeed) else { return nil }
+                seed = runningSeed
+                seededFromRunning = true
+            } else {
+                guard !admissionHoldActive, running.count < config.maxConcurrentRequests else {
+                    return nil
+                }
+                var firstWaiterIdx: Int? = nil
+                for (i, rec) in waiting.enumerated() {
+                    if rec.isPaused { continue }
+                    if rec.cancelRequested || rec.pendingSamples > 0 { break }
+                    firstWaiterIdx = i
+                    break
+                }
+                guard let firstIdx = firstWaiterIdx, isCompactionEligible(waiting[firstIdx]) else {
+                    return nil
+                }
+                seed = waiting[firstIdx]
+                seededFromRunning = false
+                waitingStartIdx = firstIdx
+            }
+
+            let targetLen = seed.remainingTokens
+            let tokenBatchCap = max(1, config.maxPackedCompactionTokens / targetLen)
+            var maxCohortSize = min(max(1, config.maxPackedCompactionBatch), tokenBatchCap)
+            if let rowCap = config.maxPrefillRowsPerStep, rowCap > 0 {
+                maxCohortSize = min(maxCohortSize, rowCap)
+            }
+            if let prefillCap = activeDecodePrefillCap {
+                let capBatch = prefillCap / targetLen
+                guard capBatch >= 1 else { return nil }
+                maxCohortSize = min(maxCohortSize, capBatch)
+            }
+
+            var cohortIDs = Set<CBv2RequestID>()
+            cohortIDs.reserveCapacity(maxCohortSize)
+
+            var runningPrefillsConsumed = 0
+            if seededFromRunning {
+                for rec in activeRunningPrefills {
+                    guard cohortIDs.count < maxCohortSize,
+                        rec.remainingTokens == targetLen,
+                        isCompactionEligible(rec)
+                    else { break }
+                    cohortIDs.insert(rec.id)
+                    runningPrefillsConsumed += 1
+                }
+            }
+
+            let canExtendFromWaiting =
+                !seededFromRunning
+                || (runningPrefillsConsumed == activeRunningPrefills.count
+                    && !admissionHoldActive
+                    && cohortIDs.count < maxCohortSize)
+            if canExtendFromWaiting {
+                let maxWaitingAdditions = max(
+                    0,
+                    min(
+                        maxCohortSize - cohortIDs.count,
+                        config.maxConcurrentRequests - running.count))
+                var waitingAdded = 0
+                var i = waitingStartIdx
+                while i < waiting.count && waitingAdded < maxWaitingAdditions {
+                    let rec = waiting[i]
+                    i += 1
+                    if rec.isPaused { continue }
+                    if rec.cancelRequested || rec.pendingSamples > 0 { break }
+                    guard rec.remainingTokens == targetLen, isCompactionEligible(rec) else {
+                        break
+                    }
+                    cohortIDs.insert(rec.id)
+                    waitingAdded += 1
+                }
+            }
+
+            guard !cohortIDs.isEmpty else { return nil }
+            return CompactionCohort(ids: cohortIDs, targetLength: targetLen)
+        }()
+
         // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
-        // Armed ONLY when this plan cannot delay anyone else's work: exactly
-        // one live request exists across running+waiting (paused rows count —
-        // they resume), it has no bidirectional blocks (causal media follows
-        // its optional preserved stripe ceiling), it is prefilling (not decode-ready),
-        // and it is not itself paused. Solo also means raising the step
-        // budget to the stripe cannot starve a decode row — there is none.
-        let soloStripe: (tokens: Int, id: CBv2RequestID, isCompaction: Bool)? = {
+        // Armed ONLY when no compaction cohort armed and this plan cannot delay
+        // anyone else's work: exactly one live request exists across
+        // running+waiting (paused rows count — they resume), it has no
+        // bidirectional blocks (causal media follows its optional preserved
+        // stripe ceiling), it is prefilling (not decode-ready), and it is not
+        // itself paused. Solo also means raising the step budget to the stripe
+        // cannot starve a decode row — there is none.
+        let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
+            guard compactionCohort == nil else { return nil }
             let hasStripe =
                 (config.soloPrefillStripeTokens ?? 0) > config.prefillChunkSize
-            let hasCompaction = (config.soloCompactionMinPromptTokens ?? 0) > 0
-            guard hasStripe || hasCompaction else { return nil }
-            let liveRunning = running.filter {
-                !$0.cancelRequested && $0.remainingTokens > 0
-            }
+            guard hasStripe else { return nil }
             let candidate: CBv2ScheduledRequest?
             if liveRunning.count + waiting.count == 1 {
                 candidate = liveRunning.first ?? waiting.first
@@ -401,40 +552,28 @@ public final class SchedulerV2 {
             guard let solo = candidate,
                 !solo.isPaused, !solo.cancelRequested,
                 solo.multimodalBlocks.isEmpty,
-                solo.remainingTokens > 1
-            else { return nil }
-            // Solo whole-prompt compaction (e.g. Gemma 4 Block-SDCM): arm for
-            // fresh cold text prompts at or above the configured floor so the
-            // model observes the complete prompt in one pass without inflating
-            // paged sliding-window rings or splitting at demanded checkpoints.
-            if let minCompaction = config.soloCompactionMinPromptTokens,
-                minCompaction > 0,
-                solo.request.multimodal == nil,
-                solo.numComputedTokens == 0,
-                solo.prefixReusePlan == nil,
-                solo.remainingTokens >= minCompaction
-            {
-                return (tokens: solo.remainingTokens, id: solo.id, isCompaction: true)
-            }
-            guard hasStripe,
+                solo.remainingTokens > 1,
                 let selectedStripe = config.resolvedSoloPrefillStripeTokens(
                     isMultimodal: solo.request.multimodal != nil)
             else { return nil }
-            return (tokens: selectedStripe, id: solo.id, isCompaction: false)
+            return (tokens: selectedStripe, id: solo.id)
         }()
         let soloStripeTokens = soloStripe?.tokens
-        // The stripe belongs to ONE armed request. A successor admitted in
-        // the striped row's final step (its remainder < stripe leaves step
-        // budget behind) must take the PLAIN chunk, or its oversized first
-        // chunk delays the striped row's own sample — defeating the very
-        // TTFT the stripe exists for.
+        // The stripe belongs to ONE armed request, and a compaction cohort
+        // belongs strictly to its cohort IDs. Any other row takes the PLAIN
+        // chunk and stays inside `maxBatchedTokensPerStep`.
         func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
-            let cap =
-                rec.prefixReusePlan?.recurrentChunkSize
-                ?? (soloStripe?.id == rec.id
-                    ? soloStripe!.tokens
-                    : config.plainPrefillChunkSize(
-                        hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty))
+            let cap: Int
+            if let recurrent = rec.prefixReusePlan?.recurrentChunkSize {
+                cap = recurrent
+            } else if let cohort = compactionCohort, cohort.ids.contains(rec.id) {
+                cap = cohort.targetLength
+            } else if soloStripe?.id == rec.id {
+                cap = soloStripe!.tokens
+            } else {
+                cap = config.plainPrefillChunkSize(
+                    hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty)
+            }
             rec.plannedPrefillChunkSize = cap
             return cap
         }
@@ -444,7 +583,7 @@ public final class SchedulerV2 {
             // Compacted rows veto checkpoint capture and need whole-prompt
             // visibility for boundary scoring, so never split them at a
             // demanded prefix-checkpoint boundary.
-            if soloStripe?.id == rec.id, soloStripe?.isCompaction == true {
+            if compactionCohort?.ids.contains(rec.id) == true {
                 return proposed
             }
             let range = config.demandedCheckpointRange(
@@ -463,12 +602,25 @@ public final class SchedulerV2 {
             }
             return range.count
         }
-        var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
+        let cohortBudgetFloor: Int
+        if let cohort = compactionCohort {
+            let decodeRowCount = running.reduce(0) { count, rec in
+                (!rec.isPaused && !rec.cancelRequested && rec.isDecodeReady) ? count + 1 : count
+            }
+            let maxDecodeTokensPerRow =
+                speculationPlanner != nil ? 1 + max(0, speculationDraftTokenUpperBound ?? 0) : 1
+            cohortBudgetFloor = decodeRowCount * maxDecodeTokensPerRow + cohort.totalTokens
+        } else {
+            cohortBudgetFloor = 0
+        }
+        var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0, cohortBudgetFloor)
         // The raise above exists ONLY for the armed row. Every other
         // consumer stays inside the configured step limit, or a successor
         // admitted beside the striped row's final short remainder could
         // push the step past `maxBatchedTokensPerStep`.
         var totalAssignedTokens = 0
+        var cohortRowsAssigned = 0
+        var cohortPrefillStopped = false
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
@@ -601,10 +753,15 @@ public final class SchedulerV2 {
                 idx += 1
                 continue
             }
+            let isCohortRow = compactionCohort?.ids.contains(rec.id) == true
+            if isCohortRow && cohortPrefillStopped {
+                idx += 1
+                continue
+            }
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
-                n = min(n, prefillChunkCap(for: rec))  // solo stripe raises ONLY its own row
+                n = min(n, prefillChunkCap(for: rec))  // stripe / cohort raises ONLY its own row(s)
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
@@ -617,6 +774,16 @@ public final class SchedulerV2 {
                 }
             }
             n = min(n, budget)
+            // Keep compaction / solo-stripe budget surplus strictly isolated
+            // from non-compaction prefill rows.
+            if isPrefillRow, !isCohortRow, soloStripe?.id != rec.id {
+                let normalHeadroom = max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
+                if normalHeadroom <= 0 {
+                    idx += 1
+                    continue
+                }
+                n = min(n, normalHeadroom)
+            }
             // Mixed-step prefill quota: a second budget that binds ONLY on
             // prefill rows. Applied BEFORE snapping/reservation so a skipped
             // row leaves nothing behind: no optimistic advance, no capacity
@@ -668,15 +835,19 @@ public final class SchedulerV2 {
             }
 
             // Reserve KV headroom; preemption is the backstop.
-            // A striped solo chunk holds capacity it only wants
-            // opportunistically: on reservation failure it shrinks back to
-            // the plain chunk size ONCE (like the speculation fallback)
-            // before the preemption machinery may run. Text-only by the solo
-            // gate, so re-snapping is a no-op and the shrink cannot split a
-            // multimodal block.
-            var striped =
-                soloStripeTokens != nil && n > config.prefillChunkSize
+            // A striped solo chunk or the FIRST row of a compaction cohort
+            // (`cohortRowsAssigned == 0`) holds capacity opportunistically: on
+            // reservation failure it shrinks back to `prefillChunkSize` ONCE so
+            // multi-row cohorts never livelock when free headroom is `< targetLen`.
+            // Once at least one cohort row is already reserved, subsequent cohort
+            // rows never shrink — they skip remaining cohort rows while letting
+            // decode rows behind them continue executing.
+            let canShrinkSoloStripe =
+                soloStripe?.id == rec.id && n > config.prefillChunkSize
                 && rec.prefixReusePlan?.recurrentChunkSize == nil
+            let canShrinkCohortRow =
+                isCohortRow && cohortRowsAssigned == 0 && n > config.prefillChunkSize
+            var striped = canShrinkSoloStripe || canShrinkCohortRow
             var reservationTokens = rec.capacityTokensForChunk(
                 start: rec.numComputedTokens,
                 count: n)
@@ -710,6 +881,10 @@ public final class SchedulerV2 {
                                 start: rec.numComputedTokens,
                                 count: n) ?? 0
                         continue
+                    }
+                    if isCohortRow && cohortRowsAssigned > 0 {
+                        cohortPrefillStopped = true
+                        break
                     }
                     // Speculative slack must never trigger the preemption
                     // backstop: retry once as plain decode before preempting.
@@ -747,7 +922,13 @@ public final class SchedulerV2 {
                     preemptions.append(victim.id)
                 }
             }
-            if !reserved { break }
+            if !reserved {
+                if cohortPrefillStopped && !stopScheduling {
+                    idx += 1
+                    continue
+                }
+                break
+            }
 
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
@@ -755,6 +936,13 @@ public final class SchedulerV2 {
             if isPrefillRow {
                 prefillTokensAssigned += n
                 prefillRowsAssigned += 1
+            }
+            if isCohortRow {
+                if n > config.prefillChunkSize {
+                    cohortRowsAssigned += 1
+                } else {
+                    cohortPrefillStopped = true
+                }
             }
             if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
@@ -808,14 +996,17 @@ public final class SchedulerV2 {
                 // quota-blocked row never arms the block starvation guard.
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0, admitsPromptRow() else { break }
-                // Non-armed admissions may not touch the stripe-only budget
-                // surplus: they are bounded by what remains of the ORDINARY
-                // step limit. The armed row itself (admission-path solo
-                // striping) keeps the raised budget.
+                // Non-armed admissions may not touch the compaction/stripe-only
+                // budget surplus: they are bounded by what remains of the
+                // ORDINARY step limit. Armed compaction cohort rows and solo
+                // stripes keep the raised budget.
+                let isCohortRow = compactionCohort?.ids.contains(rec.id) == true
+                if isCohortRow && cohortPrefillStopped { break }
                 let normalHeadroom =
-                    soloStripe?.id == rec.id
+                    (isCohortRow || soloStripe?.id == rec.id)
                     ? budget
                     : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
+                guard normalHeadroom > 0 else { break }
                 var chunk = min(
                     rec.remainingTokens, prefillChunkCap(for: rec), budget,
                     normalHeadroom, admissionHeadroom)
@@ -834,13 +1025,19 @@ public final class SchedulerV2 {
                     break
                 }
                 if let capacity {
-                    // Mirrors the running path's striped shrink: a stripe the
-                    // KV limiter cannot hold falls back to the plain chunk
-                    // size once (text-only by the solo gate — no block to
-                    // split) before admission gives up for this step.
-                    var striped =
-                        soloStripeTokens != nil && chunk > config.prefillChunkSize
+                    // A solo stripe or the FIRST row of a compaction cohort
+                    // (`cohortRowsAssigned == 0`) shrinks to `prefillChunkSize`
+                    // once when KV headroom cannot hold the full request, so
+                    // multi-row cohorts never livelock. Once at least one cohort
+                    // row is reserved, later cohort rows never shrink — they break
+                    // cleanly leaving already-reserved rows intact.
+                    let canShrinkSoloStripe =
+                        soloStripe?.id == rec.id && chunk > config.prefillChunkSize
                         && rec.prefixReusePlan?.recurrentChunkSize == nil
+                    let canShrinkCohortRow =
+                        isCohortRow && cohortRowsAssigned == 0
+                        && chunk > config.prefillChunkSize
+                    var striped = canShrinkSoloStripe || canShrinkCohortRow
                     var reservedAdmission = false
                     while !reservedAdmission {
                         let reservationTokens = rec.capacityTokensForChunk(
@@ -876,6 +1073,13 @@ public final class SchedulerV2 {
                 totalAssignedTokens += chunk
                 prefillTokensAssigned += chunk
                 prefillRowsAssigned += 1
+                if isCohortRow {
+                    if chunk > config.prefillChunkSize {
+                        cohortRowsAssigned += 1
+                    } else {
+                        cohortPrefillStopped = true
+                    }
+                }
                 if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))

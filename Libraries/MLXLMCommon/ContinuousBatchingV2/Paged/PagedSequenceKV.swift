@@ -331,6 +331,16 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
+    /// Token-only speculative drafters (such as suffix-automaton drafting) do
+    /// not depend on a neural carry's `kvOffset == absoluteOffset`, and paged
+    /// physical `beginSpeculativeWrite`/`rollback`/`commitSpeculativeWrite`
+    /// remain value-exact on compacted rows too.
+    public var supportsTokenOnlySpeculativeWrites: Bool {
+        groupKey.quantization == nil
+            && (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsNativeMTP == true)
+            && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
+    }
+
     private weak var nativeSpeculationOwner: CBv2NativePagedMTPWork?
 
     public func beginSpeculativeWrite() {

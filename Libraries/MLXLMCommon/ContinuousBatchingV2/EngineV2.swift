@@ -898,7 +898,17 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // at most this many PROMPT tokens, so newly arriving prompts cannot
         // park an actively decoding request behind ~1.6s of prefill in one
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
-        let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
+        var effectiveSchedulerConfig = schedulerConfig
+        // Request-stateful neural MTP routes prompt prefills through `forwardWithHidden`
+        // (`schedulePrefill: false`), which bypasses Block-SDCM; disarm whole-prompt
+        // compaction so prompts stay within `maxPrefillChunk`.
+        if mtpDriver?.tracksPersistentHistory == true {
+            effectiveSchedulerConfig.soloCompactionMinPromptTokens = nil
+            effectiveSchedulerConfig.allowConcurrentCompaction = false
+            effectiveSchedulerConfig.maxPackedCompactionBatch = 1
+            effectiveSchedulerConfig.compactionEligibility = nil
+        }
+        let scheduler = SchedulerV2(config: effectiveSchedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[

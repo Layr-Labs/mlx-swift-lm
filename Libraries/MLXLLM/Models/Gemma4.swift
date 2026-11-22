@@ -92,6 +92,21 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache)
     }
 
+    public func prepare() throws {
+        try languageModel.prepare()
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        try languageModel.restoreQuantizedEmbeddingIfNeeded(for: parameters)
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {

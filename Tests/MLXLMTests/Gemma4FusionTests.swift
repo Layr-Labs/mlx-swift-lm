@@ -1,7 +1,10 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import XCTest
+
+@_spi(GemmaEncoder) @testable import MLXLLM
 
 final class Gemma4FusionTests: XCTestCase {
     private func assertIdentical(
@@ -153,5 +156,100 @@ final class Gemma4FusionTests: XCTestCase {
             }
             print("[Gemma4 fusion] \(name): original \(medians[0]) µs, fused \(medians[1]) µs")
         }
+    }
+
+    func testFusedQKVParityZeroExtraBytesAndInvalidation() throws {
+        MLXRandom.seed(2026)
+        let json = """
+            {
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_global_key_value_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 64,
+                "vocab_size": 256,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 64,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "attention_k_eq_v": true,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "tie_word_embeddings": true
+            }
+            """
+        let config = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: Data(json.utf8))
+        let unfused = Gemma4TextModel(config)
+        let fused = Gemma4TextModel(config)
+        quantize(model: unfused, groupSize: 64, bits: 8)
+        quantize(model: fused, groupSize: 64, bits: 8)
+        // Mirror identical quantized weights into both models
+        try fused.update(parameters: unfused.parameters(), verify: .all)
+        eval(unfused, fused)
+
+        let qkvBytesBefore = fused.parameters().flattened()
+            .filter {
+                $0.0.contains(".self_attn.")
+                    && ($0.0.contains("q_proj") || $0.0.contains("k_proj")
+                        || $0.0.contains("v_proj"))
+            }
+            .reduce(0) { $0 + $1.1.nbytes }
+        let embedWeightBytesBefore =
+            (fused.model.embedTokens as? QuantizedEmbedding)?.weight.nbytes ?? 0
+        try fused.prepare()
+        eval(fused)
+        let qkvBytesAfter = fused.parameters().flattened()
+            .filter {
+                $0.0.contains(".self_attn.")
+                    && ($0.0.contains("q_proj") || $0.0.contains("k_proj")
+                        || $0.0.contains("v_proj"))
+            }
+            .reduce(0) { $0 + $1.1.nbytes }
+        let hiLo = fused.model.embedTokens as? Gemma4Hi4Lo4Embedding
+
+        // Both layer 0 (sliding 3-way Q+K+V) and layer 1 (full 2-way Q+K, k_eq_v) fuse cleanly.
+        XCTAssertTrue(fused.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertTrue(fused.model.layers[1].selfAttn.hasFusedQKV)
+        // Zero extra weight bytes for both Fused QKV and Hi4/Lo4 bit-plane embedding.
+        XCTAssertEqual(qkvBytesAfter, qkvBytesBefore)
+        if let hiLo {
+            XCTAssertEqual(hiLo.hiWeight.nbytes + hiLo.loWeight.nbytes, embedWeightBytesBefore)
+        }
+
+        // Verify parity across B=1, 2, 4, 8, 16, 32 at L=1 (decode) and B=1 at L=16 (prefill).
+        for (B, L) in [(1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (32, 1), (1, 16)] {
+            let x = MLXRandom.normal([B, L, 128]).asType(.bfloat16)
+            for li in 0 ..< 2 {
+                let (qU, kU, vU) = unfused.model.layers[li].selfAttn.projectQKV(
+                    x, useBatchDecodeProjection: true)
+                let (qF, kF, vF) = fused.model.layers[li].selfAttn.projectQKV(
+                    x, useBatchDecodeProjection: true)
+                eval(qU, kU, vU, qF, kF, vF)
+                let qErr = MLX.abs(qF.asType(.float32) - qU.asType(.float32)).max().item(Float.self)
+                let kErr = MLX.abs(kF.asType(.float32) - kU.asType(.float32)).max().item(Float.self)
+                let vErr = MLX.abs(vF.asType(.float32) - vU.asType(.float32)).max().item(Float.self)
+                // B <= 8 is 0-ULP bit-exact; B=16/32 allows <= 1e-2 BF16 qmm split-K tolerance.
+                let tol: Float = (B <= 8 && L == 1) ? 0.0 : 1e-2
+                XCTAssertLessThanOrEqual(qErr, tol, "Layer \(li) B=\(B) L=\(L) Q mismatch: \(qErr)")
+                XCTAssertLessThanOrEqual(kErr, tol, "Layer \(li) B=\(B) L=\(L) K mismatch: \(kErr)")
+                XCTAssertLessThanOrEqual(vErr, tol, "Layer \(li) B=\(B) L=\(L) V mismatch: \(vErr)")
+            }
+        }
+
+        // Verify parameter update invalidates fusedQKV and restores QuantizedEmbedding cleanly
+        // both at model root and via direct Gemma4DecoderLayer update (LoRA / weight reload).
+        try fused.update(parameters: unfused.parameters(), verify: .noUnusedKeys)
+        XCTAssertFalse(fused.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertFalse(fused.model.layers[1].selfAttn.hasFusedQKV)
+        XCTAssertTrue(fused.model.embedTokens is QuantizedEmbedding)
+
+        try fused.prepare()
+        XCTAssertTrue(fused.model.layers[0].selfAttn.hasFusedQKV)
+        try fused.model.layers[0].update(
+            parameters: unfused.model.layers[0].parameters(), verify: .all)
+        XCTAssertFalse(fused.model.layers[0].selfAttn.hasFusedQKV)
+        XCTAssertTrue(fused.model.layers[1].selfAttn.hasFusedQKV)
     }
 }

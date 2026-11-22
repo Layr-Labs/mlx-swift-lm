@@ -1090,7 +1090,7 @@ final class MiMoV26NativePagedPrefixCompositionTests: XCTestCase {
                     data += actual.0
                     metadata += actual.1
                 }
-                for array in [state.tail, Optional(verify.lastHidden)]
+                for array in [state.tail, verify.lastHidden]
                     + draft.inputs.map(Optional.some)
                 {
                     data.append(try read(XCTUnwrap(array)))

@@ -97,6 +97,23 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         cachedPositionOffsets = cachedPositionOffsets + Int32(length)
         hostPositionOffsets = hostPositionOffsets.map { $0 + Int32(length) }
     }
+
+    private func advancePositionOffsets(by advances: [Int32]) {
+        precondition(
+            advances.count == pagedRows.count,
+            "PagedLayerCache: per-row offset advances count \(advances.count) != rows \(pagedRows.count)"
+        )
+        guard let first = advances.first else { return }
+        if advances.allSatisfy({ $0 == first }) {
+            if first != 0 {
+                cachedPositionOffsets = cachedPositionOffsets + first
+                hostPositionOffsets = hostPositionOffsets.map { $0 + first }
+            }
+            return
+        }
+        cachedPositionOffsets = cachedPositionOffsets + MLXArray(advances)
+        hostPositionOffsets = zip(hostPositionOffsets, advances).map { $0 + $1 }
+    }
     /// Times `positionOffsets` was rebuilt from host integers (test hook);
     /// must only move on batch membership changes, never inside the step loop.
     private(set) var positionOffsetsHostRebuilds = 0
@@ -723,22 +740,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             for (index, row) in pagedRows.enumerated() {
                 let rowKeys = (b == 1 ? keys : keys[index ..< (index + 1)]).squeezed(axis: 0)
                 let rowValues = (b == 1 ? values : values[index ..< (index + 1)]).squeezed(axis: 0)
-                if row.windowSize != nil && stored > maxWindowWrite {
-                    // Chunk windowed writes to stay within `maxPrefillChunk` when the
-                    // sliding window exceeds the configured chunk size (e.g. W=1024, chunk=512).
-                    var start = 0
-                    while start < stored {
-                        let end = min(stored, start + maxWindowWrite)
-                        row.write(
-                            keys: rowKeys[0..., start ..< end, 0...],
-                            values: rowValues[0..., start ..< end, 0...])
-                        if pool.writeValidation.isFaulted { return }
-                        start = end
-                    }
-                } else {
-                    row.write(keys: rowKeys, values: rowValues)
-                    if pool.writeValidation.isFaulted { return }
-                }
+                guard
+                    writeCompactedRow(
+                        row, keys: rowKeys, values: rowValues, stored: stored,
+                        maxWindowWrite: maxWindowWrite)
+                else { return }
             }
         }
         if logicalDelta > 0 {
@@ -753,6 +759,106 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         if advance > 0 {
             advancePositionOffsets(by: advance)
         }
+    }
+
+    public func writeCompactedPromptKV(
+        perRowKeys: [MLXArray], perRowValues: [MLXArray], logicalDeltas: [Int]
+    ) {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "PagedLayerCache: KV-shared layer \(layerIndex) owns no storage")
+        let b = pagedRows.count
+        precondition(
+            perRowKeys.count == b && perRowValues.count == b && logicalDeltas.count == b,
+            "PagedLayerCache: per-row compacted K/V count mismatch")
+        if pool.usesStepOwnedAttention {
+            pool.writeValidation.refuse(
+                "compacted prompt KV write is not supported under step-owned attention",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            return
+        }
+        guard !pool.writeValidation.isFaulted else { return }
+
+        let group = pool.groupKey(forLayer: layerIndex)
+        let expectedDType = pool.layerDTypes[layerIndex]
+        var normalized: [(keys: MLXArray, values: MLXArray, stored: Int, delta: Int)] = []
+        normalized.reserveCapacity(b)
+        for i in 0 ..< b {
+            let delta = logicalDeltas[i]
+            precondition(delta >= 0, "PagedLayerCache: negative logicalDelta \(delta)")
+            let kIn = perRowKeys[i]
+            let vIn = perRowValues[i]
+            let rowK: MLXArray
+            let rowV: MLXArray
+            if kIn.ndim == 4 && vIn.ndim == 4 {
+                precondition(
+                    kIn.dim(0) == 1 && vIn.dim(0) == 1,
+                    "PagedLayerCache: rank-4 per-row compacted K/V must have batch 1")
+                rowK = kIn.squeezed(axis: 0)
+                rowV = vIn.squeezed(axis: 0)
+            } else {
+                precondition(
+                    kIn.ndim == 3 && vIn.ndim == 3,
+                    "PagedLayerCache: per-row compacted K/V must be [Hkv, L, D] or [1, Hkv, L, D]")
+                rowK = kIn
+                rowV = vIn
+            }
+            let stored = rowK.dim(1)
+            precondition(
+                rowV.dim(1) == stored,
+                "PagedLayerCache: per-row compacted K/V token length mismatch")
+            guard
+                pool.writeValidation.validate(
+                    keys: rowK, values: rowV, expected: expectedDType, layerIndex: layerIndex),
+                pool.writeValidation.validateShape(
+                    keys: rowK, values: rowV, group: group, rank: 3, batch: nil,
+                    tokens: stored, layerIndex: layerIndex)
+            else { return }
+            normalized.append((keys: rowK, values: rowV, stored: stored, delta: delta))
+        }
+
+        let maxWindowWrite = max(1, pool.config.maxPrefillChunk)
+        var advances: [Int32] = []
+        advances.reserveCapacity(b)
+        for (index, row) in pagedRows.enumerated() {
+            let entry = normalized[index]
+            if entry.stored > 0 {
+                guard
+                    writeCompactedRow(
+                        row, keys: entry.keys, values: entry.values, stored: entry.stored,
+                        maxWindowWrite: maxWindowWrite)
+                else { return }
+            }
+            if entry.delta > 0 {
+                row.addPositionDelta(entry.delta)
+            }
+            advances.append(Int32(entry.stored + entry.delta))
+        }
+        retainedPrefillKV = []
+        retainedQuantizedViews = []
+        dropPrefillMirrors()
+        advancePositionOffsets(by: advances)
+    }
+
+    private func writeCompactedRow(
+        _ row: PagedSequenceKV, keys: MLXArray, values: MLXArray, stored: Int, maxWindowWrite: Int
+    ) -> Bool {
+        if row.windowSize != nil && stored > maxWindowWrite {
+            // Chunk windowed writes to stay within `maxPrefillChunk` when the
+            // sliding window exceeds the configured chunk size (e.g. W=1024, chunk=512).
+            var start = 0
+            while start < stored {
+                let end = min(stored, start + maxWindowWrite)
+                row.write(
+                    keys: keys[0..., start ..< end, 0...],
+                    values: values[0..., start ..< end, 0...])
+                if pool.writeValidation.isFaulted { return false }
+                start = end
+            }
+            return true
+        }
+        row.write(keys: keys, values: values)
+        return !pool.writeValidation.isFaulted
     }
 
     /// Write K/V without leftover dense SDPA so gathered QSA can attend the

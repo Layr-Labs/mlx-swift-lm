@@ -472,6 +472,12 @@ extension Gemma4TextModel {
         guard tensorParallelShard == nil else {
             throw Gemma4TensorParallelError("tensor parallel is already installed")
         }
+        if let hi4 = model.embedTokens as? Gemma4Hi4Lo4Embedding {
+            try model.update(
+                modules: ModuleChildren(values: ["embed_tokens": .value(hi4.toQuantizedEmbedding())]
+                ),
+                verify: [])
+        }
         let local = try shard.localConfiguration(full)
         let own = configuration
         guard own.numAttentionHeads == local.numAttentionHeads,

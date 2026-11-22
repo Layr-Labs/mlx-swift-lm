@@ -126,6 +126,12 @@ public final class SamplerV2 {
 
     // MARK: - Per-row keyed noise
 
+    /// Generate one step's keyed `Exp(1)` noise `[B, vocab]` matching `sample`
+    /// bit-for-bit without consuming the step (caller must call `commit()`).
+    func stepExponentialNoise(vocab: Int) -> MLXArray {
+        exponentialNoise(vocab: vocab)
+    }
+
     /// Exp(1) noise [B, vocab]; row r is generated from key
     /// mix(seed_r, id_r, step_r) and stacked, so each row's draw is a pure
     /// function of that row's identity — never of batchmates. Greedy rows

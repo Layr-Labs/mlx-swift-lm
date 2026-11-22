@@ -4064,11 +4064,12 @@ METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(
     // The caller validates the full route before entering this known-shape kernel.
     static func pair(
         tokenRows: MLXArray, sortedExperts: MLXArray, rowMap: MLXArray,
-        gate: Bank, up: Bank, kernels: Kernels = production
+        gate: Bank, up: Bank, topK: Int = 8, kernels: Kernels = production
     ) -> (gate: MLXArray, up: MLXArray) {
         let rows = sortedExperts.size
-        precondition(rows >= 512 && rows <= 16384 && rows % 8 == 0)
-        precondition(tokenRows.shape == [rows / 8, 1, 2816] && tokenRows.dtype == .bfloat16)
+        precondition(topK >= 1 && topK <= 8)
+        precondition(rows >= 512 && rows <= 65536 && rows % topK == 0)
+        precondition(tokenRows.shape == [rows / topK, 1, 2816] && tokenRows.dtype == .bfloat16)
         precondition(sortedExperts.shape == [rows] && sortedExperts.dtype == .uint32)
         precondition(rowMap.shape == [rows] && rowMap.dtype == .uint32)
         for bank in [gate, up] {

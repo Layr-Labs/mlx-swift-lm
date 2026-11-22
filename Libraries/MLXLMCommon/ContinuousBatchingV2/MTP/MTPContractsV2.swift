@@ -466,6 +466,42 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
 }
 
+/// Token-only speculative drafter (e.g. online suffix automaton).
+///
+/// Proposes draft continuations directly on CPU from each row's confirmed token
+/// history — zero neural draft forwards, zero KV snapshots, zero hidden-state
+/// carries, and zero seed steps. Target verification runs plain
+/// `CBv2SteppableModel.forward(tokens:caches:)` with exact per-row rollback, so
+/// compacted Block-SDCM rows can speculate cleanly alongside ordinary rows.
+public protocol CBv2TokenOnlyMTPDrafter: CBv2MTPDrafter {
+    /// Fast check answering whether the current decode cohort has a profitable
+    /// token-only candidate match at the round's actual `maxDraftTokens` cap.
+    /// Used by `mtpWantsStep` so non-matching cohorts stay on ordinary chained
+    /// decode without breaking chaining.
+    func hasCandidateMatch(
+        for rows: [(id: CBv2RequestID, tokens: [Int])],
+        maxDraftTokens: Int
+    ) -> Bool
+    /// Build uniform-depth draft proposals for the verify cohort. Returns
+    /// `depth == 0` when no profitable match exists; otherwise every request in
+    /// `rows` receives an array of length `depth` (`1...maxDraftTokens`).
+    func proposeDrafts(
+        for rows: [(id: CBv2RequestID, tokens: [Int])],
+        maxDraftTokens: Int
+    ) -> (depth: Int, draftsByRequest: [CBv2RequestID: [Int32]])
+    /// Drop cached per-request automaton state when a request finishes, cancels,
+    /// or is retired.
+    func requestDidFinish(_ id: CBv2RequestID)
+    /// Drop all per-request state (engine shutdown / drain).
+    func removeAllRequestState()
+}
+
+extension CBv2TokenOnlyMTPDrafter {
+    public func hasCandidateMatch(for rows: [(id: CBv2RequestID, tokens: [Int])]) -> Bool {
+        hasCandidateMatch(for: rows, maxDraftTokens: CBv2MTPConfig.testedMaxDraftTokens)
+    }
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.
@@ -518,8 +554,12 @@ public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
     /// validation matrix (`verify width = 1 + k`, widths 1...8).
     public static let testedMaxDraftTokens = 7
-    /// CBv2's production rectangular batch ceiling.
+    /// CBv2's production rectangular batch ceiling for neural drafters.
     public static let testedMaxSpeculativeBatch = 8
+    /// Maximum speculative batch ceiling for zero-draft-cost token-only
+    /// drafters (such as suffix-automaton drafting). Non-token-only drafters
+    /// are still clamped to `testedMaxSpeculativeBatch` by `CBv2MTPRoundDriver`.
+    public static let maxTokenOnlySpeculativeBatch = 16
 
     /// Master switch. The engine also requires a drafter instance and a
     /// conforming model; `enabled == true` without both is inert.
@@ -662,7 +702,7 @@ public struct CBv2MTPConfig: Sendable {
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
-            max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
+            max(maxSpeculativeBatch, 1), Self.maxTokenOnlySpeculativeBatch)
         self.fixedDraftTokens = fixedDraftTokens.map {
             min(max($0, 0), resolvedMax)
         }

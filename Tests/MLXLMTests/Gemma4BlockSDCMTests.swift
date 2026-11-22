@@ -4,7 +4,7 @@ import MLXFast
 import MLXNN
 import Testing
 
-@testable import MLXLLM
+@_spi(GemmaEncoder) @testable import MLXLLM
 @testable import MLXLMCommon
 
 @Suite("Gemma 4 Block-SDCM Prefill & Paged Last-Query", .serialized)
@@ -33,6 +33,10 @@ struct Gemma4BlockSDCMTests {
         let lcDefault = Gemma4BlockSDCMConfig.resolve(environment: [
             Gemma4BlockSDCMConfig.envKey: "lightcone"
         ])
+        #expect(lcDefault.minPromptTokens == 3072)
+        #expect(lcDefault.densityGuardEnabled)
+        #expect(lcDefault.maxPackedBatch == 8)
+        #expect(lcDefault.maxPackedTokens == 32_768)
         #expect(lcDefault.interiorMoEK(forLayer: 2) == 2)
         #expect(lcDefault.interiorMoEK(forLayer: 6) == 5)
         #expect(lcDefault.interiorMoEK(forLayer: 12) == 8)
@@ -42,6 +46,7 @@ struct Gemma4BlockSDCMTests {
             Gemma4BlockSDCMConfig.envKey: "balanced"
         ])
         #expect(bal.mode == .balanced)
+        #expect(bal.minPromptTokens == 3072)
         #expect(bal.keepSchedule[6] == 0.46)
         #expect(bal.blockSize == 64)
         #expect(bal.interiorMoEK(forLayer: 2) == 2)
@@ -53,6 +58,7 @@ struct Gemma4BlockSDCMTests {
             Gemma4BlockSDCMConfig.envKey: "fast"
         ])
         #expect(fast.mode == .fast)
+        #expect(fast.minPromptTokens == 3072)
         #expect(fast.keepSchedule[6] == 0.36)
         #expect(fast.blockSize == 32)
         #expect(fast.interiorMoEK(forLayer: 2) == 2)
@@ -65,6 +71,10 @@ struct Gemma4BlockSDCMTests {
                 Gemma4BlockSDCMConfig.envKey: alias
             ])
             #expect(turbo.mode == .turbo)
+            #expect(turbo.minPromptTokens == 3072)
+            #expect(turbo.densityGuardEnabled)
+            #expect(turbo.maxPackedBatch == 8)
+            #expect(turbo.maxPackedTokens == 32_768)
             #expect(turbo.earlyPreCompactAfterLayer == 0)
             #expect(turbo.earlyPreCompactRatio == 0.55)
             #expect(turbo.earlyPreCompactBlockSize == 64)
@@ -73,6 +83,30 @@ struct Gemma4BlockSDCMTests {
             #expect(turbo.keepSchedule[6] == 0.36)
             #expect(turbo.reversePrefixQuota[24] == 0.20)
         }
+
+        let overridden = Gemma4BlockSDCMConfig.resolve(environment: [
+            Gemma4BlockSDCMConfig.envKey: "fast",
+            Gemma4BlockSDCMConfig.densityGuardEnvKey: "0",
+            Gemma4BlockSDCMConfig.maxBatchEnvKey: "4",
+            Gemma4BlockSDCMConfig.maxTokensEnvKey: "65536",
+        ])
+        #expect(!overridden.densityGuardEnabled)
+        #expect(overridden.maxPackedBatch == 4)
+        #expect(overridden.maxPackedTokens == 65_536)
+
+        let clampedLow = Gemma4BlockSDCMConfig.resolve(environment: [
+            Gemma4BlockSDCMConfig.envKey: "fast",
+            Gemma4BlockSDCMConfig.maxBatchEnvKey: "0",
+            Gemma4BlockSDCMConfig.maxTokensEnvKey: "1024",
+        ])
+        #expect(clampedLow.maxPackedBatch == 1)
+        #expect(clampedLow.maxPackedTokens == 3072)
+
+        let clampedHigh = Gemma4BlockSDCMConfig.resolve(environment: [
+            Gemma4BlockSDCMConfig.envKey: "fast",
+            Gemma4BlockSDCMConfig.maxBatchEnvKey: "64",
+        ])
+        #expect(clampedHigh.maxPackedBatch == 32)
     }
 
     // MARK: - Arbitrary-Position RoPE Exact Parity
@@ -1561,6 +1595,674 @@ struct Gemma4BlockSDCMTests {
             for layer in 0 ..< kinds.count {
                 #expect(rows[layer].ropePositionOffset == T + 1)
             }
+        }
+    }
+
+    // MARK: - Checkpoint A: Density Guard, Batched B=4 Block-SDCM, Mode A & Mode B
+
+    @Test(
+        "passesDensityGuard vetoes 20-AA protein and dense short prose while passing 4K-16K code/logs and tiny tests"
+    )
+    func densityGuardSafetyGate() throws {
+        var rng = CBv2SchedSplitMix64(seed: 0xC0DE_5AFE)
+        let cfg = Gemma4BlockSDCMConfig.fast
+
+        // 1. 20-AA protein sequence (4096 tokens, H1 ~ 4.32 bits < 5.0, repeated4GramRatio < 0.20) -> VETO
+        let proteinTokens: [Int] = (0 ..< 4096).map { _ in Int(100 + rng.next() % 20) }
+        #expect(!Gemma4BlockSDCM.passesDensityGuard(tokens: proteinTokens, config: cfg))
+
+        // Disabling density guard overrides veto cleanly.
+        var guardOffCfg = cfg
+        guardOffCfg.densityGuardEnabled = false
+        #expect(Gemma4BlockSDCM.passesDensityGuard(tokens: proteinTokens, config: guardOffCfg))
+
+        // 2. Short ultra-dense prose/proof (n = 3584 < 4096, uniqueRatio > 0.50, repeated4GramRatio < 0.05) -> VETO
+        let denseShortProse: [Int] = (0 ..< 3584).map { i in 10_000 + i }
+        #expect(!Gemma4BlockSDCM.passesDensityGuard(tokens: denseShortProse, config: cfg))
+
+        // 3. 4K and 16K code/logs (H1 >= 5.0 with recurring code/log templates) -> PASS
+        let code4K: [Int] = (0 ..< 4096).map { i in
+            (i % 16 < 8) ? (500 + (i % 8)) : Int(600 + rng.next() % 256)
+        }
+        let logs16K: [Int] = (0 ..< 16_384).map { i in
+            (i % 24 < 10) ? (900 + (i % 10)) : Int(1_000 + rng.next() % 512)
+        }
+        #expect(Gemma4BlockSDCM.passesDensityGuard(tokens: code4K, config: cfg))
+        #expect(Gemma4BlockSDCM.passesDensityGuard(tokens: logs16K, config: cfg))
+
+        // 4. Tiny synthetic prompt (interior N < 512) always passes.
+        let tinyProtein = Array(proteinTokens.prefix(500))
+        #expect(Gemma4BlockSDCM.passesDensityGuard(tokens: tinyProtein, config: cfg))
+
+        // 5. RandomAccessCollection slice with non-zero startIndex works identically.
+        let sliceBase: [Int32] = Array(repeating: 0, count: 17) + proteinTokens.map(Int32.init)
+        let slicedProtein = sliceBase[17...]
+        #expect(!Gemma4BlockSDCM.passesDensityGuard(tokens: slicedProtein, config: cfg))
+
+        // 6. canRun enforces maxPackedBatch and passesDensityGuard.
+        let model = try Self.makeSyntheticGemma4MoE()
+        var batchCfg = Gemma4BlockSDCMConfig.fast
+        batchCfg.minPromptTokens = 3072
+        batchCfg.maxPackedBatch = 8
+        #expect(
+            Gemma4BlockSDCM.canRun(
+                sdcm: batchCfg, modelConfig: model.configuration, schedulePrefill: true,
+                batchSize: 4, sequenceLength: 4096, hasInputEmbedding: false,
+                hasImageMask: false, hasCaptureHook: false, initialOffset: 0,
+                passesDensityGuard: true))
+        #expect(
+            !Gemma4BlockSDCM.canRun(
+                sdcm: batchCfg, modelConfig: model.configuration, schedulePrefill: true,
+                batchSize: 4, sequenceLength: 4096, hasInputEmbedding: false,
+                hasImageMask: false, hasCaptureHook: false, initialOffset: 0,
+                passesDensityGuard: false))
+        #expect(
+            !Gemma4BlockSDCM.canRun(
+                sdcm: batchCfg, modelConfig: model.configuration, schedulePrefill: true,
+                batchSize: 9, sequenceLength: 4096, hasInputEmbedding: false,
+                hasImageMask: false, hasCaptureHook: false, initialOffset: 0,
+                passesDensityGuard: true))
+    }
+
+    @Test(
+        "Batched B=4 applyArbitraryPositionsRoPE matches B=1 per-row and scalar RoPE bit-identically"
+    )
+    func batchedArbitraryPositionRoPEParity() {
+        MLXRandom.seed(202604)
+        let B = 4
+        let H = 4
+        let L = 24
+        let slidingRope = initializeRope(
+            dims: 64, base: 10_000, traditional: false, scalingConfig: nil,
+            maxPositionEmbeddings: 4096)
+        let fullRope = initializeRope(
+            dims: 128, base: 1_000_000, traditional: false,
+            scalingConfig: [
+                "type": .string("proportional"), "partial_rotary_factor": .float(0.25),
+            ],
+            maxPositionEmbeddings: 4096)
+
+        // Distinct non-contiguous ascending positions per batch row.
+        var posRows: [[Int32]] = []
+        var flatPos: [Int32] = []
+        for b in 0 ..< B {
+            let row = (0 ..< L).map { j in Int32(j * (b + 2) + b * 19) }
+            posRows.append(row)
+            flatPos.append(contentsOf: row)
+        }
+        let pos2D = MLXArray(flatPos, [B, L])
+
+        for (label, rope, dim) in [
+            ("sliding", slidingRope, 64), ("full-proportional", fullRope, 128),
+        ] {
+            let x = MLXRandom.normal([B, H, L, dim]).asType(.float32)
+            let batched = Gemma4BlockSDCM.applyArbitraryPositionsRoPE(
+                rope, to: x, positions: pos2D)
+            let perRow = concatenated(
+                (0 ..< B).map { b in
+                    Gemma4BlockSDCM.applyArbitraryPositionsRoPE(
+                        rope, to: x[b ..< (b + 1)], positions: MLXArray(posRows[b]))
+                }, axis: 0)
+            let scalarRef = concatenated(
+                (0 ..< B).map { b in
+                    concatenated(
+                        posRows[b].enumerated().map { idx, p in
+                            rope(
+                                x[b ..< (b + 1), 0..., idx ..< (idx + 1), 0...],
+                                offset: Int(p))
+                        }, axis: 2)
+                }, axis: 0)
+            eval(batched, perRow, scalarRef)
+            let diffRow = MLX.abs(batched - perRow).max().item(Float.self)
+            let diffScalar = MLX.abs(batched - scalarRef).max().item(Float.self)
+            #expect(diffRow == 0, "\(label) B=4 vs B=1 RoPE diff: \(diffRow)")
+            #expect(diffScalar < 1e-5, "\(label) B=4 vs scalar RoPE diff: \(diffScalar)")
+        }
+    }
+
+    @Test(
+        "PagedLayerCache and CBv2LayerCache per-row writeCompactedPromptKV handles distinct lengths, chunked sliding, prefix veto, and B=4 vs B=1 decode parity"
+    )
+    func batchedWriteCompactedPromptKVPerRowBothBackends() throws {
+        MLXRandom.seed(808)
+        let B = 4
+        let fullKind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
+        // maxPrefillChunk (32) < slidingWindow (64) exercises chunked per-row sliding writes.
+        let slidingKind = CBv2LayerKind(
+            attention: .slidingWindow(64), headDim: 64, kvHeads: 2, queryHeads: 4)
+        let kinds = [fullKind, slidingKind]
+        let poolConfig = PagedKVPoolConfig(
+            pageSize: 16, capacityBytes: 32 * 1024 * 1024, dtype: .float32, maxPrefillChunk: 32)
+
+        let storedCounts = [0, 17, 48, 64]
+        let uniformDeltas = storedCounts.map { 128 - $0 }  // all advance by 128
+        let heteroDeltas = [128, 113, 92, 86]  // advances: [128, 130, 140, 150]
+
+        let perRowK3D = storedCounts.map { n in
+            MLXRandom.normal([2, n, 64]).asType(.float32)
+        }
+        let perRowV3D = storedCounts.map { n in
+            MLXRandom.normal([2, n, 64]).asType(.float32)
+        }
+        let perRowK4D = perRowK3D.map { $0.expandedDimensions(axis: 0) }
+        let perRowV4D = perRowV3D.map { $0.expandedDimensions(axis: 0) }
+
+        let qDec = MLXRandom.normal([B, 4, 1, 64]).asType(.float32)
+        let kDec = MLXRandom.normal([B, 2, 1, 64]).asType(.float32)
+        let vDec = MLXRandom.normal([B, 2, 1, 64]).asType(.float32)
+
+        // 1. PagedLayerCache: B=4 per-row (3D uniform + 4D heterogeneous) vs B=1 parity.
+        do {
+            let pagedB4 = try PagedKVBackend(layerKinds: kinds, config: poolConfig)
+            let pagedB1 = try PagedKVBackend(layerKinds: kinds, config: poolConfig)
+            let statesB4 = try (0 ..< B).map { _ in
+                try pagedB4.makeSequenceState(layerKinds: kinds, promptLength: 128, maxLength: 256)
+            }
+            let statesB1 = try (0 ..< B).map { _ in
+                try pagedB1.makeSequenceState(layerKinds: kinds, promptLength: 128, maxLength: 256)
+            }
+            defer {
+                for s in statesB4 { pagedB4.release(s) }
+                for s in statesB1 { pagedB1.release(s) }
+            }
+
+            let cachesB4 = pagedB4.makeLayerCaches()
+            let cachesB1 = pagedB1.makeLayerCaches()
+            let fullRowsB4 = statesB4.map { $0[0] as! PagedSequenceKV }
+            let slideRowsB4 = statesB4.map { $0[1] as! PagedSequenceKV }
+            cachesB4[0].setRows(fullRowsB4)
+            cachesB4[1].setRows(slideRowsB4)
+
+            // Full layer with 4D heterogeneous advances, sliding layer with 3D uniform advances.
+            cachesB4[0].writeCompactedPromptKV(
+                perRowKeys: perRowK4D, perRowValues: perRowV4D, logicalDeltas: heteroDeltas)
+            cachesB4[1].writeCompactedPromptKV(
+                perRowKeys: perRowK3D, perRowValues: perRowV3D, logicalDeltas: uniformDeltas)
+            #expect(!pagedB4.pool.writeValidation.isFaulted)
+
+            let expectedFullOff = zip(storedCounts, heteroDeltas).map { Int32($0 + $1) }
+            let expectedSlideOff = [Int32](repeating: 128, count: B)
+            eval(cachesB4[0].positionOffsets, cachesB4[1].positionOffsets)
+            #expect(cachesB4[0].hostPositionOffsets == expectedFullOff)
+            #expect(cachesB4[0].positionOffsets.asArray(Int32.self) == expectedFullOff)
+            #expect(cachesB4[1].hostPositionOffsets == expectedSlideOff)
+            #expect(cachesB4[1].positionOffsets.asArray(Int32.self) == expectedSlideOff)
+            for b in 0 ..< B {
+                #expect(fullRowsB4[b].absoluteOffset == storedCounts[b])
+                #expect(fullRowsB4[b].ropePositionOffset == Int(expectedFullOff[b]))
+                #expect(fullRowsB4[b].isCompacted)
+                #expect(fullRowsB4[b].prefixPageHandles(tokens: 0 ..< 16) == nil)
+                #expect(slideRowsB4[b].absoluteOffset == storedCounts[b])
+                #expect(slideRowsB4[b].ropePositionOffset == 128)
+                #expect(slideRowsB4[b].isCompacted)
+            }
+
+            // Batched decode vs independent B=1 decode on sliding layer.
+            let decB4 = cachesB4[1].updateAndAttend(
+                queries: qDec, keys: kDec, values: vDec, scale: 0.25, sinks: nil)
+            var decB1Rows: [MLXArray] = []
+            for b in 0 ..< B {
+                let row1 = statesB1[b][1] as! PagedSequenceKV
+                cachesB1[1].setRows([row1])
+                cachesB1[1].writeCompactedPromptKV(
+                    keys: perRowK4D[b], values: perRowV4D[b], logicalDelta: uniformDeltas[b])
+                decB1Rows.append(
+                    cachesB1[1].updateAndAttend(
+                        queries: qDec[b ..< (b + 1)],
+                        keys: kDec[b ..< (b + 1)],
+                        values: vDec[b ..< (b + 1)],
+                        scale: 0.25, sinks: nil))
+            }
+            let decB1 = concatenated(decB1Rows, axis: 0)
+            eval(decB4, decB1)
+            let diff = MLX.abs(decB4 - decB1).max().item(Float.self)
+            #expect(diff < 1e-4, "Paged B=4 vs B=1 post-compacted sliding decode diff: \(diff)")
+            #expect(cachesB4[1].hostPositionOffsets == [129, 129, 129, 129])
+        }
+
+        // 2. Contiguous CBv2LayerCache: B=4 per-row vs B=1 parity.
+        do {
+            let fullRowsB4: [CBv2SequenceKV] = (0 ..< B).map { _ in
+                CBv2FullSequenceKV(promptLength: 128, maxLength: 256, kvHeads: 2, headDim: 64)
+            }
+            let slideRowsB4: [CBv2SequenceKV] = (0 ..< B).map { _ in
+                CBv2WindowedSequenceKV(window: 64, kvHeads: 2, headDim: 64)
+            }
+            let fullCacheB4 = CBv2LayerCache(layerIndex: 0, kind: fullKind, rows: fullRowsB4)
+            let slideCacheB4 = CBv2LayerCache(layerIndex: 1, kind: slidingKind, rows: slideRowsB4)
+
+            fullCacheB4.writeCompactedPromptKV(
+                perRowKeys: perRowK4D, perRowValues: perRowV4D, logicalDeltas: heteroDeltas)
+            slideCacheB4.writeCompactedPromptKV(
+                perRowKeys: perRowK3D, perRowValues: perRowV3D, logicalDeltas: uniformDeltas)
+
+            let expectedFullOff = zip(storedCounts, heteroDeltas).map { Int32($0 + $1) }
+            eval(fullCacheB4.positionOffsets, slideCacheB4.positionOffsets)
+            #expect(fullCacheB4.positionOffsets.asArray(Int32.self) == expectedFullOff)
+            #expect(slideCacheB4.positionOffsets.asArray(Int32.self) == [128, 128, 128, 128])
+            for b in 0 ..< B {
+                #expect(slideRowsB4[b].absoluteOffset == storedCounts[b])
+                #expect(slideRowsB4[b].ropePositionOffset == 128)
+                #expect(slideRowsB4[b].isCompacted)
+            }
+
+            let decB4 = slideCacheB4.updateAndAttend(
+                queries: qDec, keys: kDec, values: vDec, scale: 0.25, sinks: nil)
+            var decB1Rows: [MLXArray] = []
+            for b in 0 ..< B {
+                let row1 = CBv2WindowedSequenceKV(window: 64, kvHeads: 2, headDim: 64)
+                let c1 = CBv2LayerCache(layerIndex: 1, kind: slidingKind, rows: [row1])
+                c1.writeCompactedPromptKV(
+                    keys: perRowK4D[b], values: perRowV4D[b], logicalDelta: uniformDeltas[b])
+                decB1Rows.append(
+                    c1.updateAndAttend(
+                        queries: qDec[b ..< (b + 1)],
+                        keys: kDec[b ..< (b + 1)],
+                        values: vDec[b ..< (b + 1)],
+                        scale: 0.25, sinks: nil))
+            }
+            let decB1 = concatenated(decB1Rows, axis: 0)
+            eval(decB4, decB1)
+            let diff = MLX.abs(decB4 - decB1).max().item(Float.self)
+            #expect(
+                diff < 1e-4,
+                "Contiguous B=4 vs B=1 post-compacted sliding decode diff: \(diff)")
+            eval(slideCacheB4.positionOffsets)
+            #expect(slideCacheB4.positionOffsets.asArray(Int32.self) == [129, 129, 129, 129])
+        }
+    }
+
+    @Test(
+        "Batched B=4 forwardBlockSDCMTrunk + Paged/Contiguous KV caches matches B=1 row-for-row across fast and turbo modes"
+    )
+    func batchedBlockSDCMTrunkParityB4VsB1() throws {
+        MLXRandom.seed(9001)
+        let model = try Self.makeSyntheticGemma4MoE()
+        let B = 4
+        let T = 160
+        let kinds = model.cbv2LayerKinds
+
+        var rng = CBv2SchedSplitMix64(seed: 0xBA7C_4004)
+        let promptRows: [[Int32]] = (0 ..< B).map { b in
+            (0 ..< T).map { j in Int32((Int(rng.next() % 200) + b * 17 + j) % model.vocabularySize)
+            }
+        }
+        let flatPrompt = promptRows.flatMap { $0 }
+        let tokensB4 = MLXArray(flatPrompt, [B, T])
+        let hiddenB4 = model.model.embedTokens(tokensB4) * model.model.embedScale
+        let nextTokRows: [Int32] = [13, 27, 41, 55]
+        let nextTokB4 = MLXArray(nextTokRows, [B, 1])
+
+        // Test both fast (bilateral L6 compaction) and turbo (L0 early Tri-Signal + L6 bilateral + sparse L5).
+        var fastCfg = Gemma4BlockSDCMConfig.fast
+        fastCfg.minPromptTokens = 96
+        fastCfg.prefixKeep = 16
+        fastCfg.tailKeep = 16
+        fastCfg.blockSize = 16
+        fastCfg.keepSchedule = [6: 0.50]
+        fastCfg.reversePrefixQuota = [6: 0.25]
+        fastCfg.reversePrefixEnd = 24
+        fastCfg.earlySparseFullLayer = 5
+        fastCfg.sparsePrefixTokens = 16
+        fastCfg.sparseLocalWindow = 32
+        fastCfg.sparseTailTokens = 16
+        fastCfg.slidingChunkSize = 32
+        fastCfg.earlyMoEK = 2
+        fastCfg.lateMoEK = 4
+        fastCfg.earlyMoEUntilLayer = 6
+        fastCfg.layerMoEK = [0: 2, 1: 2, 2: 2, 3: 2, 4: 3, 5: 3]
+
+        var turboCfg = fastCfg
+        turboCfg.mode = .turbo
+        turboCfg.earlyPreCompactAfterLayer = 0
+        turboCfg.earlyPreCompactRatio = 0.65
+        turboCfg.earlyPreCompactBlockSize = 16
+        turboCfg.earlyPreCompactTopHaloK = 2
+
+        for (label, cfg) in [("fast", fastCfg), ("turbo", turboCfg)] {
+            let poolCfg = PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 64 * 1024 * 1024, dtype: .float32,
+                maxPrefillChunk: 160, nominalMaxSequenceLength: 256)
+            let pagedB4 = try PagedKVBackend(layerKinds: kinds, config: poolCfg)
+            var statesB4: [[CBv2SequenceKV?]] = []
+            defer { for s in statesB4 { pagedB4.release(s) } }
+            for _ in 0 ..< B {
+                statesB4.append(
+                    try pagedB4.makeSequenceState(
+                        layerKinds: kinds, promptLength: T, maxLength: T + 32))
+            }
+            let pagedCachesB4 = pagedB4.makeLayerCaches()
+            let fullCacheB4: [KVCache?] = pagedCachesB4.enumerated().map { layerIdx, cache in
+                cache.setRows(statesB4.map { $0[layerIdx]! })
+                return cache
+            }
+
+            let (postNormB4, ckptB4) = model.model.forwardBlockSDCMTrunk(
+                hiddenB4,
+                inputTokenIDRows: promptRows,
+                fullCache: fullCacheB4,
+                sdcm: cfg,
+                isExpertPrefill: false)
+            #expect(ckptB4 == nil)
+            #expect(postNormB4.shape == [B, 1, model.configuration.hiddenSize])
+            #expect(!pagedB4.pool.writeValidation.isFaulted)
+
+            let decLogitsB4 = model(nextTokB4, cache: pagedCachesB4)
+            eval(postNormB4, decLogitsB4)
+
+            // Run each row independently with B=1 on a fresh PagedKVBackend and assert parity.
+            for b in 0 ..< B {
+                let pagedB1 = try PagedKVBackend(layerKinds: kinds, config: poolCfg)
+                let stateB1 = try pagedB1.makeSequenceState(
+                    layerKinds: kinds, promptLength: T, maxLength: T + 32)
+                defer { pagedB1.release(stateB1) }
+                let pagedCachesB1 = pagedB1.makeLayerCaches()
+                let fullCacheB1: [KVCache?] = pagedCachesB1.enumerated().map { layerIdx, cache in
+                    cache.setRows([stateB1[layerIdx]!])
+                    return cache
+                }
+
+                let (postNormB1, _) = model.model.forwardBlockSDCMTrunk(
+                    hiddenB4[b ..< (b + 1)],
+                    inputTokenIDs: promptRows[b],
+                    fullCache: fullCacheB1,
+                    sdcm: cfg,
+                    isExpertPrefill: false)
+                let decLogitsB1 = model(
+                    MLXArray([nextTokRows[b]], [1, 1]), cache: pagedCachesB1)
+                eval(postNormB1, decLogitsB1)
+
+                let prefillDiff = MLX.abs(postNormB4[b ..< (b + 1)] - postNormB1).max().item(
+                    Float.self)
+                let decodeDiff = MLX.abs(decLogitsB4[b ..< (b + 1)] - decLogitsB1).max().item(
+                    Float.self)
+                #expect(
+                    prefillDiff < 5e-4,
+                    "\(label) row \(b) B=4 vs B=1 prefill postNorm diff: \(prefillDiff)")
+                #expect(
+                    decodeDiff < 5e-4,
+                    "\(label) row \(b) B=4 vs B=1 post-compaction decode diff: \(decodeDiff)")
+
+                for layerIdx in 0 ..< kinds.count {
+                    let rowB4 = statesB4[b][layerIdx]!
+                    let rowB1 = stateB1[layerIdx]!
+                    #expect(rowB4.absoluteOffset == rowB1.absoluteOffset)
+                    #expect(rowB4.ropePositionOffset == T + 1)
+                    #expect(rowB4.ropePositionOffset == rowB1.ropePositionOffset)
+                    #expect(rowB4.isCompacted == rowB1.isCompacted)
+                }
+            }
+        }
+
+        // Verify contiguous CBv2LayerCache matches PagedKVBackend on B=4 too.
+        let contigStates: [[CBv2SequenceKV]] = (0 ..< B).map { _ in
+            kinds.map { kind in
+                switch kind.attention {
+                case .full:
+                    CBv2FullSequenceKV(
+                        promptLength: T, maxLength: T + 32,
+                        kvHeads: kind.kvHeads, headDim: kind.headDim)
+                case .slidingWindow(let w):
+                    CBv2WindowedSequenceKV(window: w, kvHeads: kind.kvHeads, headDim: kind.headDim)
+                }
+            }
+        }
+        let contigCaches: [CBv2LayerCache] = kinds.enumerated().map { layerIdx, kind in
+            CBv2LayerCache(
+                layerIndex: layerIdx, kind: kind, rows: contigStates.map { $0[layerIdx] })
+        }
+        let (contigPostNorm, _) = model.model.forwardBlockSDCMTrunk(
+            hiddenB4,
+            inputTokenIDRows: promptRows,
+            fullCache: contigCaches.map { $0 as KVCache? },
+            sdcm: fastCfg,
+            isExpertPrefill: false)
+        let contigDec = model(nextTokB4, cache: contigCaches)
+        eval(contigPostNorm, contigDec)
+        #expect(!MLX.isNaN(contigPostNorm).any().item(Bool.self))
+        #expect(!MLX.isNaN(contigDec).any().item(Bool.self))
+        for b in 0 ..< B {
+            #expect(contigStates[b][11].absoluteOffset < T)
+            #expect(contigStates[b][11].ropePositionOffset == T + 1)
+            #expect(contigStates[b][11].isCompacted)
+        }
+
+        // Verify equalizeBatchedCompactedIndices reconciles unequal surviving lengths cleanly.
+        let posHost = (0 ..< 128).map { Int32($0) }
+        let unequal = Gemma4BlockSDCM.equalizeBatchedCompactedIndices(
+            keepRows: [
+                Array(0 ..< 16).map(Int32.init) + Array(112 ..< 128).map(Int32.init),
+                Array(0 ..< 32).map(Int32.init) + Array(112 ..< 128).map(Int32.init),
+            ],
+            rowBlockScores: [
+                [0, 1, 5, 2, 3, 4, 0, 0],
+                [0, 1, 2, 3, 4, 5, 0, 0],
+            ],
+            positionsHostRows: [posHost, posHost],
+            originalLength: 128,
+            blockSize: 16,
+            currentLength: 128)
+        #expect(unequal[0].count == 48)
+        #expect(unequal[1].count == 48)
+        #expect(unequal[0].first == 0 && unequal[0].last == 127)
+        for i in 1 ..< unequal[0].count { #expect(unequal[0][i] > unequal[0][i - 1]) }
+        // Highest-scoring unkept interior block in row 0 is block 2 (positions 32..<48).
+        #expect(unequal[0].contains(32) && unequal[0].contains(47))
+    }
+
+    @Test(
+        "SchedulerV2 Mode A dispatches whole-prompt compaction beside active decode while isolating budget surplus"
+    )
+    func schedulerModeAConcurrentDecodeAndCompaction() throws {
+        var config = CBv2SchedulerConfig(
+            maxConcurrentRequests: 4,
+            maxBatchedTokensPerStep: 4096,
+            prefillChunkSize: 2048,
+            soloPrefillStripeTokens: nil,
+            maxConcurrentPartialPrefills: 1,
+            enablePrefixCache: true)
+        config.soloCompactionMinPromptTokens = 3072
+        config.allowConcurrentCompaction = true
+        config.maxPackedCompactionBatch = 1
+        config.demandedShortCheckpointMinimumTokens = 1024
+        config.demandedCheckpointPartitionIncludesLongPrompts = true
+        let scheduler = SchedulerV2(config: config)
+
+        // Step 1: admit and finish prefill of short request R1 so it becomes decode-ready.
+        let r1 = CBv2Request(
+            id: CBv2RequestID(1), promptTokens: Array(repeating: 5, count: 64), maxTokens: 16)
+        try scheduler.enqueue(r1)
+        let p1 = scheduler.plan()
+        #expect(p1.assignments.count == 1 && p1.assignments[0].numTokens == 64)
+        scheduler.markPendingSamples(ids: [r1.id])
+        scheduler.recordSampled(id: r1.id, token: 99)
+
+        // Enqueue cold long compaction prompt R2 (with demanded fork hint) + short trailing waiter R3.
+        var r2 = CBv2Request(
+            id: CBv2RequestID(2), promptTokens: Array(repeating: 7, count: 6000),
+            maxTokens: 16, cacheSalt: "mode-a")
+        r2.prefixCheckpointTargetTokens = 2048
+        let r3 = CBv2Request(
+            id: CBv2RequestID(3), promptTokens: Array(repeating: 9, count: 500), maxTokens: 16)
+        try scheduler.enqueue(r2)
+        try scheduler.enqueue(r3)
+
+        // Step 2 (Mode A): R1 decodes (1) AND R2 compacts whole-prompt (6000) bypassing demanded checkpoints;
+        // R3 must stay waiting (cannot touch compaction budget surplus).
+        let p2 = scheduler.plan()
+        #expect(p2.assignments.count == 2)
+        #expect(p2.assignments[0].id == r1.id && p2.assignments[0].numTokens == 1)
+        #expect(p2.assignments[1].id == r2.id && p2.assignments[1].numTokens == 6000)
+        #expect(p2.demandedShortCheckpointRows.isEmpty)
+        #expect(scheduler.waiting.map(\.id) == [r3.id])
+
+        // Legacy guard: with allowConcurrentCompaction = false, decode presence disarms compaction.
+        var legacyConfig = config
+        legacyConfig.allowConcurrentCompaction = false
+        let legacyScheduler = SchedulerV2(config: legacyConfig)
+        try legacyScheduler.enqueue(r1)
+        _ = legacyScheduler.plan()
+        legacyScheduler.markPendingSamples(ids: [r1.id])
+        legacyScheduler.recordSampled(id: r1.id, token: 99)
+        try legacyScheduler.enqueue(r2)
+        let legacyPlan = legacyScheduler.plan()
+        #expect(legacyPlan.assignments.count == 2)
+        #expect(legacyPlan.assignments[0].id == r1.id && legacyPlan.assignments[0].numTokens == 1)
+        #expect(
+            legacyPlan.assignments[1].id == r2.id && legacyPlan.assignments[1].numTokens == 2048)
+    }
+
+    @Test(
+        "SchedulerV2 Mode B packs equal-length compaction waves, enforces density guard veto, and preserves partial cohorts on KV exhaustion"
+    )
+    func schedulerModeBPackedCohortWavesDensityGuardAndKVReserve() throws {
+        var rng = CBv2SchedSplitMix64(seed: 0x5C4E_D00B)
+        let codePrompt = (0 ..< 4096).map { i in
+            (i % 16 < 8) ? (500 + (i % 8)) : Int(600 + rng.next() % 256)
+        }
+        let proteinPrompt = (0 ..< 4096).map { _ in Int(100 + rng.next() % 20) }
+
+        // 1. Packed cohort waves capped by min(maxPackedCompactionBatch, maxPackedCompactionTokens / targetLen).
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 8,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                maxConcurrentPartialPrefills: 1)
+            config.soloCompactionMinPromptTokens = 3072
+            config.allowConcurrentCompaction = true
+            config.maxPackedCompactionBatch = 4
+            config.maxPackedCompactionTokens = 16_384
+            config.compactionEligibility = { tokens in
+                Gemma4BlockSDCM.passesDensityGuard(tokens: tokens, config: .fast)
+            }
+            let scheduler = SchedulerV2(config: config)
+            for i in 1 ... 6 {
+                try scheduler.enqueue(
+                    CBv2Request(
+                        id: CBv2RequestID(UInt64(i)), promptTokens: codePrompt, maxTokens: 16))
+            }
+
+            // Wave 1: packs 4 x 4096 = 16,384; leaves 2 waiting.
+            let wave1 = scheduler.plan()
+            #expect(wave1.assignments.count == 4)
+            #expect(wave1.assignments.allSatisfy { $0.numTokens == 4096 })
+            #expect(scheduler.waitingCount == 2)
+
+            let wave1IDs = wave1.assignments.map(\.id)
+            scheduler.markPendingSamples(ids: wave1IDs)
+            for id in wave1IDs { scheduler.recordSampled(id: id, token: 42) }
+
+            // Wave 2: Wave 1 rows decode (4 x 1) concurrently with Wave 2 cohort (2 x 4096).
+            let wave2 = scheduler.plan()
+            #expect(wave2.assignments.count == 6)
+            for i in 0 ..< 4 {
+                #expect(wave2.assignments[i].numTokens == 1)
+            }
+            for i in 4 ..< 6 {
+                #expect(wave2.assignments[i].numTokens == 4096)
+            }
+            #expect(scheduler.waitingCount == 0)
+        }
+
+        // 2. Density guard veto stops compaction cohort cleanly at vetoed prompt without jumping FCFS.
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 8,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                maxConcurrentPartialPrefills: 1)
+            config.soloCompactionMinPromptTokens = 3072
+            config.allowConcurrentCompaction = true
+            config.maxPackedCompactionBatch = 4
+            config.maxPackedCompactionTokens = 32_768
+            config.compactionEligibility = { tokens in
+                Gemma4BlockSDCM.passesDensityGuard(tokens: tokens, config: .fast)
+            }
+            let scheduler = SchedulerV2(config: config)
+            try scheduler.enqueue(
+                CBv2Request(id: CBv2RequestID(10), promptTokens: codePrompt, maxTokens: 8))
+            try scheduler.enqueue(
+                CBv2Request(id: CBv2RequestID(11), promptTokens: codePrompt, maxTokens: 8))
+            try scheduler.enqueue(
+                CBv2Request(id: CBv2RequestID(12), promptTokens: proteinPrompt, maxTokens: 8))
+            try scheduler.enqueue(
+                CBv2Request(id: CBv2RequestID(13), promptTokens: codePrompt, maxTokens: 8))
+
+            // Packs only R10 & R11; stops before vetoed R12 (protein) and preserves FCFS.
+            let p1 = scheduler.plan()
+            #expect(p1.assignments.map(\.id) == [CBv2RequestID(10), CBv2RequestID(11)])
+            #expect(p1.assignments.allSatisfy { $0.numTokens == 4096 })
+            #expect(scheduler.waiting.map(\.id) == [CBv2RequestID(12), CBv2RequestID(13)])
+
+            scheduler.markPendingSamples(ids: [CBv2RequestID(10), CBv2RequestID(11)])
+            scheduler.recordSampled(id: CBv2RequestID(10), token: 1)
+            scheduler.recordSampled(id: CBv2RequestID(11), token: 1)
+
+            // Next step: vetoed R12 gets plain prefillChunkSize (2048), NOT whole-prompt 4096.
+            let p2 = scheduler.plan()
+            #expect(
+                p2.assignments.map(\.id) == [
+                    CBv2RequestID(10), CBv2RequestID(11), CBv2RequestID(12),
+                ])
+            #expect(p2.assignments[2].numTokens == 2048)
+        }
+
+        // 3. KV reservation failure: multi-row cohort breaks leaving already-reserved rows intact
+        //    (never shrinks R3 even though prefillChunkSize=2048 would fit); 1-row cohort DOES shrink.
+        do {
+            var config = CBv2SchedulerConfig(
+                maxConcurrentRequests: 8,
+                maxBatchedTokensPerStep: 4096,
+                prefillChunkSize: 2048,
+                soloPrefillStripeTokens: nil,
+                maxConcurrentPartialPrefills: 1)
+            config.soloCompactionMinPromptTokens = 3072
+            config.allowConcurrentCompaction = true
+            config.maxPackedCompactionBatch = 4
+            config.maxPackedCompactionTokens = 32_768
+
+            // Capacity 10,500 holds R1(4096) + R2(4096) = 8192, plus 2308 spare (>= 2048).
+            // R3 MUST NOT shrink to 2048 because cohort size is 4 > 1.
+            let capMulti = CBv2SchedMockCapacity(tokenLimit: 10_500)
+            let schedMulti = SchedulerV2(config: config, capacity: capMulti)
+            for i in 1 ... 4 {
+                try schedMulti.enqueue(
+                    CBv2Request(
+                        id: CBv2RequestID(UInt64(i)), promptTokens: codePrompt, maxTokens: 8))
+            }
+            let partial = schedMulti.plan()
+            #expect(partial.assignments.map(\.id) == [CBv2RequestID(1), CBv2RequestID(2)])
+            #expect(partial.assignments.allSatisfy { $0.numTokens == 4096 })
+            #expect(schedMulti.waiting.map(\.id) == [CBv2RequestID(3), CBv2RequestID(4)])
+            #expect(schedMulti.waiting.allSatisfy { $0.numComputedTokens == 0 })
+
+            // Single-row cohort (1 waiter) with capacity 2500 DOES shrink to prefillChunkSize=2048.
+            let capSolo = CBv2SchedMockCapacity(tokenLimit: 2500)
+            let schedSolo = SchedulerV2(config: config, capacity: capSolo)
+            try schedSolo.enqueue(
+                CBv2Request(id: CBv2RequestID(20), promptTokens: codePrompt, maxTokens: 8))
+            let shrunk = schedSolo.plan()
+            #expect(shrunk.assignments.count == 1)
+            #expect(shrunk.assignments[0].id == CBv2RequestID(20))
+            #expect(shrunk.assignments[0].numTokens == 2048)
+
+            // Multi-row cohort when ZERO cohort rows fit full targetLen (capacity 2500 < 4096):
+            // row 0 shrinks once to prefillChunkSize=2048 instead of livelocking forever, and
+            // stops the remaining cohort rows cleanly.
+            let capTightMulti = CBv2SchedMockCapacity(tokenLimit: 2500)
+            let schedTightMulti = SchedulerV2(config: config, capacity: capTightMulti)
+            try schedTightMulti.enqueue(
+                CBv2Request(id: CBv2RequestID(30), promptTokens: codePrompt, maxTokens: 8))
+            try schedTightMulti.enqueue(
+                CBv2Request(id: CBv2RequestID(31), promptTokens: codePrompt, maxTokens: 8))
+            let noLivelock = schedTightMulti.plan()
+            #expect(noLivelock.assignments.count == 1)
+            #expect(noLivelock.assignments[0].id == CBv2RequestID(30))
+            #expect(noLivelock.assignments[0].numTokens == 2048)
+            #expect(schedTightMulti.waiting.map(\.id) == [CBv2RequestID(31)])
         }
     }
 }
