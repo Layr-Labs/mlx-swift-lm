@@ -7,17 +7,18 @@ name: Fork Tests
 #
 # One job builds the package and its tests, and lists the tests. Another job
 # builds the full Metal library at the same time. Both hand their products to
-# the test jobs as artifacts. Runs that are not for a pull request also save
-# them in the Actions cache, for later runs to restore. The test jobs start
-# beside them, as soon as the shard map is ready: each gets its Mac, checks out
-# and selects Xcode during the build, then waits for both jobs
+# the test jobs as artifacts. Runs on main also save them in the Actions
+# cache, for later runs to restore. The test jobs start beside them, as soon
+# as the shard map is ready: each gets its Mac, checks out and selects Xcode
+# during the build, then waits for both jobs
 # (.github/scripts/wait-for-products.py), downloads the products and runs.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
 #
 # Compute jobs queue directly for a Darkbloom Sandbox, one job at a time.
-# Push and manual runs save caches when the sandbox provides its own cache.
+# Push and manual runs on main save caches when the sandbox provides its own
+# cache. The Darkbloom cache refuses saves from a manual run on another branch.
 # Seven audio decoder tests temporarily stay hosted after the unchanged base
 # reproduced strict PCM-bit failures on native macOS. Their assertions remain intact.
 
@@ -268,8 +269,8 @@ jobs:
 
       - name: Save the build cache
         # The next build restores this entry. An exact hit means that the
-        # entry already exists. Pull requests only restore caches.
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        # entry already exists. Only runs on main save; others only restore.
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
@@ -279,7 +280,7 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Save the C and C++ compiler cache
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.ccache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.ref == 'refs/heads/main' && steps.ccache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: /Users/runner/Library/Caches/ccache-fork-tests
@@ -363,7 +364,7 @@ jobs:
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Save the Metal library
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
