@@ -197,6 +197,25 @@ struct Inkling2DSparkEngineTests {
         return outputs
     }
 
+    @Test("resetting the depth policy's cost learning while idle keeps every token")
+    func costLearningResetKeepsTokens() async throws {
+        let prompts = Self.prompts(2)
+        let (baseline, _) = try Self.engine(drafting: false, maxRows: 2)
+        let expected = try await Self.run(baseline, prompts: prompts, maxTokens: 40)
+        #expect(!baseline.resetMTPCostLearning())  // no MTP driver
+        await baseline.shutdown()
+
+        let (engine, _) = try Self.engine(drafting: true, maxRows: 2)
+        let first = try await Self.run(engine, prompts: prompts, maxTokens: 40)
+        #expect(engine.resetMTPCostLearning())
+        let second = try await Self.run(engine, prompts: prompts, maxTokens: 40)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(first == expected)
+        #expect(second == expected)
+        #expect(metrics.rounds > 0)
+    }
+
     @Test(
         "drafter on equals drafter off for 1 to 32 rows (above 8 with a raised limit)",
         arguments: [1, 2, 4, 8, 16, 32])

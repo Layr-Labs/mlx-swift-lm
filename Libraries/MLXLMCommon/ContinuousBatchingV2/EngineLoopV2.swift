@@ -2242,6 +2242,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// See `EngineV2.resetMTPCostLearning()`. False while the engine has work
+    /// or no MTP driver.
+    func resetMTPCostLearning() -> Bool {
+        onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil, let mtp else { return false }
+            mtp.resetCostLearning()
+            return true
+        }
+    }
+
     func configureLogitDiagnostic(_ configuration: CBv2LogitDiagnosticConfig?) throws {
         try onEngineQueueSync {
             guard !scheduler.hasWork, inFlight == nil else {

@@ -226,6 +226,14 @@ final class CBv2MTPDepthController {
         buckets[bucket] = fresh
     }
 
+    /// Back to a fresh controller's learning: every bucket's costs, baseline,
+    /// acceptance and probe cadence, and the workload. Compiled verification
+    /// shapes stay known. Idle engine only (engine queue).
+    func resetLearning() {
+        buckets.removeAll(keepingCapacity: false)
+        workloadRows.removeAll(keepingCapacity: false)
+    }
+
     /// Finishing a request ends this workload generation even if the caller
     /// later reuses its numeric ID. Old in-flight observations must be dropped
     /// by the driver; only shape knowledge and isolated depth-zero warmup survive.

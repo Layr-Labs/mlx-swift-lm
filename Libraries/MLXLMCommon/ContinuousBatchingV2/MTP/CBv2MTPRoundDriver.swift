@@ -1060,6 +1060,14 @@ final class CBv2MTPRoundDriver {
         return measurement?.workloadGeneration.map { $0 == workloadGeneration } ?? true
     }
 
+    /// The depth policy's measured step costs back to a fresh engine's: the
+    /// raw per-depth estimates and the controller's learning. Request state
+    /// and cumulative metrics are untouched. Idle engine only (engine queue).
+    func resetCostLearning() {
+        rawCostEstimators.removeAll(keepingCapacity: false)
+        depthController.resetLearning()
+    }
+
     /// Drain/shutdown drops every request trace and adaptive workload while
     /// retaining cumulative metrics for a final poll.
     func removeAllRequestState() {
