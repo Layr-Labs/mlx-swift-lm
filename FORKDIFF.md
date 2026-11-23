@@ -183,7 +183,12 @@ David directs it. Each merge is a merge commit, not a rebase. After the merge,
 set `base.hash` to `git merge-base HEAD upstream/main`. Then re-validate every
 section: remove globs that match nothing and describe new fork files. Between
 merges, port an upstream fix the fork needs as its own commit. Run the check
-before you push:
+before you push. Upstream's workflows name actions by tag, as in
+`actions/checkout@v7`. This organization starts only workflows whose actions
+are pinned to a full commit SHA, so a workflow with a tag fails at startup,
+even one whose jobs only run upstream. Pin each such reference to the commit
+its tag names; the Shard map job's `.github/scripts/test-action-pins.py`
+fails on one.
 
 ```
 python3 -m pip install pyyaml

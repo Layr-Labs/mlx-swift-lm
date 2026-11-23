@@ -64,6 +64,10 @@ jobs:
       - name: Test the wait for the products
         run: python3 .github/scripts/test-wait-for-products.py
 
+      - name: Test that every action is pinned
+        # The organization starts no workflow that uses an action by a tag.
+        run: python3 .github/scripts/test-action-pins.py
+
       - name: Read the shard numbers
         id: matrix
         # The seven-test audio exception uses its separate hosted shard.
