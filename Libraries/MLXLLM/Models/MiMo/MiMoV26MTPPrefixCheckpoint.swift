@@ -46,6 +46,10 @@ final class MiMoV26MTPPrefixCheckpoint: CBv2MTPPrefixCheckpoint {
 }
 
 extension MiMoV26MTPAssistant: CBv2HistoricalMTPPrefixCheckpointCoding {
+    /// Requests that cannot speculate record prompt history too, so their
+    /// checkpoints are the ones a speculating request saves.
+    public var checkpointsNonSpeculatingRows: Bool { true }
+
     package func bindImportedPrefixCheckpointOwner(
         _ checkpoint: any CBv2MTPPrefixCheckpoint, owner: AnyObject
     ) throws {
