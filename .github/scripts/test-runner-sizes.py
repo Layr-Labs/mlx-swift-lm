@@ -5,13 +5,14 @@ A Darkbloom macOS job without a size gets the size that the repository's
 approval pins. Each macOS job here names its own size instead: in its runner
 label (`darkbloom-macos-arm64-4x16-run-${{ github.run_id }}`), or, for a lane
 of `darkbloom-route.yml`, in the lane's size column. The `-run-<run id>`
-suffix scopes the label to the job's own run, as the route's labels are: a
-runner Darkbloom starts for one job can then take only a job of the same run
-and size, never another run's. This test fails when:
+suffix scopes the label to the job's own run, as Layr-Labs/d-inference's
+route labels are: a runner Darkbloom starts for one job can then take only a
+job of the same run and size, never another run's. This test fails when:
 
 - a job asks for a Darkbloom Mac without a size, or with a size that the
   image pipeline does not sign (4x16, 4x24, 8x16 and 12x32);
-- a job's Darkbloom macOS label is not scoped to its run;
+- a job's direct Darkbloom macOS label (not a route lane's) is not scoped
+  to its run;
 - a Linux route lane names a size (the route refuses one);
 - a job's size is not the size that SIZES gives it, or SIZES names a job
   that no workflow has (so a size changes only on purpose);
@@ -150,6 +151,7 @@ class RunnerSizes(unittest.TestCase):
         unsigned = job.format(f'"{MACOS}-6x12{run}"')
         unscoped = job.format(f"{MACOS}-4x16")
         other_run = job.format(f'"{MACOS}-4x16-run-${{{{ github.run_attempt }}}}"')
+        fixed_run = job.format(f'"{MACOS}-4x16-run-123"')
         block = f"jobs:\n  a:\n    runs-on:\n      - self-hosted\n      - {MACOS}\n"
         lane = (
             "jobs:\n  route:\n"
@@ -158,7 +160,7 @@ class RunnerSizes(unittest.TestCase):
             "        mac macos_arm64 xcode-27 ${{ inputs.mac && 1 || 0 }}\n"
             "        lin linux_arm64 ubuntu-24.04 1 4x16\n"
         )
-        for text in (bare, unsigned, unscoped, other_run, block):
+        for text in (bare, unsigned, unscoped, other_run, fixed_run, block):
             with self.subTest(text=text):
                 self.assertNotEqual(macos_sizes({"x.yml": text})[1], [])
         self.assertEqual(len(macos_sizes({"x.yml": lane})[1]), 2)

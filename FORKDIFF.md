@@ -116,13 +116,19 @@ must stay under 10 minutes. Build is the exception: every test job waits for
 it, and its cold build is CPU-bound, so it takes the largest signed size.
 
 The label also names the job's workflow run:
-`darkbloom-macos-arm64-4x16-run-${{ github.run_id }}`, the form that the
-route of Layr-Labs/d-inference gives its runners. Darkbloom starts a runner
-with the labels of the job it was started for. Without the run, a runner
-started for one run's 4x16 job (PR lint) could take another run's queued
-4x16 job (Metal library), and the job it was started for would wait for the
-next runner. Darkbloom refuses a job whose run label names another run.
-Jobs of one run and size still share their runners.
+`darkbloom-macos-arm64-4x16-run-${{ github.run_id }}`, the form of the
+run-scoped labels that Layr-Labs/d-inference's route asks Darkbloom for.
+Darkbloom starts a runner with the labels of the job it was started for.
+Without the run, a runner started for one run's 4x16 job (PR lint) could
+take another run's queued 4x16 job (Metal library), and the job it was
+started for would wait for the next runner. An idle runner of an older run
+could also take this run's job and lose it when a new push cancels the older
+run. Darkbloom refuses a job whose run label names another run. Jobs of one
+run and size still share their runners.
+
+These jobs need a Darkbloom plane that admits run-scoped labels, and they
+have no fallback runner: a plane without that support refuses them. Revert
+the suffix before such a plane is rolled out.
 
 The peak of a job is the larger of two sampler figures: used memory (app +
 wired + compressed) and the sum of the lifetime peak footprints of the
