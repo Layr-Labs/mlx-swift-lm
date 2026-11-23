@@ -226,6 +226,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Decode steps and rows whose tokens came through `CBv2CertifiedTokenRequest`.
+    public var certifiedTokenSteps: Int { loop.certifiedTokenSteps }
+    public var certifiedTokenRows: Int { loop.certifiedTokenRows }
     /// Reset only at an idle benchmark boundary after warmup. Ordinary
     /// engines never allocate a recorder; snapshots add no device evaluation.
     @_spi(Benchmarking)
@@ -1165,6 +1168,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         if let contract = self.nativeCompletePrefixContract {
             loop.configureNativeCompletePrefix(contract: contract)
+        }
+        // Certified tokens: build and compile at load, not on the first request.
+        if CBv2CertifiedTokenRequest.enabled, sampler is CBv2DefaultSampler,
+            let certifying = model as? any CBv2CertifiedTokenModel,
+            certifying.cbv2SupportsCertifiedTokens
+        {
+            certifying.cbv2WarmCertifiedTokens()
         }
         loop.start()
     }

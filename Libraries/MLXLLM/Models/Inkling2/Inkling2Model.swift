@@ -168,6 +168,8 @@ public final class Inkling2Model: Module, LLMModel {
     /// Paged attention used by the CBv2 path: the paged kernel by default;
     /// `Inkling2GatheredAttentionCore` is the plain-MLX reference.
     public var pagedAttentionCore: any Inkling2PagedAttentionCore = Inkling2KernelAttentionCore()
+    /// Certified greedy unembedding, built on first use (`Inkling2BytesCertified.swift`).
+    let certifiedHead = Inkling2CertifiedHeadCell()
 
     public var vocabularySize: Int { configuration.text.unpaddedVocabularySize }
     public var loraLayers: [Module] { model.layers }
@@ -197,7 +199,8 @@ public final class Inkling2Model: Module, LLMModel {
 
     /// FP32 softcapped logits for normed hidden states.
     public func logits(_ hidden: MLXArray) -> MLXArray {
-        Inkling2RowExact.withPrefill(blockRows: invariantPrefillBlockRows) {
+        if let placeholder = certifiedLogits(hidden) { return placeholder }
+        return Inkling2RowExact.withPrefill(blockRows: invariantPrefillBlockRows) {
             Inkling2Math.softcap(
                 // Prefill needs one row here; 64-row calls keep it cheap and invariant.
                 Inkling2RowExact.linear(lmHead, hidden, prefillBlockRows: 64).asType(.float32),
