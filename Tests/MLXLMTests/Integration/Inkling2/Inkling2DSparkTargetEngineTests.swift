@@ -112,7 +112,9 @@ struct Inkling2DSparkTargetEngineTests {
         }
         var outputs: [[Int]] = []
         for stream in streams {
-            outputs.append(try await cbv2CollectFinished(stream, timeoutSeconds: 300).tokens)
+            outputs.append(
+                try await cbv2CollectFinished(stream, timeoutSeconds: 300, expectedTokens: tokens)
+                    .tokens)
         }
         return outputs
     }

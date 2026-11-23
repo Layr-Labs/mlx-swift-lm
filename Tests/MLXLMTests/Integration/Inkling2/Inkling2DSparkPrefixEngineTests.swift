@@ -58,14 +58,16 @@ struct Inkling2DSparkPrefixEngineTests {
 
         let (off, _, _) = try Self.engine(drafting: false, store: nil)
         let offResult = try await cbv2CollectFinished(
-            try off.submit(Self.request(9, prompt: prompt)), timeoutSeconds: 300)
+            try off.submit(Self.request(9, prompt: prompt)), timeoutSeconds: 300, expectedTokens: 12
+        )
         await off.shutdown()
 
         let seed = CompleteCheckpointFixtureStore(segmentBytes: 4093)
         let (cold, coldBackend, _) = try Self.engine(drafting: true, store: seed)
         #expect(cold.loopForTesting.mtp != nil)
         let coldResult = try await cbv2CollectFinished(
-            try cold.submit(Self.request(1, prompt: prompt)), timeoutSeconds: 300)
+            try cold.submit(Self.request(1, prompt: prompt)), timeoutSeconds: 300,
+            expectedTokens: 12)
         seed.finishPublicationCallbacks(engine: cold)
         await cold.shutdown()
         try #require(coldResult.finishReason == .length && coldResult.tokens.count == 12)
@@ -85,7 +87,8 @@ struct Inkling2DSparkPrefixEngineTests {
                 engine: warm, request: Self.request(2, prompt: prompt, salt: "other")))
         let input = Self.request(3, prompt: prompt)
         try #require(try restored.stage(engine: warm, request: input))
-        let warmResult = try await cbv2CollectFinished(try warm.submit(input), timeoutSeconds: 300)
+        let warmResult = try await cbv2CollectFinished(
+            try warm.submit(input), timeoutSeconds: 300, expectedTokens: 12)
         restored.finishPublicationCallbacks(engine: warm)
         let metrics = warm.mtpMetricsSnapshot()
         await warm.shutdown()

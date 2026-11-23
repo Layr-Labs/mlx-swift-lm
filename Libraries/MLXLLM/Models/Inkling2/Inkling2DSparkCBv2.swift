@@ -82,6 +82,15 @@ extension Inkling2Model: CBv2RecurrentPrefillHiddenForwardable {
     }
 }
 
+/// Media requests run this target's ordinary recurrent token and embedding
+/// forwards for their whole lifetime (target-only: no drafts, verify, carry
+/// or assistant state) while text requests keep drafting in the same batch.
+/// Exact because Inkling 2 decode is row-exact (`Inkling2RowExact`: decode
+/// steps and verify windows of at most 16 positions, so a row never depends
+/// on the other rows of its forward) and its prompt chunks run the same
+/// prefill step either way (`Inkling2PrefillStep`).
+extension Inkling2Model: CBv2RecurrentMTPRequestScopedMediaFallback {}
+
 extension Inkling2Model: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
         cbv2TopTwoRows(logits)

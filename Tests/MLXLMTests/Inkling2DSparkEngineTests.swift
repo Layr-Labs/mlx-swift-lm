@@ -189,7 +189,10 @@ struct Inkling2DSparkEngineTests {
         }
         var outputs: [[Int]] = []
         for (index, stream) in streams.enumerated() {
-            outputs.append(try await cbv2CollectFinished(stream, label: "row \(index)").tokens)
+            outputs.append(
+                try await cbv2CollectFinished(
+                    stream, label: "row \(index)", expectedTokens: maxTokens
+                ).tokens)
         }
         return outputs
     }
