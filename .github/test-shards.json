@@ -407,6 +407,9 @@
             "MLXLMTests.testRewindBelowTheWrapMatchesEmittedOnlyReplay(rewinding:)",
             "MLXLMTests.testSSMAttnFinalStateGradientCrossesChunkBoundaries()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -518,6 +521,9 @@
             "MLXLMTests.testTrimSharedKVStateZeroTokensIsNoOp()",
             "MLXLMTests.typedCapacityIsUnsupportedForOnlyModelDefinedWindows()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -635,6 +641,9 @@
             "MLXLMTests.testReconcileSharedKVStateAcceptsAnAbsentSnapshot()",
             "MLXLMTests.testSSMAttnPreservesRecurrentStateDTypeAcrossChunks()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -717,6 +726,9 @@
             "MLXLMTests.testSourcelessPrefillSkipsTheRePrimeForward()",
             "MLXLMTests.testStreamMatchesGreedyWhenTheRoundIsWiderThanTheWindow()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -829,6 +841,9 @@
             "MLXLMTests.testQwen35TextConfigurationDecodesMTPFields()",
             "MLXLMTests.testQwenStyleMTPRequiresGreedySampling()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -938,6 +953,9 @@
             "MLXLMTests.testReconcileSharedKVStateClampsTheHeadToWhatTheLeafDescribes()",
             "MLXLMTests.testStoppingEarlyOnMixedWidthSlidingLayers(stopAfter:)"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1055,6 +1073,9 @@
           "groups": [
             "paged-kernel-exclusive"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1176,6 +1197,9 @@
           "groups": [
             "native-complete-prefix-ownership"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1280,6 +1304,9 @@
           "groups": [
             "contiguous-historical-checkpoint"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1400,6 +1427,9 @@
           "groups": [
             "mimo-native-retained-frontier"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1639,6 +1669,9 @@
           "tests": [
             "MLXLMTests.CBv2PagedKernelTests/decodeBatchCompositionInvariance()"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1672,6 +1705,9 @@
             "MLXLMTests.Qwen4ExpLightningMTPTests",
             "OnboardingQualificationTests.CBv2PagedSegmentReadbackBoundaryTests"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1686,6 +1722,9 @@
             "MLXLMTests.Nemotron35BatchDecodeModelTests",
             "MLXLMTests.Qwen4RectangularStateParityTests"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1701,6 +1740,9 @@
             "MLXLMTests.Qwen35VLMCompiledDecodeTests",
             "MLXLMTests.TurboQuantMSECodecTests"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
@@ -1716,6 +1758,9 @@
             "MLXLMTests.FlintPrefillExactnessTests",
             "MLXLMTests.KernelTests/GatedDeltaPrefillTests"
           ]
+        },
+        {
+          "rest": true
         }
       ]
     },
