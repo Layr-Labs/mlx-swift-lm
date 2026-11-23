@@ -460,7 +460,8 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             pool.bytesCapacity / max(1, tokenBytes),
             try CBv2PagedWorkMath.product([rows, limits.maximumContextTokens]))
         if let admissibleBytes, let charge = admittedBytesPerContextToken {
-            let perToken = max(charge, try CBv2PagedWorkMath.add(tokenBytes, scratch.bytesPerContextToken))
+            let perToken = max(
+                charge, try CBv2PagedWorkMath.add(tokenBytes, scratch.bytesPerContextToken))
             history = min(history, max(0, admissibleBytes - scratch.setupBytes) / max(1, perToken))
         }
         // Both bound every step; the all-rows-at-context price is the smaller
