@@ -468,6 +468,32 @@ final class CBv2SamplingSamplerTests: XCTestCase {
         }
     }
 
+    func testTinyUniformDrawDoesNotPromoteTailToken() {
+        let vocabSize = 201_088
+        let step = 137
+        let request = row(
+            id: 77, temperature: 1, seed: 42, output: [Int](repeating: 0, count: step))
+        // At this key, token 31,133 draws u ≈ 1.63e-8. The old Float32
+        // subtraction rounded 1 - u to 1 and made this p ≈ 9.36e-14 token win.
+        var raw = [Float](repeating: -30, count: vocabSize)
+        raw[0] = 0
+        let logits = MLXArray(raw, [1, vocabSize])
+        let sampler = SamplerV2(fallbackSeed: 0)
+        sampler.setRows([request])
+        XCTAssertEqual(sampler.sample(from: logits).item(Int32.self), 0)
+
+        let speculative = CBv2DefaultSampler(fallbackSeed: 0)
+        let verifyLogits = logits.reshaped([1, 1, vocabSize])
+        let verified = speculative.mtpVerifySample(
+            logits: verifyLogits, params: [request.params],
+            requestIDs: [request.id], stepBases: [step])
+        XCTAssertEqual(verified?.item(Int32.self), 0)
+        let proposal = speculative.mtpCoupledProposal(
+            logits: verifyLogits, params: [request.params],
+            requestIDs: [request.id], stepBases: [step])
+        XCTAssertEqual(proposal.item(Int32.self), 0)
+    }
+
     func testMixDependsOnAllThreeInputs() {
         let base = SamplerV2.mix(seed: 1, id: 2, step: 3)
         XCTAssertNotEqual(base, SamplerV2.mix(seed: 9, id: 2, step: 3))
