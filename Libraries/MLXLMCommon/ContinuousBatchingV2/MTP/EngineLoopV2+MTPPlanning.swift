@@ -32,7 +32,29 @@ extension EngineLoopV2 {
         // Opted-in native media is target-only for its complete immutable
         // request lifetime, including text tails, preemption and recompute.
         mtp?.registerTargetOnlyMedia(rec.request)
-        return mtpIneligibility(rec).isEmpty
+        if mtp?.requiresTargetOnlyMedia(rec.request) == true { return false }
+        let sampling = rec.request.sampling
+        let samplingEligible =
+            sampling.temperature == 0
+            || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
+        let constraintEligible =
+            rec.request.tokenConstraint == nil || grammarMTPEnabled
+            || mtpSpanConstraint(rec) != nil
+        guard rec.request.reasoningBudget == nil,
+            constraintEligible,
+            samplingEligible,
+            sampling.topLogprobs == 0,
+            sampling.logitBias.isEmpty,
+            sampling.repetitionPenalty == 1,
+            mtpPenaltiesEligible(rec),
+            rec.request.stopStrings.isEmpty
+                || mtp?.config.effectiveStopStringSpeculation == true
+        else { return false }
+        let hasMultimodalSpans =
+            multimodalByID[rec.id]?.spans.isEmpty == false
+        return Self.mtpMultimodalHistoryEligible(
+            hasSpans: hasMultimodalSpans,
+            tracksPersistentHistory: mtp?.tracksPersistentHistory == true)
     }
 
     /// Every whole-request gate of `mtpHistoryEligible` that the row fails.
@@ -68,18 +90,7 @@ extension EngineLoopV2 {
         samplingEligible: Bool, logprobs: Bool, logitBias: Bool, repetitionPenalty: Bool,
         penaltiesEligible: Bool, stopStringsEligible: Bool, multimodalHistoryEligible: Bool
     ) -> CBv2MTPIneligibility {
-        var reasons: CBv2MTPIneligibility = []
-        if targetOnlyMedia { reasons.insert(.media) }
-        if reasoningBudget { reasons.insert(.reasoningBudget) }
-        if !constraintEligible { reasons.insert(.grammar) }
-        if !samplingEligible { reasons.insert(.sampling) }
-        if logprobs { reasons.insert(.logprobs) }
-        if logitBias { reasons.insert(.logitBias) }
-        if repetitionPenalty { reasons.insert(.repetitionPenalty) }
-        if !penaltiesEligible { reasons.insert(.penalties) }
-        if !stopStringsEligible { reasons.insert(.stopStrings) }
-        if !multimodalHistoryEligible { reasons.insert(.multimodalHistory) }
-        return reasons
+        []
     }
 
     /// Once per request, at its first token and only with a drafter: the
