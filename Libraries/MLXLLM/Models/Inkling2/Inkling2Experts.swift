@@ -210,6 +210,7 @@ final class Inkling2SparseMoE: Module {
     /// `x`: `[B, L, hidden]` in the model dtype. Returns the model dtype; expert
     /// outputs are weighted and summed in FP32.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if Inkling2RowExact.active, let y = Inkling2Kernels.sparseMoE(self, x) { return y }
         let shape = x.shape
         let flat = x.reshaped(-1, shape.last!)
         let (indices, weights) = router(flat)

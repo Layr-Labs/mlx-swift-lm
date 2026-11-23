@@ -177,6 +177,31 @@ final class Inkling2EngineStepState: Inkling2StepState {
         gathered(slot: slot)[kind.rawValue]
     }
 
+    /// Stages `slot`'s next states already packed as the transactions store
+    /// them (instead of the four `setConvState` calls): `conv` key || value,
+    /// `ssm` postAttention || postMLP, in the activation dtype, `[B, kernel - 1, C]`;
+    /// with `capturesPositions`, every window position's state,
+    /// `[B * length, kernel - 1, C]` (row `b` at `b * length ..< (b + 1) * length`).
+    func stagePackedConvStates(slot: Int, conv: MLXArray, ssm: MLXArray, length: Int) {
+        precondition(
+            outputs[slot] == nil, "Inkling2 CBv2: slot \(slot) mixes packed and per-kind stages")
+        do {
+            for (row, evaluation) in recurrentState.enumerated() {
+                if capturesPositions {
+                    let rows = (row * length) ..< ((row + 1) * length)
+                    try evaluation.stageCaptured(
+                        modelLayerIndex: slot, conv: conv[rows], ssm: ssm[rows], positions: length)
+                } else {
+                    try evaluation.stage(
+                        modelLayerIndex: slot, conv: conv[row ..< row + 1],
+                        ssm: ssm[row ..< row + 1])
+                }
+            }
+        } catch {
+            preconditionFailure("Inkling2 CBv2 recurrent stage failed at slot \(slot): \(error)")
+        }
+    }
+
     func setConvState(
         slot: Int, _ kind: Inkling2ConvKind, _ state: MLXArray, input: MLXArray
     ) {
