@@ -32,39 +32,61 @@ extension EngineLoopV2 {
         // Opted-in native media is target-only for its complete immutable
         // request lifetime, including text tails, preemption and recompute.
         mtp?.registerTargetOnlyMedia(rec.request)
-        if mtp?.requiresTargetOnlyMedia(rec.request) == true { return false }
+        return mtpIneligibility(rec).isEmpty
+    }
+
+    /// Every whole-request gate of `mtpHistoryEligible` that the row fails.
+    /// Reads only; no allocation.
+    func mtpIneligibility(_ rec: CBv2ScheduledRequest) -> CBv2MTPIneligibility {
         let sampling = rec.request.sampling
-        let samplingEligible =
-            sampling.temperature == 0
-            || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
-        let constraintEligible =
-            rec.request.tokenConstraint == nil || grammarMTPEnabled
-            || mtpSpanConstraint(rec) != nil
-        // A reasoning budget keeps the whole request target-only: no drafts
-        // and no assistant history.
-        guard rec.request.reasoningBudget == nil,
-            constraintEligible,
-            samplingEligible,
-            sampling.topLogprobs == 0,
-            sampling.logitBias.isEmpty,
-            sampling.repetitionPenalty == 1,
-            mtpPenaltiesEligible(rec),
-            rec.request.stopStrings.isEmpty
-                || mtp?.config.effectiveStopStringSpeculation == true
-        else { return false }
-        // The current multimodal seam does not return trusted pre-norm
-        // hidden rows from embedding-spliced forwards. Only persistent-history
-        // drafters require those rows; stateless Gemma keeps its established
-        // frozen-KV multimodal path.
-        let hasMultimodalSpans =
-            multimodalByID[rec.id]?.spans.isEmpty == false
-        if !Self.mtpMultimodalHistoryEligible(
-            hasSpans: hasMultimodalSpans,
-            tracksPersistentHistory: mtp?.tracksPersistentHistory == true)
-        {
-            return false
-        }
-        return true
+        return Self.mtpIneligibility(
+            targetOnlyMedia: mtp?.requiresTargetOnlyMedia(rec.request) == true,
+            // A reasoning budget keeps the whole request target-only: no drafts
+            // and no assistant history.
+            reasoningBudget: rec.request.reasoningBudget != nil,
+            constraintEligible: rec.request.tokenConstraint == nil || grammarMTPEnabled
+                || mtpSpanConstraint(rec) != nil,
+            samplingEligible: sampling.temperature == 0
+                || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix),
+            logprobs: sampling.topLogprobs != 0,
+            logitBias: !sampling.logitBias.isEmpty,
+            repetitionPenalty: sampling.repetitionPenalty != 1,
+            penaltiesEligible: mtpPenaltiesEligible(rec),
+            stopStringsEligible: rec.request.stopStrings.isEmpty
+                || mtp?.config.effectiveStopStringSpeculation == true,
+            // The current multimodal seam does not return trusted pre-norm
+            // hidden rows from embedding-spliced forwards. Only persistent-history
+            // drafters require those rows; stateless Gemma keeps its established
+            // frozen-KV multimodal path.
+            multimodalHistoryEligible: Self.mtpMultimodalHistoryEligible(
+                hasSpans: multimodalByID[rec.id]?.spans.isEmpty == false,
+                tracksPersistentHistory: mtp?.tracksPersistentHistory == true))
+    }
+
+    static func mtpIneligibility(
+        targetOnlyMedia: Bool, reasoningBudget: Bool, constraintEligible: Bool,
+        samplingEligible: Bool, logprobs: Bool, logitBias: Bool, repetitionPenalty: Bool,
+        penaltiesEligible: Bool, stopStringsEligible: Bool, multimodalHistoryEligible: Bool
+    ) -> CBv2MTPIneligibility {
+        var reasons: CBv2MTPIneligibility = []
+        if targetOnlyMedia { reasons.insert(.media) }
+        if reasoningBudget { reasons.insert(.reasoningBudget) }
+        if !constraintEligible { reasons.insert(.grammar) }
+        if !samplingEligible { reasons.insert(.sampling) }
+        if logprobs { reasons.insert(.logprobs) }
+        if logitBias { reasons.insert(.logitBias) }
+        if repetitionPenalty { reasons.insert(.repetitionPenalty) }
+        if !penaltiesEligible { reasons.insert(.penalties) }
+        if !stopStringsEligible { reasons.insert(.stopStrings) }
+        if !multimodalHistoryEligible { reasons.insert(.multimodalHistory) }
+        return reasons
+    }
+
+    /// Once per request, at its first token and only with an MTP round
+    /// driver: the whole-request gates it fails, on its exported timing.
+    func stampMTPIneligibility(_ rec: CBv2ScheduledRequest) {
+        guard mtp != nil, rec.timing.mtpIneligibilityBits == 0 else { return }
+        rec.timing.mtpIneligibility = mtpIneligibility(rec)
     }
 
     /// Presence/frequency penalties live in the sampler's incremental row

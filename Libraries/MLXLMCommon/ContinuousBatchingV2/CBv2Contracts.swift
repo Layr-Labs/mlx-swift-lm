@@ -1011,6 +1011,41 @@ public enum CBv2Event: Sendable {
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
 
+/// Whole-request gates that keep a row from drafting, one bit per gate of the
+/// engine's MTP eligibility check. A request records every gate it fails,
+/// not only the first. The per-step free-span position of a constrained row
+/// and the storage gates are not whole-request gates and have no bit.
+public struct CBv2MTPIneligibility: OptionSet, Sendable, Hashable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+
+    /// Native media on an engine whose media fallback keeps the request target-only.
+    public static let media = Self(rawValue: 1 << 0)
+    /// A reasoning budget.
+    public static let reasoningBudget = Self(rawValue: 1 << 1)
+    /// A token constraint without constrained speculation or a free-span constraint.
+    public static let grammar = Self(rawValue: 1 << 2)
+    /// Temperature above 0 without target-prefix acceptance.
+    public static let sampling = Self(rawValue: 1 << 3)
+    /// Top logprobs requested.
+    public static let logprobs = Self(rawValue: 1 << 4)
+    /// A logit bias.
+    public static let logitBias = Self(rawValue: 1 << 5)
+    /// A repetition penalty other than 1.
+    public static let repetitionPenalty = Self(rawValue: 1 << 6)
+    /// Presence/frequency penalties the engine does not verify: the penalty
+    /// opt-in off, no target-prefix verification, a token constraint or a
+    /// non-finite value.
+    public static let penalties = Self(rawValue: 1 << 7)
+    /// Stop strings without effective stop-string speculation.
+    public static let stopStrings = Self(rawValue: 1 << 8)
+    /// Multimodal spans with a drafter that keeps persistent history.
+    public static let multimodalHistory = Self(rawValue: 1 << 9)
+
+    /// Marks `CBv2RequestTiming.mtpIneligibilityBits` as evaluated; not a gate.
+    static let evaluatedBit: UInt32 = 1 << 31
+}
+
 /// Engine-side per-request timing and step-participation counters, exported
 /// once on the terminal `CBv2Usage`. NUMERICS ONLY: never token ids, text,
 /// hashes, or pointers — the provider copies this verbatim onto the wire.
@@ -1086,7 +1121,26 @@ public struct CBv2RequestTiming: Sendable, Equatable {
     public var prefixLookupNanos: UInt64 = 0
     /// `applyAdoption` duration on the engine thread.
     public var prefixAdoptionNanos: UInt64 = 0
+    /// `CBv2MTPIneligibility` bits plus its evaluated bit, written once at the
+    /// first token and only on an engine whose MTP round driver was built (MTP
+    /// effectively enabled, a drafter for this target). `0` = not evaluated.
+    public var mtpIneligibilityBits: UInt32 = 0
     public init() {}
+
+    /// The whole-request MTP gates this request failed; empty when it failed
+    /// none, nil when they were not evaluated.
+    public var mtpIneligibility: CBv2MTPIneligibility? {
+        get {
+            mtpIneligibilityBits == 0
+                ? nil
+                : CBv2MTPIneligibility(
+                    rawValue: mtpIneligibilityBits & ~CBv2MTPIneligibility.evaluatedBit)
+        }
+        set {
+            mtpIneligibilityBits =
+                newValue.map { $0.rawValue | CBv2MTPIneligibility.evaluatedBit } ?? 0
+        }
+    }
 }
 
 /// Immutable heap box for `CBv2Usage.timing`. Keeps `CBv2Usage` — and every

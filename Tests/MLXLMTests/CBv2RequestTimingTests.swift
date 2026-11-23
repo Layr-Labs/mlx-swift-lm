@@ -264,12 +264,13 @@ final class CBv2RequestTimingTests: XCTestCase {
         // Freeze after launch, before the next engine step processes cancellation
         // and finalizes the device work. Exercise both a final and partial chunk.
         for promptLength in [16, 32] {
-            let harness = CBv2SchedHarness(schedulerConfig: CBv2SchedulerConfig(
-                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
-                prefillChunkSize: 16, maxWaiting: 1))
+            let harness = CBv2SchedHarness(
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
+                    prefillChunkSize: 16, maxWaiting: 1))
             let loop = harness.engine.loopForTesting
             loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 1 }
-            var request = CBv2SchedFixtures.request(prompt: Array(0..<promptLength), maxTokens: 4)
+            var request = CBv2SchedFixtures.request(prompt: Array(0 ..< promptLength), maxTokens: 4)
             let observations = CBv2PrefillObservationRecorder()
             request.onPrefillCompleted = { observations.append($0) }
             let stream = try harness.engine.submit(request)
@@ -290,11 +291,13 @@ final class CBv2RequestTimingTests: XCTestCase {
                 XCTAssertEqual(observations.snapshot.count, 1)
                 XCTAssertEqual(early.promptTokens, promptLength)
                 XCTAssertEqual(early.completionTokens, 0)
-                XCTAssertGreaterThan(early.timing.promptComputedNanos, early.timing.prefillFirstLaunchNanos)
+                XCTAssertGreaterThan(
+                    early.timing.promptComputedNanos, early.timing.prefillFirstLaunchNanos)
                 XCTAssertEqual(early.timing.firstTokenNanos, 0)
                 XCTAssertEqual(early.timing.finishedNanos, 0)
             } else {
-                XCTAssertTrue(observations.snapshot.isEmpty, "partial prefill is not completed work")
+                XCTAssertTrue(
+                    observations.snapshot.isEmpty, "partial prefill is not completed work")
             }
             await harness.engine.shutdown()
         }
@@ -481,8 +484,9 @@ final class CBv2RequestTimingTests: XCTestCase {
         // Confidentiality guard: the struct carries unsigned integers only —
         // no token ids, text, hashes, or pointers can ever ride it.
         let children = Mirror(reflecting: CBv2RequestTiming()).children
-        XCTAssertEqual(children.count, 31, "field count pinned to the contract")
+        XCTAssertEqual(children.count, 32, "field count pinned to the contract")
         XCTAssertTrue(children.contains { $0.label == "lastTokenNanos" })
+        XCTAssertTrue(children.contains { $0.label == "mtpIneligibilityBits" })
         XCTAssertTrue(children.contains { $0.label == "lastTokenUptimeNanos" })
         for child in children {
             XCTAssertTrue(

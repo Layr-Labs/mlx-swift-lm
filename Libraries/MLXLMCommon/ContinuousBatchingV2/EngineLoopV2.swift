@@ -5475,6 +5475,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             rec.stampTokenConfirmation(readbackDoneNanos: readbackDoneNanos)
             if firstToken {
                 rec.stampFirstToken(readbackDoneNanos: readbackDoneNanos)
+                stampMTPIneligibility(rec)
                 publishPrefillCompletion(rec)
             } else {
                 rec.timing.decodeSteps &+= 1
