@@ -1749,6 +1749,7 @@ extension KernelTests {
 
             for stated in [nil, charge] {
                 let built = engine(try backend(scratchCeiling: admitted), charge: stated)
+                #expect(built.glm5NextAdmittedBytesPerContextToken == stated)
                 if stated == nil {
                     #expect(
                         built.pagedAttentionWorkInactiveReason?.hasPrefix(

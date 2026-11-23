@@ -279,6 +279,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// reservation accounting at construction and across resizes.
     var admissionForTesting: AdmissionV2 { admission }
 
+    /// The per-token charge the caller's admission states for the GLM step
+    /// envelope check (`GLM5NextPagedModelBinding.validateStepEnvelope`); nil
+    /// keeps the row-and-context bound.
+    public let glm5NextAdmittedBytesPerContextToken: Int?
+
     public init(
         model: CBv2SteppableModel,
         layerKinds: [CBv2LayerKind],
@@ -304,6 +309,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         reasoningBudgetsEnabled: Bool = CBv2ReasoningBudget.enabled(),
         glm5NextAdmittedBytesPerContextToken: Int? = nil
     ) {
+        self.glm5NextAdmittedBytesPerContextToken = glm5NextAdmittedBytesPerContextToken
         // Explicit SDK scheduler choices stay unchanged unless the native
         // factory requests this optional default profile. Commit a wider copy
         // only after repricing and genuine budget installation below.
