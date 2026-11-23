@@ -121,6 +121,7 @@ enum Inkling2RowExact {
     ) -> MLXArray {
         let blockRows = blockRows ?? prefillBlockRows
         guard invariantPrefill else { return MLX.matmul(x, w.T) }
+        if let y = Inkling2PrefillGEMM.matmul(x, transposedWeight: w) { return y }
         let shape = x.shape
         let k = shape.last!
         let rows = shape.dropLast().reduce(1, *)
