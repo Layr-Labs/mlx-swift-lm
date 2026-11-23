@@ -253,6 +253,141 @@ extension KernelTests {
             }
         }
 
+        /// The blocked grouped GEMVs (an expert's pairs in blocks of one to four,
+        /// NVFP4 weights decoded once per block or first, one or two gate/up
+        /// rows per lane, work items of several pairs as MMA tiles in the same
+        /// launch or not) give the tiles' bits at 2 to 33 rows whose experts
+        /// are shared by many rows, and each row's bits alone.
+        @Test(arguments: [Inkling2ExpertFormat.nvfp4, .mxfp8, .dense])
+        func blockedGroupedGemvKeepsTheBits(format: Inkling2ExpertFormat) throws {
+            let topK = 8
+            let saved = (
+                Inkling2Kernels.expertGroupGemv, Inkling2Kernels.expertGroupBlock,
+                Inkling2Kernels.expertGroupBlockRows, Inkling2Kernels.expertInOrderDecode,
+                Inkling2Kernels.expertGroupPlanned, Inkling2Kernels.expertGroupTileAt,
+                Inkling2Kernels.expertGroupBlockForm, Inkling2Kernels.expertGroupBlockFrom
+            )
+            defer {
+                Inkling2Kernels.expertGroupGemv = saved.0
+                Inkling2Kernels.expertGroupBlock = saved.1
+                Inkling2Kernels.expertGroupBlockRows = saved.2
+                Inkling2Kernels.expertInOrderDecode = saved.3
+                Inkling2Kernels.expertGroupPlanned = saved.4
+                Inkling2Kernels.expertGroupTileAt = saved.5
+                Inkling2Kernels.expertGroupBlockForm = saved.6
+                Inkling2Kernels.expertGroupBlockFrom = saved.7
+            }
+            Inkling2Kernels.expertGroupPlanned = true
+            Inkling2Kernels.expertGroupBlockFrom = 2
+            Inkling2Kernels.expertGroupTileAt = 0
+            Inkling2Kernels.expertGroupBlockForm = 2
+            for (si, shape) in Self.shapes.enumerated() {
+                let (hidden, intermediate) = shape
+                let experts = hidden > 1024 ? 24 : 48
+                let up = Self.randomBank(
+                    format, experts: experts, outputs: 2 * intermediate, inputs: hidden,
+                    seed: UInt64(431 + si))
+                let down = Self.randomBank(
+                    format, experts: experts, outputs: hidden, inputs: intermediate,
+                    seed: UInt64(441 + si))
+                let x = (MLXRandom.normal([33, hidden], key: MLXRandom.key(451)) * 0.5)
+                    .asType(.bfloat16)
+                let (indices, _) = Self.routing(rows: 33, experts: experts, topK: topK, seed: 461)
+                Inkling2Kernels.expertGroupBlock = 0
+                let alone = try (0 ..< 33).map {
+                    try Self.pairOutputs(x[$0 ..< $0 + 1], indices[$0 ..< $0 + 1], up, down)
+                }
+                // The larger shape runs fewer combinations (each launch compiles a kernel).
+                let rowCounts = si == 0 ? [2, 3, 4, 5, 8, 9, 16, 33] : [2, 5, 8, 16]
+                let blocks = si == 0 ? [1, 2, 3, 4] : [2, 4]
+                for rows in rowCounts {
+                    let (xr, ids) = (x[0 ..< rows], indices[0 ..< rows])
+                    Inkling2Kernels.expertGroupGemv = false
+                    Inkling2Kernels.expertGroupBlock = 0
+                    Inkling2Kernels.expertGroupTileAt = 0
+                    let tiles = try Self.pairOutputs(xr, ids, up, down)
+                    Inkling2Kernels.expertGroupGemv = true
+                    Inkling2Kernels.expertGroupBlockRows = 64
+                    // Work items of 2, 3, 5 or 9 pairs and more as tiles (one to four
+                    // blocks of eight columns at 33 rows), in-order blocks below.
+                    Inkling2Kernels.expertGroupBlock = 4
+                    for (tileAt, upRows, form) in [
+                        (2, 1, 2), (3, 1, 3), (5, 1, 2), (5, 2, 3), (9, 1, 2), (5, 1, 4), (4, 2, 4),
+                        (4, 1, 1),
+                        (5, 2, 1),
+                    ]
+                    where si == 0 || tileAt == 5 {
+                        Inkling2Kernels.expertGroupTileAt = tileAt
+                        Inkling2Kernels.expertGroupBlockForm = form
+                        let out = try Self.withGemv(2, upRows: upRows) {
+                            try Self.pairOutputs(xr, ids, up, down)
+                        }
+                        #expect(
+                            Self.bitsEqual(out, tiles),
+                            "\(format) \(shape) rows \(rows) tiles at \(tileAt) pairs up \(upRows) form \(form)"
+                        )
+                    }
+                    // Blocks from nine rows only (smaller steps keep the grouped GEMVs
+                    // without blocks): form 4 with tiles from four pairs.
+                    Inkling2Kernels.expertGroupBlockFrom = 9
+                    Inkling2Kernels.expertGroupBlockForm = 4
+                    Inkling2Kernels.expertGroupTileAt = 4
+                    let fromNine = try Self.withGemv(2, upRows: 1) {
+                        try Self.pairOutputs(xr, ids, up, down)
+                    }
+                    #expect(
+                        Self.bitsEqual(fromNine, tiles),
+                        "\(format) \(shape) rows \(rows) blocks from nine rows")
+                    Inkling2Kernels.expertGroupBlockFrom = 2
+                    // Form 1 with blocks of up to eight pairs, with and without tiles
+                    // from nine pairs.
+                    Inkling2Kernels.expertGroupBlockForm = 1
+                    for (block, tileAt) in [(8, 0), (8, 9), (6, 0)] where si == 0 || tileAt == 9 {
+                        Inkling2Kernels.expertGroupBlock = block
+                        Inkling2Kernels.expertGroupTileAt = tileAt
+                        let out = try Self.withGemv(2, upRows: 1) {
+                            try Self.pairOutputs(xr, ids, up, down)
+                        }
+                        #expect(
+                            Self.bitsEqual(out, tiles),
+                            "\(format) \(shape) rows \(rows) form 1 block \(block) tiles at \(tileAt)"
+                        )
+                    }
+                    Inkling2Kernels.expertGroupTileAt = 0
+                    for block in blocks {
+                        Inkling2Kernels.expertGroupBlock = block
+                        // Blocks' chains in turn, single pairs in order with several
+                        // pairs decode-first or reading inputs from memory, and everything
+                        // decode-first.
+                        for (inOrder, form) in [
+                            (true, 1), (true, 2), (true, 3), (true, 4), (false, 2),
+                        ] {
+                            Inkling2Kernels.expertInOrderDecode = inOrder
+                            Inkling2Kernels.expertGroupBlockForm = form
+                            for upRows in si == 0 ? [1, 2] : [1] {
+                                let out = try Self.withGemv(2, upRows: upRows) {
+                                    try Self.pairOutputs(xr, ids, up, down)
+                                }
+                                #expect(
+                                    Self.bitsEqual(out, tiles),
+                                    "\(format) \(shape) rows \(rows) block \(block) in-order \(inOrder) form \(form) up \(upRows)"
+                                )
+                                if block == blocks.last, inOrder, form == 2, upRows == 1 {
+                                    for r in 0 ..< rows {
+                                        #expect(
+                                            Self.bitsEqual(
+                                                out[(r * topK) ..< (r * topK + topK)], alone[r]),
+                                            "\(format) \(shape) rows \(rows) row \(r) alone")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Inkling2Kernels.expertInOrderDecode = saved.3
+                }
+            }
+        }
+
         /// The grouped GEMVs of 2 to 8 rows (one or two gate/up rows per lane)
         /// give the tiles' bits for every pair, and each row equals the same row
         /// alone (one-row GEMV), with experts shared by several rows.
@@ -297,9 +432,10 @@ extension KernelTests {
             }
         }
 
-        /// A row alone (one-row GEMVs) equals the same row in steps of 2, 8 and
-        /// 33 rows (tiles, planned above 64 pairs) whose companions share all,
-        /// some or none of its experts, at varying positions.
+        /// A row alone (one-row GEMVs) equals the same row in steps of 2 and 8
+        /// rows (grouped GEMVs), 12, 20 and 32 rows (the mixed launches of the
+        /// verify windows) and 33 rows (planned tiles) whose companions share
+        /// all, some or none of its experts, at varying positions.
         @Test(arguments: [Inkling2ExpertFormat.nvfp4, .mxfp8])
         func rowAloneEqualsRowInCompany(format: Inkling2ExpertFormat) throws {
             let (experts, hidden, intermediate, topK) = (48, 2304, 1152, 8)
@@ -314,7 +450,7 @@ extension KernelTests {
             let alone = try Self.combined(target, targetIds, targetWeights, up, down)
             let mine = targetIds.asArray(UInt32.self)
             let others = (0 ..< UInt32(experts)).filter { !mine.contains($0) }
-            for rows in [2, 8, 33] {
+            for rows in [2, 8, 12, 20, 32, 33] {
                 for (mi, mix) in ["same", "some", "none", "random"].enumerated() {
                     let count = rows - 1
                     let companions =
