@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every macOS job that runs on Darkbloom names a signed VM size and its run.
+"""Check direct Darkbloom runner labels and signed macOS sizes.
 
 A Darkbloom macOS job without a size gets the size that the repository's
 approval pins. Each macOS job here names its own size instead: in its runner
@@ -136,6 +136,21 @@ class RunnerSizes(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertLessEqual(set(SIZES.values()), SIGNED)
         self.assertEqual(sizes, SIZES)
+
+    def test_direct_linux_jobs_name_their_run(self):
+        labels = '[self-hosted, linux, ARM64, "darkbloom-linux-arm64-run-${{ github.run_id }}"]'
+        actual = {
+            (workflow, name): value.strip()
+            for workflow, text in self.workflows.items()
+            for name, job in jobs(text).items()
+            for value in RUNS_ON.findall(job)
+            if "darkbloom-linux-arm64" in value
+        }
+        self.assertEqual(actual, {
+            ("fork-tests.yml", "list"): labels,
+            ("forkdiff-check.yml", "analysis-up-to-date"): labels,
+            ("forkdiff-pages.yml", "render"): labels,
+        })
 
     def test_actionlint_lists_the_sized_labels_only(self):
         labels = actionlint_labels()

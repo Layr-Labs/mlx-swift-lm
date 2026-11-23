@@ -99,6 +99,12 @@ one rescue; a rerun of these native-only jobs still requests native
 runners. Job timeouts also remain in force. These limits are not a promise
 of a 24-hour native queue.
 
+Check the shard map, Fork Diff Check and the Pages render job request
+`darkbloom-linux-arm64-run-${{ github.run_id }}`. As with the macOS
+jobs below, the runner can take jobs only from its own run. These direct
+Linux jobs have no fallback; revert the suffix before rolling back to a
+plane that cannot admit run-scoped labels.
+
 The GitHub-hosted Pages job still packages and publishes the rendered
 artifact through the `github-pages` environment. The disabled native
 CodeQL workflow has separate activation and rollback gates in
