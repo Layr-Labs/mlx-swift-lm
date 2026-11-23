@@ -171,7 +171,7 @@ python3 scripts/prepare-mimo-native-retention-fixtures.py \
 MIMO_V26_SERIAL_NATIVE_TESTS=1 \
 MIMO_V26_SERIAL_LOAD_FIXTURES=/tmp/mimo-native-retention \
 scripts/run-nested-suite.sh \
-  MiMoV26NativeHistoricalRetentionTests.testDemandedMiddleFrontierSurvivesNativePublicationAndReopenedFork \
+  MiMoV26NativeHistoricalRetentionTests \
   --disable-automatic-resolution --no-parallel
 ```
 
@@ -182,7 +182,7 @@ helper. The SDK-local staging script takes two arguments as shown above; the
 companion helper takes one. Neither substitutes a metallib from another source
 revision.
 
-The test captures a 897-token donor with hint 512, publishes actual frontiers
+The first test captures a 897-token donor with hint 512, publishes actual frontiers
 896/512/128, retires the donor and reopens encoded state for a 513-token fork.
 It checks 512 saved tokens, zero replay and exact 24-token greedy continuation
 against independent cold execution and reservation drain. Both MTP modes run:
@@ -191,6 +191,12 @@ positive serial verification rounds and drafts; off has no MTP metrics. This
 transport does not qualify provider encryption, SSD durability, full-model TPS
 or native-paged runtime.
 
+A second test runs a sampled, seeded 900-token donor. Sampled rows never
+speculate on MiMo, so it records prompt history through
+`checkpointsNonSpeculatingRows`. It publishes 896/512/128 without drafting,
+with the same manifests and tensors as a greedy donor, and a sampled fork and
+a greedy fork each restore 512 with zero replay and the cold tokens.
+
 The closed source-matched original A4 control retained 896/128 and failed
 its one owning MTP-off XCTest with two expected missing-512 assertions. The
 first iteration throws at the absent archive; this establishes no original
@@ -198,7 +204,7 @@ MTP-on or warm-import behavior. Preserve its source/compiler/image/metallib
 receipts. The earlier disk-aborted build attempts remain separate and are not
 native before results.
 
-The fork CI runs the retention6, partition3, continuation7 and native1 XCTest selectors
+The fork CI runs the retention6, partition3, continuation7 and native2 XCTest selectors
 through the nonempty/no-skip wrapper after successful build/Metal staging. Its
 MiMo opt-in applies only to the dedicated native selector. The generic full
 suite may skip optional native/reference-hardware cases; those skips do not
