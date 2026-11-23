@@ -163,8 +163,11 @@ final class Inkling2EngineStepState: Inkling2StepState {
             convRows.append(state?.conv ?? MLXArray.zeros([1, k, 2 * kv], dtype: dtype))
             ssmRows.append(state?.ssm ?? MLXArray.zeros([1, k, 2 * hidden], dtype: dtype))
         }
-        let conv = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-        let ssm = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+        // 2 ... 8 rows: one packing launch (decode kernels) instead of 2 x B copies.
+        let packed = Inkling2Kernels.gatherRowStates(conv: convRows, ssm: ssmRows)
+        let conv =
+            packed?[0] ?? (convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0))
+        let ssm = packed?[1] ?? (ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0))
         let split = [
             conv[.ellipsis, ..<kv], conv[.ellipsis, kv...],
             ssm[.ellipsis, ..<hidden], ssm[.ellipsis, hidden...],

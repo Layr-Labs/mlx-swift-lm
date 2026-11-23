@@ -569,10 +569,24 @@ enum Inkling2PagedAttentionMetal {
             if (active) blk.reset();
             constexpr int RS = D + 4;
             constexpr int HALF = PTOK / 2;
+            // Several blocks (verification windows) share one staged page per
+            // half: the half's NB simdgroups stage it together and each block
+            // takes the pages of its own range, so the threadgroup reads a page
+            // once and fits all its queries.
+            constexpr bool SHARE = NB > 1;
+            // The group's keys in this partition: from its first query's lowest
+            // key to its last query.
+            const int gklo = max(p * PTOK, ink2::lowest_key(qstart + i0, base, window));
+            const int gkhi = min((p + 1) * PTOK - 1, qstart + i1);
             threadgroup float scratch_all[NB * PSUB * 192];
             threadgroup float* scratch = scratch_all + sg * 192;
-            threadgroup T stage_all[NB * PSUB * 2 * S * RS];
-            threadgroup T* ks = stage_all + sg * 2 * S * RS;
+            // With two halves the shared pages also carry every block's hand-off
+            // (below), so they are at least that large.
+            constexpr int STAGE_T = (SHARE ? PSUB : NB * PSUB) * 2 * S * RS;
+            constexpr int XFER_T = SHARE && PSUB == 2
+                ? (NB * (NF * 2 + 2) * 32 * 4 + (int)sizeof(T) - 1) / (int)sizeof(T) : 0;
+            threadgroup T stage_all[STAGE_T > XFER_T ? STAGE_T : XFER_T];
+            threadgroup T* ks = stage_all + (SHARE ? half_index : (int)sg) * 2 * S * RS;
             threadgroup T* vs = ks + S * RS;
             const device int32_t* table = tables + (size_t)b * maxp;
             const device T* kn = knew + (size_t)ink2::io_row<TM>(b, kvh, 0, KVH, L) * D;
@@ -597,6 +611,42 @@ enum Inkling2PagedAttentionMetal {
                 }
                 const int hlo = max(klo, p * PTOK + h * HALF);
                 const int hhi = min(khi, p * PTOK + (h + 1) * HALF - 1);
+                if (SHARE) {
+                    // The group's pages of this half, staged once; a block updates
+                    // with the pages its own loop below would take, in the same
+                    // order. Every simdgroup takes the same number of steps (with
+                    // two halves, the larger half's pages) so the barriers line up.
+                    const int ulo = max(gklo, p * PTOK + h * HALF);
+                    const int uhi = min(gkhi, p * PTOK + (h + 1) * HALF - 1);
+                    const int upages = ulo <= uhi ? uhi / S - ulo / S + 1 : 0;
+                    int steps = upages;
+                    if (PSUB == 2) {
+                        const int olo = max(gklo, p * PTOK + (1 - h) * HALF);
+                        const int ohi = min(gkhi, p * PTOK + (2 - h) * HALF - 1);
+                        steps = max(steps, olo <= ohi ? ohi / S - olo / S + 1 : 0);
+                    }
+                    const int own_first = (hlo / S) * S;
+                    for (int j = 0; j < steps; j++) {
+                        const int kp0 = (ulo / S) * S + j * S;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (j < upages) {
+                            const int page = ink2::page_of(table, kp0, S, tlen, qstart, base);
+                            const size_t head = (size_t)kvh * S * D;
+                            ink2::stage_page<T, S, D, 0, RS, 32 * NB, false>(
+                                kp0, qstart, base, L, pages.key_page(page) + head,
+                                pages.value_page(page) + head, kn, vn, dense_stride, ks, vs,
+                                bi * 32 + (int)lane);
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (active && j < upages && kp0 >= own_first && kp0 <= hhi) {
+                            const ink2::StagedRowMajor<T, RS> rows{ks, vs};
+                            const ink2::RegisterQueries<NF> queries{blk.q};
+                            ink2::tile_update<NF, REL, DREL, BIAS>(
+                                blk, rows, kp0, proj, scratch, lane, queries);
+                        }
+                    }
+                    continue;
+                }
                 for (int kp0 = (hlo / S) * S; active && kp0 <= hhi; kp0 += S) {
                     const int page = ink2::page_of(table, kp0, S, tlen, qstart, base);
                     const size_t head = (size_t)kvh * S * D;
@@ -629,9 +679,11 @@ enum Inkling2PagedAttentionMetal {
             }
             if (PSUB == 2) {
                 // The second-half simdgroup hands its state to the first through
-                // its own (finished) staging area.
-                threadgroup float* xfer =
-                    reinterpret_cast<threadgroup float*>(stage_all + (bi + NB) * 2 * S * RS);
+                // its own (finished) staging area, or (SHARE) block `bi`'s slot of
+                // the finished shared pages.
+                threadgroup float* xfer = SHARE
+                    ? reinterpret_cast<threadgroup float*>(stage_all) + bi * (NF * 2 + 2) * 32
+                    : reinterpret_cast<threadgroup float*>(stage_all + (bi + NB) * 2 * S * RS);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (half_index == 1 && active) {
                     _Pragma("clang loop unroll(full)")

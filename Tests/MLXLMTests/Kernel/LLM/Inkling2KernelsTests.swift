@@ -761,6 +761,49 @@ extension KernelTests {
             }
         }
 
+        /// The engine's per-slot state gather: 2 ... 8 rows of conv and SSM
+        /// states (fresh rows, rows with their own history, row views of an
+        /// earlier packed step) pack to the bits of concatenating them; one row,
+        /// more than 8 rows or rows that are not whole 16-byte multiples fall
+        /// back (nil).
+        @Test(arguments: [1, 2, 3, 5, 8, 9])
+        func rowStateGatherEqualsConcatenation(rows: Int) throws {
+            let packedConv = MLXRandom.normal([9, 3, 128], key: MLXRandom.key(91)).asType(.bfloat16)
+            let packedSSM = MLXRandom.normal([9, 3, 256], key: MLXRandom.key(92)).asType(.bfloat16)
+            func state(_ r: Int, _ packed: MLXArray, seed: UInt64) -> MLXArray {
+                switch r % 3 {
+                case 0: MLXArray.zeros([1, 3, packed.dim(2)], dtype: .bfloat16)
+                case 1:
+                    MLXRandom.normal([1, 3, packed.dim(2)], key: MLXRandom.key(seed + UInt64(r)))
+                        .asType(.bfloat16)
+                default: packed[r ..< r + 1]
+                }
+            }
+            let conv = (0 ..< rows).map { state($0, packedConv, seed: 100) }
+            let ssm = (0 ..< rows).map { state($0, packedSSM, seed: 200) }
+            eval(conv + ssm)
+            let gathered = Inkling2Kernels.$override.withValue(true) {
+                Inkling2Kernels.gatherRowStates(conv: conv, ssm: ssm)
+            }
+            if rows < 2 || rows > 8 {
+                #expect(gathered == nil)
+                return
+            }
+            guard let gathered else {
+                Issue.record("gather not covered at \(rows) rows")
+                return
+            }
+            eval(gathered)
+            #expect(Self.bitsEqual(gathered[0], concatenated(conv, axis: 0)), "conv, \(rows) rows")
+            #expect(Self.bitsEqual(gathered[1], concatenated(ssm, axis: 0)), "ssm, \(rows) rows")
+            // Rows of an odd byte size are not covered.
+            let odd = (0 ..< rows).map { _ in MLXArray.zeros([1, 3, 5], dtype: .bfloat16) }
+            #expect(
+                Inkling2Kernels.$override.withValue(true) {
+                    Inkling2Kernels.gatherRowStates(conv: odd, ssm: ssm)
+                } == nil)
+        }
+
         // MARK: Module hooks
 
         /// The MoE module under `Inkling2RowExact.active`: the kernel path stays
