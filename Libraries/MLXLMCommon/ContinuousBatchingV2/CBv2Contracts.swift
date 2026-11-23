@@ -1011,8 +1011,8 @@ public enum CBv2Event: Sendable {
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
 
-/// Whole-request gates that keep a row from drafting, one bit per gate of
-/// `EngineLoopV2.mtpHistoryEligible`. A request records every gate it fails,
+/// Whole-request gates that keep a row from drafting, one bit per gate of the
+/// engine's MTP eligibility check. A request records every gate it fails,
 /// not only the first. The per-step free-span position of a constrained row
 /// and the storage gates are not whole-request gates and have no bit.
 public struct CBv2MTPIneligibility: OptionSet, Sendable, Hashable {
@@ -1029,9 +1029,13 @@ public struct CBv2MTPIneligibility: OptionSet, Sendable, Hashable {
     public static let sampling = Self(rawValue: 1 << 3)
     /// Top logprobs requested.
     public static let logprobs = Self(rawValue: 1 << 4)
+    /// A logit bias.
     public static let logitBias = Self(rawValue: 1 << 5)
+    /// A repetition penalty other than 1.
     public static let repetitionPenalty = Self(rawValue: 1 << 6)
-    /// Presence/frequency penalties outside `mtpPenaltiesEligible`.
+    /// Presence/frequency penalties the engine does not verify: the penalty
+    /// opt-in off, no target-prefix verification, a token constraint or a
+    /// non-finite value.
     public static let penalties = Self(rawValue: 1 << 7)
     /// Stop strings without effective stop-string speculation.
     public static let stopStrings = Self(rawValue: 1 << 8)
@@ -1118,7 +1122,8 @@ public struct CBv2RequestTiming: Sendable, Equatable {
     /// `applyAdoption` duration on the engine thread.
     public var prefixAdoptionNanos: UInt64 = 0
     /// `CBv2MTPIneligibility` bits plus its evaluated bit, written once at the
-    /// first token and only when a drafter is configured. `0` = not evaluated.
+    /// first token and only on an engine whose MTP round driver was built (MTP
+    /// effectively enabled, a drafter for this target). `0` = not evaluated.
     public var mtpIneligibilityBits: UInt32 = 0
     public init() {}
 
