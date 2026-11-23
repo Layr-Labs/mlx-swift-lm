@@ -259,6 +259,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// drive rounds). Lock-protected snapshot — safe to poll from any
     /// thread (provider heartbeats/telemetry).
     public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
+    /// Forgets the MTP depth policy's measured step costs while the engine is
+    /// idle, so the next request measures them again. The policy keeps one
+    /// plain-step sample per engine for its whole life; when that sample came
+    /// from a cold step (a load warm-up's first kernels, cold caches) it drafts
+    /// too deep from then on (one row, M5 Ultra: 61 vs 123 tok/s). Call after a
+    /// warm-up and before serving. Tokens are unaffected. False when the engine
+    /// has work or no MTP driver.
+    @discardableResult
+    public func resetMTPCostLearning() -> Bool { loop.resetMTPCostLearning() }
     /// Construction-time reason MTP is inactive. nil means the driver is
     /// active. Providers can surface this alongside the nil metrics snapshot.
     public let mtpInactiveReason: String?
