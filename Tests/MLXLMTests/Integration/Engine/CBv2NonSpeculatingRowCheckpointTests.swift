@@ -216,6 +216,19 @@ struct CBv2NonSpeculatingRowCheckpointTests {
         var testDescription: String { rawValue }
     }
 
+    private static func penaltyEngine(_ target: PenaltyTarget, optIn: Bool) throws -> (
+        EngineV2, PagedKVBackend
+    ) {
+        switch target {
+        case .qwen35Serial:
+            try qwen35Engine(nil, penaltySpeculation: optIn)
+        case .qwen4Serial:
+            try qwen4Engine(nil, verification: .serialTarget, penaltySpeculation: optIn)
+        case .qwen4RectangularExact:
+            try qwen4Engine(nil, verification: .rectangularExact, penaltySpeculation: optIn)
+        }
+    }
+
     /// Opted-in penalty rows on the request-stateful Qwen assistants (the
     /// production drafters): presence/frequency rows speculate, and their
     /// tokens equal those of the same MTP engine without the opt-in, where the
@@ -227,15 +240,7 @@ struct CBv2NonSpeculatingRowCheckpointTests {
         async throws
     {
         func make(_ optIn: Bool) throws -> (EngineV2, PagedKVBackend) {
-            switch target {
-            case .qwen35Serial:
-                try Self.qwen35Engine(nil, penaltySpeculation: optIn)
-            case .qwen4Serial:
-                try Self.qwen4Engine(nil, verification: .serialTarget, penaltySpeculation: optIn)
-            case .qwen4RectangularExact:
-                try Self.qwen4Engine(
-                    nil, verification: .rectangularExact, penaltySpeculation: optIn)
-            }
+            try Self.penaltyEngine(target, optIn: optIn)
         }
         let prompt = (0 ..< Self.chunk + 7).map { 1 + ($0 * 7) % 61 }
         for (i, sampling) in [
@@ -268,6 +273,29 @@ struct CBv2NonSpeculatingRowCheckpointTests {
                 served.tokens == expected.tokens,
                 "\(target) \(control) T=\(sampling.temperature): on=\(served.tokens) off=\(expected.tokens)"
             )
+        }
+    }
+
+    /// The penalty opt-in on the request-stateful Qwen assistants clears the
+    /// penalties bit on the row's exported timing; without it the bit is set.
+    @Test(.timeLimit(.minutes(5)), arguments: PenaltyTarget.allCases)
+    func penaltyOptInClearsThePenaltiesBit(_ target: PenaltyTarget) async throws {
+        let prompt = (0 ..< Self.chunk + 7).map { 1 + ($0 * 7) % 61 }
+        for control in [Control.presencePenalty, .frequencyPenalty] {
+            var request = CBv2Request(
+                id: .init(60), promptTokens: prompt, sampling: .init(temperature: 0),
+                maxTokens: 6)
+            control.apply(to: &request)
+            for optIn in [false, true] {
+                let (engine, backend) = try Self.penaltyEngine(target, optIn: optIn)
+                let served = try await cbv2ServeControlled(engine, request)
+                Self.released(engine, backend)
+                await engine.shutdown()
+                let cleared = optIn && CBv2MTPConfig.envPenaltySpeculation
+                #expect(
+                    served.usage?.timing.mtpIneligibility == (cleared ? [] : [.penalties]),
+                    "\(target) \(control) opt-in \(optIn)")
+            }
         }
     }
 }
