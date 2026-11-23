@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
+    runs-on: [self-hosted, macOS, ARM64, "darkbloom-macos-arm64-4x16-run-${{ github.run_id }}"]
     permissions:
       contents: read
     timeout-minutes: 15
