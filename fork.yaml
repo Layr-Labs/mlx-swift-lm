@@ -639,6 +639,7 @@ def:
             - "Tests/MLXLMTests/Inkling2*.swift"
             - "Tests/MLXLMTests/Integration/Inkling2/**"
             - "changelog.d/inkling2-mini-*.md"
+            - "tools/inkling2_dspark_reference.py"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
             Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:

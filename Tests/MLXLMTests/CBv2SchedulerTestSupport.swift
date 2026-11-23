@@ -543,6 +543,58 @@ func cbv2SchedCollect(
     return result
 }
 
+/// A stream that must finish did not within its watchdog: the test fails
+/// with this message instead of comparing a truncated output.
+struct CBv2StreamTimedOut: Error, CustomStringConvertible {
+    let label: String
+    let seconds: TimeInterval
+    let tokens: Int
+    var description: String {
+        "\(label): timed out after \(Int(seconds)) s with \(tokens) tokens and no finish event "
+            + "(a truncated output is never compared; raise CBV2_TEST_STREAM_TIMEOUT_SECONDS on a "
+            + "loaded machine)"
+    }
+}
+
+/// Default watchdog for streams that must finish: generous for a machine
+/// shared with other GPU work. `CBV2_TEST_STREAM_TIMEOUT_SECONDS` overrides it.
+let cbv2TestStreamTimeoutSeconds: TimeInterval =
+    ProcessInfo.processInfo.environment["CBV2_TEST_STREAM_TIMEOUT_SECONDS"].flatMap(
+        TimeInterval.init) ?? 120
+
+/// A stream that had to produce `expected` tokens finished early.
+struct CBv2StreamFinishedEarly: Error, CustomStringConvertible {
+    let label: String
+    let reason: CBv2FinishReason?
+    let tokens: Int
+    let expected: Int
+    var description: String {
+        "\(label): finished early (\(reason.map { String(describing: $0) } ?? "no reason")) after "
+            + "\(tokens) of \(expected) tokens (a truncated output is never compared)"
+    }
+}
+
+/// `cbv2SchedCollect` for a stream that must finish: a watchdog expiry throws
+/// `CBv2StreamTimedOut`, and with `expectedTokens` any other ending than
+/// `.length` at exactly that count throws `CBv2StreamFinishedEarly`, so no
+/// caller ever compares a truncated output.
+func cbv2CollectFinished(
+    _ stream: AsyncStream<CBv2Event>, timeoutSeconds: TimeInterval? = nil,
+    label: String = "stream", expectedTokens: Int? = nil
+) async throws -> CBv2SchedCollected {
+    let seconds = max(timeoutSeconds ?? 0, cbv2TestStreamTimeoutSeconds)
+    let result = await cbv2SchedCollect(stream, timeoutSeconds: seconds)
+    guard result.finishReason != nil else {
+        throw CBv2StreamTimedOut(label: label, seconds: seconds, tokens: result.tokens.count)
+    }
+    if let expectedTokens, result.finishReason != .length || result.tokens.count != expectedTokens {
+        throw CBv2StreamFinishedEarly(
+            label: label, reason: result.finishReason, tokens: result.tokens.count,
+            expected: expectedTokens)
+    }
+    return result
+}
+
 /// Poll until `condition` holds (engine loop runs on its own queue).
 func cbv2SchedWait(
     timeoutSeconds: TimeInterval = 10, intervalSeconds: TimeInterval = 0.005,

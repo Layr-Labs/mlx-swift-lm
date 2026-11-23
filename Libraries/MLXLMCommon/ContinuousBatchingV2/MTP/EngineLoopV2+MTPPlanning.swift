@@ -217,9 +217,13 @@ extension EngineLoopV2 {
         // the hidden-returning MTP path. Explicit fixed k=0 has no history
         // ownership and remains on ordinary chained decode. A drafter that
         // takes ordinary-decode history keeps chaining while no row can
-        // speculate; the chained launch captures hidden for finalize.
+        // speculate, and while the next plan would run at depth zero
+        // (`mtpPreviewRunsAsOrdinaryDecode`); the chained launch captures
+        // hidden for finalize.
         if mtp.tracksPersistentHistory {
-            return canSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+            guard mtpFeedsHistoryFromOrdinaryDecode else { return true }
+            guard canSpeculate, mtp.depthZeroChaining else { return canSpeculate }
+            return !mtpPreviewRunsAsOrdinaryDecode()
         }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
@@ -252,13 +256,108 @@ extension EngineLoopV2 {
         }
     }
 
+    /// Decode rows of the next scheduler plan, as `beginMTPPlan` counts them.
+    private func mtpPlanDecodeRows() -> [CBv2ScheduledRequest] {
+        scheduler.running.filter { !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady }
+    }
+
+    private func mtpPlanEligibleRows(
+        _ rows: [CBv2ScheduledRequest]
+    ) -> [CBv2ScheduledRequest] {
+        rows.filter { rec in
+            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+            return Self.mtpStorageEligible(state)
+        }
+    }
+
+    /// The per-row clamps `beginMTPPlan` applies to an offered decision, in
+    /// order. Each clamp lowers the depth and, like `clampPlanDepth`, makes
+    /// the decision a non-exploration one. `clamp` receives every applied
+    /// clamp (nil for a preview, which leaves the driver untouched). The one
+    /// definition keeps the chain predicate and the plan in step.
+    private func mtpClampedPlanDecision(
+        _ decision: CBv2MTPDepthDecision, rows: [CBv2ScheduledRequest],
+        eligibleRows: [CBv2ScheduledRequest], driver mtp: CBv2MTPRoundDriver,
+        clamp: ((Int, String) -> Void)?
+    ) -> (depth: Int, isExploration: Bool) {
+        var depth = decision.depth
+        var isExploration = decision.isExploration
+        func lower(to requested: Int, reason: String) {
+            let newDepth = min(max(requested, 0), depth)
+            guard newDepth != depth else { return }
+            depth = newDepth
+            isExploration = false
+            clamp?(newDepth, reason)
+        }
+        if mtp.usesMarginalPolicy, !decision.isExploration, depth > 0, !eligibleRows.isEmpty {
+            let verificationLimit = mtp.maximumAutomaticDepth(plannedDecodeRows: rows.count)
+            let offered = depth
+            let marginalDepth =
+                eligibleRows.map { rec in
+                    mtp.marginalDepth(
+                        for: rec.id,
+                        offeredDepth: offered,
+                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                        verificationLimit: verificationLimit,
+                        decodeRowBucket: decision.decodeRowBucket)
+                }.min() ?? 0
+            lower(to: marginalDepth, reason: "marginal_policy")
+        }
+        if depth > 0 {
+            lower(
+                to: Self.mtpDepthWithinOutputBudget(
+                    offeredDepth: depth,
+                    remainingTokens: eligibleRows.map {
+                        $0.request.maxTokens - $0.generatedTokenCount
+                    }),
+                reason: "tail_depth")
+        }
+        if depth > 0 {
+            let eligibleIDs = Set(eligibleRows.map(\.id))
+            let stepTokens = rows.count + eligibleRows.count * depth
+            let capacityTokens = rows.reduce(0) { total, rec in
+                let count = 1 + (eligibleIDs.contains(rec.id) ? depth : 0)
+                return total
+                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
+            }
+            if stepTokens > scheduler.config.maxBatchedTokensPerStep {
+                lower(to: 0, reason: "step_token_budget")
+            } else if !(capacity?.hasHeadroom(additionalTokens: capacityTokens) ?? true) {
+                lower(to: 0, reason: "step_kv_headroom")
+            }
+        }
+        if depth > 0, let limit = mtp.planDepthLimitForTesting,
+            let cap = limit(rows.map { $0.generatedTokenCount + $0.pendingSamples })
+        {
+            lower(to: cap, reason: "test_schedule")
+        }
+        return (depth, isExploration)
+    }
+
+    /// Whether the next plan would run as ordinary decode feeding history
+    /// (`CBv2MTPRoundDriver.planRunsAsOrdinaryDecode`), computed without
+    /// touching the driver: the same rows, gates, offered decision and clamps
+    /// as `beginMTPPlan`, which runs right after on the chained path.
+    private func mtpPreviewRunsAsOrdinaryDecode() -> Bool {
+        guard let mtp else { return false }
+        let rows = mtpPlanDecodeRows()
+        let batchRows = mtpDraftBatchRows(rows)
+        let canSpeculate =
+            batchRows.count <= mtp.config.maxSpeculativeBatch && mtpRowsCanSpeculate(batchRows)
+        guard canSpeculate else { return true }
+        let decision = mtp.previewPlanDecision(
+            plannedDecodeRows: rows.count, canSpeculate: canSpeculate)
+        let planned = mtpClampedPlanDecision(
+            decision, rows: rows, eligibleRows: mtpPlanEligibleRows(rows), driver: mtp,
+            clamp: nil)
+        return planned.depth == 0 && !planned.isExploration
+    }
+
     /// Select one controller depth for all decode rows in the scheduler plan.
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
-        let rows = scheduler.running.filter {
-            !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
-        }
+        let rows = mtpPlanDecodeRows()
         let batchRows = CBv2StepProfiler.time("v2.plan.mtp.batchRows") { mtpDraftBatchRows(rows) }
         let withinBatchGate = batchRows.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = CBv2StepProfiler.time("v2.plan.mtp.canSpeculate") {
@@ -269,52 +368,11 @@ extension EngineLoopV2 {
                 plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
                 rowIDs: rows.map(\.id))
         }
-        let eligibleRows = rows.filter { rec in
-            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
-        }
-
-        if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
-            !eligibleRows.isEmpty
-        {
-            let verificationLimit = mtp.maximumAutomaticDepth(
-                plannedDecodeRows: rows.count)
-            let marginalDepth =
-                eligibleRows.map { rec in
-                    mtp.marginalDepth(
-                        for: rec.id,
-                        offeredDepth: mtp.planDepth,
-                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
-                        verificationLimit: verificationLimit,
-                        decodeRowBucket: mtp.planDecodeRowBucket)
-                }.min() ?? 0
-            if marginalDepth < mtp.planDepth {
-                mtp.clampPlanDepth(to: marginalDepth, reason: "marginal_policy")
-            }
-        }
-        if mtp.planDepth > 0 {
-            let tailDepth = Self.mtpDepthWithinOutputBudget(
-                offeredDepth: mtp.planDepth,
-                remainingTokens: eligibleRows.map {
-                    $0.request.maxTokens - $0.generatedTokenCount
-                })
-            if tailDepth < mtp.planDepth {
-                mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
-            }
-        }
-        if mtp.planDepth > 0 {
-            let eligibleIDs = Set(eligibleRows.map(\.id))
-            let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
-            let capacityTokens = rows.reduce(0) { total, rec in
-                let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
-                return total
-                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
-            }
-            if stepTokens > scheduler.config.maxBatchedTokensPerStep {
-                mtp.clampPlanDepth(to: 0, reason: "step_token_budget")
-            } else if !(capacity?.hasHeadroom(additionalTokens: capacityTokens) ?? true) {
-                mtp.clampPlanDepth(to: 0, reason: "step_kv_headroom")
-            }
+        let eligibleRows = mtpPlanEligibleRows(rows)
+        _ = mtpClampedPlanDecision(
+            mtp.planDecision, rows: rows, eligibleRows: eligibleRows, driver: mtp
+        ) { depth, reason in
+            mtp.clampPlanDepth(to: depth, reason: reason)
         }
         if mtp.planDepth > 0,
             eligibleRows.contains(where: { !mtp.hasValidCarry(for: $0) })
@@ -374,12 +432,15 @@ extension EngineLoopV2 {
         }
     }
 
-    /// A plan that cannot speculate, whose history-owning rows are all plain
+    /// A plan that cannot speculate or runs at depth zero
+    /// (`planRunsAsOrdinaryDecode`), whose history-owning rows are all plain
     /// decode rows, needs no MTP step: `executeMixed` captures their hidden
     /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
     /// so persistent history starts at prompt position 0.
     private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
-        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp, !mtp.planCanSpeculate else {
+        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp,
+            !mtp.planCanSpeculate || mtp.planRunsAsOrdinaryDecode
+        else {
             return false
         }
         return plan.assignments.allSatisfy { assignment in

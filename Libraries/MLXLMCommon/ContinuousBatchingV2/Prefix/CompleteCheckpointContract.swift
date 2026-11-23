@@ -140,6 +140,9 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     /// windowed layer) followed by every recurrent layer's state, for models
     /// with both sliding-window attention and recurrent state.
     public static let pagedHistoricalRecurrentLayout = "native-paged-historical-recurrent-v1"
+    /// `pagedHistoricalRecurrentLayout` followed by an exact-history drafter's
+    /// own prefix history (`assistantCodecID` names its codec).
+    public static let pagedHistoricalRecurrentMTPLayout = "native-paged-historical-recurrent-mtp-v1"
     public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
     public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
@@ -254,6 +257,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.quantizedHistoricalLayout
                 || backendLayout == Self.historicalAttentionLayout
                 || backendLayout == Self.pagedHistoricalRecurrentLayout
+                || backendLayout == Self.pagedHistoricalRecurrentMTPLayout
                 || backendLayout == Self.nativeContiguousHistoricalLayout
                 || backendLayout == Self.diffusionBlockLayout
                 || backendLayout == Self.contiguousAsymmetricLayout
@@ -263,6 +267,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.glm5NextPagedLayout,
             backendLayout == Self.historicalAttentionLayout
                 || backendLayout == Self.pagedHistoricalRecurrentLayout
+                || backendLayout == Self.pagedHistoricalRecurrentMTPLayout
                 || backendLayout == Self.nativeQuantizedHistoricalLayout
                 || backendLayout == Self.nativeQuantizedContiguousHistoricalLayout
                 || backendLayout == Self.nativeContiguousHistoricalLayout
@@ -288,6 +293,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || position % chunkSize == 0
                 || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
                     || backendLayout == Self.pagedHistoricalRecurrentLayout
+                    || backendLayout == Self.pagedHistoricalRecurrentMTPLayout
                     || backendLayout == Self.quantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedPagedMTPLayout

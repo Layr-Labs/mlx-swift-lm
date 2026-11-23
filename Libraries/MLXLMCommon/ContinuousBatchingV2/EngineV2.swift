@@ -944,7 +944,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 kind.sharesKVWithLayer == nil && kind.valueHeadDim == kind.headDim
                     && kind.qwen4IndexerCompressRatio == nil && !kind.isBidirectional
             }
-            && !(mtpDriver?.tracksPersistentHistory ?? false)
+            && (!(mtpDriver?.tracksPersistentHistory ?? false)
+                || mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding)
             && checkpointQuantization == nil
             && (backend as? PagedKVBackend)?.nativeModelBinding == nil
             && schedulerConfig.enablePrefixCache
@@ -1028,7 +1029,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             case let codec = CBv2CompleteCheckpointCodec(
                 identity: completePrefixCache.identity, layerKinds: layerKinds,
                 recurrentSpec: recurrentSpec, kvDTypes: segmentedPool.layerDTypes,
-                assistant: nil, admission: admission, pagedConfig: pagedCheckpointConfig,
+                assistant: mtpDriver?.tracksPersistentHistory == true
+                    ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
+                admission: admission, pagedConfig: pagedCheckpointConfig,
                 historicalRecurrent: true),
             codec.historicalRecurrent
         {

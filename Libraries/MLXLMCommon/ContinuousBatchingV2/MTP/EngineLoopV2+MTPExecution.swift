@@ -758,7 +758,26 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+        if let blockDrafter = mtp.drafter as? any CBv2MTPBatchedBlockDrafter {
+            let states = rowMetadata.map { row -> any CBv2MTPRequestState in
+                guard let state = row.assistantState else {
+                    preconditionFailure("CBv2 block MTP assistant state missing for \(row.id)")
+                }
+                return state
+            }
+            let ids = blockDrafter.draftBlock(
+                tokens: (0 ..< batch).map { seedColumn[$0 ..< $0 + 1, 0...] },
+                hidden: carryHiddens, requestStates: states, depth: k)
+            let evalTargets =
+                [ids] + states.flatMap { blockDrafter.evaluationTargets(for: $0) }
+            retainNativeWork(evalTargets, owners: states.map { $0 as AnyObject })
+            try requireNativeWork()
+            asyncEval(evalTargets)
+            try nativeWorkSubmitted()
+            mtp.recordEarlyDraftSubmission()
+            assistantEvalTargets.append(contentsOf: evalTargets)
+            for column in 0 ..< k { draftSteps.append(ids[0..., column]) }
+        } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }

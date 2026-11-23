@@ -165,6 +165,25 @@ extension EngineLoopV2 {
                 throw CBv2KVError.backendIneligible(
                     reason: "assistant checkpoint cannot be restored")
             }
+            // A restored donor keeps capturing deeper boundaries, as a cold
+            // one does (`mtpTakeHistoryState` installs at its first
+            // observation): the context is installed once, before any suffix
+            // observation, and checks the restored tokens against the prompt.
+            if request.prefixCacheEnabled,
+                let historical = completeCheckpointCapture?.codec.assistant
+                    as? any CBv2HistoricalMTPPrefixCheckpointCoding,
+                historical as AnyObject === mtp.drafter as AnyObject
+            {
+                do {
+                    try historical.installPrefixCaptureContext(
+                        requestState: assistant, promptTokens: request.promptTokens)
+                } catch {
+                    mtp.releaseDetachedAssistantState(assistant)
+                    try recurrent.release()
+                    throw CBv2KVError.backendIneligible(
+                        reason: "restored assistant prefix does not match the prompt")
+                }
+            }
             mtp.restoreAssistantState(assistant, for: requestID)
         } else if checkpoint.assistant != nil {
             try recurrent.release()

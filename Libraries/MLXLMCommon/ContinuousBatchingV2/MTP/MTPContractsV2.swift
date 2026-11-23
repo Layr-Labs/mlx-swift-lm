@@ -466,6 +466,20 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
 }
 
+/// Optional refinement for block drafters (Inkling 2 DSpark): one call drafts
+/// every speculating row's whole chain, so the rows share one drafter forward
+/// and one read of its weights instead of one per row and step.
+public protocol CBv2MTPBatchedBlockDrafter: CBv2MTPRequestStatefulDrafter {
+    /// - tokens: each row's `[1, 1]` seed token (the round anchor).
+    /// - hidden: each row's `[1, 1, H]` seed hidden (the carry).
+    /// - Returns: `[rows, depth]` int32 greedy drafts, lazy. Each state stages
+    ///   `depth` inputs, exactly as `depth` calls of `draftStep` would.
+    func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int
+    ) -> MLXArray
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.
@@ -518,8 +532,11 @@ public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
     /// validation matrix (`verify width = 1 + k`, widths 1...8).
     public static let testedMaxDraftTokens = 7
-    /// CBv2's production rectangular batch ceiling.
+    /// CBv2's production rectangular batch ceiling: the default limit on
+    /// speculating rows, and the limit for every family that does not raise it.
     public static let testedMaxSpeculativeBatch = 8
+    /// The highest speculating-row limit a configuration may request.
+    public static let supportedMaxSpeculativeBatch = 64
 
     /// Master switch. The engine also requires a drafter instance and a
     /// conforming model; `enabled == true` without both is inert.
@@ -538,9 +555,10 @@ public struct CBv2MTPConfig: Sendable {
     /// keeps one depth for every width. Every depth verifies exactly; only
     /// the work per round changes.
     public var fixedDraftTokensByDecodeRows: [Int]?
-    /// Hard operational gate on decode rows in one plan, clamped to 1...8.
-    /// Together with the k<=7 bound this caps staged window-KV to 64 token
-    /// rows per storage-owning layer and one in-flight step. The adaptive
+    /// Hard operational gate on decode rows in one plan, clamped to
+    /// 1...`speculativeBatchLimit` (default 8, at most 64). With the k<=7 bound
+    /// the default caps staged window-KV to 64 token rows per storage-owning
+    /// layer and one in-flight step. The adaptive
     /// controller is separately keyed by a planned-decode-row bucket.
     public var maxSpeculativeBatch: Int
     /// Target scoring strategy. Automatic verification is the safe default:
@@ -648,7 +666,8 @@ public struct CBv2MTPConfig: Sendable {
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
-        stopStringSpeculation: Bool = false
+        stopStringSpeculation: Bool = false,
+        speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
@@ -661,8 +680,9 @@ public struct CBv2MTPConfig: Sendable {
         self.stopStringSpeculation = stopStringSpeculation
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
-        self.maxSpeculativeBatch = min(
-            max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
+        // A family raises its limit only after measuring that wider rounds pay.
+        let limit = min(max(speculativeBatchLimit, 1), Self.supportedMaxSpeculativeBatch)
+        self.maxSpeculativeBatch = min(max(maxSpeculativeBatch, 1), limit)
         self.fixedDraftTokens = fixedDraftTokens.map {
             min(max($0, 0), resolvedMax)
         }

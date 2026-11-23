@@ -32,6 +32,23 @@ extension EngineLoopV2 {
         nativeShutdownState == nil && mtp?.seedsCarryFromPrefill == true
     }
 
+    /// Ordinary-decode history reads only each step's hidden rows, never its
+    /// logits, so such a step takes the model's certified tokens like the
+    /// drafter-off step does. `DARKBLOOM_CBV2_MTP_HISTORY_CERTIFIED=0/false/no/off`
+    /// (read once) keeps history rows on the full product.
+    static let historyAllowsCertifiedTokens: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_HISTORY_CERTIFIED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Whether this decode step's history rows keep it off certified tokens.
+    func mtpHistoryNeedsFullLogits(_ rows: [(id: CBv2RequestID, index: Int, preemptions: Int)])
+        -> Bool
+    {
+        !rows.isEmpty && !Self.historyAllowsCertifiedTokens
+    }
+
     /// Decode rows whose trusted hidden must reach persistent history when
     /// they run as ordinary decode. Same gates as MTP-step observation.
     func mtpOrdinaryHistoryRows(
