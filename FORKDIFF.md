@@ -190,6 +190,12 @@ python3 -m pip install pyyaml
 python3 scripts/check_forkdiff.py --upstream-ref refs/remotes/upstream/main
 ```
 
+Upstream's workflows name actions by tag, as in `actions/checkout@v7`. This
+organization starts only workflows whose actions are pinned to a full commit
+SHA, so a workflow with a tag fails at startup, even one whose jobs only run
+upstream. In a merge, pin each such reference to the commit its tag names;
+the Shard map job's `.github/scripts/test-action-pins.py` fails on one.
+
 **Previewing the page locally** (Go 1.21+):
 
 ```
