@@ -9,8 +9,11 @@ even a job that runs only in the upstream repository fails here. Upstream's
 workflows name actions by tag, so a merge from upstream can bring one in.
 
 This test fails on each `uses:` of another repository's action or reusable
-workflow that names no 40-character commit SHA. Local actions and workflows
-(`./…`) and Docker images (`docker://…`) are not checked.
+workflow that names no 40-character commit SHA, and on a `uses` key it
+cannot read (a flow mapping, a value on the next line). Local actions and
+workflows (`./…`) and Docker images (`docker://…`) are not checked. Nor are
+the actions a remote action uses itself (f9569fc73's case): pin a release
+whose own references are pinned.
 
 Run: python3 .github/scripts/test-action-pins.py
 """
@@ -21,17 +24,20 @@ from pathlib import Path
 
 GITHUB = Path(__file__).resolve().parent.parent
 USES = re.compile(r"""(?m)^[ \t]*(?:-[ \t]+)?uses:[ \t]*["']?([^\s"'#]+)""")
+# Every `uses` key on a line, however it is written: it must be one USES reads.
+KEYS = re.compile(r"""(?m)^[^#\n]*?["']?\buses["']?[ \t]*:""")
 PINNED = re.compile(r"[^@\s]+@[0-9a-f]{40}")
 LOCAL = ("./", "docker://")
 
 
 def unpinned(text):
-    """Return the `uses:` references in `text` that name no commit SHA."""
+    """Return the `uses:` references in `text` that name no commit SHA, and
+    one entry per `uses` key it cannot read."""
+    refs = USES.findall(text)
+    unread = len(KEYS.findall(text)) - len(refs)
     return [
-        ref
-        for ref in USES.findall(text)
-        if not ref.startswith(LOCAL) and not PINNED.fullmatch(ref)
-    ]
+        ref for ref in refs if not ref.startswith(LOCAL) and not PINNED.fullmatch(ref)
+    ] + ["unreadable uses"] * unread
 
 
 def files():
@@ -58,6 +64,13 @@ class ActionPins(unittest.TestCase):
             with self.subTest(ref=ref):
                 self.assertEqual(unpinned(f"    steps:\n      - uses: {ref}\n"), [ref])
                 self.assertEqual(unpinned(f"    uses: '{ref}'\n"), [ref])
+        for text in (
+            "      - { uses: actions/checkout@v7 }\n",
+            "      - uses:\n          actions/checkout@v7\n",
+            '      - "uses": actions/checkout@v7\n',
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(unpinned(text), [])
         pinned = (
             "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
             "      - uses: ./.github/actions/select-xcode\n"
