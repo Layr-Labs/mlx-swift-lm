@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Every macOS job that runs on Darkbloom names a signed VM size.
+"""Every macOS job that runs on Darkbloom names a signed VM size and its run.
 
 A Darkbloom macOS job without a size gets the size that the repository's
 approval pins. Each macOS job here names its own size instead: in its runner
-label (`darkbloom-macos-arm64-4x16`), or, for a lane of
-`darkbloom-route.yml`, in the lane's size column. This test fails when:
+label (`darkbloom-macos-arm64-4x16-run-${{ github.run_id }}`), or, for a lane
+of `darkbloom-route.yml`, in the lane's size column. The `-run-<run id>`
+suffix scopes the label to the job's own run, as the route's labels are: a
+runner Darkbloom starts for one job can then take only a job of the same run
+and size, never another run's. This test fails when:
 
 - a job asks for a Darkbloom Mac without a size, or with a size that the
   image pipeline does not sign (4x16, 4x24, 8x16 and 12x32);
+- a job's Darkbloom macOS label is not scoped to its run;
 - a Linux route lane names a size (the route refuses one);
 - a job's size is not the size that SIZES gives it, or SIZES names a job
   that no workflow has (so a size changes only on purpose);
-- `.github/actionlint.yaml` does not list a used label, or still lists the
-  label without a size.
+- `.github/actionlint.yaml` does not list the label of a used size, or
+  still lists the label without a size.
 
 FORKDIFF.md (Job sizes) gives each size and the data behind it.
 
@@ -40,8 +44,9 @@ SIZES = {
 
 JOB = re.compile(r"(?m)^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?\n")
 RUNS_ON = re.compile(r"(?m)^    runs-on:(.*)$")
+RUN = r"-run-\$\{\{ github\.run_id \}\}"
 MACOS_LABELS = re.compile(
-    r"\[self-hosted, macOS, ARM64, " + MACOS + r"-([0-9]+x[0-9]+)\]"
+    r'\[self-hosted, macOS, ARM64, "' + MACOS + r"-([0-9]+x[0-9]+)" + RUN + r'"\]'
 )
 ROUTE = "    uses: ./.github/workflows/darkbloom-route.yml"
 LANES = re.compile(r"(?m)^      lanes: \|\n((?:        .*\n|[ \t]*\n)*)")
@@ -103,8 +108,9 @@ def macos_sizes(workflows):
             match = MACOS_LABELS.fullmatch(value)
             if not match:
                 errors.append(
-                    f"{where}: runs-on {value} names no size; use [self-hosted, "
-                    f"macOS, ARM64, {MACOS}-<size>], a size of {sorted(SIGNED)}"
+                    f"{where}: runs-on {value} names no size or no run; use "
+                    f'[self-hosted, macOS, ARM64, "{MACOS}-<size>-run-${{{{ github.run_id }}}}"], '
+                    f"a size of {sorted(SIGNED)}"
                 )
                 continue
             if match.group(1) not in SIGNED:
@@ -136,11 +142,14 @@ class RunnerSizes(unittest.TestCase):
             self.assertIn(f"{MACOS}-{size}", labels)
         self.assertNotIn(MACOS, labels)
 
-    def test_an_unsized_or_unsigned_job_fails(self):
+    def test_an_unsized_unsigned_or_unscoped_job_fails(self):
         # The check must block, not only pass: each of these is refused.
         job = "jobs:\n  a:\n    runs-on: [self-hosted, macOS, ARM64, {}]\n"
-        bare = job.format(MACOS)
-        unsigned = job.format(f"{MACOS}-6x12")
+        run = "-run-${{ github.run_id }}"
+        bare = job.format(f'"{MACOS}{run}"')
+        unsigned = job.format(f'"{MACOS}-6x12{run}"')
+        unscoped = job.format(f"{MACOS}-4x16")
+        other_run = job.format(f'"{MACOS}-4x16-run-${{{{ github.run_attempt }}}}"')
         block = f"jobs:\n  a:\n    runs-on:\n      - self-hosted\n      - {MACOS}\n"
         lane = (
             "jobs:\n  route:\n"
@@ -149,11 +158,11 @@ class RunnerSizes(unittest.TestCase):
             "        mac macos_arm64 xcode-27 ${{ inputs.mac && 1 || 0 }}\n"
             "        lin linux_arm64 ubuntu-24.04 1 4x16\n"
         )
-        for text in (bare, unsigned, block):
+        for text in (bare, unsigned, unscoped, other_run, block):
             with self.subTest(text=text):
                 self.assertNotEqual(macos_sizes({"x.yml": text})[1], [])
         self.assertEqual(len(macos_sizes({"x.yml": lane})[1]), 2)
-        sized = job.format(f"{MACOS}-4x16")
+        sized = job.format(f'"{MACOS}-4x16{run}"')
         self.assertEqual(macos_sizes({"x.yml": sized}), ({("x.yml", "a"): "4x16"}, []))
 
 

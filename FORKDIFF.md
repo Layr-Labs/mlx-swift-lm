@@ -115,6 +115,15 @@ headroom over its measured memory peak. A job that took less than 10 minutes
 must stay under 10 minutes. Build is the exception: every test job waits for
 it, and its cold build is CPU-bound, so it takes the largest signed size.
 
+The label also names the job's workflow run:
+`darkbloom-macos-arm64-4x16-run-${{ github.run_id }}`, the form that the
+route of Layr-Labs/d-inference gives its runners. Darkbloom starts a runner
+with the labels of the job it was started for. Without the run, a runner
+started for one run's 4x16 job (PR lint) could take another run's queued
+4x16 job (Metal library), and the job it was started for would wait for the
+next runner. Darkbloom refuses a job whose run label names another run.
+Jobs of one run and size still share their runners.
+
 The peak of a job is the larger of two sampler figures: used memory (app +
 wired + compressed) and the sum of the lifetime peak footprints of the
 runner user's processes. The second matters where memory is compressed:
@@ -137,7 +146,7 @@ three largest processes, the busy vCPUs and the sampled time scaled to 4 and
 8 vCPUs. Use these numbers to change a size. The Shard map job runs
 `.github/scripts/test-runner-sizes.py`. It fails when a macOS job names no
 size, a size that is not signed, or a size other than the one its table
-gives.
+gives, or when its label does not name its run.
 
 ## The gate
 
