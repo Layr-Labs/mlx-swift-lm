@@ -234,6 +234,8 @@ final class Inkling2MessageGate: Module {
         let fl: MLXArray
         let gl: MLXArray
         if Inkling2Fused.concatenationActive, let fused = _fused.weight {
+            // Inkling2StageFusion: both products and the tail in one kernel, same bits.
+            if let y = Inkling2StageFusion.messageGate(g, fused: fused, h: h, m: m) { return y }
             let both = Inkling2RowExact.fp32Rows(g, fused)
             let rows = forget.dim(0)
             (fl, gl) = (both[.ellipsis, ..<rows], both[.ellipsis, rows...])

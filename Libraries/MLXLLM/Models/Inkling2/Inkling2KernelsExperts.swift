@@ -163,6 +163,20 @@ extension Inkling2Kernels {
         const uint sg = simdgroup_index_in_threadgroup;
         """
 
+    /// The work item of a planned grouped GEMV: one (expert, first pair, count)
+    /// row of `items`; `ink2_list` lists the expert's pairs in ascending order
+    /// (`auto`: MLX binds a pair list of fewer than eight entries as `constant`).
+    private static let plannedGroupPreamble = """
+        const uint tid = thread_index_in_threadgroup;
+        const uint nt = threads_per_threadgroup.x;
+        const int expert = items[int(threadgroup_position_in_grid.y) * 3];
+        if (expert < 0) {
+            return;
+        }
+        const auto ink2_list = order + items[int(threadgroup_position_in_grid.y) * 3 + 1];
+        const int pairs = items[int(threadgroup_position_in_grid.y) * 3 + 2];
+        """
+
     /// The MMA products of one work item and the epilogue: gate/up rounded to
     /// T as projection outputs, softcapped SwiGLU in FP32 rounded to T; or the
     /// down projection rounded to T.
@@ -372,6 +386,27 @@ extension Inkling2Kernels {
     nonisolated(unsafe) static var expertDownRowsPerLane =
         Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_DOWN_ROWS"] ?? "") ?? 1
 
+    /// NVFP4 banks of the version-2 one-row GEMVs and of the grouped GEMVs
+    /// decode each k-slot pair from its raw byte right before its two FMAs,
+    /// so a lane keeps the raw words instead of 32 decoded weights and 32
+    /// widened inputs per row: the same products in the same order (tests
+    /// compare both forms). `DARKBLOOM_INKLING2_EXPERT_INORDER=0` decodes each
+    /// superblock first.
+    nonisolated(unsafe) static var expertInOrderDecode =
+        ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_INORDER"] != "0"
+    /// Grouped GEMVs of 2 to 8 rows take their work items from one `plan`
+    /// launch instead of gathering the pairs in every threadgroup (same
+    /// chains, same bits). `DARKBLOOM_INKLING2_EXPERT_GROUP_PLAN=0` keeps the
+    /// gathering in each threadgroup.
+    nonisolated(unsafe) static var expertGroupPlanned =
+        ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_PLAN"] != "0"
+    /// Gate/up rows per lane of the grouped GEMVs: 1 (gate and up rows in
+    /// adjacent lane groups) or 2 (both rows in one lane); same bits. The
+    /// one-row GEMV keeps its own choice (`expertUpRowsPerLane`).
+    /// `DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS`.
+    nonisolated(unsafe) static var expertGroupUpRowsPerLane =
+        Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS"] ?? "")
+        ?? 1
     /// Helpers of the version-2 one-row kernels. Each lane runs split-K chain
     /// `ks` (superblocks ks, ks + SK, ...) of R weight rows at once: one wide
     /// load per row and superblock, the 32 input values loaded and widened
@@ -518,16 +553,102 @@ extension Inkling2Kernels {
                 }
             }
 
-            // Input loader: one superblock's 32 values of a stored row as FP32.
+            // Input loader: one superblock's 32 values of a stored row as FP32
+            // (load32), or its raw words (two-byte T: eight values per uint4).
             template <typename T>
             struct ink2e_xdev {
                 const device T* xr;
                 inline void load32(int s, thread float* v) const { ink2e_inputs<T>(xr, s, v); }
+                inline void raw32(int s, thread uint4* u) const {
+                    const device uint4* p = (const device uint4*)(xr + s * 32);
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++) {
+                        u[b] = p[b];
+                    }
+                }
             };
+
+            // Component Q of a uint4 (Q a constant).
+            template <int Q>
+            inline uint ink2e_word(uint4 v) {
+                return Q == 0 ? v.x : Q == 1 ? v.y : Q == 2 ? v.z : v.w;
+            }
+
+            // Two two-byte values in one word widened to FP32, as ink2_load8 does.
+            template <typename T>
+            inline float2 ink2e_pair(uint w) {
+                if constexpr (metal::is_same_v<T, half>) {
+                    return float2(as_type<half2>(w));
+                } else {
+                    return float2(as_type<float>(w << 16), as_type<float>(w & 0xFFFF0000u));
+                }
+            }
+
+            // The two E2M1 nibbles of byte J of t (elements 2J and 2J + 1 of the
+            // word's eight) as FP32 times 2^-14: ink2e_e2m1_at's values. The two
+            // multiplies place each nibble's magnitude at bits 9..11 and its sign
+            // at bit 15 of its own 16-bit half (no carries: the shifted copies of
+            // the byte do not overlap).
+            template <int J>
+            inline float2 ink2e_e2m1_byte(uint t) {
+                const uint b = (t >> (8 * J)) & 0xFFu;
+                const uint h = ((b * 0x00200200u) & 0x0E000E00u) | ((b * 0x01001000u) & 0x80008000u);
+                return float2(as_type<half2>(h));
+            }
+
+            // K-slot pair (J, Q) of one NVFP4 superblock for R rows: elements
+            // Q * 8 + 2J and Q * 8 + 2J + 1, each weight times its block scale
+            // (ink2e_decode's value), the two FMAs per row in order.
+            template <int J, int Q, typename T, typename WT, int R>
+            inline void ink2e_inorder_pair(
+                uint4 xq, thread const ink2e_sb<WT, 1>* cur, thread const float* sa,
+                thread const float* sb, thread float* acc) {
+                const float2 xv = ink2e_pair<T>(ink2e_word<J>(xq));
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    const float2 w = ink2e_e2m1_byte<J>(ink2e_word<Q>(cur[r].q[0]))
+                        * (Q < 2 ? sa[r] : sb[r]);
+                    acc[r] = fma(w.x, xv.x, acc[r]);
+                    acc[r] = fma(w.y, xv.y, acc[r]);
+                }
+            }
+
+            // One NVFP4 superblock of R chains with the weights decoded in k-slot
+            // order (j, then the four eight-element blocks, then the pair): the
+            // FMAs of the decode-first form below, nothing decoded kept.
+            template <typename T, typename WT, int R>
+            inline void ink2e_inorder_step(
+                thread const uint4* xr, thread const ink2e_sb<WT, 1>* cur, thread float* acc) {
+                float sa[R];
+                float sb[R];
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    sa[r] = ink2_e4m3_shifted(cur[r].s & 0xFFu) * 4194304.0f;
+                    sb[r] = ink2_e4m3_shifted(cur[r].s >> 8) * 4194304.0f;
+                }
+                ink2e_inorder_pair<0, 0, T, WT, R>(xr[0], cur, sa, sb, acc);
+                ink2e_inorder_pair<0, 1, T, WT, R>(xr[1], cur, sa, sb, acc);
+                ink2e_inorder_pair<0, 2, T, WT, R>(xr[2], cur, sa, sb, acc);
+                ink2e_inorder_pair<0, 3, T, WT, R>(xr[3], cur, sa, sb, acc);
+                ink2e_inorder_pair<1, 0, T, WT, R>(xr[0], cur, sa, sb, acc);
+                ink2e_inorder_pair<1, 1, T, WT, R>(xr[1], cur, sa, sb, acc);
+                ink2e_inorder_pair<1, 2, T, WT, R>(xr[2], cur, sa, sb, acc);
+                ink2e_inorder_pair<1, 3, T, WT, R>(xr[3], cur, sa, sb, acc);
+                ink2e_inorder_pair<2, 0, T, WT, R>(xr[0], cur, sa, sb, acc);
+                ink2e_inorder_pair<2, 1, T, WT, R>(xr[1], cur, sa, sb, acc);
+                ink2e_inorder_pair<2, 2, T, WT, R>(xr[2], cur, sa, sb, acc);
+                ink2e_inorder_pair<2, 3, T, WT, R>(xr[3], cur, sa, sb, acc);
+                ink2e_inorder_pair<3, 0, T, WT, R>(xr[0], cur, sa, sb, acc);
+                ink2e_inorder_pair<3, 1, T, WT, R>(xr[1], cur, sa, sb, acc);
+                ink2e_inorder_pair<3, 2, T, WT, R>(xr[2], cur, sa, sb, acc);
+                ink2e_inorder_pair<3, 3, T, WT, R>(xr[3], cur, sa, sb, acc);
+            }
+
             // Chain `ks` of R consecutive stored rows (from `row0`) against one
             // input row: acc[r] gets ink2_row_chain's value for row r. The next
-            // superblock's loads are issued before this one's FMAs.
-            template <typename XL, typename WT, int FMT, int K, int SK, int R>
+            // superblock's loads are issued before this one's FMAs. IO 1 (NVFP4
+            // weights, two-byte inputs): the in-order decode; same FMAs.
+            template <typename T, typename XL, typename WT, int FMT, int K, int SK, int R, int IO>
             inline void ink2e_chains(
                 XL xl, const device WT* row0, const device uchar* srow0, int ks, thread float* acc) {
                 #pragma unroll
@@ -551,21 +672,27 @@ extension Inkling2Kernels {
                     for (int r = 0; r < R; r++) {
                         nxt[r] = ink2e_load<WT, FMT>(row0 + r * rs, srow0 + r * ss, sn);
                     }
-                    float xv[32];
-                    xl.load32(s, xv);
-                    float wv[R][32];
-                    #pragma unroll
-                    for (int r = 0; r < R; r++) {
-                        ink2e_decode<WT, FMT>(cur[r], wv[r]);
-                    }
-                    #pragma unroll
-                    for (int j = 0; j < 4; j++) {
+                    if constexpr (IO == 1 && FMT == 1 && sizeof(T) == 2) {
+                        uint4 xr[4];
+                        xl.raw32(s, xr);
+                        ink2e_inorder_step<T, WT, R>(xr, cur, acc);
+                    } else {
+                        float xv[32];
+                        xl.load32(s, xv);
+                        float wv[R][32];
                         #pragma unroll
-                        for (int c = 0; c < 8; c++) {
-                            const int k = (c / 2) * 8 + 2 * j + (c & 1);
+                        for (int r = 0; r < R; r++) {
+                            ink2e_decode<WT, FMT>(cur[r], wv[r]);
+                        }
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
                             #pragma unroll
-                            for (int r = 0; r < R; r++) {
-                                acc[r] = fma(wv[r][k], xv[k], acc[r]);
+                            for (int c = 0; c < 8; c++) {
+                                const int k = (c / 2) * 8 + 2 * j + (c & 1);
+                                #pragma unroll
+                                for (int r = 0; r < R; r++) {
+                                    acc[r] = fma(wv[r][k], xv[k], acc[r]);
+                                }
                             }
                         }
                     }
@@ -606,8 +733,10 @@ extension Inkling2Kernels {
             // input rows of up to MAXP pairs (np used): every superblock's weights
             // are loaded and decoded once, then each pair runs its own chain in
             // the k-slot order, so acc[p][r] equals ink2_row_chain for that pair.
-            // Pair p's input row is x + (list[p] / DIV) * K.
-            template <typename T, typename WT, int FMT, int K, int SK, int R, int MAXP, int DIV, typename PL>
+            // Pair p's input row is x + (list[p] / DIV) * K. IO 1 (NVFP4 weights,
+            // two-byte inputs): each pair decodes the superblock again in k-slot
+            // order instead (nothing decoded kept between pairs); same FMAs.
+            template <typename T, typename WT, int FMT, int K, int SK, int R, int MAXP, int DIV, int IO, typename PL>
             inline void ink2e_group_chains(
                 const device T* x, PL list, int np, const device WT* row0, const device uchar* srow0,
                 int ks, thread float* acc) {
@@ -635,24 +764,35 @@ extension Inkling2Kernels {
                     for (int r = 0; r < R; r++) {
                         nxt[r] = ink2e_load<WT, FMT>(row0 + r * rs, srow0 + r * ss, sn);
                     }
-                    float wv[R][32];
-                    #pragma unroll
-                    for (int r = 0; r < R; r++) {
-                        ink2e_decode<WT, FMT>(cur[r], wv[r]);
-                    }
-                    #pragma unroll
-                    for (int p = 0; p < MAXP; p++) {
-                        if (p < np) {
-                            float xv[32];
-                            ink2e_inputs<T>(x + size_t(int(list[p]) / DIV) * K, s, xv);
-                            #pragma unroll
-                            for (int j = 0; j < 4; j++) {
+                    if constexpr (IO == 1 && FMT == 1 && sizeof(T) == 2) {
+                        #pragma unroll
+                        for (int p = 0; p < MAXP; p++) {
+                            if (p < np) {
+                                uint4 xr[4];
+                                ink2e_xdev<T>{x + size_t(int(list[p]) / DIV) * K}.raw32(s, xr);
+                                ink2e_inorder_step<T, WT, R>(xr, cur, acc + p * R);
+                            }
+                        }
+                    } else {
+                        float wv[R][32];
+                        #pragma unroll
+                        for (int r = 0; r < R; r++) {
+                            ink2e_decode<WT, FMT>(cur[r], wv[r]);
+                        }
+                        #pragma unroll
+                        for (int p = 0; p < MAXP; p++) {
+                            if (p < np) {
+                                float xv[32];
+                                ink2e_inputs<T>(x + size_t(int(list[p]) / DIV) * K, s, xv);
                                 #pragma unroll
-                                for (int c = 0; c < 8; c++) {
-                                    const int k = (c / 2) * 8 + 2 * j + (c & 1);
+                                for (int j = 0; j < 4; j++) {
                                     #pragma unroll
-                                    for (int r = 0; r < R; r++) {
-                                        acc[p * R + r] = fma(wv[r][k], xv[k], acc[p * R + r]);
+                                    for (int c = 0; c < 8; c++) {
+                                        const int k = (c / 2) * 8 + 2 * j + (c & 1);
+                                        #pragma unroll
+                                        for (int r = 0; r < R; r++) {
+                                            acc[p * R + r] = fma(wv[r][k], xv[k], acc[p * R + r]);
+                                        }
                                     }
                                 }
                             }
@@ -700,7 +840,8 @@ extension Inkling2Kernels {
             const device WT* row0 = w + r0 * ink2_row_stride<FMT, K>();
             const device uchar* srow0 = sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>());
             float acc[RU];
-            ink2e_chains<ink2e_xdev<T>, WT, FMT, K, SK, RU>(ink2e_xdev<T>{xr}, row0, srow0, sub, acc);
+            ink2e_chains<T, ink2e_xdev<T>, WT, FMT, K, SK, RU, IO>(
+                ink2e_xdev<T>{xr}, row0, srow0, sub, acc);
             float g = ink2e_chain_total<SK>(acc[0]);
             float u = RU == 2 ? ink2e_chain_total<SK>(acc[RU - 1]) : simd_shuffle_down(g, ushort(SK));
             if (valid && sub == 0 && hsel == 0) {
@@ -733,7 +874,7 @@ extension Inkling2Kernels {
             const device WT* row0 = w + r0 * ink2_row_stride<FMT, K>();
             const device uchar* srow0 = sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>());
             float acc[RD];
-            ink2e_chains<ink2e_xdev<T>, WT, FMT, K, SK, RD>(
+            ink2e_chains<T, ink2e_xdev<T>, WT, FMT, K, SK, RD, IO>(
                 ink2e_xdev<T>{x + size_t(pair) * K}, row0, srow0, sub, acc);
             float v[RD];
             #pragma unroll
@@ -756,65 +897,85 @@ extension Inkling2Kernels {
     /// once per superblock and runs one chain per pair (the one-row bits).
     /// Gate/up: RU 2 runs the gate and up rows in one lane, RU 1 in adjacent
     /// lane groups; 256 / SK lanes groups per threadgroup.
+    private static let gateUpGroupBody = """
+
+        const int sub = int(tid) % SK;
+        const int local = int(tid) / SK;
+        const int hsel = RU == 1 ? local % 2 : 0;
+        const int perTile = int(nt) / SK / (3 - RU);
+        const int i = int(threadgroup_position_in_grid.x) * perTile + local / (3 - RU);
+        const bool valid = i < N / 2;
+        const size_t r0 = size_t(expert) * N + size_t(2 * (valid ? i : 0) + hsel);
+        float acc[MAXP * RU];
+        ink2e_group_chains<T, WT, FMT, K, SK, RU, MAXP, TOPK, IO>(
+            x, ink2_list, pairs, w + r0 * ink2_row_stride<FMT, K>(),
+            sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>()), sub, acc);
+        const float inv = FMT == 1 ? gs[expert] / 2688.0f : 1.0f;
+        #pragma unroll
+        for (int p = 0; p < MAXP; p++) {
+            float g = ink2e_chain_total<SK>(acc[p * RU]);
+            float u = RU == 2 ? ink2e_chain_total<SK>(acc[p * RU + RU - 1])
+                : simd_shuffle_down(g, ushort(SK));
+            if (p < pairs && valid && sub == 0 && hsel == 0) {
+                g = float(static_cast<T>(g * inv));
+                u = float(static_cast<T>(u * inv));
+                const float gated = (metal::precise::tanh(g / caps[0]) * caps[0])
+                    * (1.0f / (1.0f + metal::precise::exp(-g)));
+                const float a = gated * (metal::precise::tanh(u / caps[1]) * caps[1]);
+                out[size_t(ink2_list[p]) * (N / 2) + i] = static_cast<T>(a);
+            }
+        }
+        """
+
     private static let gateUpGroupKernel = MLXFast.metalKernel(
         name: "inkling2_experts_gate_up_group",
         inputNames: ["x", "idx", "w", "sc", "gs", "caps"],
         outputNames: ["out"],
-        source: expertPreamble + """
+        source: expertPreamble + gateUpGroupBody,
+        header: expertsGemvHeader)
 
-            const int sub = int(tid) % SK;
-            const int local = int(tid) / SK;
-            const int hsel = RU == 1 ? local % 2 : 0;
-            const int perTile = int(nt) / SK / (3 - RU);
-            const int i = int(threadgroup_position_in_grid.x) * perTile + local / (3 - RU);
-            const bool valid = i < N / 2;
-            const size_t r0 = size_t(expert) * N + size_t(2 * (valid ? i : 0) + hsel);
-            float acc[MAXP * RU];
-            ink2e_group_chains<T, WT, FMT, K, SK, RU, MAXP, TOPK>(
-                x, ink2_list, pairs, w + r0 * ink2_row_stride<FMT, K>(),
-                sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>()), sub, acc);
-            const float inv = FMT == 1 ? gs[expert] / 2688.0f : 1.0f;
-            #pragma unroll
-            for (int p = 0; p < MAXP; p++) {
-                float g = ink2e_chain_total<SK>(acc[p * RU]);
-                float u = RU == 2 ? ink2e_chain_total<SK>(acc[p * RU + RU - 1])
-                    : simd_shuffle_down(g, ushort(SK));
-                if (p < pairs && valid && sub == 0 && hsel == 0) {
-                    g = float(static_cast<T>(g * inv));
-                    u = float(static_cast<T>(u * inv));
-                    const float gated = (metal::precise::tanh(g / caps[0]) * caps[0])
-                        * (1.0f / (1.0f + metal::precise::exp(-g)));
-                    const float a = gated * (metal::precise::tanh(u / caps[1]) * caps[1]);
-                    out[size_t(ink2_list[p]) * (N / 2) + i] = static_cast<T>(a);
-                }
-            }
-            """,
+    /// The same grouped GEMV with its work item from the `plan` launch.
+    private static let plannedGateUpGroupKernel = MLXFast.metalKernel(
+        name: "inkling2_experts_gate_up_group_planned",
+        inputNames: ["x", "items", "order", "w", "sc", "gs", "caps"],
+        outputNames: ["out"],
+        source: plannedGroupPreamble + gateUpGroupBody,
         header: expertsGemvHeader)
 
     /// Down projection of 2 to MAXP rows: one output row per lane group.
+    private static let downGroupBody = """
+
+        const int sub = int(tid) % SK;
+        const int n = int(threadgroup_position_in_grid.x) * (int(nt) / SK) + int(tid) / SK;
+        const bool valid = n < N;
+        const size_t r0 = size_t(expert) * N + size_t(valid ? n : 0);
+        float acc[MAXP];
+        ink2e_group_chains<T, WT, FMT, K, SK, 1, MAXP, 1, IO>(
+            x, ink2_list, pairs, w + r0 * ink2_row_stride<FMT, K>(),
+            sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>()), sub, acc);
+        const float inv = FMT == 1 ? gs[expert] / 2688.0f : 1.0f;
+        #pragma unroll
+        for (int p = 0; p < MAXP; p++) {
+            const float v = ink2e_chain_total<SK>(acc[p]);
+            if (p < pairs && valid && sub == 0) {
+                out[size_t(ink2_list[p]) * N + n] = static_cast<T>(v * inv);
+            }
+        }
+        """
+
     private static let downGroupKernel = MLXFast.metalKernel(
         name: "inkling2_experts_down_group",
         inputNames: ["x", "idx", "w", "sc", "gs"],
         outputNames: ["out"],
-        source: expertPreamble + """
+        source: expertPreamble + downGroupBody,
+        header: expertsGemvHeader)
 
-            const int sub = int(tid) % SK;
-            const int n = int(threadgroup_position_in_grid.x) * (int(nt) / SK) + int(tid) / SK;
-            const bool valid = n < N;
-            const size_t r0 = size_t(expert) * N + size_t(valid ? n : 0);
-            float acc[MAXP];
-            ink2e_group_chains<T, WT, FMT, K, SK, 1, MAXP, 1>(
-                x, ink2_list, pairs, w + r0 * ink2_row_stride<FMT, K>(),
-                sc + (FMT == 0 ? size_t(0) : r0 * ink2_scale_stride<FMT, K>()), sub, acc);
-            const float inv = FMT == 1 ? gs[expert] / 2688.0f : 1.0f;
-            #pragma unroll
-            for (int p = 0; p < MAXP; p++) {
-                const float v = ink2e_chain_total<SK>(acc[p]);
-                if (p < pairs && valid && sub == 0) {
-                    out[size_t(ink2_list[p]) * N + n] = static_cast<T>(v * inv);
-                }
-            }
-            """,
+    /// The same grouped GEMV with its work item from the `plan` launch.
+    private static let plannedDownGroupKernel = MLXFast.metalKernel(
+        name: "inkling2_experts_down_group_planned",
+        inputNames: ["x", "items", "order", "w", "sc", "gs"],
+        outputNames: ["out"],
+        source: plannedGroupPreamble + downGroupBody,
         header: expertsGemvHeader)
 
     /// One-row steps: one thread per (pair, output) with `ink2_row_dot`, the
@@ -1061,8 +1222,16 @@ extension Inkling2Kernels {
         let nsg = expertSimdgroups
         let tm = 8
         let pairs = rows * topK
-        // Launch keys carry every template flag (table decode, narrow operands).
-        let flags = (nvfp4Table ? 100 : 0) + (narrowOperands ? 1000 : 0)
+        // Launch keys carry every template flag (table decode, narrow operands,
+        // in-order decode).
+        let flags =
+            (nvfp4Table ? 100 : 0) + (narrowOperands ? 1000 : 0)
+            + (expertInOrderDecode ? 100_000 : 0)
+        // The in-order NVFP4 decode reads the inputs as raw words: two-byte types.
+        func inOrder(_ bank: Inkling2ExpertWeights) -> Bool {
+            expertInOrderDecode && bank.format == .nvfp4
+                && (x.dtype == .bfloat16 || x.dtype == .float16)
+        }
 
         func inputs(_ bank: Inkling2ExpertWeights) -> [MLXArray] {
             [bank.weight, bank.scales ?? constants.byte, bank.globalScale ?? constants.one]
@@ -1074,7 +1243,7 @@ extension Inkling2Kernels {
                 ("PF", pf), ("MAXRB", maxRB(rows)),
                 ("T", x.dtype), ("WT", bank.weight.dtype), ("FMT", bank.formatCode), ("N", n),
                 ("K", k), ("E", experts), ("TOPK", topK), ("NSG", nsg), ("SK", expertSK(k)),
-                ("TBLON", nvfp4Table),
+                ("TBLON", nvfp4Table), ("IO", inOrder(bank) ? 1 : 0),
                 (
                     "OPT",
                     operandType(x: x.dtype, weight: bank.weight.dtype, dense: bank.format == .dense)
@@ -1163,15 +1332,29 @@ extension Inkling2Kernels {
         if expertGroupGemv, rows >= 2, rows <= expertGroupMaxRows, pairs <= pairsPerChunk,
             upOperand != .float32, downOperand != .float32, gemvSite("up"), gemvSite("down")
         {
-            let gru = expertUpRowsPerLane == 1 && 2 * expertSK(hidden) <= 32 ? 1 : 2
+            let gru = expertGroupUpRowsPerLane == 1 && 2 * expertSK(hidden) <= 32 ? 1 : 2
             let upPerTile = 256 / expertSK(hidden) / (3 - gru)
             let downPerTile = 256 / expertSK(intermediate)
+            // Work items: gathered in every threadgroup, or once by the `plan` launch.
+            let groupPlanned = expertGroupPlanned
+            var groupRouting: [MLXArray] = [idx]
+            if groupPlanned {
+                let planThreads = min(1024, (experts * max(1, 1024 / experts) + 31) / 32 * 32)
+                let planKey = LaunchKey(kernel: 3, dtype: .uint32, a: experts, b: topK, c: rows)
+                let planLaunch = launches.launch(planKey) {
+                    planKernel.prepare(
+                        template: [("E", experts), ("TOPK", topK), ("ITEMS", slots)],
+                        grid: (planThreads, 1, 1), threadGroup: (planThreads, 1, 1),
+                        outputShapes: [[slots * 3], [pairs]], outputDTypes: [.int32, .int32])
+                }
+                groupRouting = planLaunch([idx])
+            }
             let upKey = LaunchKey(
                 kernel: 54 + flags, dtype: x.dtype, weightType: gateUp.weight.dtype,
-                a: gateUp.formatCode + 10 * gru, b: gateUp.outputs, c: hidden, d: experts,
-                e: topK, f: rows)
+                a: gateUp.formatCode + 10 * gru + (groupPlanned ? 100 : 0), b: gateUp.outputs,
+                c: hidden, d: experts, e: topK, f: rows)
             let upLaunch = launches.launch(upKey) {
-                gateUpGroupKernel.prepare(
+                (groupPlanned ? plannedGateUpGroupKernel : gateUpGroupKernel).prepare(
                     template: template(gateUp, n: gateUp.outputs, k: hidden, pf: 1) + [
                         ("RU", gru), ("MAXP", rows),
                     ],
@@ -1179,19 +1362,20 @@ extension Inkling2Kernels {
                     threadGroup: (256, 1, 1),
                     outputShapes: [[pairs, intermediate]], outputDTypes: [x.dtype])
             }
-            let activated = upLaunch([x, idx] + inputs(gateUp) + [constants.caps(gateCap, upCap)])[
-                0]
+            let activated = upLaunch(
+                [x] + groupRouting + inputs(gateUp) + [constants.caps(gateCap, upCap)])[0]
             let downKey = LaunchKey(
                 kernel: 55 + flags, dtype: x.dtype, weightType: down.weight.dtype,
-                a: down.formatCode, b: hidden, c: intermediate, d: experts, e: topK, f: rows)
+                a: down.formatCode + (groupPlanned ? 100 : 0), b: hidden, c: intermediate,
+                d: experts, e: topK, f: rows)
             let downLaunch = launches.launch(downKey) {
-                downGroupKernel.prepare(
+                (groupPlanned ? plannedDownGroupKernel : downGroupKernel).prepare(
                     template: template(down, n: hidden, k: intermediate, pf: 1) + [("MAXP", rows)],
                     grid: ((hidden + downPerTile - 1) / downPerTile * 256, slots, 1),
                     threadGroup: (256, 1, 1),
                     outputShapes: [[pairs, hidden]], outputDTypes: [x.dtype])
             }
-            return downLaunch([activated, idx] + inputs(down))[0]
+            return downLaunch([activated] + groupRouting + inputs(down))[0]
         }
 
         // Small steps find their work items inside each threadgroup; larger ones

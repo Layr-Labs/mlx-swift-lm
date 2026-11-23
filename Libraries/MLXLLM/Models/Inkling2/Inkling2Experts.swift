@@ -132,9 +132,32 @@ final class Inkling2Router: Module {
         self.routeScale = routeScale
     }
 
+    /// `DARKBLOOM_INKLING2_PREFILL_ROUTER_SELECT=0` keeps the graph below
+    /// after the logits of a prompt chunk.
+    static let selectKernelEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_PREFILL_ROUTER_SELECT"]?
+            .lowercased()
+        return raw.map { !["0", "false", "off", "no"].contains($0) } ?? true
+    }()
+
+    /// Test hook: overrides `selectKernelEnabled` for the current task.
+    @TaskLocal static var selectKernelOverride: Bool? = nil
+
     /// `x`: `[N, hidden]`. Returns expert indices `[N, k]` (uint32) and weights `[N, k]` FP32.
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let logits = Inkling2RowExact.fp32Rows(x, weight)
+        // One select kernel per row gives the graph's bits: MLX's argPartition
+        // is a stable full sort, so its first k indices are the kernel's picks
+        // (selection descending, lower expert on a tie), added in that order.
+        if Self.selectKernelOverride ?? Self.selectKernelEnabled, !Inkling2RowExact.active,
+            logits.ndim == 2, logits.dtype == .float32, bias.dtype == .float32,
+            topK <= weight.dim(0)
+        {
+            let (indices, weights, selection) = Inkling2Kernels.select(self, logits: logits)
+            Inkling2Diagnostics.routerIndices?(indices)
+            Inkling2Diagnostics.routerSelection?(selection)
+            return (indices, weights)
+        }
         let scores = sigmoid(logits)
         let selection = scores + bias.asType(.float32)
         let k = topK

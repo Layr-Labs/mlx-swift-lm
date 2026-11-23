@@ -421,6 +421,8 @@ public enum Inkling2PagedAttention {
             } else if b <= fusedMaximumBatch && plan.maxPartitions <= fusedMaximumPartitions
                 && fusedStates * 4 <= fusedWorkspaceLimit
                 && segmentList.count <= fusedMaximumSegmentBindings
+                && !(fusedMultiBlockCap && (splitQPT * gqa + 7) / 8 > 1
+                    && plan.maxPartitions > fusedMultiBlockMaximumPartitions)
             {
                 pass = .fused
             } else {
@@ -755,6 +757,17 @@ public enum Inkling2PagedAttention {
         }
         return qpt
     }
+
+    /// Most partitions `.automatic` runs fused when the threadgroup holds more
+    /// than one block (verification windows): past it the one-dispatch tail
+    /// (each group's last threadgroup merging every partition) costs more
+    /// than the split kernel's merge pass (M5 Max, full 1.9K history, 16
+    /// partitions: 8-token windows 1 row 106.5 vs 74.7 us, 4 rows 320 vs 246;
+    /// at 9 partitions equal). Same bits either way.
+    public static let fusedMultiBlockMaximumPartitions = 9
+    /// `DARKBLOOM_INKLING2_ATTN_FUSED_CAP=0` turns the cap off (A/B).
+    static let fusedMultiBlockCap =
+        ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_ATTN_FUSED_CAP"] != "0"
 
     /// Rows from which the one-dispatch kernel runs one simdgroup per block.
     public static let fusedOneSimdgroupRows = 3

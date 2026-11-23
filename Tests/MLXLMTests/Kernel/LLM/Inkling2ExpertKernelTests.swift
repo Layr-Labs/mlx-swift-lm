@@ -110,22 +110,25 @@ extension KernelTests {
             return out
         }
 
-        /// Runs `body` with the one-row GEMV version and rows per lane set.
+        /// Runs `body` with the one-row GEMV version and rows per lane set (the
+        /// grouped GEMVs take the same gate/up rows per lane).
         static func withGemv<R>(
             _ version: Int, downRows: Int = 1, upRows: Int = 2, _ body: () throws -> R
         ) rethrows -> R {
-            let (v, d, u) = (
+            let (v, d, u, g) = (
                 Inkling2Kernels.expertGemvVersion, Inkling2Kernels.expertDownRowsPerLane,
-                Inkling2Kernels.expertUpRowsPerLane
+                Inkling2Kernels.expertUpRowsPerLane, Inkling2Kernels.expertGroupUpRowsPerLane
             )
             defer {
                 Inkling2Kernels.expertGemvVersion = v
                 Inkling2Kernels.expertDownRowsPerLane = d
                 Inkling2Kernels.expertUpRowsPerLane = u
+                Inkling2Kernels.expertGroupUpRowsPerLane = g
             }
             Inkling2Kernels.expertGemvVersion = version
             Inkling2Kernels.expertDownRowsPerLane = downRows
             Inkling2Kernels.expertUpRowsPerLane = upRows
+            Inkling2Kernels.expertGroupUpRowsPerLane = upRows
             return try body()
         }
 
@@ -177,6 +180,76 @@ extension KernelTests {
                             "\(format) \(shape) rows \(rows)")
                     }
                 }
+            }
+        }
+
+        /// The in-order NVFP4 decode and the planned work items give the bits of
+        /// the decode-first GEMVs that gather their pairs in each threadgroup
+        /// (one-row and grouped GEMVs, every rows-per-lane choice).
+        @Test(arguments: [Inkling2ExpertFormat.nvfp4, .mxfp8, .dense])
+        func inOrderDecodeAndPlannedItemsKeepTheBits(format: Inkling2ExpertFormat) throws {
+            let topK = 8
+            let saved = (Inkling2Kernels.expertInOrderDecode, Inkling2Kernels.expertGroupPlanned)
+            defer {
+                Inkling2Kernels.expertInOrderDecode = saved.0
+                Inkling2Kernels.expertGroupPlanned = saved.1
+            }
+            for (si, shape) in Self.shapes.enumerated() {
+                let (hidden, intermediate) = shape
+                let experts = hidden > 1024 ? 24 : 48
+                let up = Self.randomBank(
+                    format, experts: experts, outputs: 2 * intermediate, inputs: hidden,
+                    seed: UInt64(231 + si))
+                let down = Self.randomBank(
+                    format, experts: experts, outputs: hidden, inputs: intermediate,
+                    seed: UInt64(241 + si))
+                let x = (MLXRandom.normal([8, hidden], key: MLXRandom.key(251)) * 0.5)
+                    .asType(.bfloat16)
+                let (indices, _) = Self.routing(rows: 8, experts: experts, topK: topK, seed: 261)
+                for rows in [1, 2, 4, 8] {
+                    let (xr, ids) = (x[0 ..< rows], indices[0 ..< rows])
+                    Inkling2Kernels.expertInOrderDecode = false
+                    Inkling2Kernels.expertGroupPlanned = false
+                    let base = try Self.withGemv(2) { try Self.pairOutputs(xr, ids, up, down) }
+                    for (inOrder, planned) in [(true, false), (false, true), (true, true)] {
+                        Inkling2Kernels.expertInOrderDecode = inOrder
+                        Inkling2Kernels.expertGroupPlanned = planned
+                        for (upRows, downRows) in [(2, 1), (1, 1), (2, 2)] {
+                            let out = try Self.withGemv(2, downRows: downRows, upRows: upRows) {
+                                try Self.pairOutputs(xr, ids, up, down)
+                            }
+                            #expect(
+                                Self.bitsEqual(out, base),
+                                "\(format) \(shape) rows \(rows) in-order \(inOrder) planned \(planned) up \(upRows) down \(downRows)"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Planned grouped GEMVs with fewer than eight (row, slot) pairs (MLX binds
+        /// such a pair list in another address space) give the unplanned bits.
+        @Test func plannedGroupedGemvTakesShortPairLists() throws {
+            let saved = Inkling2Kernels.expertGroupPlanned
+            defer { Inkling2Kernels.expertGroupPlanned = saved }
+            let (hidden, intermediate, experts) = (512, 256, 16)
+            let up = Self.randomBank(
+                .nvfp4, experts: experts, outputs: 2 * intermediate, inputs: hidden, seed: 331)
+            let down = Self.randomBank(
+                .nvfp4, experts: experts, outputs: hidden, inputs: intermediate, seed: 341)
+            let x = (MLXRandom.normal([3, hidden], key: MLXRandom.key(351)) * 0.5).asType(.bfloat16)
+            for (rows, topK) in [(2, 2), (3, 2), (2, 3)] {
+                let (indices, _) = Self.routing(rows: rows, experts: experts, topK: topK, seed: 361)
+                var outputs: [MLXArray] = []
+                for planned in [false, true] {
+                    Inkling2Kernels.expertGroupPlanned = planned
+                    outputs.append(
+                        try Self.withGemv(2) {
+                            try Self.pairOutputs(x[0 ..< rows], indices, up, down)
+                        })
+                }
+                #expect(Self.bitsEqual(outputs[1], outputs[0]), "rows \(rows) topK \(topK)")
             }
         }
 
