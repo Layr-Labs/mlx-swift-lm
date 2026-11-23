@@ -7,17 +7,18 @@ name: Fork Tests
 #
 # One job builds the package and its tests, and lists the tests. Another job
 # builds the full Metal library at the same time. Both hand their products to
-# the test jobs as artifacts. Runs that are not for a pull request also save
-# them in the Actions cache, for later runs to restore. The test jobs start
-# beside them, as soon as the shard map is ready: each gets its Mac, checks out
-# and selects Xcode during the build, then waits for both jobs
+# the test jobs as artifacts. Runs on main also save them in the Actions
+# cache, for later runs to restore. The test jobs start beside them, as soon
+# as the shard map is ready: each gets its Mac, checks out and selects Xcode
+# during the build, then waits for both jobs
 # (.github/scripts/wait-for-products.py), downloads the products and runs.
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
 #
 # Compute jobs queue directly for a Darkbloom Sandbox, one job at a time.
-# Push and manual runs save caches when the sandbox provides its own cache.
+# Push and manual runs on main save caches when the sandbox provides its own
+# cache. The Darkbloom cache refuses saves from a manual run on another branch.
 # Seven audio decoder tests temporarily stay hosted after the unchanged base
 # reproduced strict PCM-bit failures on native macOS. Their assertions remain intact.
 
@@ -39,8 +40,6 @@ concurrency:
 env:
   # Float32 parity oracles require full precision on TF32-capable GPUs.
   MLX_ENABLE_TF32: "0"
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
   plan:
@@ -65,6 +64,10 @@ jobs:
       - name: Test the wait for the products
         run: python3 .github/scripts/test-wait-for-products.py
 
+      - name: Test that every action is pinned
+        # The organization starts no workflow that uses an action by a tag.
+        run: python3 .github/scripts/test-action-pins.py
+
       - name: Read the shard numbers
         id: matrix
         # The seven-test audio exception uses its separate hosted shard.
@@ -79,21 +82,13 @@ jobs:
     name: Build
     # Every test job waits for this cold, CPU-bound build: it takes the
     # largest signed size (FORKDIFF.md, Job sizes).
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-12x32]
+    runs-on: [self-hosted, macOS, ARM64, "darkbloom-macos-arm64-12x32-run-${{ github.run_id }}"]
     permissions:
       contents: read
     timeout-minutes: 90
     outputs:
       workspace: ${{ steps.products.outputs.workspace }}
       developer-dir: ${{ steps.products.outputs.developer-dir }}
-    env:
-      CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
-      CCACHE_BASEDIR: ${{ github.workspace }}
-      CCACHE_MAXSIZE: 3G
-      # SwiftPM compiles the C targets with -fmodules. ccache caches them
-      # only with the modules sloppiness. The restored headers keep their
-      # time stamps, so ccache can also ignore the header times.
-      CCACHE_SLOPPINESS: modules,include_file_mtime,include_file_ctime,time_macros,pch_defines,system_headers
     steps:
       # Before every cache step: a Darkbloom Sandbox that the plane gave no
       # Darkbloom cache would reach GitHub's own Actions cache, so there every
@@ -148,16 +143,6 @@ jobs:
             fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift') }}-
             fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
 
-      - name: Restore the C and C++ compiler cache
-        id: ccache
-        if: env.CI_ACTIONS_CACHE != 'off'
-        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
-        with:
-          path: /Users/runner/Library/Caches/ccache-fork-tests
-          key: fork-ccache-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ github.sha }}
-          restore-keys: |
-            fork-ccache-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
-
       - name: Remove cached Metal libraries and coverage data
         # The metallib job builds the Metal library from the current sources.
         # The unit tests fail when the build folder contains a Metal library.
@@ -182,46 +167,21 @@ jobs:
         # -enable-incremental-file-hashing lets the Swift driver keep the
         # restored objects of a file whose content did not change. The
         # checkout gives every file a new modification time.
-        # SwiftPM gives the C and C++ files to the compiler in CC, here
-        # through ccache. Without ccache, and when Homebrew is missing or
-        # cannot install it, the build runs without it. Without a cache,
-        # ccache has nothing to hit, so it is neither installed nor used.
+        # SwiftPM gives the C and C++ files to the selected Xcode's clang (CC).
         run: |
-          use_ccache=false
-          if [ "${CI_ACTIONS_CACHE:-}" != off ]; then
-            if ! command -v ccache > /dev/null && command -v brew > /dev/null; then
-              brew install ccache || echo "::warning title=No ccache::brew install ccache failed. The C and C++ files build without ccache."
-            fi
-            command -v ccache > /dev/null && use_ccache=true
-          fi
-          wrapper=$(xcrun -f clang)
-          if [ "$use_ccache" = true ]; then
-            ccache --zero-stats > /dev/null
-            wrapper=$RUNNER_TEMP/ccache-clang
-            printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -f clang)" > "$wrapper"
-            chmod +x "$wrapper"
-          elif [ "${CI_ACTIONS_CACHE:-}" != off ] && ! command -v brew > /dev/null; then
-            echo "::warning title=No ccache::This runner has no ccache and no Homebrew. The C and C++ files build without ccache."
-          fi
           start=$(date +%s)
           # Swift 6.4 defaults to Swift Build; every SwiftPM call here uses the native
           # build system, so --skip-build and --show-bin-path find these products.
-          CC=$wrapper swift build --build-system native --build-tests --enable-code-coverage --disable-index-store \
+          CC=$(xcrun -f clang) swift build --build-system native --build-tests --enable-code-coverage --disable-index-store \
             -debug-info-format none \
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-          if [ "$use_ccache" = true ]; then
-            ccache --show-stats -v
-            grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
-          fi
           # The test jobs use the same package versions. Package.resolved
           # stays in .build, so the cache paths do not change.
           cp Package.resolved .build/fork-tests-Package.resolved
-          du -sh .build ~/Library/Caches/org.swift.swiftpm "$CCACHE_DIR" || true
+          du -sh .build ~/Library/Caches/org.swift.swiftpm || true
           echo "Build: $(( elapsed / 60 )) min $(( elapsed % 60 )) s (cache: ${{ steps.cache.outputs.cache-matched-key || 'none' }})" >> "$GITHUB_STEP_SUMMARY"
-        env:
-          CCACHE_LOGFILE: ${{ runner.temp }}/ccache.log
 
       - name: List the tests
         # The test jobs select their tests from this list. The shard map
@@ -268,8 +228,8 @@ jobs:
 
       - name: Save the build cache
         # The next build restores this entry. An exact hit means that the
-        # entry already exists. Pull requests only restore caches.
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        # entry already exists. Only runs on main save; others only restore.
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
@@ -278,13 +238,6 @@ jobs:
             .build
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
-      - name: Save the C and C++ compiler cache
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.ccache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
-        with:
-          path: /Users/runner/Library/Caches/ccache-fork-tests
-          key: ${{ steps.ccache.outputs.cache-primary-key }}
-
       - name: Report the resource samples
         # Prints the peaks that size this job (FORKDIFF.md, Job sizes). Report-only.
         if: ${{ always() }}
@@ -292,7 +245,7 @@ jobs:
 
   metallib:
     name: Metal library
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
+    runs-on: [self-hosted, macOS, ARM64, "darkbloom-macos-arm64-4x16-run-${{ github.run_id }}"]
     permissions:
       contents: read
     timeout-minutes: 30
@@ -363,7 +316,7 @@ jobs:
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Save the Metal library
-        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ env.CI_ACTIONS_CACHE != 'off' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ${{ runner.temp }}/metallib
@@ -398,8 +351,8 @@ jobs:
 
       - name: Check that each test is in exactly one shard
         # Fails when a listed test is in no main run or in more than one.
-        # A test that no shard names runs in the rest run, so this check
-        # fails only when the map itself is wrong.
+        # A test that no shard names runs in one of the rest runs, so this
+        # check fails only when the map itself is wrong.
         run: python3 .github/scripts/test_shards.py check --list "$RUNNER_TEMP/tests.txt"
 
   test:
@@ -408,7 +361,7 @@ jobs:
     # Macs, checkouts and Xcode are ready when the products are. "Wait for
     # the products" holds the downloads until both jobs have succeeded.
     needs: plan
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x24]
+    runs-on: [self-hosted, macOS, ARM64, "darkbloom-macos-arm64-4x24-run-${{ github.run_id }}"]
     permissions:
       contents: read
       # wait-for-products.py reads this run's jobs.
@@ -457,7 +410,8 @@ jobs:
 
       - name: Run the shard
         # Runs each run of the shard in its own swift test process, also
-        # after an earlier run failed. The runs without the Metal library go
+        # after an earlier run failed. The shard's share of the tests that no
+        # shard names joins its main run. The runs without the Metal library go
         # first, then the script stages the library. A strict group fails
         # when it skips a test or executes zero tests. Every run fails when a
         # test fails. The job summary shows the time and result of each run.
@@ -707,7 +661,7 @@ jobs:
     # requests skip it: it starts after the last shard and adds a new
     # sandbox's start to their wait. Pushes to main report it.
     if: ${{ !cancelled() && needs.build.result == 'success' && github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, macOS, ARM64, darkbloom-macos-arm64-4x16]
+    runs-on: [self-hosted, macOS, ARM64, "darkbloom-macos-arm64-4x16-run-${{ github.run_id }}"]
     permissions:
       contents: read
     timeout-minutes: 30
