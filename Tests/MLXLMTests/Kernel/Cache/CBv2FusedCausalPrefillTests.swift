@@ -21,6 +21,9 @@
 //  5. head_dim 256 at a 1030-query chunk after history: on NAX both backends
 //     must return exactly MLX's own single `.causal` call (the head-dim split
 //     kernel), which the blocked path does not; elsewhere the blocks stay.
+//  6. MLX's prefill-row scope (`GPU.withPrefillRowInvariance`): the mirror
+//     fuses head_dim 256 on NAX from 16 queries, and paged chunks cut on
+//     multiples of 128 have the bits of the same rows of a one-chunk prefill.
 //
 // Tiny synthetic tensors, seeded RNG, no model download.
 
@@ -420,6 +423,79 @@ extension KernelTests {
                     }
                 }
                 start += chunk
+            }
+        }
+
+        // MARK: - Prefill-row scope
+
+        @Test func routingMirrorFollowsThePrefillRowScope() {
+            func fuses(_ qL: Int, _ d: Int = 256, dtype: DType = .bfloat16, nax: Bool) -> Bool {
+                CBv2AttentionV1.mlxFusesCausalAttention(
+                    queryLength: qL, queryHeadDim: d, valueHeadDim: d, dtype: dtype,
+                    naxAvailable: nax)
+            }
+            #expect(!fuses(1023, nax: true))
+            GPU.withPrefillRowInvariance(rows: 4096) {
+                #expect(fuses(16, nax: true))
+                #expect(fuses(1023, nax: true))
+                #expect(fuses(4096, dtype: .float16, nax: true))
+                #expect(!fuses(15, nax: true), "MLX composes 9-15 queries")
+                #expect(!fuses(4096, nax: false))
+                #expect(!fuses(4096, dtype: .float32, nax: true))
+                // Other widths do not follow the scope.
+                #expect(fuses(9, 128, nax: true))
+                #expect(!fuses(8, 128, nax: true))
+                #expect(!fuses(4096, 512, nax: true))
+            }
+            #expect(!fuses(1023, nax: true))
+        }
+
+        /// Qwen full-attention geometry on the paged backend: in the scope, chunks
+        /// cut on multiples of 128 have the bits of the same rows of a one-chunk
+        /// prefill. Off NAX the attention is composed in 128-query blocks from the
+        /// chunk start either way, so there the scope changes nothing; on NAX each
+        /// chunk of 16 or more queries is one fused call in the scope.
+        @Test func pagedChunksOnTheGridKeepTheOneChunkBitsInTheScope() throws {
+            let kind = fullKind(headDim: 256, kvHeads: 1, queryHeads: 4)
+            let scale: Float = 1 / Float(256).squareRoot()
+            let total = 640
+            let prompt = Prompt(tokens: total, kind: kind, dtype: .bfloat16, seed: 19)
+
+            func prefill(_ chunks: [Int], scoped: Bool) throws -> [MLXArray] {
+                let arm = try PrefillArm(
+                    .paged, kind: kind, dtype: .bfloat16, maxChunk: total, maxLength: total)
+                var outputs: [MLXArray] = []
+                var start = 0
+                for chunk in chunks {
+                    let range = start ..< (start + chunk)
+                    let step = {
+                        arm.step(
+                            prompt.slice(prompt.queries, range), prompt.slice(prompt.keys, range),
+                            prompt.slice(prompt.values, range), scale: scale, sinks: nil)
+                    }
+                    let out = scoped ? GPU.withPrefillRowInvariance(rows: 4096, step) : step()
+                    eval(out)
+                    outputs.append(out)
+                    start += chunk
+                }
+                return outputs
+            }
+
+            let whole = try prefill([total], scoped: true)[0]
+            for cuts in [[256, 384], [128, 384, 128]] {
+                let chunks = try prefill(cuts, scoped: true)
+                var start = 0
+                for (chunk, count) in zip(chunks, cuts) {
+                    #expect(
+                        bitIdentical(chunk, whole[0..., 0..., start ..< (start + count), 0...]),
+                        "cuts \(cuts), rows \(start)..<\(start + count)")
+                    start += count
+                }
+                if !MiMoV26NAXGatherQMM.naxAvailable {
+                    for (a, b) in zip(chunks, try prefill(cuts, scoped: false)) {
+                        #expect(bitIdentical(a, b), "off NAX the scope keeps the blocks")
+                    }
+                }
             }
         }
     }
