@@ -93,8 +93,8 @@ extension EngineLoopV2 {
         []
     }
 
-    /// Once per request, at its first token and only with a drafter: the
-    /// whole-request gates it fails, on its exported timing.
+    /// Once per request, at its first token and only with an MTP round
+    /// driver: the whole-request gates it fails, on its exported timing.
     func stampMTPIneligibility(_ rec: CBv2ScheduledRequest) {
         guard mtp != nil, rec.timing.mtpIneligibilityBits == 0 else { return }
         rec.timing.mtpIneligibility = mtpIneligibility(rec)

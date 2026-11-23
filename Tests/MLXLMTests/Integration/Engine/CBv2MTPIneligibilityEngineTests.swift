@@ -32,24 +32,6 @@ private struct CBv2IneligibilityTokenizer: Tokenizer {
     ) throws -> [Int] { throw TokenizerError.missingChatTemplate }
 }
 
-/// Allows only odd token ids; not a free-span constraint.
-private final class CBv2IneligibilityOddConstraint: CBv2TokenConstraint, @unchecked Sendable {
-    let mode: CBv2TokenConstraintMode = .required
-    let maxTokens: Int
-    let fallbackTokenID = 1
-    let initialState = 0
-
-    init(maxTokens: Int) { self.maxTokens = maxTokens }
-
-    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
-        remainingTokens > 0 ? Array(stride(from: 1, to: 64, by: 2)) : []
-    }
-
-    func nextState(state: Int, tokenID: Int) -> Int? {
-        tokenID > 0 && tokenID < 64 && tokenID % 2 == 1 ? 0 : nil
-    }
-}
-
 @Suite("CBv2MTPIneligibilityEngine", .serialized, .tags(.integration))
 struct CBv2MTPIneligibilityEngineTests {
     typealias Gate = CBv2MTPIneligibility
@@ -189,8 +171,7 @@ struct CBv2MTPIneligibilityEngineTests {
                             if mask & 32 != 0 { request.stopStrings = ["<9>"] }
                             if mask & 64 != 0 { request.reasoningBudget = budget }
                             if mask & 128 != 0 {
-                                request.tokenConstraint = CBv2IneligibilityOddConstraint(
-                                    maxTokens: 8)
+                                CBv2NonSpeculatingControl.tokenConstraint.apply(to: &request)
                             }
                             let (reasons, eligible, earlier) = loop.onEngineQueueSync {
                                 let rec = CBv2ScheduledRequest(
