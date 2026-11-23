@@ -301,7 +301,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         nativeExecutionContract: CBv2NativeExecutionContract? = nil,
         automaticMiMoPrefill: Bool = false,
         miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil,
-        reasoningBudgetsEnabled: Bool = CBv2ReasoningBudget.enabled()
+        reasoningBudgetsEnabled: Bool = CBv2ReasoningBudget.enabled(),
+        glm5NextAdmittedBytesPerContextToken: Int? = nil
     ) {
         // Explicit SDK scheduler choices stay unchanged unless the native
         // factory requests this optional default profile. Commit a wider copy
@@ -853,7 +854,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                         try glm.validateStepEnvelope(
                             maximumRequests: schedulerConfig.maxConcurrentRequests,
                             maximumStepTokens: maximumQuery, maximumRowTokens: rowTokens,
-                            admissibleBytes: admission.admissibleBytesCapacity)
+                            admissibleBytes: admission.admissibleBytesCapacity,
+                            admittedBytesPerContextToken: glm5NextAdmittedBytesPerContextToken)
                     } catch {
                         pool.attentionWorkEngineRefusal =
                             "GLM worst-case step scratch exceeds the engine envelope (\(error)); reduce the context, step tokens or concurrency"
