@@ -649,6 +649,12 @@ public struct CBv2MTPConfig: Sendable {
         guard let limit = maxDraftPromptTokens, limit > 0 else { return false }
         return promptTokens > limit
     }
+    /// Whether a plan whose eligible rows have these prompt lengths runs at
+    /// depth zero for the prompt limit: there is at least one row, and every
+    /// one is over `maxDraftPromptTokens`.
+    public func cohortExceedsDraftLimit(promptTokenCounts: [Int]) -> Bool {
+        !promptTokenCounts.isEmpty && promptTokenCounts.allSatisfy { promptExceedsDraftLimit($0) }
+    }
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")
     /// The opt-in AND the process kill switch.
