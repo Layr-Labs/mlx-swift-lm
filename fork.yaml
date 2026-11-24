@@ -171,8 +171,14 @@ def:
             restoration does not promise original-byte or repeated-encoding equality. Generic
             symmetric contiguous targets may supply observed native dtypes without overriding a
             model's own declaration or native binding.
+            A restore decodes the coded rows of each transfer call on several cores (at most eight,
+            at most half the active ones; `DARKBLOOM_PREFIX_CACHE_PARALLEL_STAGE=0` keeps one), writing
+            paged native rows straight to their page addresses and other rows through the same ordered
+            sink calls, with the same bytes. Provider-staged segments wrap zero-fill-on-demand pages
+            when the live pool does (`hostZeroedSegments`).
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
+            - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
