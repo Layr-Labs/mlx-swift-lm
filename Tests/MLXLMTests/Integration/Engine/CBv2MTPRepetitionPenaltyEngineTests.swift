@@ -190,9 +190,12 @@ struct CBv2MTPRepetitionPenaltyEngineTests {
         }
     }
 
-    /// Rejections mid-round (the oracle stream with every third draft
-    /// changed): the rejected tokens are rolled back and never enter a later
-    /// position's repetition window, so the stream is the MTP-off one.
+    /// Rejections mid-round (the oracle stream with two of every three
+    /// positions changed): the rejected tokens are rolled back and never enter
+    /// a later position's repetition window, so the stream is the MTP-off one.
+    /// Any two consecutive positions hold a changed one, so every k = 2 round
+    /// rejects a draft wherever the round starts, and a round starting on an
+    /// unchanged position keeps its first draft before rejecting the second.
     @Test func rejectedDraftsLeaveNoTraceInTheWindow() async throws {
         let target = try makeRankedTarget()
         let prompt = [2, 6, 10, 14]
@@ -203,7 +206,7 @@ struct CBv2MTPRepetitionPenaltyEngineTests {
                 target: target, script: nil, prompt: prompt, requests: [req]
             ).tokens[0]
             let script = (expected + [Int](repeating: 0, count: 2 * k)).enumerated().map {
-                $0.offset % 3 == 1 ? ($0.element + 5) % vocabSize : $0.element
+                $0.offset % 3 != 0 ? ($0.element + 5) % vocabSize : $0.element
             }
             for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
                 let mixed = try await run(
@@ -213,6 +216,7 @@ struct CBv2MTPRepetitionPenaltyEngineTests {
                 let metrics = try #require(mixed.metrics)
                 #expect(metrics.rounds > 0, "\(name) \(mode)")
                 #expect(metrics.acceptedTokens < metrics.draftedTokens, "\(name) \(mode)")
+                #expect(metrics.acceptedTokens > 0, "\(name) \(mode): a draft before a rejection")
             }
         }
     }
