@@ -162,6 +162,116 @@ struct ToolArgumentNormalizationTests {
         }
     }
 
+    private static let notString: [String: any Sendable] = ["not": ["type": "string"]]
+    private static let integerOrText: [String: any Sendable] = [
+        "if": ["type": "integer"],
+        "then": ["type": "integer", "minimum": -100_000_000] as [String: any Sendable],
+        "else": ["type": "string"],
+    ]
+
+    /// The calls `format` reads from one `value` parameter written as text.
+    private func xmlCall(_ text: String, _ schema: [String: any Sendable], format: ToolCallFormat)
+        -> JSONValue?
+    {
+        let processor = ToolCallProcessor(
+            format: format, tools: tools(schema),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+        _ = processor.processChunk(
+            "<tool_call>\n<function=read>\n<parameter=value>\n\(text)\n</parameter>\n</function>\n</tool_call>"
+        )
+        processor.processEOS()
+        return processor.toolCalls.first?.function.arguments["value"]
+    }
+
+    @Test("XML text reads as the JSON literal a combinator or untyped schema admits")
+    func xmlLiteralsUnderCombinators() {
+        let cases: [([String: any Sendable], String, JSONValue)] = [
+            (Self.notString, "-2500", .int(-2500)),
+            (Self.notString, "15000", .int(15000)),
+            (Self.notString, "true", .bool(true)),
+            (Self.notString, "null", .null),
+            (Self.integerOrText, "-2500", .int(-2500)),
+            (["type": ["integer", "string"]] as [String: any Sendable], "-2500", .int(-2500)),
+            (
+                ["anyOf": [["type": "string"], ["type": "number"]] as [[String: any Sendable]]],
+                "2.5", .double(2.5)
+            ),
+            (["description": "untyped"], "-2500", .int(-2500)),
+            ([:], "42", .int(42)),
+        ]
+        for (schema, text, expected) in cases {
+            for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                #expect(xmlCall(text, schema, format: format) == expected, "\(text), \(format)")
+            }
+        }
+    }
+
+    @Test("XML text keeps its spelling when no admitted literal reads it")
+    func xmlTextKeptUnderCombinators() {
+        let cases: [([String: any Sendable], String)] = [
+            (Self.integerOrText, "12.50"),
+            (Self.integerOrText, "-200000000"),
+            (Self.integerOrText, "001"),
+            (["type": ["integer", "string"]], "+5"),
+            (["type": ["boolean", "string"]], "true"),
+            (["type": ["null", "string"]], "null"),
+            (["not": ["type": "integer"]], "7"),
+            (["type": "string"], "-2500"),
+            (
+                [
+                    "anyOf": [["type": "integer"], ["$ref": "#/$defs/missing"]]
+                        as [[String: any Sendable]]
+                ], "-2500"
+            ),
+        ]
+        for (schema, text) in cases {
+            for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                #expect(
+                    xmlCall(text, schema, format: format) == .string(text), "\(text), \(format)")
+            }
+        }
+    }
+
+    @Test("A quoted string becomes a literal only when the schema rejects every string")
+    func quotedLiteralsOnlyWhenTextIsRejected() {
+        let json: (String, [String: any Sendable]) -> JSONValue? = { text, schema in
+            let processor = ToolCallProcessor(
+                format: .json, tools: self.tools(schema),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+            _ = processor.processChunk(
+                #"<tool_call>{"name":"read","arguments":{"value":"\#(text)"}}</tool_call>"#)
+            processor.processEOS()
+            return processor.toolCalls.first?.function.arguments["value"]
+        }
+        #expect(json("-2500", Self.notString) == .int(-2500))
+        #expect(json("-2500", Self.integerOrText) == .string("-2500"))
+        #expect(json("-2500", ["type": ["integer", "string"]]) == .string("-2500"))
+        #expect(json("-2500", ["description": "untyped"]) == .string("-2500"))
+        #expect(json("abc", Self.notString) == .string("abc"))
+    }
+
+    @Test("Streaming exposes no text a literal reading would replace")
+    func keepsTextAgreesWithLiteralReading() {
+        let parameters: (([String: any Sendable]) -> [[String: any Sendable]]) = { self.tools($0) }
+        for schema: [String: any Sendable] in [
+            Self.notString, Self.integerOrText, ["type": ["integer", "string"]], [:],
+        ] {
+            #expect(
+                !parameterKeepsText(paramName: "value", funcName: "read", tools: parameters(schema))
+            )
+        }
+        for schema: [String: any Sendable] in [
+            ["type": "string"], ["type": ["string", "null"]], ["type": ["string", "boolean"]],
+            [
+                "anyOf": [["type": "integer"], ["$ref": "#/$defs/missing"]]
+                    as [[String: any Sendable]]
+            ],
+        ] {
+            #expect(
+                parameterKeepsText(paramName: "value", funcName: "read", tools: parameters(schema)))
+        }
+    }
+
     @Test("Python container parsing is bounded and rejects incomplete structure")
     func boundedLiterals() {
         #expect(
