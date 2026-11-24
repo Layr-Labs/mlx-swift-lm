@@ -651,8 +651,9 @@ def:
             their ranges. The image processor refuses a request of more than 64 images before it decodes
             any (`Inkling2ImageLimitError`).
             The DSpark drafter (`mtp.safetensors`) drives MTP with row-exact rectangular verification and its
-            own durable prefix-checkpoint layout. The vision tower, processor and VLM wrapper are in the
-            vision-language section.
+            own durable prefix-checkpoint layout. Its private paged pool is granted the segmented pool's own
+            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`). The vision tower, processor
+            and VLM wrapper are in the vision-language section.
           globs:
             - "Libraries/MLXLLM/Models/Inkling2/**"
             - "Tests/MLXLMTests/Inkling2*.swift"

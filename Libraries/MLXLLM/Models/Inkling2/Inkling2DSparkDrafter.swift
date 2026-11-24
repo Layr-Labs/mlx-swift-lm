@@ -188,15 +188,25 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
                 if case .full = kind.attention { return total + fullPages + 2 }
                 return total + min(fullPages, ringPages) + 2
             }
-            let capacity = pageBytes * pages + 4 * 1024 * 1024
-            backend = try PagedKVBackend(
-                layerKinds: kinds,
-                config: .init(
-                    capacityBytes: capacity, dtype: .bfloat16,
-                    maxPrefillChunk: Inkling2DSparkDrafter.contextChunk,
-                    nominalMaxSequenceLength: maximumSequenceLength,
-                    segmentSizeBytes: min(capacity, 4 * 1024 * 1024),
-                    layerDTypes: kinds.map { _ in .bfloat16 }))
+            let segmentBytes = 4 * 1024 * 1024
+            var config = PagedKVPoolConfig(
+                capacityBytes: pageBytes * pages + segmentBytes, dtype: .bfloat16,
+                maxPrefillChunk: Inkling2DSparkDrafter.contextChunk,
+                nominalMaxSequenceLength: maximumSequenceLength,
+                segmentSizeBytes: segmentBytes,
+                layerDTypes: kinds.map { _ in .bfloat16 })
+            // The pool charges its grant whole segments (one poison page
+            // each, power-of-two sizes, allocation footprint), more than the
+            // pages alone past about 41K tokens: grant the row what it charges.
+            guard
+                let reservation = PagedKVPool.segmentedRowReservationBytes(
+                    layerKinds: kinds, maxLength: maximumSequenceLength, config: config)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "Inkling2 DSpark pool geometry is invalid")
+            }
+            config.capacityBytes = max(config.capacityBytes, reservation)
+            backend = try PagedKVBackend(layerKinds: kinds, config: config)
             let state = try backend.makeSequenceState(
                 layerKinds: kinds, promptLength: 0, maxLength: maximumSequenceLength)
             rows = state.map { $0 as! PagedSequenceKV }

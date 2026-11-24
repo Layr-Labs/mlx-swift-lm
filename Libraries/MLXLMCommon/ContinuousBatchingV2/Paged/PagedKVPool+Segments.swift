@@ -8,6 +8,45 @@ extension PagedKVPool {
         physicalLease = admission.bindBackendPhysicalFloor(initialBytes: bytesMaterialized)
     }
 
+    /// The bytes a fresh segmented pool of `config` charges its grant to hold
+    /// one row of `layerKinds` bounded by `maxLength` tokens, as
+    /// `reserveSegments` plans it: every group's page demand in that group's
+    /// own segment layout, poison pages and allocation footprint included. A
+    /// caller that sizes a private pool for one row grants it at least this.
+    /// Nil when `config` is not segmented or its geometry is invalid.
+    package static func segmentedRowReservationBytes(
+        layerKinds: [CBv2LayerKind], maxLength: Int, config: PagedKVPoolConfig
+    ) -> Int? {
+        guard let target = config.segmentSizeBytes, maxLength > 0, config.pageSize > 0,
+            let dtypes = try? PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
+        else { return nil }
+        let keys = PagedKVGroupKey.storageKeys(
+            layerKinds: layerKinds, dtypes: dtypes, separateWindow: true,
+            quantization: config.quantization, nativeLayerIndices: config.nativeLayerIndices)
+        var pages: [PagedKVGroupKey: Int] = [:]
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
+            pages[keys[index], default: 0] += pageDemand(
+                kind: kind, maxLength: maxLength, config: config)
+        }
+        var total = 0
+        for (key, usable) in pages {
+            guard let tokenBytes = try? key.bytesPerToken() else { return nil }
+            let (pageBytes, pageOverflow) = tokenBytes.multipliedReportingOverflow(
+                by: config.pageSize)
+            guard !pageOverflow,
+                let layout = try? PagedKVSegmentLayout(
+                    pageBytes: pageBytes, targetBytes: target,
+                    maximumBufferBytes: config.maxBufferLength,
+                    maximumAddressPages: Int(Int32.max) / config.pageSize),
+                let bytes = layout.allocationBytes(addingUsablePages: usable)
+            else { return nil }
+            let (sum, overflow) = total.addingReportingOverflow(bytes)
+            guard !overflow else { return nil }
+            total = sum
+        }
+        return total
+    }
+
     struct SegmentGrowth {
         let group: PagedKVGroup
         let plan: PagedKVGroup.GrowthPlan
