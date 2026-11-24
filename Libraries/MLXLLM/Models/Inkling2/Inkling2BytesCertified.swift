@@ -695,7 +695,7 @@ public final class Inkling2CertifiedHead: @unchecked Sendable {
                 .asType(.bfloat16)
             let u = MLXRandom.uniform(
                 low: Float(0), high: Float(1), [r, rows], key: MLXRandom.key(UInt64(100 + r)))
-            let noise = maximum(-log(1 - u), MLXArray(Float(1e-20)))
+            let noise = SamplerV2.exponentialNoise(fromUniform: u)
             let greedyRows = (0 ..< r).map { $0 % 2 == 1 }
             let g = greedy(hidden)
             let race = select(
@@ -1264,7 +1264,7 @@ extension Inkling2CertifiedHead {
             let t = MLXArray.full([r, 1], values: MLXArray(temperature))
             let u = MLXRandom.uniform(
                 low: Float(0), high: Float(1), [r, rows], key: MLXRandom.key(seed &+ UInt64(start)))
-            let noise = maximum(-log(1 - u), MLXArray(Float(1e-20)))
+            let noise = SamplerV2.exponentialNoise(fromUniform: u)
             let reference = argMax(softmax(f / t, axis: -1) / noise, axis: -1).asType(.int32)
             let referenceFlags = CBv2NonFiniteLogitsMirror.flags(f)
             let s = select(
