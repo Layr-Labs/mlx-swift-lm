@@ -486,6 +486,44 @@ public protocol CBv2MTPBatchedBlockDrafter: CBv2MTPRequestStatefulDrafter {
     ) -> MLXArray
 }
 
+/// Coupled proposals for one block round (`CBv2MTPConfig.coupledProposals`):
+/// given draft index `step`'s draft logits `[rows, vocab]` for the round's
+/// rows in order, each sampled row's proposal is the keyed race the target's
+/// verify draw runs at that row's output index (`generatedTokenCount + step`),
+/// over the draft's row (`CBv2StepSampler.mtpCoupledDraftProposal`). Greedy
+/// and ineligible rows get the row's argmax. The engine builds it; a drafter
+/// only applies it.
+public struct CBv2MTPBlockProposalSelection {
+    private let race: (MLXArray, Int) -> MLXArray?
+
+    public init(_ race: @escaping (_ logits: MLXArray, _ step: Int) -> MLXArray?) {
+        self.race = race
+    }
+
+    /// Lazy `[rows]` int32 proposals, or nil when the sampler has no coupled
+    /// race (the drafter then keeps its own rule).
+    public func propose(_ logits: MLXArray, step: Int) -> MLXArray? {
+        race(logits, step)
+    }
+}
+
+/// A block drafter that can propose with its rows' verify noise.
+///
+/// Exact acceptance keeps a draft only when it equals the target's own draw,
+/// and that draw is what is emitted, so which proposal is made never changes
+/// the output; a proposal raced with the same noise as the draw only agrees
+/// with it more often. The engine calls this instead of `draftBlock` only for
+/// a round with a selection; every other round is unchanged.
+public protocol CBv2MTPCoupledBlockDrafter: CBv2MTPBatchedBlockDrafter {
+    /// `draftBlock`, with each step's proposals taken from `selection`: the
+    /// next Markov step consumes the selected token. Stages exactly what
+    /// `draftBlock` stages.
+    func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int, selection: CBv2MTPBlockProposalSelection
+    ) -> MLXArray
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.
@@ -625,6 +663,22 @@ public struct CBv2MTPConfig: Sendable {
     public var effectivePenaltySpeculation: Bool {
         penaltySpeculation && Self.envPenaltySpeculation
     }
+    /// Opt-in: admit rows with a repetition penalty to target-prefix MTP when
+    /// the sampler re-derives the penalty at every verify position
+    /// (`CBv2StepSampler.supportsMTPRepetitionPenaltyVerification`): the
+    /// position's window is the last `repetitionContextSize` tokens of prompt,
+    /// confirmed output and the drafts before it, as in ordinary decode. Such
+    /// rows always use exact acceptance. Off by default; the process kill
+    /// switch `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` overrides an opt-in
+    /// (`effectiveRepetitionPenaltySpeculation`).
+    public var repetitionPenaltySpeculation: Bool
+    /// False for `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0/false/no/off`; read once.
+    public static let envRepetitionPenaltySpeculation = envSwitch(
+        "DARKBLOOM_MTP_REPETITION_PENALTY_ROWS")
+    /// The opt-in AND the process kill switch.
+    public var effectiveRepetitionPenaltySpeculation: Bool {
+        repetitionPenaltySpeculation && Self.envRepetitionPenaltySpeculation
+    }
     /// Opt-in: rows with stop strings may draft. The round's finalize
     /// confirms committed tokens one at a time through the row's
     /// detokenizer and ends the row at the first stop-string match, the
@@ -637,11 +691,21 @@ public struct CBv2MTPConfig: Sendable {
     /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off. No value
     /// turns it on for a family that has not opted in. Tokens are unaffected.
     public var costCurveDepthSelection: Bool
-    /// Optional prompt-length gate: a request whose prompt holds more than
-    /// this many tokens never drafts and keeps no assistant history for its
-    /// whole lifetime, as a reasoning budget does; it decodes as ordinary
-    /// target-only rows, so its tokens are the MTP-off engine's. nil (the
-    /// default) or a value below one lets every prompt length draft.
+    /// Coupled drafting for drafters that adopt `CBv2MTPCoupledBlockDrafter`:
+    /// a sampled row under exact target-prefix acceptance proposes the keyed
+    /// race its verify draw runs at each output index, instead of the draft's
+    /// argmax. Output is unchanged (exact acceptance commits only the
+    /// target's draws); only acceptance can move. Rows that are greedy, in a
+    /// grammar, or under typical acceptance keep their own rule. Off by
+    /// default; a family opts in after measuring it.
+    public var coupledProposals: Bool
+    /// Optional prompt-length gate, applied per plan: a plan whose eligible
+    /// decode rows all have prompts of more than this many tokens runs at
+    /// depth zero (`prompt_limit`), as ordinary decode. A plan with at least
+    /// one row at or under the limit keeps the depth it would otherwise get,
+    /// for every row in it. So a long row decoding alone never drafts, and in
+    /// company follows the same depth table as before. nil (the default) or a
+    /// value below one lets every prompt length draft.
     public var maxDraftPromptTokens: Int?
     /// Whether a prompt of `promptTokens` tokens is over `maxDraftPromptTokens`
     /// (never when the limit is nil or below one).
@@ -649,11 +713,34 @@ public struct CBv2MTPConfig: Sendable {
         guard let limit = maxDraftPromptTokens, limit > 0 else { return false }
         return promptTokens > limit
     }
+    /// Whether a plan whose eligible rows have these prompt lengths runs at
+    /// depth zero for the prompt limit: there is at least one row, and every
+    /// one is over `maxDraftPromptTokens`.
+    public func cohortExceedsDraftLimit(promptTokenCounts: [Int]) -> Bool {
+        !promptTokenCounts.isEmpty && promptTokenCounts.allSatisfy { promptExceedsDraftLimit($0) }
+    }
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")
     /// The opt-in AND the process kill switch.
     public var effectiveStopStringSpeculation: Bool {
         stopStringSpeculation && Self.envStopStringSpeculation
+    }
+    /// Opt-in: rows that request logprobs may draft. Each committed token's
+    /// logprob and top logprobs are gathered from the verify window's raw
+    /// logits exactly as ordinary decode gathers them from its step's logits.
+    /// That equals drafter-off bit for bit only when every window position's
+    /// logits equal a one-token decode step's, so the opt-in takes effect only
+    /// for `.rectangularExact` verification with `.exact` acceptance
+    /// (`effectiveLogprobSpeculation`). Off by default;
+    /// `DARKBLOOM_MTP_LOGPROB_ROWS=0` overrides an opt-in.
+    public var logprobSpeculation: Bool
+    /// False for `DARKBLOOM_MTP_LOGPROB_ROWS=0/false/no/off`; read once.
+    public static let envLogprobSpeculation = envSwitch("DARKBLOOM_MTP_LOGPROB_ROWS")
+    /// The opt-in AND the process kill switch AND a verify path whose logits
+    /// equal one-token decode's (`.rectangularExact`, `.exact` acceptance).
+    public var effectiveLogprobSpeculation: Bool {
+        logprobSpeculation && Self.envLogprobSpeculation
+            && verificationMode == .rectangularExact && acceptance == .exact
     }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
@@ -690,12 +777,16 @@ public struct CBv2MTPConfig: Sendable {
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
+        repetitionPenaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
+        logprobSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
-        maxDraftPromptTokens: Int? = nil
+        maxDraftPromptTokens: Int? = nil,
+        coupledProposals: Bool = false
     ) {
         self.enabled = enabled
+        self.coupledProposals = coupledProposals
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
         self.ordinaryDecodeHistory = ordinaryDecodeHistory
@@ -703,7 +794,9 @@ public struct CBv2MTPConfig: Sendable {
         self.constrainedSpeculation = constrainedSpeculation
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
+        self.repetitionPenaltySpeculation = repetitionPenaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
+        self.logprobSpeculation = logprobSpeculation
         self.costCurveDepthSelection = costCurveDepthSelection
         self.maxDraftPromptTokens = maxDraftPromptTokens.flatMap { $0 > 0 ? $0 : nil }
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
@@ -723,6 +816,19 @@ public struct CBv2MTPConfig: Sendable {
 
     /// The effective on/off state (config AND env kill switch).
     public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+
+    /// This configuration as the round driver runs it beside a drafter whose
+    /// `requiredVerificationMode` is `required`: a required mode replaces the
+    /// configured one (and only `.rectangular` keeps the automatic token
+    /// bound). Callers can read gates that depend on the mode, such as
+    /// `effectiveLogprobSpeculation`, as the engine will apply them.
+    public func requiring(_ required: CBv2MTPVerificationMode?) -> CBv2MTPConfig {
+        guard let required else { return self }
+        var config = self
+        config.verificationMode = required
+        if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+        return config
+    }
 }
 
 // MARK: - Metrics

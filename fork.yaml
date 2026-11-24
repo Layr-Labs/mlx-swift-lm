@@ -224,13 +224,30 @@ def:
             `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0` turns it off), the split assistant-copy failure
             rule only for a historical coder with `refusedAssistantCopyKeepsDonorStep` (Inkling 2),
             and `DARKBLOOM_CBV2_MTP_COST_CURVE` can only turn the cost-curve depth choice off.
-            `CBv2MTPConfig.maxDraftPromptTokens` (nil by default) keeps a request whose prompt is
-            longer than the limit target-only for its whole lifetime, as a reasoning budget does.
+            `CBv2MTPConfig.coupledProposals` (off by default) lets a block drafter that adopts
+            `CBv2MTPCoupledBlockDrafter` (Inkling 2) propose each sampled row's verify-draw race
+            under exact acceptance; output is unchanged, only acceptance can move.
+            `CBv2MTPConfig.repetitionPenaltySpeculation` (off by default;
+            `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` turns an opt-in off) lets repetition-penalty
+            rows draft: the sampler penalizes each verify position over the last
+            `repetitionContextSize` tokens of prompt, confirmed output and preceding drafts, and
+            these rows accept exactly.
+            `CBv2MTPConfig.maxDraftPromptTokens` (nil by default) is a plan-time gate: a plan whose
+            eligible decode rows all have prompts longer than the limit runs at depth zero
+            (`prompt_limit`) on the chained path; a plan with any row at or under it keeps its depth.
+            `CBv2MTPConfig.logprobSpeculation` (off by default; `DARKBLOOM_MTP_LOGPROB_ROWS=0` turns it
+            off) lets rows that request logprobs draft on a `.rectangularExact` target under exact
+            acceptance; each committed token's logprobs come from the verify window's raw logits, the
+            values a one-token decode step gives.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
             - "changelog.d/cbv2-mtp-drafter-opt-ins.md"
             - "changelog.d/cbv2-mtp-draft-prompt-limit.md"
+            - "changelog.d/cbv2-mtp-coupled-block-drafting.md"
+            - "changelog.d/cbv2-mtp-repetition-penalty-rows.md"
+            - "changelog.d/cbv2-mtp-draft-prompt-limit-cohort.md"
+            - "changelog.d/cbv2-mtp-logprob-rows.md"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix

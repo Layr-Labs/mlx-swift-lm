@@ -81,7 +81,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
                         verifier.mtpVerifySample(
                             logits: x, params: p, requestIDs: ids, stepBases: bases,
                             penalties: .init(
-                                outputTokens: outputs, drafts: width > 1 ? oracle : nil)))
+                                outputTokens: outputs, drafts: width > 1 ? oracle : nil,
+                                promptTokens: [])))
                     eval(verified)
                     for r in 0 ..< ids.count {
                         XCTAssertEqual(
@@ -97,7 +98,7 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
                                 requestIDs: ids, stepBases: bases.map { $0 + column },
                                 penalties: .init(
                                     outputTokens: outputs, drafts: width > 1 ? oracle : nil,
-                                    columnOffset: column)))
+                                    columnOffset: column, promptTokens: [])))
                         eval(one)
                         XCTAssertEqual(
                             one.asArray(Int32.self), ordinary.map { $0[column] },
@@ -112,7 +113,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
                                 requestIDs: [ids[r]], stepBases: [bases[r]],
                                 penalties: .init(
                                     outputTokens: [outputs[r]],
-                                    drafts: width > 1 ? oracle[r ..< (r + 1), 0...] : nil)))
+                                    drafts: width > 1 ? oracle[r ..< (r + 1), 0...] : nil,
+                                    promptTokens: [])))
                         eval(solo)
                         XCTAssertEqual(solo[0].asArray(Int32.self), ordinary[r])
                     }
@@ -130,7 +132,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
                                 logits: x, params: p, requestIDs: ids, stepBases: bases,
                                 penalties: .init(
                                     outputTokens: outputs,
-                                    drafts: MLXArray(wrong.flatMap { $0 }, [ids.count, width - 1])))
+                                    drafts: MLXArray(wrong.flatMap { $0 }, [ids.count, width - 1]),
+                                    promptTokens: []))
                         )
                         eval(scored)
                         for r in 0 ..< ids.count {
@@ -182,7 +185,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
             sampler.mtpVerifySample(
                 logits: x, params: p, requestIDs: rowIDs, stepBases: [0, 0],
                 penalties: .init(
-                    outputTokens: [[], []], drafts: MLXArray([Int32]([0, 0, 0, 0]), [2, 2]))))
+                    outputTokens: [[], []], drafts: MLXArray([Int32]([0, 0, 0, 0]), [2, 2]),
+                    promptTokens: [])))
         eval(tokens)
         let t = tokens.asArray(Int32.self)
         // Drafts that differ from the target draw at position 0.
@@ -191,7 +195,7 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
             sampler.mtpVerifyTypical(
                 logits: x, draftIDs: drafts, delta: 0.3, params: p, requestIDs: rowIDs,
                 stepBases: [0, 0],
-                penalties: .init(outputTokens: [[], []], drafts: drafts)))
+                penalties: .init(outputTokens: [[], []], drafts: drafts, promptTokens: [])))
         eval(scored.tokens, scored.accept)
         let accept = scored.accept.asArray(Bool.self)
         XCTAssertFalse(accept[0], "penalty row: a non-target draft is rejected")
@@ -210,7 +214,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
         func score(_ sampler: CBv2DefaultSampler, _ history: [Int]) -> Int32 {
             let t = sampler.mtpVerifySample(
                 logits: x, params: p, requestIDs: id, stepBases: [history.count],
-                penalties: .init(outputTokens: [ArraySlice(history)], drafts: nil))!
+                penalties: .init(outputTokens: [ArraySlice(history)], drafts: nil, promptTokens: [])
+            )!
             eval(t)
             return t.asArray(Int32.self)[0]
         }
@@ -252,7 +257,8 @@ final class CBv2MTPPenaltyVerifyTests: XCTestCase {
                 stepBases: [Int](repeating: history.count, count: n),
                 penalties: .init(
                     outputTokens: [ArraySlice<Int>](repeating: ArraySlice(history), count: n),
-                    drafts: MLXArray([Int32](repeating: draft, count: n), [n, 1]))))
+                    drafts: MLXArray([Int32](repeating: draft, count: n), [n, 1]), promptTokens: [])
+            ))
         eval(tokens)
         let position1 = tokens[0..., 1].asArray(Int32.self)
         var counts = [Int](repeating: 0, count: vocab)
