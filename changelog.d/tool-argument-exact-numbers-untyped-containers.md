@@ -11,3 +11,12 @@
   now read as that object or array instead of a string. Any other text, a value
   whose numbers would not decode exactly, a typed or combinator schema, and
   Gemma's tool calls keep the text as before.
+- A tool parameter schema as ingress normalization forwards it carries a single
+  render `type` beside a union (its first branch's type), beside an `enum` whose
+  members it does not cover, beside a `not` of that same type, or beside an
+  `if`/`then`/`else` with a branch typed otherwise. That type is now read as a
+  render hint: the union, enum or condition decides the value, as the
+  provider's strict check already reads it, so `-4200` under
+  `{"anyOf":[{"type":"string"},{"type":"integer"}],"type":"string"}` reads as
+  an integer and validates. A null still needs `nullable: true` beside such a
+  type, and a type that agrees with every branch keeps asserting.
