@@ -295,6 +295,107 @@ struct ToolArgumentNormalizationTests {
         }
     }
 
+    @Test("A number no integer or double holds exactly keeps its digits as text")
+    func inexactNumbersKeepTheirText() {
+        let schemas: [[String: any Sendable]] = [
+            Self.notString, [:], ["type": ["integer", "string"]],
+            ["anyOf": [["type": "string"], ["type": "number"]] as [[String: any Sendable]]],
+        ]
+        for schema in schemas {
+            for text in [
+                "12345678901234567890", "-98765432109876543210", "0.12345678901234567891",
+                "123456789012345678901234567890.5", "1e400",
+            ] {
+                for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                    #expect(
+                        xmlCall(text, schema, format: format) == .string(text), "\(text), \(format)"
+                    )
+                }
+            }
+        }
+        for (text, value): (String, JSONValue) in [
+            ("9223372036854775807", .int(Int.max)), ("-9223372036854775808", .int(Int.min)),
+            ("1.5", .double(1.5)), ("0.1", .double(0.1)), ("1e3", .int(1000)),
+            ("2.50", .double(2.5)),
+        ] {
+            #expect(xmlCall(text, [:], format: .qwen35) == value, "\(text)")
+        }
+    }
+
+    @Test("XML JSON object or array text under an untyped parameter reads as that value")
+    func untypedContainers() throws {
+        let untyped: [[String: any Sendable]] = [[:], ["description": "any value"]]
+        for schema in untyped {
+            for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                #expect(
+                    xmlCall(#"{"a":1,"b":[true,null,"x"]}"#, schema, format: format)
+                        == .object(["a": .int(1), "b": .array([.bool(true), .null, .string("x")])]))
+                #expect(
+                    xmlCall(#"[1,"two",{"c":2.5}]"#, schema, format: format)
+                        == .array([.int(1), .string("two"), .object(["c": .double(2.5)])]))
+            }
+        }
+        // Partial or trailing text, inexact numbers, and typed or combinator
+        // schemas keep the text.
+        for text in [
+            #"{"a":"#, #"{"a":1} and more"#, #"{"n":12345678901234567890}"#,
+            #"[0.12345678901234567]"#,
+        ] {
+            #expect(xmlCall(text, [:], format: .qwen35) == .string(text), "\(text)")
+        }
+        let typed: [[String: any Sendable]] = [
+            Self.notString, ["type": ["object", "string"]], ["type": "string"],
+            ["anyOf": [["type": "string"], ["type": "object"]] as [[String: any Sendable]]],
+        ]
+        for schema in typed {
+            #expect(xmlCall(#"{"a":1}"#, schema, format: .qwen35) == .string(#"{"a":1}"#))
+        }
+        // A quoted JSON string and Gemma's marker-quoted text are unchanged.
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools([:]),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+        _ = processor.processChunk(
+            #"<tool_call>{"name":"read","arguments":{"value":"{\"a\":1}"}}</tool_call>"#)
+        processor.processEOS()
+        #expect(processor.toolCalls.first?.function.arguments["value"] == .string(#"{"a":1}"#))
+        let gemma = try #require(
+            GemmaFunctionParser().parse(
+                content: #"<|tool_call>call:read{value:<|"|>{"a":1}<|"|>}<tool_call|>"#,
+                tools: tools([:])))
+        #expect(gemma.function.arguments["value"] == .string(#"{"a":1}"#))
+    }
+
+    @Test("A streamed call keeps the digits its complete parse keeps")
+    func streamedInexactNumbersAgree() {
+        let text = "12345678901234567890"
+        let processor = ToolCallProcessor(
+            format: .qwen35, tools: tools([:]),
+            streaming: .init(exposesName: { _ in true }))
+        let frame =
+            "<tool_call>\n<function=read>\n<parameter=value>\n\(text)\n</parameter>\n</function>\n</tool_call>"
+        var arguments = ""
+        var completed: [ToolCall] = []
+        for character in frame {
+            for segment in processor.processChunkSegments(String(character)) {
+                switch segment {
+                case .callArguments(let fragment): arguments += fragment
+                case .callCompleted(let call, let remainder):
+                    completed.append(call)
+                    arguments += remainder
+                default: break
+                }
+            }
+        }
+        for segment in processor.processEOSSegments() {
+            if case .callCompleted(let call, let remainder) = segment {
+                completed.append(call)
+                arguments += remainder
+            }
+        }
+        #expect(completed.first?.function.arguments["value"] == .string(text))
+        #expect(arguments == #"{"value":"12345678901234567890"}"#)
+    }
+
     @Test("Streaming exposes no text a literal reading would replace")
     func keepsTextAgreesWithLiteralReading() {
         let parameters: (([String: any Sendable]) -> [[String: any Sendable]]) = { self.tools($0) }
