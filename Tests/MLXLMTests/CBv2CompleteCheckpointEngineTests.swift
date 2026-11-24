@@ -38,6 +38,10 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
     private var disarmedAt: [Int] = []
     private var donationFailures: [String] = []
     let maximumPosition: Int
+    /// The store's manifest bound. Like the provider's envelope, `donate`
+    /// refuses a manifest whose storage encoding (sorted keys, slashes
+    /// unescaped) is larger.
+    let maximumManifestBytes: Int
     let segmentBytes: Int
     let gate: CheckpointPublicationGate?
     let completionGate: CheckpointPublicationGate?
@@ -50,10 +54,12 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
         archives: [Archive] = [], maximumPosition: Int = .max,
         gate: CheckpointPublicationGate? = nil,
         admissionGate: CheckpointPublicationGate? = nil, segmentBytes: Int = 64,
-        completionGate: CheckpointPublicationGate? = nil
+        completionGate: CheckpointPublicationGate? = nil,
+        maximumManifestBytes: Int = CBv2CompleteCheckpointManifest.maximumEncodedBytes
     ) {
         self.archives = archives
         self.maximumPosition = maximumPosition
+        self.maximumManifestBytes = maximumManifestBytes
         self.segmentBytes = segmentBytes
         self.gate = gate
         self.completionGate = completionGate
@@ -148,6 +154,11 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
                 return
             }
             do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                guard try encoder.encode(source.manifest).count <= maximumManifestBytes else {
+                    throw CBv2CompleteCheckpointError.invalidManifest
+                }
                 var chunks: [Chunk] = []
                 for (index, tensor) in source.manifest.tensors.enumerated() {
                     var offset = 0
@@ -1097,6 +1108,54 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
                     prefixCacheReceiptID: .init(1009))))
         XCTAssertEqual(result.finishReason, .length)
         XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
+        XCTAssertEqual(backend.bytesReserved, 0)
+        store.finishPublicationCallbacks(engine: engine)
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        await engine.shutdown()
+    }
+
+    /// A boundary whose manifest the store would refuse is never kept in
+    /// place of a shallower one it would write: with the bound between the
+    /// manifests of two and three chunks, the donor publishes two chunks
+    /// beside its first, instead of a deepest boundary that fails to write
+    /// and leaves only the first.
+    func testManifestBoundKeepsTheDeepestWritableCheckpoint() async throws {
+        let prompt = Array(repeating: 1, count: 4 * chunk + 1)
+        func manifestBytes(_ manifest: CBv2CompleteCheckpointManifest) throws -> Int {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            return try encoder.encode(manifest).count
+        }
+        // Measure the manifest of the first and the deepest boundary.
+        let reference = CompleteCheckpointFixtureStore()
+        let (referenceEngine, _) = engine(reference)
+        _ = await cbv2SchedCollect(
+            try referenceEngine.submit(
+                .init(
+                    id: .init(31), promptTokens: prompt, maxTokens: 1,
+                    prefixCacheReceiptID: .init(1031))))
+        reference.finishPublicationCallbacks(engine: referenceEngine)
+        await referenceEngine.shutdown()
+        let measured = try reference.saved.map {
+            ($0.manifest.position, try manifestBytes($0.manifest))
+        }
+        XCTAssertEqual(measured.map { $0.0 }, [4 * chunk, chunk])
+        let (first, deepest) = (measured[1].1, measured[0].1)
+        // Every prefix token adds about the same bytes here, so halfway
+        // between the one- and four-chunk manifests is the size at two and
+        // a half chunks: two chunks fit, three do not.
+        let bound = first + (deepest - first) / 2
+
+        let store = CompleteCheckpointFixtureStore(maximumManifestBytes: bound)
+        let (engine, backend) = engine(store)
+        let result = await cbv2SchedCollect(
+            try engine.submit(
+                .init(
+                    id: .init(32), promptTokens: prompt, maxTokens: 1,
+                    prefixCacheReceiptID: .init(1032))))
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
+        XCTAssertEqual(store.donationErrors, [])
         XCTAssertEqual(backend.bytesReserved, 0)
         store.finishPublicationCallbacks(engine: engine)
         XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)

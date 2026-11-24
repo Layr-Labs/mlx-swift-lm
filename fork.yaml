@@ -179,6 +179,7 @@ def:
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
+            - "Tests/MLXLMTests/CompleteCheckpointLongPrefixTests.swift"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
