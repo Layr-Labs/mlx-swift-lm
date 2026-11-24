@@ -203,7 +203,11 @@ package enum ToolSchemaValidator {
         case .malformed:
             assessment.containsUnknown = true
         case .value(let types):
-            guard admitsNull || types.contains(where: { matchesType(value, $0) }) else {
+            // A render type (`ToolArgumentNormalization.rendersSiblingType`)
+            // leaves the value to the union, enum or condition beside it; a
+            // null still needs the `nullable` marker.
+            let hinted = ToolArgumentNormalization.rendersSiblingType(schema) && value != .null
+            guard admitsNull || hinted || types.contains(where: { matchesType(value, $0) }) else {
                 return .invalid([
                     Violation(path: path, requirement: typeRequirement(types))
                 ])
