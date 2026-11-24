@@ -20,7 +20,8 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         }) {
             return nil
         }
-        let value = ToolArgumentNormalization.normalize(.string(text), schema: schema)
+        let value = ToolArgumentNormalization.normalize(
+            .string(text), schema: schema, literals: .never)
         switch value {
         case .int, .double: break
         default: return nil
@@ -31,7 +32,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             union["anyOf"] != nil || union["oneOf"] != nil
         {
             union.removeValue(forKey: "type")
-            switch ToolArgumentNormalization.normalize(.string(text), schema: union) {
+            switch ToolArgumentNormalization.normalize(
+                .string(text), schema: union, literals: .never)
+            {
             case .int, .double: break
             default: return nil
             }
@@ -483,7 +486,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
                 .map { String(rawValue[contentStart ..< $0.lowerBound]) }
                 ?? String(rawValue[contentStart...])
             return convertParameterValue(
-                unescaped, paramName: key, funcName: funcName, tools: tools)
+                unescaped, paramName: key, funcName: funcName, tools: tools, readsLiterals: false)
         }
 
         let literal = String(rawValue)
@@ -495,7 +498,8 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         if Self.isStructured(declaredType), let value = parseStructured(literal, marker: marker) {
             return value
         }
-        return convertParameterValue(literal, paramName: key, funcName: funcName, tools: tools)
+        return convertParameterValue(
+            literal, paramName: key, funcName: funcName, tools: tools, readsLiterals: false)
     }
 
     /// Strips a marker pair around a key, which the model sometimes writes.
