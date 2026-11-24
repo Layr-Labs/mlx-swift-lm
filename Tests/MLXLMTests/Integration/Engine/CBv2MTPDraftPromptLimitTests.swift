@@ -139,16 +139,20 @@ struct CBv2MTPDraftPromptLimitTests {
         }
     }
 
-    /// Without a limit, or with one below one, the longer prompt drafts as
-    /// before.
+    /// Without a limit, or with one below one (the integrator's off state),
+    /// the gate never acts: the longer prompt drafts alone and beside a
+    /// shorter one, and no plan is clamped for the prompt limit.
     @Test(arguments: [nil, 0, -1] as [Int?])
     func noLimitLetsEveryPromptDraft(_ configured: Int?) async throws {
         let target = try makeTarget()
-        let prompts = [prompt(limit + 1)]
-        let off = try await serve(target: target, prompts: prompts, drafts: false, limit: nil)
-        let on = try await serve(target: target, prompts: prompts, drafts: true, limit: configured)
-        #expect(on.tokens == off.tokens)
-        #expect(on.rounds > 0)
+        for prompts in [[prompt(limit + 1)], [prompt(limit + 1), prompt(limit + 4)]] {
+            let off = try await serve(target: target, prompts: prompts, drafts: false, limit: nil)
+            let on = try await serve(
+                target: target, prompts: prompts, drafts: true, limit: configured)
+            #expect(on.tokens == off.tokens, "\(prompts.count) rows")
+            #expect(on.rounds > 0, "\(prompts.count) rows")
+            #expect(on.promptLimitClamps == 0, "\(prompts.count) rows")
+        }
     }
 
     /// A row over the limit decoding beside a row under it: each row's tokens
