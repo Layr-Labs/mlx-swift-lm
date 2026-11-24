@@ -26,19 +26,38 @@ enum ToolArgumentNormalization {
             function: .init(name: call.function.name, arguments: arguments), id: call.id)
     }
 
+    /// When a text that spells a JSON literal (a number, `true`, `false` or
+    /// `null`) becomes that literal under a schema with no single non-string
+    /// reading (`not`, `if`/`then`/`else`, a union, no `type`).
+    enum LiteralReading {
+        /// Only when the schema admits the literal and rejects the text as a
+        /// string, so the text could never be valid as written.
+        case whenTextRejected
+        /// Also when both are admitted and the text is the literal's own JSON
+        /// spelling: the dialects whose every value is unquoted text (the Qwen
+        /// XML parameters), where a string and a number are written alike.
+        case preferred
+    }
+
     /// `root` is the parameters schema the value's `schema` belongs to. With
     /// it, a local `$ref` reads as the schema it names (`resolved`); without
     /// it a reference is unknown and the value keeps its spelling.
     static func normalize(
         _ value: JSONValue, schema: [String: any Sendable]?, depth: Int = 0,
-        root: [String: any Sendable]? = nil
+        root: [String: any Sendable]? = nil, literals: LiteralReading = .whenTextRejected
     ) -> JSONValue {
         switch value {
         case .string, .array, .object: break
         default: return value
         }
-        return normalize(
-            value, reading: reading(schema, depth: depth, root: root), depth: depth, root: root)
+        let reading = reading(schema, depth: depth, root: root)
+        if reading == nil, case .string(let text) = value, let schema,
+            let literal = literal(
+                text, schema: schema, depth: depth, root: root, literals: literals)
+        {
+            return literal
+        }
+        return normalize(value, reading: reading, depth: depth, root: root)
     }
 
     /// `normalize` under a reading already taken: an array's items, and an
@@ -120,7 +139,9 @@ enum ToolArgumentNormalization {
     static func keepsText(
         schema: [String: any Sendable]?, root: [String: any Sendable]? = nil
     ) -> Bool {
-        reading(schema, depth: 0, root: root) == nil
+        guard reading(schema, depth: 0, root: root) == nil else { return false }
+        guard let schema else { return true }
+        return !admitsLiteralType(schema, depth: 0, root: root)
     }
 
     private struct Reading {
@@ -144,6 +165,8 @@ enum ToolArgumentNormalization {
         let root: [String: any Sendable]?
         private var remaining = 256
         private var followed = false
+        /// A step was refused: some part of the schema went unread.
+        private(set) var exhausted = false
 
         init(root: [String: any Sendable]?) { self.root = root }
 
@@ -151,6 +174,7 @@ enum ToolArgumentNormalization {
             guard followed else { return true }
             guard cost <= remaining else {
                 remaining = 0
+                exhausted = true
                 return false
             }
             remaining -= cost
@@ -180,6 +204,297 @@ enum ToolArgumentNormalization {
         // to guess which union branch the model meant (for example "001").
         guard !types.contains("string"), nonNull.count <= 1 else { return nil }
         return Reading(schema: schema, types: types, nonNull: nonNull)
+    }
+
+    /// The JSON literal `text` spells, when `schema` admits it and the policy
+    /// lets it replace the text (`LiteralReading`). A schema this reader
+    /// cannot decide (an unknown reference, `$dynamicRef`, an unreadable
+    /// pattern, past the reference budget) keeps the text.
+    private static func literal(
+        _ text: String, schema: [String: any Sendable], depth: Int,
+        root: [String: any Sendable]?, literals: LiteralReading
+    ) -> JSONValue? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let literal = jsonLiteral(trimmed),
+            admitsLiteralType(schema, depth: depth, root: root)
+        else { return nil }
+        var references = References(root: root)
+        guard admission(of: .value(literal), schema, depth: depth, &references) == .yes else {
+            return nil
+        }
+        switch literal {
+        case .int, .double:
+            if literals == .preferred && trimmed == text { return literal }
+        default: break
+        }
+        var textReferences = References(root: root)
+        return admission(of: .value(.string(text)), schema, depth: depth, &textReferences) == .no
+            ? literal : nil
+    }
+
+    /// A scalar spelled exactly as JSON writes it: `true`, `false`, `null`
+    /// or a JSON number (no sign but `-`, no leading zeros, no bare point).
+    private static func jsonLiteral(_ text: String) -> JSONValue? {
+        switch text {
+        case "true": return .bool(true)
+        case "false": return .bool(false)
+        case "null": return .null
+        default: break
+        }
+        var scalars = text.unicodeScalars[...]
+        if scalars.first == "-" { scalars.removeFirst() }
+        func digits() -> Int {
+            let count = scalars.prefix(while: { ("0" ... "9").contains($0) }).count
+            scalars.removeFirst(count)
+            return count
+        }
+        let leading = scalars.first
+        let whole = digits()
+        guard whole > 0, leading != "0" || whole == 1 else { return nil }
+        if scalars.first == "." {
+            scalars.removeFirst()
+            guard digits() > 0 else { return nil }
+        }
+        if scalars.first == "e" || scalars.first == "E" {
+            scalars.removeFirst()
+            if scalars.first == "+" || scalars.first == "-" { scalars.removeFirst() }
+            guard digits() > 0 else { return nil }
+        }
+        guard scalars.isEmpty else { return nil }
+        return number(text, integer: false)
+    }
+
+    /// What one reading of a scalar against a schema can tell: admitted,
+    /// rejected, admitted for some values of a type only (`maybe`, when the
+    /// probe is a type), or undecided by this reader (`unknown`).
+    private enum Admission { case yes, no, maybe, unknown }
+
+    /// A concrete scalar, or any value of a JSON type.
+    private enum Probe {
+        case value(JSONValue)
+        case type(String)
+
+        var type: String {
+            switch self {
+            case .type(let type): return type
+            case .value(.null): return "null"
+            case .value(.bool): return "boolean"
+            case .value(.int): return "integer"
+            case .value(.double): return "number"
+            case .value(.string): return "string"
+            case .value(.array): return "array"
+            case .value(.object): return "object"
+            }
+        }
+    }
+
+    /// Whether `literal` may read some text under `schema`, read decidedly:
+    /// a number the schema may admit, or a Boolean or null it may admit while
+    /// it does not admit every string (only numbers are preferred over an
+    /// admitted string, `LiteralReading.preferred`).
+    private static func admitsLiteralType(
+        _ schema: [String: any Sendable], depth: Int, root: [String: any Sendable]?
+    ) -> Bool {
+        var references = References(root: root)
+        var readings: [String: Admission] = [:]
+        for type in ["integer", "number", "boolean", "null", "string"] {
+            let reading = admission(of: .type(type), schema, depth: depth, &references)
+            guard reading != .unknown else { return false }
+            readings[type] = reading
+        }
+        guard !references.exhausted else { return false }
+        func admitted(_ type: String) -> Bool { readings[type] != .no }
+        return admitted("integer") || admitted("number")
+            || ((admitted("boolean") || admitted("null")) && readings["string"] != .yes)
+    }
+
+    /// Reads the keywords that decide a scalar: `type`, `nullable`, `enum`,
+    /// `const`, the numeric and string bounds, `pattern`, `not`, `allOf`,
+    /// `anyOf`, `oneOf`, `if`/`then`/`else` and local references. Object and
+    /// array keywords hold vacuously for a scalar; other keywords annotate.
+    private static func admission(
+        of probe: Probe, _ node: any Sendable, depth: Int, _ references: inout References
+    ) -> Admission {
+        if let flag = node as? Bool { return flag ? .yes : .no }
+        guard depth < 32, references.spend(), let declared = node as? [String: any Sendable],
+            declared["$dynamicRef"] == nil
+        else { return .unknown }
+        guard let schema = resolved(declared, &references), schema["$ref"] == nil else {
+            return .unknown
+        }
+        var parts: [Admission] = []
+        if let raw = schema["type"] {
+            let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
+            let types = names.compactMap(canonicalType)
+            guard !names.isEmpty, types.count == names.count else { return .unknown }
+            var admitted = Set(types)
+            if let marker = schema["nullable"], marker is Bool || marker is NSNumber,
+                JSONValue.from(marker) == .bool(true)
+            {
+                admitted.insert("null")
+            }
+            let type = probe.type
+            parts.append(
+                admitted.contains(type) || (type == "integer" && admitted.contains("number"))
+                    ? .yes : .no)
+        }
+        for key in ["enum", "const"] where schema[key] != nil {
+            let options = key == "enum" ? (schema[key] as? [any Sendable]) : [schema[key]!]
+            guard let options else { return .unknown }
+            let values = options.map { JSONValue.from($0) }
+            switch probe {
+            case .value(let value): parts.append(values.contains(value) ? .yes : .no)
+            case .type(let type):
+                parts.append(
+                    values.contains {
+                        Probe.value($0).type == type
+                            || (type == "number" && Probe.value($0).type == "integer")
+                    }
+                        ? .maybe : .no)
+            }
+        }
+        parts.append(bounds(of: probe, schema))
+        if let not = schema["not"] {
+            switch admission(of: probe, not, depth: depth + 1, &references) {
+            case .yes: parts.append(.no)
+            case .no: parts.append(.yes)
+            case let other: parts.append(other)
+            }
+        }
+        for key in ["allOf", "anyOf", "oneOf"] where schema[key] != nil {
+            guard let branches = schema[key] as? [any Sendable], !branches.isEmpty else {
+                return .unknown
+            }
+            let readings = branches.map {
+                admission(of: probe, $0, depth: depth + 1, &references)
+            }
+            switch key {
+            case "allOf": parts.append(all(readings))
+            case "anyOf": parts.append(any(readings))
+            default:
+                let admitted = readings.filter { $0 == .yes }.count
+                if readings.contains(.unknown) {
+                    parts.append(.unknown)
+                } else if admitted > 1 {
+                    parts.append(.no)
+                } else if readings.contains(.maybe) {
+                    parts.append(.maybe)
+                } else {
+                    parts.append(admitted == 1 ? .yes : .no)
+                }
+            }
+        }
+        if let condition = schema["if"] {
+            let then = schema["then"].map {
+                admission(of: probe, $0, depth: depth + 1, &references)
+            }
+            let otherwise = schema["else"].map {
+                admission(of: probe, $0, depth: depth + 1, &references)
+            }
+            switch admission(of: probe, condition, depth: depth + 1, &references) {
+            case .yes: parts.append(then ?? .yes)
+            case .no: parts.append(otherwise ?? .yes)
+            case .maybe:
+                let both = [then ?? .yes, otherwise ?? .yes]
+                parts.append(
+                    both.contains(.unknown)
+                        ? .unknown
+                        : all(both) == .yes
+                            ? .yes
+                            : any(both) == .no ? .no : .maybe)
+            case .unknown: parts.append(.unknown)
+            }
+        }
+        return all(parts)
+    }
+
+    private static func all(_ readings: [Admission]) -> Admission {
+        if readings.contains(.no) { return .no }
+        if readings.contains(.unknown) { return .unknown }
+        return readings.contains(.maybe) ? .maybe : .yes
+    }
+
+    private static func any(_ readings: [Admission]) -> Admission {
+        if readings.contains(.yes) { return .yes }
+        if readings.contains(.unknown) { return .unknown }
+        return readings.contains(.maybe) ? .maybe : .no
+    }
+
+    /// The numeric bounds for a number, the length bounds and `pattern` for
+    /// a string; a type probe only learns that some values may fail them.
+    private static func bounds(of probe: Probe, _ schema: [String: any Sendable]) -> Admission {
+        let numeric = ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"]
+        let textual = ["minLength", "maxLength", "pattern"]
+        let keys =
+            ["integer", "number"].contains(probe.type)
+            ? numeric
+            : probe.type == "string" ? textual : []
+        let present = keys.filter { schema[$0] != nil }
+        guard !present.isEmpty else { return .yes }
+        guard case .value(let value) = probe else { return .maybe }
+        func bound(_ key: String) -> Double? {
+            guard let raw = schema[key], raw is NSNumber || raw is Int || raw is Double else {
+                return nil
+            }
+            switch JSONValue.from(raw) {
+            case .int(let int): return Double(int)
+            case .double(let double): return double
+            default: return nil
+            }
+        }
+        switch value {
+        case .int, .double:
+            let number: Double
+            if case .int(let int) = value {
+                number = Double(int)
+            } else if case .double(let double) = value {
+                number = double
+            } else {
+                return .unknown
+            }
+            let exclusiveFlags = (
+                minimum: schema["exclusiveMinimum"] as? Bool == true,
+                maximum: schema["exclusiveMaximum"] as? Bool == true
+            )
+            for key in present {
+                if ["exclusiveMinimum", "exclusiveMaximum"].contains(key), schema[key] is Bool {
+                    continue
+                }
+                guard let limit = bound(key) else { return .unknown }
+                let holds: Bool
+                switch key {
+                case "minimum": holds = exclusiveFlags.minimum ? number > limit : number >= limit
+                case "maximum": holds = exclusiveFlags.maximum ? number < limit : number <= limit
+                case "exclusiveMinimum": holds = number > limit
+                case "exclusiveMaximum": holds = number < limit
+                default:
+                    guard limit > 0 else { return .unknown }
+                    let quotient = number / limit
+                    holds = quotient.isFinite && quotient.rounded() == quotient
+                }
+                if !holds { return .no }
+            }
+            return .yes
+        case .string(let text):
+            let length = text.unicodeScalars.count
+            for key in present {
+                if key == "pattern" {
+                    guard let pattern = schema[key] as? String,
+                        let regex = try? NSRegularExpression(pattern: pattern)
+                    else { return .unknown }
+                    let range = NSRange(text.startIndex..., in: text)
+                    if regex.firstMatch(in: text, range: range) == nil { return .no }
+                } else {
+                    guard let limit = bound(key) else { return .unknown }
+                    if key == "minLength" ? Double(length) < limit : Double(length) > limit {
+                        return .no
+                    }
+                }
+            }
+            return .yes
+        default:
+            return .yes
+        }
     }
 
     private static let maximumReferenceHops = 8

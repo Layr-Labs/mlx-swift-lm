@@ -201,7 +201,9 @@ func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
 /// Read a textual parameter using its declared schema; unknown or ambiguous
 /// schemas preserve the original text. Validation is a separate boundary.
 /// `resolvingReferences` reads a local `$ref` as the schema it names in the
-/// tool's parameters (the Qwen XML dialect, whose every value is text).
+/// tool's parameters (the Qwen XML dialect, whose every value is text), and
+/// reads a JSON literal the schema admits as that literal
+/// (`ToolArgumentNormalization.LiteralReading.preferred`).
 func convertParameterValue(
     _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?,
     resolvingReferences: Bool = false
@@ -212,7 +214,8 @@ func convertParameterValue(
     else { return value }
     return ToolArgumentNormalization.normalize(
         .string(value), schema: properties[paramName] as? [String: any Sendable],
-        root: resolvingReferences ? parameters : nil
+        root: resolvingReferences ? parameters : nil,
+        literals: resolvingReferences ? .preferred : .whenTextRejected
     ).sendableValue
 }
 
