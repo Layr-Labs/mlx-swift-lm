@@ -665,6 +665,13 @@ extension EngineLoopV2 {
                 ? rec.request.promptTokens : nil)
     }
 
+    /// Red control stand-in: no row couples.
+    static func mtpCouplesProposals(
+        _ params: CBv2SamplingParams, freeSpan: Bool, constrained: Bool
+    ) -> Bool {
+        false
+    }
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,

@@ -500,6 +500,17 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
         return result
     }
 
+    /// Red control stand-in: the selection is ignored (greedy drafts).
+    public func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int, selection: CBv2MTPBlockProposalSelection
+    ) -> MLXArray {
+        draftBlock(tokens: tokens, hidden: hidden, requestStates: requestStates, depth: depth)
+    }
+
+    /// Red control stand-in: never counts.
+    var coupledRoundCountForTesting = 0
+
     /// Right-pads per-row context K/V to one length and masks the padding.
     static func padded(_ rows: [(keys: MLXArray, values: MLXArray)], block: Int) -> (
         keys: MLXArray, values: MLXArray, mask: MLXArray?
@@ -582,7 +593,7 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
     }
 }
 
-extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
+extension Inkling2DSparkDrafter: CBv2MTPCoupledBlockDrafter {
     /// The engine configuration the drafter ships with: on, up to the
     /// checkpoint's full block (7 drafts), up to eight speculating rows, one
     /// verify window per round. `adaptive` lets the engine's marginal policy
@@ -591,7 +602,8 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
     /// does not pay); otherwise every round drafts `maxDraftTokens`. The exactness of
     /// the window is the target's claim (`requiredVerificationMode`).
     public static func defaultMTPConfig(
-        maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8
+        maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8,
+        coupledProposals: Bool = false
     ) -> CBv2MTPConfig {
         CBv2MTPConfig(
             enabled: true, maxDraftTokens: maxDraftTokens,
@@ -599,6 +611,7 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
             fixedDraftTokens: adaptive ? nil : maxDraftTokens, verificationMode: .rectangular,
             maxAutomaticRectangularTokens: maxSpeculativeRows * (maxDraftTokens + 1),
             costCurveDepthSelection: true,
-            speculativeBatchLimit: maxSpeculativeRows)
+            speculativeBatchLimit: maxSpeculativeRows,
+            coupledProposals: coupledProposals)
     }
 }
