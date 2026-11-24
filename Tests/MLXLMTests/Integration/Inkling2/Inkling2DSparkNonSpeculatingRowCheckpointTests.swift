@@ -20,6 +20,8 @@ struct Inkling2DSparkNonSpeculatingRowCheckpointTests {
 
     static let chunk = 64
     static let segmentBytes = 1 << 20
+    /// Inkling's sampled logits cover the unpadded vocabulary only.
+    static let vocabulary = 60
     static var dtype: DType { .bfloat16 }
 
     static func engine(
@@ -70,7 +72,7 @@ struct Inkling2DSparkNonSpeculatingRowCheckpointTests {
             id: .init(id), promptTokens: prompt, sampling: .init(temperature: 0),
             maxTokens: maxTokens, cacheSalt: "tenant", prefixCacheEnabled: cached,
             prefixCacheReceiptID: cached ? .init(id + 1000) : nil)
-        control?.apply(to: &request)
+        control?.apply(to: &request, vocabulary: vocabulary)
         return request
     }
 
@@ -108,6 +110,7 @@ struct Inkling2DSparkNonSpeculatingRowCheckpointTests {
         let drafter = try Geometry.drafter(target: model, dtype: Self.dtype)
         try await cbv2ExpectNonSpeculatingDonorCheckpoints(
             control, chunk: Self.chunk, maxTokens: 8, segmentBytes: Self.segmentBytes,
+            vocabulary: Self.vocabulary,
             make: { try Self.engine(model: model, drafter: drafter, store: $0) },
             released: Self.released)
     }
