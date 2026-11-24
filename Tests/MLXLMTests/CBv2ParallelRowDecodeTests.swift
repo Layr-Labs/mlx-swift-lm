@@ -326,12 +326,13 @@ struct CBv2ParallelRowDecodeTests {
 /// `append` writes for the same rows.
 @Suite("CBv2PagedCheckpointRowTargets", .serialized)
 struct CBv2PagedCheckpointRowTargetsTests {
-    private func kind() -> CBv2LayerKind {
-        .init(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
+    private func kind(key: Int = 64, value: Int = 64) -> CBv2LayerKind {
+        .init(attention: .full, headDim: key, valueHeadDim: value, kvHeads: 2, queryHeads: 4)
     }
 
-    private func config(types: [DType]) -> PagedKVPoolConfig {
-        let largestPage = 2 * 2 * 16 * 64 * types.map(\.size).max()!
+    private func config(types: [DType], kind: CBv2LayerKind) -> PagedKVPoolConfig {
+        let largestPage =
+            kind.kvHeads * 16 * (kind.headDim + kind.valueHeadDim) * types.map(\.size).max()!
         return .init(
             capacityBytes: 16 << 20, maxPrefillChunk: 64, maxBufferLength: 16 << 20,
             segmentSizeBytes: largestPage * 3, layerDTypes: types)
@@ -345,9 +346,24 @@ struct CBv2PagedCheckpointRowTargetsTests {
         "targets and append fill the same pages, across head, page and segment seams",
         arguments: [DType.bfloat16, .float16, .float32])
     func sameBytes(dtype: DType) throws {
-        let admission = AdmissionV2(layerKinds: [kind(), kind()], bytesCapacity: 16 << 20)
+        try fill(kind(), dtype: dtype)
+    }
+
+    /// The value role sits at the segment's value offset, after the key
+    /// pages of the key width: a layer whose value width differs from its
+    /// key width pins that offset and both row widths.
+    @Test(
+        "targets and append fill the same pages when the value width differs from the key width",
+        arguments: [DType.bfloat16, .float32], [(key: 128, value: 64), (key: 64, value: 128)])
+    func asymmetricSameBytes(dtype: DType, widths: (key: Int, value: Int)) throws {
+        try fill(kind(key: widths.key, value: widths.value), dtype: dtype)
+    }
+
+    private func fill(_ kind: CBv2LayerKind, dtype: DType) throws {
+        let admission = AdmissionV2(layerKinds: [kind, kind], bytesCapacity: 16 << 20)
         let plan = try CBv2PagedCheckpointStoragePlan(
-            layerKinds: [kind(), kind()], config: config(types: [dtype, dtype]), position: 65)
+            layerKinds: [kind, kind], config: config(types: [dtype, dtype], kind: kind),
+            position: 65)
         let appended = try CBv2PagedCheckpointStorage(plan: plan) { array in
             try withError { eval(array) }
         }
@@ -360,10 +376,10 @@ struct CBv2PagedCheckpointRowTargetsTests {
             appended.close()
             targeted.close()
         }
-        let rowBytes = 64 * dtype.size
         let rows = 2 * 65
         for layer in plan.layers.indices {
             for values in [false, true] {
+                let rowBytes = (values ? kind.valueHeadDim : kind.headDim) * dtype.size
                 let expected = bytes(count: rows * rowBytes, salt: layer * 19 + (values ? 7 : 3))
                 try appended.append(
                     layerIndex: layer, values: values, byteOffset: 0, data: expected)

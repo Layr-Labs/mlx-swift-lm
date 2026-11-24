@@ -225,7 +225,7 @@ struct NativeQuantizedPagedCheckpointTests {
     /// K/V bit of the three owning layers.
     private func restoredBits(
         _ dtype: DType, hostZeroed: Bool, segmentBytes: Int,
-        decoder: @escaping () -> CBv2NativeCheckpointRowDecoder
+        decoder: @escaping @Sendable () -> CBv2NativeCheckpointRowDecoder
     ) throws -> [[UInt32]] {
         let f = try fixture(dtype, hostZeroed: hostZeroed)
         try f.admission.reserve(id: donorID, additionalTokens: 1025)
@@ -239,9 +239,10 @@ struct NativeQuantizedPagedCheckpointTests {
         let exported = try source(donor, f)
         defer { exported.close() }
         let plan = try f.codec.plan(manifest: exported.manifest, request: f.request)
-        CBv2NativeCheckpointRowDecoder.importDecoderForTesting = decoder
-        defer { CBv2NativeCheckpointRowDecoder.importDecoderForTesting = nil }
-        let sink = try plan.allocate(onRelease: {})
+        // The import takes its decoder when it is allocated, in this task.
+        let sink = try CBv2NativeCheckpointRowDecoder.$importDecoderForTesting.withValue(decoder) {
+            try plan.allocate(onRelease: {})
+        }
         defer { sink.close() }
         for (index, descriptor) in exported.manifest.tensors.enumerated() {
             var offset = 0
@@ -289,7 +290,7 @@ struct NativeQuantizedPagedCheckpointTests {
         let reference = try restoredBits(
             dtype, hostZeroed: false, segmentBytes: 257, decoder: { .init(workers: 1) })
         for (hostZeroed, segmentBytes) in [(false, 4 << 20), (true, 4 << 20), (true, 257)] {
-            for decoder in [
+            let decoders: [@Sendable () -> CBv2NativeCheckpointRowDecoder] = [
                 {
                     CBv2NativeCheckpointRowDecoder(workers: 4, waveRows: 7, minimumRowsPerWorker: 2)
                 },
@@ -298,7 +299,8 @@ struct NativeQuantizedPagedCheckpointTests {
                         workers: 3, waveRows: 1024, minimumRowsPerWorker: 1)
                 },
                 { CBv2NativeCheckpointRowDecoder() },
-            ] {
+            ]
+            for decoder in decoders {
                 #expect(
                     try restoredBits(
                         dtype, hostZeroed: hostZeroed, segmentBytes: segmentBytes, decoder: decoder)
