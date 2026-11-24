@@ -383,9 +383,12 @@ def:
             (`fitsVideoSampleToDecodedBytes`, off by default).
             A refused prefix restore's release leaves its imported assistant charge on the stage,
             and a cold start after it gets its own assistant binding.
+            The engine's GLM step-envelope check can bound history by the tokens the caller's
+            admission admits (`glm5NextAdmittedBytesPerContextToken`, nil by default).
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"
+            - "changelog.d/glm-step-envelope-admitted-tokens.md"
             - "changelog.d/glm-refused-prefix-restore-cold-start.md"
             - "changelog.d/glm-refused-prefix-restore-release.md"
             - "changelog.d/glm5-video-decode-budget-sampling.md"
