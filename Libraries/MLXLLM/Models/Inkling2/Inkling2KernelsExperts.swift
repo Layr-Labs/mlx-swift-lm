@@ -461,6 +461,14 @@ extension Inkling2Kernels {
     nonisolated(unsafe) static var expertGroupBlockRows =
         Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS"] ?? "")
         ?? 32
+
+    /// Test hook of the red control: a knob parsed as `main` parses it, unchecked.
+    static func expertGroupKnob(
+        _ name: String, default fallback: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        Int(environment[name] ?? "") ?? fallback
+    }
     /// Helpers of the version-2 one-row kernels. Each lane runs split-K chain
     /// `ks` (superblocks ks, ks + SK, ...) of R weight rows at once: one wide
     /// load per row and superblock, the 32 input values loaded and widened
