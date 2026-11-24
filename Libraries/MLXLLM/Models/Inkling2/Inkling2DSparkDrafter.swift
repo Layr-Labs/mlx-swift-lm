@@ -435,6 +435,32 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
         tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
         depth: Int
     ) -> MLXArray {
+        draftBlock(
+            tokens: tokens, hidden: hidden, requestStates: requestStates, depth: depth,
+            coupled: nil)
+    }
+
+    /// `draftBlock` whose proposals come from `selection` (coupled drafting,
+    /// `CBv2MTPConfig.coupledProposals`): each step forms the full draft
+    /// logits and the next Markov step consumes the selected token. Stages
+    /// exactly what `draftBlock` stages; the context cache never holds drafts,
+    /// so a rejected proposal leaves nothing to roll back.
+    public func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int, selection: CBv2MTPBlockProposalSelection
+    ) -> MLXArray {
+        draftBlock(
+            tokens: tokens, hidden: hidden, requestStates: requestStates, depth: depth,
+            coupled: selection)
+    }
+
+    /// Rounds drafted with a coupled selection (tests).
+    var coupledRoundCountForTesting = 0
+
+    private func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int, coupled selection: CBv2MTPBlockProposalSelection?
+    ) -> MLXArray {
         let c = configuration
         let batch = requestStates.count
         precondition(
@@ -477,7 +503,32 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
                     + [plan.baseLogits, plan.lower, plan.upper].compactMap { $0 })
         }
         let result: MLXArray
-        if Self.compiledChainEnabled, let base = plan.baseLogits {
+        if let selection {
+            // Full draft logits per step: the certified plan keeps no base
+            // logits, so its rows take one full product here.
+            let base =
+                plan.baseLogits
+                ?? Inkling2DSparkModel.baseProduct(
+                    block[0..., 1 ... depth, 0...].reshaped(batch * depth, c.hiddenSize),
+                    head.unembedding
+                ).reshaped(batch, depth, -1)
+            var markov = model.initialMarkovState(batch: batch)
+            var previous = seeds.reshaped(batch)
+            var drafts: [MLXArray] = []
+            for step in 0 ..< depth {
+                let next = model.markovStep(
+                    state: markov, previous: previous, context: plan.context[0..., step, 0...])
+                markov = next.state
+                let logits = model.draftLogits(
+                    base: base[0..., step, 0...], latent: next.latent, head: head)
+                previous =
+                    selection.propose(logits, step: step)?.asType(.int32)
+                    ?? argMax(logits, axis: -1).asType(.int32)
+                drafts.append(previous)
+            }
+            result = stacked(drafts, axis: 1)
+            coupledRoundCountForTesting += 1
+        } else if Self.compiledChainEnabled, let base = plan.baseLogits {
             result = compiledChain([plan.context, seeds.reshaped(batch), base])[0]
         } else {
             var markov = model.initialMarkovState(batch: batch)
@@ -582,7 +633,7 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
     }
 }
 
-extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
+extension Inkling2DSparkDrafter: CBv2MTPCoupledBlockDrafter {
     /// The engine configuration the drafter ships with: on, up to the
     /// checkpoint's full block (7 drafts), up to eight speculating rows, one
     /// verify window per round. `adaptive` lets the engine's marginal policy
@@ -590,8 +641,12 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
     /// measured cost of each window depth (down to plain decode where drafting
     /// does not pay); otherwise every round drafts `maxDraftTokens`. The exactness of
     /// the window is the target's claim (`requiredVerificationMode`).
+    /// `coupledProposals` (off by default) lets sampled rows under exact
+    /// acceptance propose their verify draw's keyed race instead of the
+    /// argmax; output is unchanged.
     public static func defaultMTPConfig(
-        maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8
+        maxDraftTokens: Int = 7, adaptive: Bool = true, maxSpeculativeRows: Int = 8,
+        coupledProposals: Bool = false
     ) -> CBv2MTPConfig {
         CBv2MTPConfig(
             enabled: true, maxDraftTokens: maxDraftTokens,
@@ -599,6 +654,7 @@ extension Inkling2DSparkDrafter: CBv2MTPBatchedBlockDrafter {
             fixedDraftTokens: adaptive ? nil : maxDraftTokens, verificationMode: .rectangular,
             maxAutomaticRectangularTokens: maxSpeculativeRows * (maxDraftTokens + 1),
             costCurveDepthSelection: true,
-            speculativeBatchLimit: maxSpeculativeRows)
+            speculativeBatchLimit: maxSpeculativeRows,
+            coupledProposals: coupledProposals)
     }
 }

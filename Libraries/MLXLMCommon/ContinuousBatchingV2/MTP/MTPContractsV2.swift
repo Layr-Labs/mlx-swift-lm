@@ -486,6 +486,44 @@ public protocol CBv2MTPBatchedBlockDrafter: CBv2MTPRequestStatefulDrafter {
     ) -> MLXArray
 }
 
+/// Coupled proposals for one block round (`CBv2MTPConfig.coupledProposals`):
+/// given draft index `step`'s draft logits `[rows, vocab]` for the round's
+/// rows in order, each sampled row's proposal is the keyed race the target's
+/// verify draw runs at that row's output index (`generatedTokenCount + step`),
+/// over the draft's row (`CBv2StepSampler.mtpCoupledDraftProposal`). Greedy
+/// and ineligible rows get the row's argmax. The engine builds it; a drafter
+/// only applies it.
+public struct CBv2MTPBlockProposalSelection {
+    private let race: (MLXArray, Int) -> MLXArray?
+
+    public init(_ race: @escaping (_ logits: MLXArray, _ step: Int) -> MLXArray?) {
+        self.race = race
+    }
+
+    /// Lazy `[rows]` int32 proposals, or nil when the sampler has no coupled
+    /// race (the drafter then keeps its own rule).
+    public func propose(_ logits: MLXArray, step: Int) -> MLXArray? {
+        race(logits, step)
+    }
+}
+
+/// A block drafter that can propose with its rows' verify noise.
+///
+/// Exact acceptance keeps a draft only when it equals the target's own draw,
+/// and that draw is what is emitted, so which proposal is made never changes
+/// the output; a proposal raced with the same noise as the draw only agrees
+/// with it more often. The engine calls this instead of `draftBlock` only for
+/// a round with a selection; every other round is unchanged.
+public protocol CBv2MTPCoupledBlockDrafter: CBv2MTPBatchedBlockDrafter {
+    /// `draftBlock`, with each step's proposals taken from `selection`: the
+    /// next Markov step consumes the selected token. Stages exactly what
+    /// `draftBlock` stages.
+    func draftBlock(
+        tokens: [MLXArray], hidden: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        depth: Int, selection: CBv2MTPBlockProposalSelection
+    ) -> MLXArray
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.
@@ -653,6 +691,14 @@ public struct CBv2MTPConfig: Sendable {
     /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off. No value
     /// turns it on for a family that has not opted in. Tokens are unaffected.
     public var costCurveDepthSelection: Bool
+    /// Coupled drafting for drafters that adopt `CBv2MTPCoupledBlockDrafter`:
+    /// a sampled row under exact target-prefix acceptance proposes the keyed
+    /// race its verify draw runs at each output index, instead of the draft's
+    /// argmax. Output is unchanged (exact acceptance commits only the
+    /// target's draws); only acceptance can move. Rows that are greedy, in a
+    /// grammar, or under typical acceptance keep their own rule. Off by
+    /// default; a family opts in after measuring it.
+    public var coupledProposals: Bool
     /// Optional prompt-length gate: a request whose prompt holds more than
     /// this many tokens never drafts and keeps no assistant history for its
     /// whole lifetime, as a reasoning budget does; it decodes as ordinary
@@ -710,9 +756,11 @@ public struct CBv2MTPConfig: Sendable {
         stopStringSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
-        maxDraftPromptTokens: Int? = nil
+        maxDraftPromptTokens: Int? = nil,
+        coupledProposals: Bool = false
     ) {
         self.enabled = enabled
+        self.coupledProposals = coupledProposals
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
         self.ordinaryDecodeHistory = ordinaryDecodeHistory

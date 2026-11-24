@@ -182,6 +182,7 @@ def:
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
+            - "changelog.d/checkpoint-row-decode-test-coverage.md"
             - "changelog.d/cbv2-long-prefix-checkpoint-manifests.md"
             - "Tests/MLXLMTests/CompleteCheckpointLongPrefixTests.swift"
             - "docs/prefix-checkpoint-retention.md"
@@ -225,6 +226,9 @@ def:
             and `DARKBLOOM_CBV2_MTP_COST_CURVE` can only turn the cost-curve depth choice off.
             `CBv2MTPConfig.maxDraftPromptTokens` (nil by default) keeps a request whose prompt is
             longer than the limit target-only for its whole lifetime, as a reasoning budget does.
+            `CBv2MTPConfig.coupledProposals` (off by default) lets a block drafter that adopts
+            `CBv2MTPCoupledBlockDrafter` (Inkling 2) propose each sampled row's verify-draw race
+            under exact acceptance; output is unchanged, only acceptance can move.
             `CBv2MTPConfig.repetitionPenaltySpeculation` (off by default;
             `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` turns an opt-in off) lets repetition-penalty
             rows draft: the sampler penalizes each verify position over the last
@@ -235,6 +239,7 @@ def:
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
             - "changelog.d/cbv2-mtp-drafter-opt-ins.md"
             - "changelog.d/cbv2-mtp-draft-prompt-limit.md"
+            - "changelog.d/cbv2-mtp-coupled-block-drafting.md"
             - "changelog.d/cbv2-mtp-repetition-penalty-rows.md"
         - title: "Engine v2 contract docs"
           description: |
@@ -673,13 +678,16 @@ def:
             any (`Inkling2ImageLimitError`).
             The DSpark drafter (`mtp.safetensors`) drives MTP with row-exact rectangular verification and its
             own durable prefix-checkpoint layout. Its private paged pool is granted the segmented pool's own
-            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`). The vision tower, processor
-            and VLM wrapper are in the vision-language section.
+            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`). Rows that cannot speculate
+            record the drafter's prompt history (`checkpointsNonSpeculatingRows`), so they save the same
+            checkpoints as a drafting row. The vision tower, processor and VLM wrapper are in the
+            vision-language section.
           globs:
             - "Libraries/MLXLLM/Models/Inkling2/**"
             - "Tests/MLXLMTests/Inkling2*.swift"
             - "Tests/MLXLMTests/Integration/Inkling2/**"
             - "changelog.d/inkling2-mini-*.md"
+            - "changelog.d/inkling2-mini-non-speculating-row-checkpoints.md"
             - "tools/inkling2_dspark_reference.py"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
