@@ -266,7 +266,7 @@ final class CBv2PagedCheckpointStorage {
             let localPage = group.layout.localPage(group.pages[layer.firstPage + logicalPage])
             let element =
                 ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot) * roleWidth
-                + (values ? segment.valueOffset : 0)
+                + 0
             let first = UnsafeMutableRawPointer(mutating: pointer).advanced(by: element * width)
             for row in 0 ..< length / rowBytes {
                 targets.append(first.advanced(by: row * rowBytes))
