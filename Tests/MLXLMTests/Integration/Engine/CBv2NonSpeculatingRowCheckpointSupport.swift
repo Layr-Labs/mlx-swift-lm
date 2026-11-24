@@ -4,15 +4,15 @@ import Testing
 @testable import MLXLMCommon
 
 /// Request controls that keep a row from speculating. None of them changes
-/// the prompt state a prefix checkpoint saves. The fixtures that use these
-/// all have a 64-token vocabulary.
+/// the prompt state a prefix checkpoint saves. `vocabulary` is the size of
+/// the fixture's sampled logits (64 unless a fixture says otherwise).
 enum CBv2NonSpeculatingControl: String, CaseIterable, Sendable, CustomTestStringConvertible {
     case stopString, presencePenalty, frequencyPenalty, repetitionPenalty, logitBias, logprobs
     case tokenConstraint
 
     var testDescription: String { rawValue }
 
-    func apply(to request: inout CBv2Request) {
+    func apply(to request: inout CBv2Request, vocabulary: Int = 64) {
         switch self {
         case .stopString: request.stopStrings = ["\u{1}never matches\u{1}"]
         case .presencePenalty: request.sampling.presencePenalty = 1.5
@@ -21,26 +21,31 @@ enum CBv2NonSpeculatingControl: String, CaseIterable, Sendable, CustomTestString
         case .logitBias: request.sampling.logitBias = [5: -40]
         case .logprobs: request.sampling.topLogprobs = 64
         case .tokenConstraint:
-            request.tokenConstraint = CBv2OddTokenConstraint(maxTokens: request.maxTokens)
+            request.tokenConstraint = CBv2OddTokenConstraint(
+                maxTokens: request.maxTokens, vocabulary: vocabulary)
         }
     }
 }
 
-/// Allows only odd token ids.
+/// Allows only odd token ids below `vocabulary`.
 private final class CBv2OddTokenConstraint: CBv2TokenConstraint, @unchecked Sendable {
     let mode: CBv2TokenConstraintMode = .required
     let maxTokens: Int
+    let vocabulary: Int
     let fallbackTokenID = 1
     let initialState = 0
 
-    init(maxTokens: Int) { self.maxTokens = maxTokens }
+    init(maxTokens: Int, vocabulary: Int) {
+        self.maxTokens = maxTokens
+        self.vocabulary = vocabulary
+    }
 
     func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
-        remainingTokens > 0 ? Array(stride(from: 1, to: 64, by: 2)) : []
+        remainingTokens > 0 ? Array(stride(from: 1, to: vocabulary, by: 2)) : []
     }
 
     func nextState(state: Int, tokenID: Int) -> Int? {
-        tokenID > 0 && tokenID < 64 && tokenID % 2 == 1 ? 0 : nil
+        tokenID > 0 && tokenID < vocabulary && tokenID % 2 == 1 ? 0 : nil
     }
 }
 
@@ -87,6 +92,7 @@ func cbv2CollectControlled(_ events: AsyncStream<CBv2Event>) async -> CBv2Contro
 /// engine without a prefix cache: the reference for every token.
 func cbv2ExpectNonSpeculatingDonorCheckpoints(
     _ control: CBv2NonSpeculatingControl, chunk: Int, maxTokens: Int, segmentBytes: Int,
+    vocabulary: Int = 64,
     make: (CompleteCheckpointFixtureStore?) throws -> (EngineV2, PagedKVBackend),
     released: (EngineV2, PagedKVBackend) -> Void
 ) async throws {
@@ -98,7 +104,7 @@ func cbv2ExpectNonSpeculatingDonorCheckpoints(
             id: .init(id), promptTokens: prompt, sampling: .init(temperature: 0),
             maxTokens: maxTokens, cacheSalt: "tenant", prefixCacheEnabled: cached,
             prefixCacheReceiptID: cached ? .init(id + 1000) : nil)
-        if controlled { control.apply(to: &request) }
+        if controlled { control.apply(to: &request, vocabulary: vocabulary) }
         return request
     }
     func archives(_ store: Store) async -> [Store.Archive] {
