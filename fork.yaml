@@ -179,6 +179,7 @@ def:
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
+            - "Tests/MLXLMTests/CompleteCheckpointLongPrefixTests.swift"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
@@ -345,6 +346,7 @@ def:
       globs:
         - "changelog.d/glm5-tool-grammar-only.md"
         - "changelog.d/qwen35-stream-schema-reading.md"
+        - "changelog.d/tool-argument-exact-numbers-untyped-containers.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"
