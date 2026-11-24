@@ -50,7 +50,7 @@ extension EngineLoopV2 {
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
-            mtpRepetitionPenaltyEligible(rec),
+            sampling.repetitionPenalty == 1,
             mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
                 || mtp?.config.effectiveStopStringSpeculation == true

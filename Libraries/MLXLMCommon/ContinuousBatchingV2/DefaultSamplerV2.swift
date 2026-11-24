@@ -474,11 +474,6 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         // penalty are left untouched (the ordinary path's `x - 0 * counts`,
         // and its repetition divide by 1, are the identity on them as well).
         let repetitionRows = params.map(CBv2MTPVerifyPenalties.appliesRepetition)
-        if let penalties, repetitionRows.contains(true) {
-            flat = applyWindowRepetition(
-                flat, penalties: penalties, params: params,
-                repetitionRows: repetitionRows, b: b, w: w, vocab: vocab)
-        }
         let countRows = params.map(CBv2MTPVerifyPenalties.applies)
         if let penalties, countRows.contains(true) {
             flat = applyWindowPenalties(
