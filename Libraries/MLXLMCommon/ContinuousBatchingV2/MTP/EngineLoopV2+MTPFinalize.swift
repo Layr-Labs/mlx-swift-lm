@@ -199,6 +199,9 @@ extension EngineLoopV2 {
         }
         var host: [Int32] = []
         var policyTopTwoHost: [Float]?
+        // Logprob rows: every window position's logprobs, row major, labelled
+        // with the target's token there (`EngineLoopV2.mtpWindowLogprobs`).
+        var windowLogprobs: [CBv2TokenLogprob?] = []
         let acceptanceStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         defer {
             if CBv2StepProfiler.enabled {
@@ -212,6 +215,21 @@ extension EngineLoopV2 {
                 host = verify.acceptancePacket.asArray(Int32.self)
                 CBv2CoreInstrumentation.recordHostSync()
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+                if let gathered = verify.logprobs {
+                    let width = 1 + k
+                    let targetStart = verify.rows.count * k
+                    windowLogprobs = CBv2Logprobs.assemble(
+                        gathered,
+                        sampledTokens: (0 ..< verify.rows.count * width).map {
+                            Int(host[targetStart + $0])
+                        },
+                        topLogprobsPerRow: verify.rows.flatMap { row in
+                            Array(
+                                repeating: scheduler.record(for: row.id)?.request.sampling
+                                    .topLogprobs ?? 0,
+                                count: width)
+                        })
+                }
             })
         else { return }
         if CBv2StepProfiler.enabled {
@@ -574,12 +592,25 @@ extension EngineLoopV2 {
                 requestID: id,
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
+            // One logprob per emitted token, as ordinary decode emits them.
+            // Exact acceptance commits the target's token at every position,
+            // so each entry's token is the emitted one.
+            func emittedLogprobs(_ tokens: [Int]) -> [CBv2TokenLogprob]? {
+                guard !windowLogprobs.isEmpty, !tokens.isEmpty else { return nil }
+                let base = batchIndex * (1 + k)
+                let entries = tokens.indices.compactMap { windowLogprobs[base + $0] }
+                guard entries.count == tokens.count else { return nil }
+                assert(zip(entries, tokens).allSatisfy { $0.token == $1 })
+                return entries
+            }
             if hasStopStrings {
                 // A grammar-failing token is never emitted (ordinary decode
                 // finishes with the error before emitting it).
                 let visibleTokens = keptFailingToken ? Array(kept.dropLast()) : kept
                 stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: visibleTokens, logprobs: nil))
+                    .delta(
+                        text: textPieces.joined(), tokens: visibleTokens,
+                        logprobs: emittedLogprobs(visibleTokens)))
             } else {
                 let stream = stream(for: id)
                 stream?.reserveEmission()
@@ -587,12 +618,13 @@ extension EngineLoopV2 {
                 let visibleTokens = outcome.constraintFailure == nil ? kept : Array(kept.dropLast())
                 let pushTokens = endsWithStopToken ? Array(visibleTokens.dropLast()) : visibleTokens
                 let allTokens = visibleTokens
+                let logprobs = emittedLogprobs(allTokens)
                 let trackedLoop = nativeShutdownState == nil ? nil : self
                 enqueueDetokenization(owner: detokenizer) {
                     let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
                     let publish: () -> Void = {
                         stream?.emit(
-                            .delta(text: text, tokens: allTokens, logprobs: nil),
+                            .delta(text: text, tokens: allTokens, logprobs: logprobs),
                             consumingReservation: true)
                     }
                     if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }

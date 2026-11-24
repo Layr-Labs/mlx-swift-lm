@@ -156,6 +156,10 @@ final class CBv2MTPRoundInFlight {
         let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Lazy logprob gather over every `[B, 1+k]` window position, row
+        /// major (`EngineLoopV2.mtpWindowLogprobs`); nil when no verify row
+        /// requested logprobs. Finalize slices each row's committed prefix.
+        var logprobs: CBv2Logprobs.Gathered? = nil
 
     }
 

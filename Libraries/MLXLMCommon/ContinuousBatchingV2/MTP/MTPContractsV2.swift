@@ -655,6 +655,23 @@ public struct CBv2MTPConfig: Sendable {
     public var effectiveStopStringSpeculation: Bool {
         stopStringSpeculation && Self.envStopStringSpeculation
     }
+    /// Opt-in: rows that request logprobs may draft. Each committed token's
+    /// logprob and top logprobs are gathered from the verify window's raw
+    /// logits exactly as ordinary decode gathers them from its step's logits.
+    /// That equals drafter-off bit for bit only when every window position's
+    /// logits equal a one-token decode step's, so the opt-in takes effect only
+    /// for `.rectangularExact` verification with `.exact` acceptance
+    /// (`effectiveLogprobSpeculation`). Off by default;
+    /// `DARKBLOOM_MTP_LOGPROB_ROWS=0` overrides an opt-in.
+    public var logprobSpeculation: Bool
+    /// False for `DARKBLOOM_MTP_LOGPROB_ROWS=0/false/no/off`; read once.
+    public static let envLogprobSpeculation = envSwitch("DARKBLOOM_MTP_LOGPROB_ROWS")
+    /// The opt-in AND the process kill switch AND a verify path whose logits
+    /// equal one-token decode's (`.rectangularExact`, `.exact` acceptance).
+    public var effectiveLogprobSpeculation: Bool {
+        logprobSpeculation && Self.envLogprobSpeculation
+            && verificationMode == .rectangularExact && acceptance == .exact
+    }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
         ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
@@ -691,6 +708,7 @@ public struct CBv2MTPConfig: Sendable {
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
+        logprobSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
         maxDraftPromptTokens: Int? = nil
@@ -704,6 +722,7 @@ public struct CBv2MTPConfig: Sendable {
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
+        self.logprobSpeculation = logprobSpeculation
         self.costCurveDepthSelection = costCurveDepthSelection
         self.maxDraftPromptTokens = maxDraftPromptTokens.flatMap { $0 > 0 ? $0 : nil }
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)

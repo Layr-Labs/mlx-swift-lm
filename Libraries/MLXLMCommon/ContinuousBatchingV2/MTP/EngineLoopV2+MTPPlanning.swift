@@ -47,7 +47,7 @@ extension EngineLoopV2 {
             mtp?.config.promptExceedsDraftLimit(rec.request.promptTokens.count) != true,
             constraintEligible,
             samplingEligible,
-            sampling.topLogprobs == 0,
+            mtpLogprobRowEligible(rec),
             sampling.logitBias.isEmpty,
             sampling.repetitionPenalty == 1,
             mtpPenaltiesEligible(rec),
@@ -99,6 +99,18 @@ extension EngineLoopV2 {
         !hasSpans || !tracksPersistentHistory
     }
 
+    /// A row that requests logprobs drafts only under the logprob opt-in
+    /// (`CBv2MTPConfig.effectiveLogprobSpeculation`: exact acceptance on a
+    /// `.rectangularExact` target, whose verify logits equal a one-token
+    /// decode step's) and without a token constraint. Its committed tokens'
+    /// logprobs are then gathered from the verify window
+    /// (`EngineLoopV2+MTPTargetVerification`).
+    func mtpLogprobRowEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        rec.request.sampling.topLogprobs == 0
+            || (mtp?.config.effectiveLogprobSpeculation == true
+                && rec.request.tokenConstraint == nil)
+    }
+
     /// Only the explicit native fallback may remove media/ineligible rows from
     /// the head batch count, and only in a cohort actually containing media, a
     /// logprob row or, on a row-exact recurrent fallback target, any other
@@ -112,7 +124,7 @@ extension EngineLoopV2 {
             rows.contains(where: {
                 mtp.requiresTargetOnlyMedia($0.request)
                     || (mtp.supportsRequestScopedMediaFallback
-                        && $0.request.sampling.topLogprobs != 0)
+                        && $0.request.sampling.topLogprobs != 0 && !mtpLogprobRowEligible($0))
                     || (mtp.ineligibleRowsDecodeBesideSpeculation && !mtpBasicEligible($0))
             })
         else {
