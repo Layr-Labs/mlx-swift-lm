@@ -9,8 +9,17 @@ extension KernelTests {
     @Suite(.serialized)
     struct GLM5NextAdmittedStepEnvelopeTests {
         // The tests build engines and price steps; they run no forward pass.
+        // A 16K context: at 128 tokens the per-row shape price is below the
+        // step's setup bytes alone, so no history bound can lower the price.
         private func makeModel() throws -> GLM5NextTextModel {
-            let config = try GLM5NextInventoryFixture.configuration(layers: 4)
+            let base = try GLM5NextInventoryFixture.configuration(layers: 4)
+            var json = try #require(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+            var text = try #require(json["text_config"] as? [String: Any])
+            text["max_position_embeddings"] = 65536
+            json["text_config"] = text
+            let config = try JSONDecoder().decode(
+                GLM5NextConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
             let headers = try GLM5NextWeightInventory.expectedTensors(
                 configuration: config, storage: .float32, shard: "tiny.safetensors")
             let inventory = try GLM5NextWeightInventory.validate(
@@ -31,9 +40,9 @@ extension KernelTests {
             let model = try makeModel()
             func backend(scratchCeiling: Int) throws -> PagedKVBackend {
                 try model.makeCBv2PagedBackend(
-                    kvBytesCapacity: 128 << 20, maximumBatchSize: 2, maximumQueryTokens: 64,
-                    maximumContextTokens: 128, maximumScratchBytes: scratchCeiling,
-                    segmentBytes: 64 << 10, maximumBufferBytes: 32 << 20)
+                    kvBytesCapacity: 512 << 20, maximumBatchSize: 2, maximumQueryTokens: 64,
+                    maximumContextTokens: 16384, maximumScratchBytes: scratchCeiling,
+                    segmentBytes: 64 << 10, maximumBufferBytes: 1 << 40)
             }
             func engine(_ backend: PagedKVBackend, charge: Int?) -> EngineV2 {
                 EngineV2(
