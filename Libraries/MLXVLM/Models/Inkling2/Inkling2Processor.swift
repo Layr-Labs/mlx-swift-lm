@@ -140,9 +140,31 @@ public struct Inkling2MessageGenerator: MessageGenerator {
     }
 }
 
+/// A request with more images than `Inkling2Processor.maximumImagesPerRequest`,
+/// refused before any image is decoded. The request itself is invalid: every
+/// server refuses it the same way.
+public struct Inkling2ImageLimitError: LocalizedError, Equatable, Sendable {
+    public let images: Int
+    public let limit: Int
+
+    public init(images: Int, limit: Int) {
+        self.images = images
+        self.limit = limit
+    }
+
+    public var errorDescription: String? {
+        "Inkling 2 takes at most \(limit) images per request; this request has \(images)"
+    }
+}
+
 public struct Inkling2Processor: UserInputProcessor {
     /// `<|unused_200054|>`, the published placeholder id.
     public static let defaultImageTokenId = 200_054
+    /// Most images one request carries, checked before any image is decoded
+    /// (each costs up to a 4096 x 4096 RGB raster and its patches while it is
+    /// prepared). 64 is the largest per-request image cap the Darkbloom
+    /// provider gives a vision model (the Qwen3-VL family's).
+    public static let maximumImagesPerRequest = 64
 
     private let configuration: Inkling2ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -203,6 +225,10 @@ public struct Inkling2Processor: UserInputProcessor {
         }
         guard input.audios.isEmpty else {
             throw VLMError.processing("Inkling 2 does not accept audio input")
+        }
+        guard input.images.count <= Self.maximumImagesPerRequest else {
+            throw Inkling2ImageLimitError(
+                images: input.images.count, limit: Self.maximumImagesPerRequest)
         }
         let messages = Inkling2MessageGenerator().generate(
             from: input.removingSpecialTokenLabels(using: tokenizer))

@@ -970,6 +970,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// position hands over the pre-norm target hidden that a seed would, so
     /// batch-gated rows may chain and a final prompt row may seed the carry.
     public var supportsOrdinaryDecodeHistory: Bool { true }
+    /// Depth-zero plans chain as ordinary decode: T 0 output and speed were
+    /// measured unchanged on Qwen 3.5 9B and 35B and Qwen 3.6 35B.
+    public var supportsDepthZeroChaining: Bool { true }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
     /// the engine sampler supports verify pre-sampling.

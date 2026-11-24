@@ -96,6 +96,10 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            The exponential race's Exp(1) noise (`SamplerV2.exponentialNoise(fromUniform:)`,
+            shared by the ordinary, MTP verify and coupled-proposal draws) is
+            `max(-log1p(-max(u, 2^-33)), 2^-33)`; the outer floor binds only if `log1p` is
+            inaccurate.
             Identity-greedy batches skip unused parameter/history tensor construction and the
             unused all-greedy mask while retaining constraints, transforms and sampler row state.
             Opt-in native reasoning budgets count confirmed thought payload tokens, force the
@@ -107,6 +111,7 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
             - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
             - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/receipt.json"
+            - "changelog.d/cbv2-sampler-noise-floor.md"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
@@ -202,9 +207,15 @@ def:
             The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
             falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
             so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
+            Shared behaviours stay drafter opt-ins: depth-zero plans chain as ordinary decode only for
+            a drafter with `supportsDepthZeroChaining` (Qwen 3.5, Inkling 2;
+            `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0` turns it off), the split assistant-copy failure
+            rule only for a historical coder with `refusedAssistantCopyKeepsDonorStep` (Inkling 2),
+            and `DARKBLOOM_CBV2_MTP_COST_CURVE` can only turn the cost-curve depth choice off.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
+            - "changelog.d/cbv2-mtp-drafter-opt-ins.md"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
@@ -383,9 +394,12 @@ def:
             (`fitsVideoSampleToDecodedBytes`, off by default).
             A refused prefix restore's release leaves its imported assistant charge on the stage,
             and a cold start after it gets its own assistant binding.
+            The engine's GLM step-envelope check can bound history by the tokens the caller's
+            admission admits (`glm5NextAdmittedBytesPerContextToken`, nil by default).
             Registration and activation remain provider decisions.
           globs:
             - "changelog.d/glm-native-segment-release.md"
+            - "changelog.d/glm-step-envelope-admitted-tokens.md"
             - "changelog.d/glm-refused-prefix-restore-cold-start.md"
             - "changelog.d/glm-refused-prefix-restore-release.md"
             - "changelog.d/glm5-video-decode-budget-sampling.md"
@@ -631,6 +645,11 @@ def:
             The model runs only on the paged CBv2 engine: a model-owned paged attention kernel reached through
             the `PagedLayerCache` seam, convolution state as recurrent state, historical-window prefix
             checkpoints, and row-exact decode/verify kernels for projections and grouped experts.
+            The seam binds segment pages in place only when each page's local index fits the 24 bits of its
+            table entry; otherwise the call reads the gathered copy. The grouped expert row and pair knobs
+            (`DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS`, `_FROM`, `_TILE_AT`, `_UP_ROWS`) ignore values outside
+            their ranges. The image processor refuses a request of more than 64 images before it decodes
+            any (`Inkling2ImageLimitError`).
             The DSpark drafter (`mtp.safetensors`) drives MTP with row-exact rectangular verification and its
             own durable prefix-checkpoint layout. The vision tower, processor and VLM wrapper are in the
             vision-language section.
@@ -1099,8 +1118,8 @@ def:
         The Fork Tests workflow runs them before it stages the Metal library.
         `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
-        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process, the page allocator's tiers and placement, and the decode dispatches per step over busy-provider arrival and retirement traces.
-        `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
+        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process, the page allocator's tiers and placement, the decode dispatches per step over busy-provider arrival and retirement traces, and the entry encoding of the model-attention segment tables.
+        `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows, the `DARKBLOOM_CBV2_MTP_COST_CURVE` switch, and the settled assistant-copy failure rule.
         `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorFrameStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
         `TestTokenizer.swift` keeps the random test tokenizer that upstream removed (a86ee6a7); many fork tests use it.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.

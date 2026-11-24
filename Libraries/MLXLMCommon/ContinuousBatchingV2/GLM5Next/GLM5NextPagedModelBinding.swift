@@ -428,10 +428,19 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
     /// or a pool grown after setup, is still priced exactly (and refused) per
     /// step. The native maximum-buffer shape limit is not checked here: each
     /// step still refuses an oversized rectangular transport.
+    ///
+    /// `admittedBytesPerContextToken` is what the caller's admission reserves
+    /// for each request token within `admissibleBytes`, beside the setup
+    /// bytes it reserves once: KV and `bytesPerContextToken` of step scratch
+    /// at least, as `PagedKVBackend.glm5NextStepScratch` asks. The rows'
+    /// history then never exceeds the tokens that admission admits, which
+    /// bounds the price as well. A charge below KV plus scratch counts as KV
+    /// plus scratch. Nil, or no `admissibleBytes`, keeps the bound to the pool
+    /// and the context limit.
     @discardableResult
     package func validateStepEnvelope(
         maximumRequests: Int, maximumStepTokens: Int, maximumRowTokens: Int,
-        admissibleBytes: Int?
+        admissibleBytes: Int?, admittedBytesPerContextToken: Int? = nil
     ) throws -> Int {
         guard let pool = backend?.pool else {
             throw CBv2KVError.backendIneligible(reason: "GLM step envelope lacks its bound pool")
@@ -447,9 +456,14 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                 ]))
         }
         let rows = min(maximumRequests, limits.maximumBatchSize)
-        let history = min(
+        var history = min(
             pool.bytesCapacity / max(1, tokenBytes),
             try CBv2PagedWorkMath.product([rows, limits.maximumContextTokens]))
+        if let admissibleBytes, let charge = admittedBytesPerContextToken {
+            let perToken = max(
+                charge, try CBv2PagedWorkMath.add(tokenBytes, scratch.bytesPerContextToken))
+            history = min(history, max(0, admissibleBytes - scratch.setupBytes) / max(1, perToken))
+        }
         // Both bound every step; the all-rows-at-context price is the smaller
         // one when a short context leaves allocator overhead dominant.
         let required = min(

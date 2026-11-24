@@ -2149,7 +2149,29 @@ package final class CBv2ModelAttentionCounters: @unchecked Sendable {
 extension PagedLayerCache {
     /// Most segment buffers one model-kernel call binds.
     package static let modelAttentionMaximumBindings = 16
+    /// Local pages an in-place segment table entry addresses (its low 24 bits).
+    package static let modelAttentionMaximumLocalPages = 1 << 24
     package static let modelAttentionCounters = CBv2ModelAttentionCounters()
+
+    /// In-place segment table entries, `binding << 24 | local page`, for each
+    /// row's pages, `width` per row and zero past a row's pages. Nil when a
+    /// page's binding or local page does not fit its field (the call then reads
+    /// the gathered copy).
+    package static func modelAttentionSegmentEntries(
+        tables: [[Int32]], width: Int, binding: (Int32) -> Int, localPage: (Int32) -> Int
+    ) -> [Int32]? {
+        var flat = [Int32](repeating: 0, count: tables.count * width)
+        for (index, table) in tables.enumerated() {
+            for (slot, page) in table.enumerated() {
+                let (bound, local) = (binding(page), localPage(page))
+                guard (0 ..< modelAttentionMaximumBindings).contains(bound),
+                    (0 ..< modelAttentionMaximumLocalPages).contains(local)
+                else { return nil }
+                flat[index * width + slot] = Int32(bound << 24 | local)
+            }
+        }
+        return flat
+    }
 
     /// Attention by a model-owned kernel over this layer's pages, with the
     /// same write validation, page ownership and offset advance as
@@ -2255,19 +2277,16 @@ extension PagedLayerCache {
                 var tables: MLXArray?
                 // Bound in place only when there is something to bind (rows with
                 // no pages yet, a fresh prompt's first chunk, have nothing: the
-                // pool may not even hold a segment) and one dispatch can bind it.
+                // pool may not even hold a segment), one dispatch can bind it and
+                // every page fits the entry encoding.
+                let width = max(8, rows.map(\.table.count).max() ?? 0)
                 if !order.isEmpty && order.count <= Self.modelAttentionMaximumBindings
-                    && order.allSatisfy({ group.segments[$0] != nil })
+                    && order.allSatisfy({ group.segments[$0] != nil }),
+                    let flat = Self.modelAttentionSegmentEntries(
+                        tables: rows.map(\.table), width: width,
+                        binding: { binding[layout.segmentIndex(page: $0)]! },
+                        localPage: { layout.localPage($0) })
                 {
-                    let width = max(8, rows.map(\.table.count).max() ?? 0)
-                    var flat = [Int32](repeating: 0, count: rows.count * width)
-                    for (index, row) in rows.enumerated() {
-                        for (slot, page) in row.table.enumerated() {
-                            flat[index * width + slot] = Int32(
-                                binding[layout.segmentIndex(page: page)]! << 24
-                                    | layout.localPage(page))
-                        }
-                    }
                     tables = MLXArray(flat, [rows.count, width])
                 }
                 segmentTables = CBv2ModelAttentionSegmentTables(

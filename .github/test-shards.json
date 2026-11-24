@@ -62,7 +62,8 @@
       "strict": true,
       "extra": true,
       "filters": [
-        "MiMoV26NativeHistoricalRetentionTests.testDemandedMiddleFrontierSurvivesNativePublicationAndReopenedFork"
+        "MiMoV26NativeHistoricalRetentionTests.testDemandedMiddleFrontierSurvivesNativePublicationAndReopenedFork",
+        "MiMoV26NativeHistoricalRetentionTests.testSampledDonorPublishesFrontiersThatSampledAndGreedyForksRestore"
       ],
       "env": {
         "MIMO_V26_SERIAL_NATIVE_TESTS": "1",
@@ -77,7 +78,7 @@
           "--asymmetric"
         ]
       ],
-      "timeout_minutes": 5
+      "timeout_minutes": 10
     },
     {
       "name": "paged-safety",

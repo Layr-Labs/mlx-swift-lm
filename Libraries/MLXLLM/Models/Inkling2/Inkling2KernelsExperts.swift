@@ -414,9 +414,8 @@ extension Inkling2Kernels {
     /// adjacent lane groups) or 2 (both rows in one lane); same bits. The
     /// one-row GEMV keeps its own choice (`expertUpRowsPerLane`).
     /// `DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS`.
-    nonisolated(unsafe) static var expertGroupUpRowsPerLane =
-        Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS"] ?? "")
-        ?? 1
+    nonisolated(unsafe) static var expertGroupUpRowsPerLane = expertGroupKnob(
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS", default: 1)
     /// Steps of 9 to 32 rows (a drafter verify window of several streams runs
     /// streams x window rows whose consecutive tokens share experts) run the
     /// mixed launches by default: planned grouped GEMVs that take each
@@ -447,20 +446,39 @@ extension Inkling2Kernels {
     /// as MMA tiles inside the same launch (0: none): a tile costs the same
     /// for one to eight pairs, a GEMV grows with each pair.
     /// `DARKBLOOM_INKLING2_EXPERT_GROUP_TILE_AT`.
-    nonisolated(unsafe) static var expertGroupTileAt =
-        Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_TILE_AT"] ?? "")
-        ?? 4
+    nonisolated(unsafe) static var expertGroupTileAt = expertGroupKnob(
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_TILE_AT", default: 4)
     /// Fewest rows of a step the blocked grouped GEMVs take: smaller steps
     /// keep the grouped GEMVs without blocks (measured as good or better up
     /// to 8 rows). `DARKBLOOM_INKLING2_EXPERT_GROUP_FROM`.
-    nonisolated(unsafe) static var expertGroupBlockFrom =
-        Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_FROM"] ?? "")
-        ?? 9
+    nonisolated(unsafe) static var expertGroupBlockFrom = expertGroupKnob(
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_FROM", default: 9)
     /// Most rows of a step the blocked grouped GEMVs take (the tiles take
     /// larger steps). `DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS`.
-    nonisolated(unsafe) static var expertGroupBlockRows =
-        Int(ProcessInfo.processInfo.environment["DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS"] ?? "")
-        ?? 32
+    nonisolated(unsafe) static var expertGroupBlockRows = expertGroupKnob(
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS", default: 32)
+
+    /// Values the grouped GEMVs' row and pair knobs take: gate/up rows per
+    /// lane, the tile threshold (at most a work item's pairs), and the step
+    /// rows of the blocks (up to the 64 rows the expert kernel tests run).
+    static let expertGroupKnobRanges: [String: ClosedRange<Int>] = [
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_UP_ROWS": 1 ... 2,
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_TILE_AT": 0 ... pairsPerChunk,
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_FROM": 2 ... 64,
+        "DARKBLOOM_INKLING2_EXPERT_GROUP_ROWS": expertGroupMaxRows ... 64,
+    ]
+
+    /// The knob `name` from `environment`, or `fallback` when it is unset,
+    /// does not parse or is outside its `expertGroupKnobRanges` range.
+    static func expertGroupKnob(
+        _ name: String, default fallback: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard let value = environment[name].flatMap({ Int($0) }),
+            expertGroupKnobRanges[name]?.contains(value) ?? false
+        else { return fallback }
+        return value
+    }
     /// Helpers of the version-2 one-row kernels. Each lane runs split-K chain
     /// `ks` (superblocks ks, ks + SK, ...) of R weight rows at once: one wide
     /// load per row and superblock, the 32 input values loaded and widened
