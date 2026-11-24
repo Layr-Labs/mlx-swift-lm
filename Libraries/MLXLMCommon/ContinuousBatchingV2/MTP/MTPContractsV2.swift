@@ -655,6 +655,13 @@ public struct CBv2MTPConfig: Sendable {
     public var effectiveStopStringSpeculation: Bool {
         stopStringSpeculation && Self.envStopStringSpeculation
     }
+    /// Red control: the opt-in's API only; nothing reads it.
+    public var logprobSpeculation: Bool
+    public static let envLogprobSpeculation = envSwitch("DARKBLOOM_MTP_LOGPROB_ROWS")
+    public var effectiveLogprobSpeculation: Bool {
+        logprobSpeculation && Self.envLogprobSpeculation
+            && verificationMode == .rectangularExact && acceptance == .exact
+    }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
         ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
@@ -691,6 +698,7 @@ public struct CBv2MTPConfig: Sendable {
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
+        logprobSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
         maxDraftPromptTokens: Int? = nil
@@ -704,6 +712,7 @@ public struct CBv2MTPConfig: Sendable {
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
+        self.logprobSpeculation = logprobSpeculation
         self.costCurveDepthSelection = costCurveDepthSelection
         self.maxDraftPromptTokens = maxDraftPromptTokens.flatMap { $0 > 0 ? $0 : nil }
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
