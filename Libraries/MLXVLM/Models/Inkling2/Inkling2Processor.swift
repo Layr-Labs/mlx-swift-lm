@@ -140,9 +140,26 @@ public struct Inkling2MessageGenerator: MessageGenerator {
     }
 }
 
+/// Test hook of the red control: the error type, never thrown.
+public struct Inkling2ImageLimitError: LocalizedError, Equatable, Sendable {
+    public let images: Int
+    public let limit: Int
+
+    public init(images: Int, limit: Int) {
+        self.images = images
+        self.limit = limit
+    }
+
+    public var errorDescription: String? {
+        "Inkling 2 takes at most \(limit) images per request; this request has \(images)"
+    }
+}
+
 public struct Inkling2Processor: UserInputProcessor {
     /// `<|unused_200054|>`, the published placeholder id.
     public static let defaultImageTokenId = 200_054
+    /// Test hook of the red control: the cap, not enforced.
+    public static let maximumImagesPerRequest = 64
 
     private let configuration: Inkling2ProcessorConfiguration
     private let tokenizer: any Tokenizer

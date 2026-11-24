@@ -94,6 +94,25 @@ private func sha256(_ array: MLXArray) -> String {
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
+/// Renders every prompt as `images` image placeholders between two text tokens.
+private struct Inkling2PlaceholderTokenizer: MLXLMCommon.Tokenizer {
+    let images: Int
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [1] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        [1] + Array(repeating: Inkling2Processor.defaultImageTokenId, count: images) + [2]
+    }
+}
+
 /// A tiny Inkling 2 VLM: the text shape of `Inkling2PagedEngineTests` plus a
 /// two-layer tower projecting to its hidden size.
 enum Inkling2TinyVLM {
@@ -185,6 +204,25 @@ extension KernelTests {
             let table = Inkling2ImagePatches.normalizationTable()
             let values = Set(pixels.asArray(Float.self))
             #expect(values == [table[0][200], table[0][256]])
+        }
+
+        /// A request with exactly the cap of images is prepared: one
+        /// placeholder run and one grid per image.
+        @Test func requestAtTheImageCapIsPrepared() async throws {
+            let cap = Inkling2Processor.maximumImagesPerRequest
+            let tokenizer = Inkling2PlaceholderTokenizer(images: cap)
+            let processor = Inkling2Processor(
+                Inkling2ProcessorConfiguration(), tokenizer: tokenizer)
+            let image = inkling2CIImage(
+                [UInt8](repeating: 90, count: 40 * 40 * 3), height: 40, width: 40, channels: 3)
+            let prepared = try await processor.prepare(
+                input: UserInput(
+                    prompt: "Describe.",
+                    images: [UserInput.Image](repeating: .ciImage(image), count: cap)))
+            #expect(prepared.image?.frames?.count == cap)
+            let tokens = prepared.text.tokens.asArray(Int32.self)
+            #expect(
+                tokens.filter { $0 == Int32(Inkling2Processor.defaultImageTokenId) }.count == cap)
         }
 
         @Test func featuresReplacePlaceholderRowsInOrder() throws {

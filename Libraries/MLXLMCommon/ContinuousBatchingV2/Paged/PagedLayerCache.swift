@@ -2149,7 +2149,21 @@ package final class CBv2ModelAttentionCounters: @unchecked Sendable {
 extension PagedLayerCache {
     /// Most segment buffers one model-kernel call binds.
     package static let modelAttentionMaximumBindings = 16
+    package static let modelAttentionMaximumLocalPages = 1 << 24
     package static let modelAttentionCounters = CBv2ModelAttentionCounters()
+
+    /// Test hook of the red control: the entries as `main` builds them, unchecked.
+    package static func modelAttentionSegmentEntries(
+        tables: [[Int32]], width: Int, binding: (Int32) -> Int, localPage: (Int32) -> Int
+    ) -> [Int32]? {
+        var flat = [Int32](repeating: 0, count: tables.count * width)
+        for (index, table) in tables.enumerated() {
+            for (slot, page) in table.enumerated() {
+                flat[index * width + slot] = Int32(binding(page) << 24 | localPage(page))
+            }
+        }
+        return flat
+    }
 
     /// Attention by a model-owned kernel over this layer's pages, with the
     /// same write validation, page ownership and offset advance as
