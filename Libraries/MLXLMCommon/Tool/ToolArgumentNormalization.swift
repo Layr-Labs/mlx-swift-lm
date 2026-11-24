@@ -33,9 +33,12 @@ enum ToolArgumentNormalization {
         /// Only when the schema admits the literal and rejects the text as a
         /// string, so the text could never be valid as written.
         case whenTextRejected
-        /// Also when both are admitted and the text is the literal's own JSON
-        /// spelling: the dialects whose every value is unquoted text (the Qwen
-        /// XML parameters), where a string and a number are written alike.
+        /// Also when both are admitted and the text is the literal's own
+        /// spelling, in any case (`True`, `FALSE`, `Null`) or Python's `None`:
+        /// the dialects
+        /// whose every value is unquoted text (the Qwen XML parameters), where a
+        /// string and a literal are written alike, as vLLM's `convert_value`
+        /// reads them (`null` for an optional string).
         case preferred
         /// Never: the text keeps its spelling (Gemma's marker-quoted strings).
         case never
@@ -217,21 +220,30 @@ enum ToolArgumentNormalization {
         root: [String: any Sendable]?, literals: LiteralReading
     ) -> JSONValue? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let literal = jsonLiteral(trimmed),
+        guard
+            let literal = jsonLiteral(trimmed)
+                ?? (literals == .preferred ? spelledLiteral(trimmed) : nil),
             admitsLiteralType(schema, depth: depth, root: root)
         else { return nil }
         var references = References(root: root)
         guard admission(of: .value(literal), schema, depth: depth, &references) == .yes else {
             return nil
         }
-        switch literal {
-        case .int, .double:
-            if literals == .preferred && trimmed == text { return literal }
-        default: break
-        }
+        if literals == .preferred && trimmed == text { return literal }
         var textReferences = References(root: root)
         return admission(of: .value(.string(text)), schema, depth: depth, &textReferences) == .no
             ? literal : nil
+    }
+
+    /// The same scalars in any case, and Python's `None`, as vLLM reads
+    /// XML text (`coerce_to_schema_type`, `_convert_param_value`).
+    private static func spelledLiteral(_ text: String) -> JSONValue? {
+        switch text.lowercased() {
+        case "true": .bool(true)
+        case "false": .bool(false)
+        case "null", "none": .null
+        default: nil
+        }
     }
 
     /// A scalar spelled exactly as JSON writes it: `true`, `false`, `null`
@@ -291,9 +303,7 @@ enum ToolArgumentNormalization {
     }
 
     /// Whether `literal` may read some text under `schema`, read decidedly:
-    /// a number the schema may admit, or a Boolean or null it may admit while
-    /// it does not admit every string (only numbers are preferred over an
-    /// admitted string, `LiteralReading.preferred`).
+    /// a number, Boolean or null the schema may admit.
     private static func admitsLiteralType(
         _ schema: [String: any Sendable], depth: Int, root: [String: any Sendable]?
     ) -> Bool {
@@ -305,9 +315,7 @@ enum ToolArgumentNormalization {
             readings[type] = reading
         }
         guard !references.exhausted else { return false }
-        func admitted(_ type: String) -> Bool { readings[type] != .no }
-        return admitted("integer") || admitted("number")
-            || ((admitted("boolean") || admitted("null")) && readings["string"] != .yes)
+        return ["integer", "number", "boolean", "null"].contains { readings[$0] != .no }
     }
 
     /// Reads the keywords that decide a scalar: `type`, `nullable`, `enum`,
