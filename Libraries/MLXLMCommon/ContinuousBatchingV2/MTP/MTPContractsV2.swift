@@ -398,6 +398,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// prompt row may seed the first carry. Default false; ignored when
     /// `requiresCommittedObservationFence` is true.
     var supportsOrdinaryDecodeHistory: Bool { get }
+    /// Opt in, with `supportsOrdinaryDecodeHistory`, to run a plan whose final
+    /// depth is zero as ordinary chained decode instead of a seed step
+    /// (`CBv2MTPRoundDriver.depthZeroChaining`). Opt in only after measuring
+    /// it for the family. Default false.
+    var supportsDepthZeroChaining: Bool { get }
     func makeRequestState() -> any CBv2MTPRequestState
     /// Bind the admitted request's complete logical bound before the state
     /// allocates request-owned storage. Stateful assistants whose allocator
@@ -458,6 +463,7 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 extension CBv2MTPRequestStatefulDrafter {
     public var requiresCommittedObservationFence: Bool { false }
     public var supportsOrdinaryDecodeHistory: Bool { false }
+    public var supportsDepthZeroChaining: Bool { false }
     public var submitsEveryDraftStepEarly: Bool { false }
     public var draftShortlistSize: Int? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
@@ -628,8 +634,8 @@ public struct CBv2MTPConfig: Sendable {
     /// The marginal depth policy picks each row's depth from the measured
     /// per-depth round costs (`CBv2MTPMarginalDepthPolicy.selectDepthByCost`)
     /// instead of one linear head-step cost ratio. A family opts in after
-    /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off and `=1`
-    /// turns it on for any family. Tokens are unaffected.
+    /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off. No value
+    /// turns it on for a family that has not opted in. Tokens are unaffected.
     public var costCurveDepthSelection: Bool
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")

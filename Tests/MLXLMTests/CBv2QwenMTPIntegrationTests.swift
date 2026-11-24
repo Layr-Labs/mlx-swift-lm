@@ -86,6 +86,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     var maximumSpeculativeBatch: Int? { 1 }
     var supportsTargetPrefixAcceptance: Bool { targetPrefix }
     var supportsOrdinaryDecodeHistory: Bool { ordinaryDecodeHistory }
+    var supportsDepthZeroChaining: Bool { ordinaryDecodeHistory }
     var requiresCommittedObservationFence: Bool { committedObservationFence }
     var requestStateBytesPerToken: Int { 8 }
     var requestStateTokenGranularity: Int { 256 }

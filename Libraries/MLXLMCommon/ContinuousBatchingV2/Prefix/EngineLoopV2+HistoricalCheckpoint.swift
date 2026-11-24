@@ -456,14 +456,43 @@ extension EngineLoopV2 {
         return roots
     }
 
+    /// What `finishStep` does when `captureSettledHistoricalAssistants` throws.
+    enum SettledAssistantCopyFailure: Equatable {
+        /// Discard the steps of the rows that had checkpoints.
+        case discardCheckpointRows
+        /// Discard every participant and finish the cohort with the error.
+        case failCohort
+        /// Drop only the step's checkpoints; the donors' steps stand.
+        case dropCheckpoints
+    }
+
+    /// The split rule (`failCohort` for an `MLXError`, else `dropCheckpoints`)
+    /// applies only to an assistant that opts in
+    /// (`CBv2HistoricalMTPPrefixCheckpointCoding.refusedAssistantCopyKeepsDonorStep`).
+    static func settledAssistantCopyFailure(
+        _ error: any Error, keepsDonorStep: Bool
+    ) -> SettledAssistantCopyFailure {
+        guard keepsDonorStep else { return .discardCheckpointRows }
+        return error is MLXError ? .failCohort : .dropCheckpoints
+    }
+
+    /// See `CBv2HistoricalMTPPrefixCheckpointCoding.refusedAssistantCopyKeepsDonorStep`.
+    var refusedAssistantCopyKeepsDonorStep: Bool {
+        (completeCheckpointCapture?.codec.assistant
+            as? any CBv2HistoricalMTPPrefixCheckpointCoding)?
+            .refusedAssistantCopyKeepsDonorStep == true
+    }
+
     /// Runs after the actual observation fence and before the native commit.
     ///
-    /// A paged historical (non-native) candidate whose assistant copy is
+    /// For an assistant that opts in (`refusedAssistantCopyKeepsDonorStep`),
+    /// a paged historical (non-native) candidate whose assistant copy is
     /// refused is only a lost checkpoint: it is already marked failed (or
     /// carries no assistant), so the commit closes it, and the donor's own
     /// step stays committed. Device errors, native work and contiguous
-    /// candidates still throw.
+    /// candidates still throw, as does every refusal of other assistants.
     func captureSettledHistoricalAssistants(_ step: CBv2InFlightStep) throws {
+        let keepsDonorStep = refusedAssistantCopyKeepsDonorStep
         for (id, candidates) in step.historicalCheckpoints {
             for candidate in candidates {
                 guard
@@ -474,7 +503,8 @@ extension EngineLoopV2 {
                 else { continue }
                 let work = step.nativeHistoricalCheckpointWork[id]
                 let refusable =
-                    work == nil && nativeShutdownState == nil && candidate.historical != nil
+                    keepsDonorStep && work == nil && nativeShutdownState == nil
+                    && candidate.historical != nil
                 guard
                     let observation = step.mtpRound?.committedObservationRows.first(where: {
                         $0.id == id

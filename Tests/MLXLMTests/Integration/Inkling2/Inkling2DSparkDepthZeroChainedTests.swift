@@ -53,6 +53,7 @@ final class Inkling2DepthZeroRecordingDrafter: CBv2MTPBatchedBlockDrafter, @unch
     }
     var requiresCommittedObservationFence: Bool { inner.requiresCommittedObservationFence }
     var supportsOrdinaryDecodeHistory: Bool { inner.supportsOrdinaryDecodeHistory }
+    var supportsDepthZeroChaining: Bool { inner.supportsDepthZeroChaining }
     var draftShortlistSize: Int? { inner.draftShortlistSize }
     var submitsEveryDraftStepEarly: Bool { inner.submitsEveryDraftStepEarly }
 

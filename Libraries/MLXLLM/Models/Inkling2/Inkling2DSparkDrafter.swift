@@ -148,6 +148,7 @@ public final class Inkling2DSparkDrafter: CBv2MTPRequestStatefulDrafter, @unchec
     public var supportsTargetPrefixAcceptance: Bool { true }
     public var commitsAcceptedPrefixPerRow: Bool { perRowCommit }
     public var supportsOrdinaryDecodeHistory: Bool { true }
+    public var supportsDepthZeroChaining: Bool { true }
 
     /// Context K/V of all three layers (bf16), plus queued feature rows held
     /// until the next round writes them.

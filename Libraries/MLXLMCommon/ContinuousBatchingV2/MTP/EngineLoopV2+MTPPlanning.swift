@@ -217,9 +217,9 @@ extension EngineLoopV2 {
         // the hidden-returning MTP path. Explicit fixed k=0 has no history
         // ownership and remains on ordinary chained decode. A drafter that
         // takes ordinary-decode history keeps chaining while no row can
-        // speculate, and while the next plan would run at depth zero
-        // (`mtpPreviewRunsAsOrdinaryDecode`); the chained launch captures
-        // hidden for finalize.
+        // speculate and, when it opts in to depth-zero chaining, while the
+        // next plan would run at depth zero (`mtpPreviewRunsAsOrdinaryDecode`);
+        // the chained launch captures hidden for finalize.
         if mtp.tracksPersistentHistory {
             guard mtpFeedsHistoryFromOrdinaryDecode else { return true }
             guard canSpeculate, mtp.depthZeroChaining else { return canSpeculate }

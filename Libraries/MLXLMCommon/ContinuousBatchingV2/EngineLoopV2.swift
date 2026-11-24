@@ -5354,13 +5354,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 failNativeCompletion(.nativeWorkFailed)
                 return
             }
-            if let error = error as? MLXError {
+            switch Self.settledAssistantCopyFailure(
+                error, keepsDonorStep: refusedAssistantCopyKeepsDonorStep)
+            {
+            case .discardCheckpointRows:
+                step.discard.formUnion(step.historicalCheckpoints.keys)
+            case .failCohort:
                 // A device error fails the cohort exactly as a failed
                 // checkpoint copy does at commit (`historicalFailure`):
                 // discarded, then finished with an error.
-                assistantCopyFailure = error
+                assistantCopyFailure = error as? MLXError
                 step.discard.formUnion(step.participants)
-            } else {
+            case .dropCheckpoints:
                 // Any other refusal loses only the checkpoints. Discarding a
                 // live donor's step would roll back its recurrent state while
                 // its KV writes and scheduler progress stand.

@@ -355,7 +355,7 @@ final class CBv2MTPRoundDriver {
     var carryHiddenObserverForTesting: ((CBv2RequestID, MLXArray) -> Void)?
 
     /// `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0/false/no/off` turns depth-zero
-    /// chaining off (seed steps, as before). Read once.
+    /// chaining off (seed steps, as before) for every drafter. Read once.
     static let envDepthZeroChaining: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED"]
         else { return true }
@@ -365,9 +365,11 @@ final class CBv2MTPRoundDriver {
     /// ordinary chainable decode when the drafter takes ordinary-decode
     /// history (`planRunsAsOrdinaryDecode`); off, such a plan seeds every
     /// row. Either way target logits and tokens are the same; only which
-    /// path computes the decode step changes. Tests may set it on the engine
+    /// path computes the decode step changes. On only for a drafter that opts
+    /// in (`CBv2MTPRequestStatefulDrafter.supportsDepthZeroChaining`) and
+    /// while the process switch allows it. Tests may set it on the engine
     /// queue before submitting requests.
-    var depthZeroChaining = CBv2MTPRoundDriver.envDepthZeroChaining
+    var depthZeroChaining: Bool
     /// Test-only plan depth cap from each decode row's committed-or-in-flight
     /// token count (`generatedTokenCount + pendingSamples`, equal on the
     /// chained and general paths), applied after every other clamp. Nil in
@@ -430,6 +432,8 @@ final class CBv2MTPRoundDriver {
         self.supportsOrdinaryDecodeHistory =
             requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
             && stateful?.requiresCommittedObservationFence == false
+        self.depthZeroChaining =
+            Self.envDepthZeroChaining && stateful?.supportsDepthZeroChaining == true
         self.config = config
         self.drafter = drafter
         self.model = model
@@ -921,7 +925,9 @@ final class CBv2MTPRoundDriver {
                 remainingTokens: remainingTokens,
                 verificationLimit: verificationLimit)
         }
-        if Self.costCurveSelection ?? config.costCurveDepthSelection {
+        if Self.costCurveDepthSelection(
+            configured: config.costCurveDepthSelection, environment: Self.costCurveEnvironment)
+        {
             return CBv2MTPMarginalDepthPolicy.selectDepthByCost(
                 offeredDepth: cappedOffer,
                 remainingTokens: remainingTokens,
@@ -939,16 +945,17 @@ final class CBv2MTPRoundDriver {
             headStepCostRatio: cost.headStepCostRatio)
     }
 
-    /// `DARKBLOOM_CBV2_MTP_COST_CURVE`: `1` turns the cost-curve depth choice
-    /// (`CBv2MTPConfig.costCurveDepthSelection`) on for any family, `0` off;
-    /// unset leaves the configuration's choice.
-    static let costCurveSelection: Bool? = {
-        switch ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"] {
-        case "1": return true
-        case "0": return false
-        default: return nil
-        }
-    }()
+    /// `DARKBLOOM_CBV2_MTP_COST_CURVE`, read once.
+    static let costCurveEnvironment =
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"]
+
+    /// The cost-curve depth choice is on only for a family whose configuration
+    /// opts in (`CBv2MTPConfig.costCurveDepthSelection`), unless
+    /// `DARKBLOOM_CBV2_MTP_COST_CURVE` is exactly `0`. No value turns it on
+    /// for a family that has not opted in.
+    static func costCurveDepthSelection(configured: Bool, environment: String?) -> Bool {
+        configured && environment != "0"
+    }
 
     func observeRequestAcceptance(
         id: CBv2RequestID,
