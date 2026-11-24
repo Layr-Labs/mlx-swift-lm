@@ -6,10 +6,8 @@ import Testing
 @testable import MLXLMCommon
 
 /// Inkling 2 rows that cannot speculate (a stop string, a penalty, a logit
-/// bias, logprobs, a token constraint) record the DSpark drafter's prompt
-/// history, so they save the durable checkpoints an unconstrained row saves.
-/// A later request, speculating or not, restores them and emits its cold
-/// tokens and logprob bits, which equal the drafter-off engine's. The real
+/// bias, logprobs, a token constraint) beside rows that decode. The DSpark
+/// drafter does not record their prompt history in this release. The real
 /// Inkling 2 Mini attention geometry at a tiny hidden size, BF16, synthetic
 /// weights, the production sampler.
 @Suite("Inkling 2 rows that cannot speculate save checkpoints", .serialized, .tags(.integration))
@@ -95,140 +93,11 @@ struct Inkling2DSparkNonSpeculatingRowCheckpointTests {
             }
     }
 
-    @Test("the DSpark drafter opts in")
-    func drafterOptsIn() throws {
+    @Test("the DSpark drafter does not opt in for 0.10.19")
+    func drafterDoesNotOptIn() throws {
         let model = try Geometry.target(dtype: Self.dtype)
         let drafter = try Geometry.drafter(target: model, dtype: Self.dtype)
-        #expect(drafter.checkpointsNonSpeculatingRows)
-    }
-
-    /// The shared check of every family that opts in: the controlled donor
-    /// emits its cold tokens with capture on and off, saves the unconstrained
-    /// donor's archives byte for byte, and a controlled and an unconstrained
-    /// (drafting) request each restore them and emit their cold tokens.
-    @Test(.timeLimit(.minutes(10)), arguments: Control.allCases)
-    func rowSavesAndReusesCheckpoints(_ control: Control) async throws {
-        let model = try Geometry.target(dtype: Self.dtype)
-        let drafter = try Geometry.drafter(target: model, dtype: Self.dtype)
-        try await cbv2ExpectNonSpeculatingDonorCheckpoints(
-            control, chunk: Self.chunk, maxTokens: 8, segmentBytes: Self.segmentBytes,
-            vocabulary: Self.vocabulary,
-            make: { try Self.engine(model: model, drafter: drafter, store: $0) },
-            released: Self.released)
-    }
-
-    /// Drafter on equals drafter off: the controlled donor (capture on) and
-    /// both restored requests emit the tokens and logprob bits of an engine
-    /// without the drafter and without a prefix cache.
-    @Test(.timeLimit(.minutes(10)), arguments: Control.allCases)
-    func restoredOutputEqualsDrafterOff(_ control: Control) async throws {
-        let model = try Geometry.target(dtype: Self.dtype)
-        let drafter = try Geometry.drafter(target: model, dtype: Self.dtype)
-        let prompt = (0 ..< 2 * Self.chunk + 7).map { 1 + ($0 * 7) % 59 }
-
-        let (off, offBackend) = try Self.engine(model: model, drafter: nil, store: nil)
-        let offControlled = try await cbv2ServeControlled(
-            off, Self.request(1, prompt, control, cached: false))
-        let offPlain = try await cbv2ServeControlled(
-            off, Self.request(2, prompt, nil, cached: false))
-        Self.released(off, offBackend)
-        await off.shutdown()
-        #expect(offControlled.tokens.count == 8 && offPlain.tokens.count == 8)
-
-        let store = Store(segmentBytes: Self.segmentBytes)
-        let (donor, donorBackend) = try Self.engine(model: model, drafter: drafter, store: store)
-        let donated = try await cbv2ServeControlled(donor, Self.request(3, prompt, control))
-        _ = await cbv2SchedWait(timeoutSeconds: 3) { store.saved.count >= 2 }
-        store.finishPublicationCallbacks(engine: donor)
-        Self.released(donor, donorBackend)
-        await donor.shutdown()
-        #expect(donated.tokens == offControlled.tokens, "donor")
-        #expect(donated.logprobBits == offControlled.logprobBits, "donor")
-        #expect(store.donationErrors.isEmpty)
-        let saved = store.saved
-        #expect(saved.map(\.manifest.position) == [2 * Self.chunk, Self.chunk])
-        #expect(
-            saved.allSatisfy {
-                $0.manifest.assistantCodecID?.hasPrefix("inkling2-dspark") == true
-            })
-
-        let reopened = Store(archives: saved, segmentBytes: Self.segmentBytes)
-        let (warm, warmBackend) = try Self.engine(model: model, drafter: drafter, store: reopened)
-        for (id, controlled) in [(UInt64(4), true), (UInt64(5), false)] {
-            let next = Self.request(id, prompt, controlled ? control : nil)
-            let reference = controlled ? offControlled : offPlain
-            try #require(try reopened.stage(engine: warm, request: next), "request \(id)")
-            let served = try await cbv2ServeControlled(warm, next)
-            #expect(served.tokens == reference.tokens, "request \(id)")
-            #expect(served.logprobBits == reference.logprobBits, "request \(id)")
-            #expect(served.finish == reference.finish, "request \(id)")
-            #expect(served.saved == 2 * Self.chunk, "request \(id)")
-            reopened.finishPublicationCallbacks(engine: warm)
-            Self.released(warm, warmBackend)
-        }
-        #expect((warm.mtpMetricsSnapshot()?.draftedTokens ?? 0) > 0, "the plain request drafts")
-        await warm.shutdown()
-    }
-
-    /// The store's manifest bound applies to a controlled donor as to an
-    /// unconstrained one: with the bound between the manifests of the first
-    /// and the deepest boundary, both keep the same writable boundaries, with
-    /// the same bytes, and nothing above the bound.
-    @Test(.timeLimit(.minutes(10)))
-    func controlledDonorKeepsTheDeepestWritableCheckpoint() async throws {
-        let model = try Geometry.target(dtype: Self.dtype)
-        let drafter = try Geometry.drafter(target: model, dtype: Self.dtype)
-        let prompt = (0 ..< 4 * Self.chunk + 7).map { 1 + ($0 * 7) % 59 }
-        let control = Control.logprobs
-
-        func donate(_ store: Store, _ request: CBv2Request) async throws -> CBv2ControlledServed {
-            let (engine, backend) = try Self.engine(model: model, drafter: drafter, store: store)
-            let served = try await cbv2ServeControlled(engine, request)
-            _ = await cbv2SchedWait(timeoutSeconds: 3) { store.saved.count >= 2 }
-            store.finishPublicationCallbacks(engine: engine)
-            Self.released(engine, backend)
-            await engine.shutdown()
-            return served
-        }
-
-        let reference = Store(segmentBytes: Self.segmentBytes)
-        _ = try await donate(reference, Self.request(1, prompt, nil))
-        let measured = try reference.saved.map {
-            ($0.manifest.position, try Self.manifestBytes($0.manifest))
-        }
-        try #require(measured.count == 2)
-        #expect(measured.map(\.0) == [4 * Self.chunk, Self.chunk])
-        let (deepest, first) = (measured[0].1, measured[1].1)
-        let bound = first + (deepest - first) / 2
-
-        let plainStore = Store(segmentBytes: Self.segmentBytes, maximumManifestBytes: bound)
-        let plain = try await donate(plainStore, Self.request(2, prompt, nil))
-        let controlledStore = Store(segmentBytes: Self.segmentBytes, maximumManifestBytes: bound)
-        let controlled = try await donate(controlledStore, Self.request(3, prompt, control))
-
-        let (off, offBackend) = try Self.engine(model: model, drafter: nil, store: nil)
-        let offControlled = try await cbv2ServeControlled(
-            off, Self.request(4, prompt, control, cached: false))
-        let offPlain = try await cbv2ServeControlled(
-            off, Self.request(5, prompt, nil, cached: false))
-        Self.released(off, offBackend)
-        await off.shutdown()
-        #expect(plain.tokens == offPlain.tokens)
-        #expect(controlled.tokens == offControlled.tokens)
-        #expect(controlled.logprobBits == offControlled.logprobBits)
-
-        let kept = controlledStore.saved
-        #expect(!kept.isEmpty)
-        #expect(controlledStore.donationErrors.isEmpty && plainStore.donationErrors.isEmpty)
-        #expect(kept.map(\.manifest.position) == plainStore.saved.map(\.manifest.position))
-        #expect(kept.allSatisfy { $0.manifest.position < 4 * Self.chunk })
-        for archive in kept {
-            #expect(try Self.manifestBytes(archive.manifest) <= bound)
-        }
-        for (ours, theirs) in zip(kept, plainStore.saved) {
-            #expect(ours.manifest == theirs.manifest, "position \(ours.manifest.position)")
-            #expect(Self.sameTensors(ours, theirs), "position \(ours.manifest.position)")
-        }
+        #expect(!drafter.checkpointsNonSpeculatingRows)
     }
 
     /// Counts steps whose sample call holds a decoding row while the
