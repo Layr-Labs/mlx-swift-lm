@@ -53,10 +53,6 @@ private func inkling2DSparkCopy(_ x: MLXArray) -> MLXArray {
 }
 
 extension Inkling2DSparkDrafter: CBv2HistoricalMTPPrefixCheckpointCoding {
-    /// Requests that cannot speculate record prompt history too, so their
-    /// checkpoints are the ones a speculating request saves.
-    public var checkpointsNonSpeculatingRows: Bool { true }
-
     public var prefixCheckpointCodecID: String {
         let c = configuration
         return "inkling2-dspark-ctx-kv-l\(c.numHiddenLayers)-kv\(c.numKeyValueHeads)"
