@@ -96,6 +96,10 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            The exponential race's Exp(1) noise (`SamplerV2.exponentialNoise(fromUniform:)`,
+            shared by the ordinary, MTP verify and coupled-proposal draws) is
+            `max(-log1p(-max(u, 2^-33)), 2^-33)`; the outer floor binds only if `log1p` is
+            inaccurate.
             Identity-greedy batches skip unused parameter/history tensor construction and the
             unused all-greedy mask while retaining constraints, transforms and sampler row state.
             Opt-in native reasoning budgets count confirmed thought payload tokens, force the
@@ -107,6 +111,7 @@ def:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
             - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
             - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/receipt.json"
+            - "changelog.d/cbv2-sampler-noise-floor.md"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,

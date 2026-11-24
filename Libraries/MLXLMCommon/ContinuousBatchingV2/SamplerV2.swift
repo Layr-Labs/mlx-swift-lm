@@ -180,9 +180,18 @@ public final class SamplerV2 {
     private static func exponentialNoise(vocab: Int, key: MLXArray) -> MLXArray {
         let u = MLXRandom.uniform(
             low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
+        return exponentialNoise(fromUniform: u)
+    }
+
+    /// Exp(1) noise from uniform draws in [0, 1), elementwise.
+    package static func exponentialNoise(fromUniform u: MLXArray) -> MLXArray {
         // Put zero at the midpoint of its 32-bit RNG bucket. log1p preserves
-        // small positive draws that would round 1 - u to 1 in Float32.
-        return -log1p(-maximum(u, Float(0x1p-33)))
+        // small positive draws that would round 1 - u to 1 in Float32. An
+        // accurate log1p gives -log1p(-v) >= v >= 2^-33, so the outer floor
+        // changes nothing there; it keeps the noise positive if a fast-math
+        // log rounds a small draw's log1p to zero.
+        let tiny = Float(0x1p-33)
+        return maximum(-log1p(-maximum(u, tiny)), tiny)
     }
 
     /// SplitMix64-style mix of (seed, requestID, step) into one RNG key
