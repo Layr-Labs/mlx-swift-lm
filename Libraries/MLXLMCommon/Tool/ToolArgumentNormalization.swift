@@ -34,7 +34,8 @@ enum ToolArgumentNormalization {
         /// string, so the text could never be valid as written.
         case whenTextRejected
         /// Also when both are admitted and the text is the literal's own
-        /// spelling, JSON's or Python's (`True`, `False`, `None`): the dialects
+        /// spelling, in any case (`True`, `FALSE`, `Null`) or Python's `None`:
+        /// the dialects
         /// whose every value is unquoted text (the Qwen XML parameters), where a
         /// string and a literal are written alike, as vLLM's `convert_value`
         /// reads them (`null` for an optional string).
@@ -221,7 +222,7 @@ enum ToolArgumentNormalization {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
             let literal = jsonLiteral(trimmed)
-                ?? (literals == .preferred ? pythonLiteral(trimmed) : nil),
+                ?? (literals == .preferred ? spelledLiteral(trimmed) : nil),
             admitsLiteralType(schema, depth: depth, root: root)
         else { return nil }
         var references = References(root: root)
@@ -234,12 +235,13 @@ enum ToolArgumentNormalization {
             ? literal : nil
     }
 
-    /// Python's spellings of the same scalars.
-    private static func pythonLiteral(_ text: String) -> JSONValue? {
-        switch text {
-        case "True": .bool(true)
-        case "False": .bool(false)
-        case "None": .null
+    /// The same scalars in any case, and Python's `None`, as vLLM reads
+    /// XML text (`coerce_to_schema_type`, `_convert_param_value`).
+    private static func spelledLiteral(_ text: String) -> JSONValue? {
+        switch text.lowercased() {
+        case "true": .bool(true)
+        case "false": .bool(false)
+        case "null", "none": .null
         default: nil
         }
     }

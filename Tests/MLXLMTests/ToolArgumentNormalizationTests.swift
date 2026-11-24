@@ -205,6 +205,8 @@ struct ToolArgumentNormalizationTests {
             (["type": ["null", "string"]], "None", .null),
             (["type": ["boolean", "string"]], "True", .bool(true)),
             (["type": ["boolean", "string"]], "False", .bool(false)),
+            (["type": ["boolean", "string"]], "TRUE", .bool(true)),
+            (["type": ["null", "string"]], "NULL", .null),
             (Self.notString, "None", .null),
             ([:], "true", .bool(true)),
         ]
@@ -224,7 +226,7 @@ struct ToolArgumentNormalizationTests {
             (["type": ["integer", "string"]], "+5"),
             (["type": ["integer", "string"]], "true"),
             (["type": ["integer", "string"]], "None"),
-            (["type": ["boolean", "string"]], "TRUE"),
+            (["type": ["boolean", "string"]], "yes"),
             (["type": ["null", "string"]], "nil"),
             (["not": ["type": "integer"]], "7"),
             (["type": "string"], "-2500"),
