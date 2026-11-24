@@ -198,6 +198,15 @@ struct ToolArgumentNormalizationTests {
             ),
             (["description": "untyped"], "-2500", .int(-2500)),
             ([:], "42", .int(42)),
+            // A literal a non-string type admits wins over the string reading,
+            // as vLLM reads `null` for an optional string; Python's spellings too.
+            (["type": ["boolean", "string"]], "true", .bool(true)),
+            (["type": ["null", "string"]], "null", .null),
+            (["type": ["null", "string"]], "None", .null),
+            (["type": ["boolean", "string"]], "True", .bool(true)),
+            (["type": ["boolean", "string"]], "False", .bool(false)),
+            (Self.notString, "None", .null),
+            ([:], "true", .bool(true)),
         ]
         for (schema, text, expected) in cases {
             for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
@@ -213,10 +222,13 @@ struct ToolArgumentNormalizationTests {
             (Self.integerOrText, "-200000000"),
             (Self.integerOrText, "001"),
             (["type": ["integer", "string"]], "+5"),
-            (["type": ["boolean", "string"]], "true"),
-            (["type": ["null", "string"]], "null"),
+            (["type": ["integer", "string"]], "true"),
+            (["type": ["integer", "string"]], "None"),
+            (["type": ["boolean", "string"]], "TRUE"),
+            (["type": ["null", "string"]], "nil"),
             (["not": ["type": "integer"]], "7"),
             (["type": "string"], "-2500"),
+            (["type": "string"], "None"),
             (
                 [
                     "anyOf": [["type": "integer"], ["$ref": "#/$defs/missing"]]
@@ -248,6 +260,8 @@ struct ToolArgumentNormalizationTests {
         #expect(json("-2500", ["type": ["integer", "string"]]) == .string("-2500"))
         #expect(json("-2500", ["description": "untyped"]) == .string("-2500"))
         #expect(json("abc", Self.notString) == .string("abc"))
+        #expect(json("null", ["type": ["null", "string"]]) == .string("null"))
+        #expect(json("None", Self.notString) == .string("None"))
     }
 
     @Test("Gemma keeps its marker-quoted and bare text under string-rejecting schemas")
@@ -284,13 +298,14 @@ struct ToolArgumentNormalizationTests {
         let parameters: (([String: any Sendable]) -> [[String: any Sendable]]) = { self.tools($0) }
         for schema: [String: any Sendable] in [
             Self.notString, Self.integerOrText, ["type": ["integer", "string"]], [:],
+            ["type": ["string", "null"]], ["type": ["string", "boolean"]],
         ] {
             #expect(
                 !parameterKeepsText(paramName: "value", funcName: "read", tools: parameters(schema))
             )
         }
         for schema: [String: any Sendable] in [
-            ["type": "string"], ["type": ["string", "null"]], ["type": ["string", "boolean"]],
+            ["type": "string"], ["enum": ["a", "b"]],
             [
                 "anyOf": [["type": "integer"], ["$ref": "#/$defs/missing"]]
                     as [[String: any Sendable]]

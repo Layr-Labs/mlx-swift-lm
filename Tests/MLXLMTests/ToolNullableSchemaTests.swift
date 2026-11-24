@@ -120,7 +120,7 @@ struct ToolNullableSchemaTests {
 
     // MARK: - Values that must not change
 
-    @Test("Typed nulls pass through and string schemas keep literal text")
+    @Test("Typed nulls pass through; string schemas keep literal text but read null when nullable")
     func typedNullAndStringLiterals() throws {
         let nullable = try schema(#"{"type":"integer","nullable":true}"#)
         #expect(ToolArgumentNormalization.normalize(.null, schema: nullable) == .null)
@@ -134,7 +134,10 @@ struct ToolNullableSchemaTests {
             let property = try schema(json)
             for text in ["null", "None", "true", "001", #"{"a":1}"#] {
                 let value = try read(text, property)
-                #expect(value == .string(text), "\(json): \(text)")
+                // XML text: a nullable string reads null as null, as vLLM reads
+                // an optional string; plain strings keep every text.
+                let nullable = json != #"{"type":"string"}"# && ["null", "None"].contains(text)
+                #expect(value == (nullable ? .null : .string(text)), "\(json): \(text)")
                 #expect(outcome(value, property) == "valid", "\(json): \(text)")
             }
         }
