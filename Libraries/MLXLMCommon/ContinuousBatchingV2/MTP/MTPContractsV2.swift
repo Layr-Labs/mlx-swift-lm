@@ -637,17 +637,25 @@ public struct CBv2MTPConfig: Sendable {
     /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off. No value
     /// turns it on for a family that has not opted in. Tokens are unaffected.
     public var costCurveDepthSelection: Bool
-    /// Optional prompt-length gate: a request whose prompt holds more than
-    /// this many tokens never drafts and keeps no assistant history for its
-    /// whole lifetime, as a reasoning budget does; it decodes as ordinary
-    /// target-only rows, so its tokens are the MTP-off engine's. nil (the
-    /// default) or a value below one lets every prompt length draft.
+    /// Optional prompt-length gate, applied per plan: a plan whose eligible
+    /// decode rows all have prompts of more than this many tokens runs at
+    /// depth zero (`prompt_limit`), as ordinary decode. A plan with at least
+    /// one row at or under the limit keeps the depth it would otherwise get,
+    /// for every row in it. So a long row decoding alone never drafts, and in
+    /// company follows the same depth table as before. nil (the default) or a
+    /// value below one lets every prompt length draft.
     public var maxDraftPromptTokens: Int?
     /// Whether a prompt of `promptTokens` tokens is over `maxDraftPromptTokens`
     /// (never when the limit is nil or below one).
     public func promptExceedsDraftLimit(_ promptTokens: Int) -> Bool {
         guard let limit = maxDraftPromptTokens, limit > 0 else { return false }
         return promptTokens > limit
+    }
+    /// Whether a plan whose eligible rows have these prompt lengths runs at
+    /// depth zero for the prompt limit: there is at least one row, and every
+    /// one is over `maxDraftPromptTokens`.
+    public func cohortExceedsDraftLimit(promptTokenCounts: [Int]) -> Bool {
+        !promptTokenCounts.isEmpty && promptTokenCounts.allSatisfy { promptExceedsDraftLimit($0) }
     }
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")

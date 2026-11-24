@@ -40,11 +40,10 @@ extension EngineLoopV2 {
         let constraintEligible =
             rec.request.tokenConstraint == nil || grammarMTPEnabled
             || mtpSpanConstraint(rec) != nil
-        // A reasoning budget, or a prompt over the configured draft limit
-        // (`CBv2MTPConfig.maxDraftPromptTokens`), keeps the whole request
-        // target-only: no drafts and no assistant history.
+        // A reasoning budget keeps the whole request target-only: no drafts
+        // and no assistant history. The prompt-length limit is a plan-time
+        // gate instead (`mtpClampedPlanDecision`).
         guard rec.request.reasoningBudget == nil,
-            mtp?.config.promptExceedsDraftLimit(rec.request.promptTokens.count) != true,
             constraintEligible,
             samplingEligible,
             sampling.topLogprobs == 0,
@@ -236,6 +235,8 @@ extension EngineLoopV2 {
             return canSpeculate && mtp.requiresNonChainedDepthZeroProbe(decision)
         }
         guard canSpeculate else { return false }
+        // The plan clamps to depth zero (`prompt_limit`): stay chained.
+        if mtpPromptLimitHoldsPlan(mtpPlanEligibleRows(rows), driver: mtp) { return false }
         return eligible.allSatisfy { rec in
             let remaining = rec.request.maxTokens - rec.generatedTokenCount
             return mtp.hasValidCarry(for: rec)
@@ -272,6 +273,16 @@ extension EngineLoopV2 {
         }
     }
 
+    /// The prompt-length gate (`CBv2MTPConfig.maxDraftPromptTokens`) holds a
+    /// plan at depth zero only when every eligible row is over the limit; a
+    /// row over it beside one under it keeps the plan's depth.
+    private func mtpPromptLimitHoldsPlan(
+        _ eligibleRows: [CBv2ScheduledRequest], driver mtp: CBv2MTPRoundDriver
+    ) -> Bool {
+        mtp.config.cohortExceedsDraftLimit(
+            promptTokenCounts: eligibleRows.map { $0.request.promptTokens.count })
+    }
+
     /// The per-row clamps `beginMTPPlan` applies to an offered decision, in
     /// order. Each clamp lowers the depth and, like `clampPlanDepth`, makes
     /// the decision a non-exploration one. `clamp` receives every applied
@@ -290,6 +301,9 @@ extension EngineLoopV2 {
             depth = newDepth
             isExploration = false
             clamp?(newDepth, reason)
+        }
+        if depth > 0, mtpPromptLimitHoldsPlan(eligibleRows, driver: mtp) {
+            lower(to: 0, reason: "prompt_limit")
         }
         if mtp.usesMarginalPolicy, !decision.isExploration, depth > 0, !eligibleRows.isEmpty {
             let verificationLimit = mtp.maximumAutomaticDepth(plannedDecodeRows: rows.count)
