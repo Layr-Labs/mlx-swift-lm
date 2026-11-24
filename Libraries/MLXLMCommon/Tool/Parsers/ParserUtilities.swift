@@ -203,10 +203,11 @@ func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
 /// `resolvingReferences` reads a local `$ref` as the schema it names in the
 /// tool's parameters (the Qwen XML dialect, whose every value is text), and
 /// reads a JSON literal the schema admits as that literal
-/// (`ToolArgumentNormalization.LiteralReading.preferred`).
+/// (`ToolArgumentNormalization.LiteralReading.preferred`). `readsLiterals:
+/// false` keeps the text under a schema with no single non-string type.
 func convertParameterValue(
     _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?,
-    resolvingReferences: Bool = false
+    resolvingReferences: Bool = false, readsLiterals: Bool = true
 ) -> any Sendable {
     guard let tools,
         let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
@@ -215,7 +216,7 @@ func convertParameterValue(
     return ToolArgumentNormalization.normalize(
         .string(value), schema: properties[paramName] as? [String: any Sendable],
         root: resolvingReferences ? parameters : nil,
-        literals: resolvingReferences ? .preferred : .whenTextRejected
+        literals: !readsLiterals ? .never : resolvingReferences ? .preferred : .whenTextRejected
     ).sendableValue
 }
 

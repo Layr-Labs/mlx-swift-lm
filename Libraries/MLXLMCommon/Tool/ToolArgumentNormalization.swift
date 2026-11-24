@@ -37,6 +37,8 @@ enum ToolArgumentNormalization {
         /// spelling: the dialects whose every value is unquoted text (the Qwen
         /// XML parameters), where a string and a number are written alike.
         case preferred
+        /// Never: the text keeps its spelling (Gemma's marker-quoted strings).
+        case never
     }
 
     /// `root` is the parameters schema the value's `schema` belongs to. With
@@ -51,7 +53,7 @@ enum ToolArgumentNormalization {
         default: return value
         }
         let reading = reading(schema, depth: depth, root: root)
-        if reading == nil, case .string(let text) = value, let schema,
+        if reading == nil, literals != .never, case .string(let text) = value, let schema,
             let literal = literal(
                 text, schema: schema, depth: depth, root: root, literals: literals)
         {
