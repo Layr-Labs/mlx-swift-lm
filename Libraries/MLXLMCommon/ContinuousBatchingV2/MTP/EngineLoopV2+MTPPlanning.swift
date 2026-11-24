@@ -18,8 +18,9 @@ extension EngineLoopV2 {
     /// same-state previews. Presence/frequency penalties pass only under the
     /// penalty opt-in (`mtpPenaltiesEligible`), stop strings only under the
     /// stop-string opt-in (`effectiveStopStringSpeculation`; finalize confirms
-    /// token by token through the detokenizer). Logprob capture, bias and
-    /// repetition penalty keep their gates.
+    /// token by token through the detokenizer), repetition penalty only under
+    /// its own opt-in (`mtpRepetitionPenaltyEligible`). Logprob capture and
+    /// bias keep their gates.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         mtpHistoryEligible(rec)
             && (rec.request.tokenConstraint == nil || grammarMTPEnabled
@@ -40,16 +41,15 @@ extension EngineLoopV2 {
         let constraintEligible =
             rec.request.tokenConstraint == nil || grammarMTPEnabled
             || mtpSpanConstraint(rec) != nil
-        // A reasoning budget, or a prompt over the configured draft limit
-        // (`CBv2MTPConfig.maxDraftPromptTokens`), keeps the whole request
-        // target-only: no drafts and no assistant history.
+        // A reasoning budget keeps the whole request target-only: no drafts
+        // and no assistant history. The prompt-length limit is a plan-time
+        // gate instead (`mtpClampedPlanDecision`).
         guard rec.request.reasoningBudget == nil,
-            mtp?.config.promptExceedsDraftLimit(rec.request.promptTokens.count) != true,
             constraintEligible,
             samplingEligible,
             mtpLogprobRowEligible(rec),
             sampling.logitBias.isEmpty,
-            sampling.repetitionPenalty == 1,
+            mtpRepetitionPenaltyEligible(rec),
             mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
                 || mtp?.config.effectiveStopStringSpeculation == true
@@ -84,6 +84,25 @@ extension EngineLoopV2 {
             penaltyVerification: sampler.supportsMTPPenaltyVerification,
             constrained: rec.request.tokenConstraint != nil,
             finite: sampling.presencePenalty.isFinite && sampling.frequencyPenalty.isFinite)
+    }
+
+    /// A row with a repetition penalty may draft only when the engine opted in
+    /// and the kill switch is not set
+    /// (`CBv2MTPConfig.effectiveRepetitionPenaltySpeculation`), the drafter
+    /// opted into target-prefix acceptance and the sampler re-derives the
+    /// penalty per verify position over the same window ordinary decode uses
+    /// (`supportsMTPRepetitionPenaltyVerification`; such rows always accept
+    /// exactly). Constrained rows keep the historical exclusion. Without the
+    /// opt-in every `repetitionPenalty != 1` row stays target-only, as before.
+    func mtpRepetitionPenaltyEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard sampling.repetitionPenalty != 1 else { return true }
+        return Self.mtpPenaltyRowEligible(
+            switchOn: mtp?.config.effectiveRepetitionPenaltySpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            penaltyVerification: sampler.supportsMTPRepetitionPenaltyVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.repetitionPenalty.isFinite)
     }
 
     static func mtpPenaltyRowEligible(
@@ -248,6 +267,8 @@ extension EngineLoopV2 {
             return canSpeculate && mtp.requiresNonChainedDepthZeroProbe(decision)
         }
         guard canSpeculate else { return false }
+        // The plan clamps to depth zero (`prompt_limit`): stay chained.
+        if mtpPromptLimitHoldsPlan(mtpPlanEligibleRows(rows), driver: mtp) { return false }
         return eligible.allSatisfy { rec in
             let remaining = rec.request.maxTokens - rec.generatedTokenCount
             return mtp.hasValidCarry(for: rec)
@@ -284,6 +305,16 @@ extension EngineLoopV2 {
         }
     }
 
+    /// The prompt-length gate (`CBv2MTPConfig.maxDraftPromptTokens`) holds a
+    /// plan at depth zero only when every eligible row is over the limit; a
+    /// row over it beside one under it keeps the plan's depth.
+    private func mtpPromptLimitHoldsPlan(
+        _ eligibleRows: [CBv2ScheduledRequest], driver mtp: CBv2MTPRoundDriver
+    ) -> Bool {
+        mtp.config.cohortExceedsDraftLimit(
+            promptTokenCounts: eligibleRows.map { $0.request.promptTokens.count })
+    }
+
     /// The per-row clamps `beginMTPPlan` applies to an offered decision, in
     /// order. Each clamp lowers the depth and, like `clampPlanDepth`, makes
     /// the decision a non-exploration one. `clamp` receives every applied
@@ -302,6 +333,9 @@ extension EngineLoopV2 {
             depth = newDepth
             isExploration = false
             clamp?(newDepth, reason)
+        }
+        if depth > 0, mtpPromptLimitHoldsPlan(eligibleRows, driver: mtp) {
+            lower(to: 0, reason: "prompt_limit")
         }
         if mtp.usesMarginalPolicy, !decision.isExploration, depth > 0, !eligibleRows.isEmpty {
             let verificationLimit = mtp.maximumAutomaticDepth(plannedDecodeRows: rows.count)

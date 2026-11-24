@@ -669,6 +669,58 @@ extension EngineLoopV2 {
                 ? rec.request.promptTokens : nil)
     }
 
+    /// Whether a row's block proposals may be coupled: a sampled row outside
+    /// any grammar. The round must also use exact target-prefix acceptance
+    /// (`mtpCoupledBlockSelection`), where the emitted token is the target's
+    /// draw whatever is proposed.
+    static func mtpCouplesProposals(
+        _ params: CBv2SamplingParams, freeSpan: Bool, constrained: Bool
+    ) -> Bool {
+        params.temperature >= LogitsPipelineV2.greedyEpsilon && !freeSpan && !constrained
+    }
+
+    /// The round's coupled proposals, or nil to keep the drafter's own rule
+    /// (coupling off, typical acceptance, no target-prefix verify, or no row
+    /// that couples). Draft index j of row r is verified against the target's
+    /// draw at output index `generatedTokenCount + j`, the verify path's own
+    /// step base, so the race uses exactly that draw's noise. Rows that do
+    /// not couple race as greedy rows: their argmax.
+    func mtpCoupledBlockSelection(
+        _ rows: [CBv2MTPRowWork], rowMetadata: [CBv2MTPRoundInFlight.VerifyRow],
+        driver mtp: CBv2MTPRoundDriver
+    ) -> CBv2MTPBlockProposalSelection? {
+        guard mtp.config.coupledProposals, mtp.targetPrefixAcceptance,
+            sampler.supportsMTPTargetPrefix, mtp.config.acceptance == .exact
+        else { return nil }
+        var params: [CBv2SamplingParams] = []
+        params.reserveCapacity(rows.count)
+        var anyCoupled = false
+        for (index, row) in rows.enumerated() {
+            var rowParams = row.rec.request.sampling
+            if Self.mtpCouplesProposals(
+                rowParams, freeSpan: rowMetadata[index].freeSpan != nil,
+                constrained: row.rec.request.tokenConstraint != nil)
+            {
+                anyCoupled = true
+            } else {
+                rowParams.temperature = 0
+            }
+            params.append(rowParams)
+        }
+        guard anyCoupled else { return nil }
+        let sampler = self.sampler
+        let requestIDs = rows.map(\.rec.id)
+        let bases = rows.map(\.rec.generatedTokenCount)
+        return CBv2MTPBlockProposalSelection { logits, step in
+            guard logits.ndim == 2, logits.dim(0) == requestIDs.count else { return nil }
+            let n = logits.dim(0)
+            return sampler.mtpCoupledDraftProposal(
+                logits: logits.reshaped([n, 1, logits.dim(1)]), params: params,
+                requestIDs: requestIDs, stepBases: bases.map { $0 + step }
+            )?.reshaped([n])
+        }
+    }
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
@@ -769,9 +821,19 @@ extension EngineLoopV2 {
                 }
                 return state
             }
-            let ids = blockDrafter.draftBlock(
-                tokens: (0 ..< batch).map { seedColumn[$0 ..< $0 + 1, 0...] },
-                hidden: carryHiddens, requestStates: states, depth: k)
+            let seeds = (0 ..< batch).map { seedColumn[$0 ..< $0 + 1, 0...] }
+            let ids: MLXArray
+            if let coupled = blockDrafter as? any CBv2MTPCoupledBlockDrafter,
+                let selection = mtpCoupledBlockSelection(
+                    verifyRows, rowMetadata: rowMetadata, driver: mtp)
+            {
+                ids = coupled.draftBlock(
+                    tokens: seeds, hidden: carryHiddens, requestStates: states, depth: k,
+                    selection: selection)
+            } else {
+                ids = blockDrafter.draftBlock(
+                    tokens: seeds, hidden: carryHiddens, requestStates: states, depth: k)
+            }
             let evalTargets =
                 [ids] + states.flatMap { blockDrafter.evaluationTargets(for: $0) }
             retainNativeWork(evalTargets, owners: states.map { $0 as AnyObject })
