@@ -199,6 +199,9 @@ extension EngineLoopV2 {
         }
         var host: [Int32] = []
         var policyTopTwoHost: [Float]?
+        // Logprob rows: every window position's logprobs, row major, labelled
+        // with the target's token there (`EngineLoopV2.mtpWindowLogprobs`).
+        var windowLogprobs: [CBv2TokenLogprob?] = []
         let acceptanceStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         defer {
             if CBv2StepProfiler.enabled {
@@ -212,6 +215,21 @@ extension EngineLoopV2 {
                 host = verify.acceptancePacket.asArray(Int32.self)
                 CBv2CoreInstrumentation.recordHostSync()
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+                if let gathered = verify.logprobs {
+                    let width = 1 + k
+                    let targetStart = verify.rows.count * k
+                    windowLogprobs = CBv2Logprobs.assemble(
+                        gathered,
+                        sampledTokens: (0 ..< verify.rows.count * width).map {
+                            Int(host[targetStart + $0])
+                        },
+                        topLogprobsPerRow: verify.rows.flatMap { row in
+                            Array(
+                                repeating: scheduler.record(for: row.id)?.request.sampling
+                                    .topLogprobs ?? 0,
+                                count: width)
+                        })
+                }
             })
         else { return }
         if CBv2StepProfiler.enabled {
@@ -574,28 +592,64 @@ extension EngineLoopV2 {
                 requestID: id,
                 safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
+            // One logprob per emitted token, as ordinary decode emits them.
+            // Exact acceptance commits the target's token at every position,
+            // so each entry's token is the emitted one. A row that asked for
+            // logprobs never receives tokens without them: if the round's
+            // gather does not cover them (unreachable under the admission
+            // gate), the tokens are withheld and the request ends with an
+            // error, counted as `logprob_gather_mismatch`.
+            let wantsLogprobs = rec.request.sampling.topLogprobs > 0
+            func emittedLogprobs(_ tokens: [Int]) -> (ok: Bool, value: [CBv2TokenLogprob]?) {
+                guard wantsLogprobs, !tokens.isEmpty else { return (true, nil) }
+                let base = batchIndex * (1 + k)
+                let entries =
+                    windowLogprobs.isEmpty
+                    ? [] : tokens.indices.compactMap { windowLogprobs[base + $0] }
+                guard entries.count == tokens.count,
+                    zip(entries, tokens).allSatisfy({ $0.token == $1 })
+                else {
+                    mtp.recordControllerFallback("logprob_gather_mismatch")
+                    finishReason = .error(
+                        "MTP verify produced no logprobs for \(tokens.count) committed token(s)")
+                    return (false, nil)
+                }
+                return (true, entries)
+            }
             if hasStopStrings {
                 // A grammar-failing token is never emitted (ordinary decode
                 // finishes with the error before emitting it).
                 let visibleTokens = keptFailingToken ? Array(kept.dropLast()) : kept
-                stream(for: id)?.emit(
-                    .delta(text: textPieces.joined(), tokens: visibleTokens, logprobs: nil))
+                let logprobs = emittedLogprobs(visibleTokens)
+                if logprobs.ok {
+                    stream(for: id)?.emit(
+                        .delta(
+                            text: textPieces.joined(), tokens: visibleTokens,
+                            logprobs: logprobs.value))
+                }
             } else {
-                let stream = stream(for: id)
-                stream?.reserveEmission()
                 let endsWithStopToken = finishReason == .stop
                 let visibleTokens = outcome.constraintFailure == nil ? kept : Array(kept.dropLast())
                 let pushTokens = endsWithStopToken ? Array(visibleTokens.dropLast()) : visibleTokens
                 let allTokens = visibleTokens
-                let trackedLoop = nativeShutdownState == nil ? nil : self
-                enqueueDetokenization(owner: detokenizer) {
-                    let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
-                    let publish: () -> Void = {
-                        stream?.emit(
-                            .delta(text: text, tokens: allTokens, logprobs: nil),
-                            consumingReservation: true)
+                let logprobs = emittedLogprobs(allTokens)
+                if logprobs.ok {
+                    let stream = stream(for: id)
+                    stream?.reserveEmission()
+                    let trackedLoop = nativeShutdownState == nil ? nil : self
+                    enqueueDetokenization(owner: detokenizer) {
+                        let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
+                        let publish: () -> Void = {
+                            stream?.emit(
+                                .delta(text: text, tokens: allTokens, logprobs: logprobs.value),
+                                consumingReservation: true)
+                        }
+                        if let trackedLoop {
+                            _ = trackedLoop.nativeCommit(publish)
+                        } else {
+                            publish()
+                        }
                     }
-                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
                 }
             }
 
