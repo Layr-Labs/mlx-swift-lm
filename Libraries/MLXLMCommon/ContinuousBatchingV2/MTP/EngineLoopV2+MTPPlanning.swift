@@ -18,8 +18,9 @@ extension EngineLoopV2 {
     /// same-state previews. Presence/frequency penalties pass only under the
     /// penalty opt-in (`mtpPenaltiesEligible`), stop strings only under the
     /// stop-string opt-in (`effectiveStopStringSpeculation`; finalize confirms
-    /// token by token through the detokenizer). Logprob capture, bias and
-    /// repetition penalty keep their gates.
+    /// token by token through the detokenizer), repetition penalty only under
+    /// its own opt-in (`mtpRepetitionPenaltyEligible`). Logprob capture and
+    /// bias keep their gates.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         mtpHistoryEligible(rec)
             && (rec.request.tokenConstraint == nil || grammarMTPEnabled
@@ -49,7 +50,7 @@ extension EngineLoopV2 {
             samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
-            sampling.repetitionPenalty == 1,
+            mtpRepetitionPenaltyEligible(rec),
             mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
                 || mtp?.config.effectiveStopStringSpeculation == true
@@ -84,6 +85,25 @@ extension EngineLoopV2 {
             penaltyVerification: sampler.supportsMTPPenaltyVerification,
             constrained: rec.request.tokenConstraint != nil,
             finite: sampling.presencePenalty.isFinite && sampling.frequencyPenalty.isFinite)
+    }
+
+    /// A row with a repetition penalty may draft only when the engine opted in
+    /// and the kill switch is not set
+    /// (`CBv2MTPConfig.effectiveRepetitionPenaltySpeculation`), the drafter
+    /// opted into target-prefix acceptance and the sampler re-derives the
+    /// penalty per verify position over the same window ordinary decode uses
+    /// (`supportsMTPRepetitionPenaltyVerification`; such rows always accept
+    /// exactly). Constrained rows keep the historical exclusion. Without the
+    /// opt-in every `repetitionPenalty != 1` row stays target-only, as before.
+    func mtpRepetitionPenaltyEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard sampling.repetitionPenalty != 1 else { return true }
+        return Self.mtpPenaltyRowEligible(
+            switchOn: mtp?.config.effectiveRepetitionPenaltySpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            penaltyVerification: sampler.supportsMTPRepetitionPenaltyVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.repetitionPenalty.isFinite)
     }
 
     static func mtpPenaltyRowEligible(

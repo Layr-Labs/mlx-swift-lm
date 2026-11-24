@@ -225,11 +225,17 @@ def:
             and `DARKBLOOM_CBV2_MTP_COST_CURVE` can only turn the cost-curve depth choice off.
             `CBv2MTPConfig.maxDraftPromptTokens` (nil by default) keeps a request whose prompt is
             longer than the limit target-only for its whole lifetime, as a reasoning budget does.
+            `CBv2MTPConfig.repetitionPenaltySpeculation` (off by default;
+            `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` turns an opt-in off) lets repetition-penalty
+            rows draft: the sampler penalizes each verify position over the last
+            `repetitionContextSize` tokens of prompt, confirmed output and preceding drafts, and
+            these rows accept exactly.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
             - "changelog.d/cbv2-mtp-drafter-opt-ins.md"
             - "changelog.d/cbv2-mtp-draft-prompt-limit.md"
+            - "changelog.d/cbv2-mtp-repetition-penalty-rows.md"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
