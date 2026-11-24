@@ -286,6 +286,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
 
     public var supportsMTPTargetPrefix: Bool { true }
     public var supportsMTPPenaltyVerification: Bool { true }
+    public var supportsMTPRepetitionPenaltyVerification: Bool { true }
 
     /// Pure re-derivation of the ordinary per-token draw for every verify
     /// window position. Eligibility gating guarantees the admitted rows use
@@ -308,7 +309,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
 
     /// Penalty-aware `mtpVerifySample`: window position `j` of row `r` is
     /// penalized with the row's confirmed output counts plus the drafts
-    /// before it, using `LogitsPipelineV2.process`'s ops in its order and
+    /// before it (the repetition window: the last `repetitionContextSize`
+    /// tokens of prompt, confirmed output and those drafts), using `LogitsPipelineV2.process`'s ops in its order and
     /// dtype (bias → penalties → temperature → top-k/top-p/min-p), so on
     /// the accepted prefix every draw is the one sequential sampling makes
     /// from the same logits.
@@ -322,7 +324,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         ).tokens
     }
 
-    /// Penalty-aware `mtpVerifyTypical`; penalty rows accept exactly.
+    /// Penalty-aware `mtpVerifyTypical`; penalty rows (presence, frequency or
+    /// repetition) accept exactly.
     public func mtpVerifyTypical(
         logits: MLXArray, draftIDs: MLXArray, delta: Float,
         params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int],
@@ -430,6 +433,15 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         return which(MLXArray(greedyFlags), mode, proposals).reshaped([b, 1])
     }
 
+    /// `mtpCoupledProposal` through the step-sampler seam.
+    public func mtpCoupledDraftProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? {
+        mtpCoupledProposal(
+            logits: logits, params: params, requestIDs: requestIDs, stepBases: stepBases)
+    }
+
     /// Exact acceptance per draft position: keep iff the target token equals
     /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
     private static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {
@@ -458,14 +470,22 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         }
         var flat = logits.reshaped([b * w, vocab]).asType(.float32)
         // Penalty rows: stage (2) of `LogitsPipelineV2.process` per window
-        // position. Rows without a penalty are left untouched (the ordinary
-        // path's `x - 0 * counts` is the identity on them as well).
-        let penaltyRows = params.map(CBv2MTPVerifyPenalties.applies)
-        if let penalties, penaltyRows.contains(true) {
+        // position, repetition first, then presence/frequency. Rows without a
+        // penalty are left untouched (the ordinary path's `x - 0 * counts`,
+        // and its repetition divide by 1, are the identity on them as well).
+        let repetitionRows = params.map(CBv2MTPVerifyPenalties.appliesRepetition)
+        if let penalties, repetitionRows.contains(true) {
+            flat = applyWindowRepetition(
+                flat, penalties: penalties, params: params,
+                repetitionRows: repetitionRows, b: b, w: w, vocab: vocab)
+        }
+        let countRows = params.map(CBv2MTPVerifyPenalties.applies)
+        if let penalties, countRows.contains(true) {
             flat = applyWindowPenalties(
                 flat, penalties: penalties, params: params, requestIDs: requestIDs,
-                penaltyRows: penaltyRows, b: b, w: w, vocab: vocab)
+                penaltyRows: countRows, b: b, w: w, vocab: vocab)
         }
+        let penaltyRows = params.map(CBv2MTPVerifyPenalties.appliesAny)
         let greedyTokens = argMax(flat, axis: -1).asType(.int32)
         let anyStochastic = params.contains {
             $0.temperature >= LogitsPipelineV2.greedyEpsilon
@@ -557,6 +577,89 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         }
         let exactPerPosition = MLXArray(exactRows).reshaped([b, w])[0..., ..<d]
         return (tokens, which(exactPerPosition, exact, typicalAccept))
+    }
+
+    /// The repetition penalty per window position, as stage (2) of
+    /// `LogitsPipelineV2.process` applies it: every token present in the
+    /// position's window has its logit divided by the penalty when positive
+    /// and multiplied by it otherwise. The window of global position `g` is the
+    /// last `repetitionContextSize` tokens of prompt + confirmed output +
+    /// `drafts[0 ..< g]`, the ordinary ring buffer's contents after those
+    /// drafts were sampled (token ids outside `0 ..< vocab` count for nothing,
+    /// as in `buildCounts`).
+    private func applyWindowRepetition(
+        _ flat: MLXArray, penalties: CBv2MTPVerifyPenalties, params: [CBv2SamplingParams],
+        repetitionRows: [Bool], b: Int, w: Int, vocab: Int
+    ) -> MLXArray {
+        precondition(
+            penalties.outputTokens.count == b && penalties.promptTokens.count == b,
+            "MTP verify repetition row metadata mismatch")
+        let draftsNeeded = penalties.columnOffset + w - 1
+        // A window never holds more than the whole history, so slots past the
+        // longest history plus the drafts would only ever be empty.
+        let longest =
+            (0 ..< b).map {
+                repetitionRows[$0]
+                    ? penalties.promptTokens[$0].count + penalties.outputTokens[$0].count : 0
+            }.max() ?? 0
+        let sizes = (0 ..< b).map {
+            repetitionRows[$0]
+                ? min(params[$0].repetitionContextSize, longest + max(draftsNeeded, 0)) : 0
+        }
+        let span = sizes.max() ?? 0
+        guard span > 0 else { return flat }
+        // History tail per row: its last `span` tokens, right-aligned, -1 padded.
+        var tail = [Int32](repeating: -1, count: b * span)
+        for r in 0 ..< b where repetitionRows[r] {
+            let output = penalties.outputTokens[r].suffix(span)
+            let prompt = penalties.promptTokens[r].suffix(span - output.count)
+            var slot = r * span + span - prompt.count - output.count
+            for token in [prompt, output].joined() {
+                tail[slot] = token >= 0 && token < vocab ? Int32(token) : -1
+                slot += 1
+            }
+        }
+        var history = MLXArray(tail, [b, span])
+        if draftsNeeded > 0 {
+            guard let drafts = penalties.drafts else {
+                preconditionFailure("CBv2 MTP: penalty verification needs the round's drafts")
+            }
+            precondition(
+                drafts.ndim == 2 && drafts.dim(0) == b && drafts.dim(1) >= draftsNeeded,
+                "CBv2 MTP: penalty drafts must be [B, >= \(draftsNeeded)]")
+            history = concatenated(
+                [history, drafts[0..., ..<draftsNeeded].asType(.int32)], axis: 1)
+        }
+        // Window slot k of position j reads history[g + k], g = columnOffset + j;
+        // row r uses the last sizes[r] slots.
+        var gather = [Int32]()
+        gather.reserveCapacity(w * span)
+        for j in 0 ..< w {
+            for k in 0 ..< span { gather.append(Int32(penalties.columnOffset + j + k)) }
+        }
+        var inWindow = [Bool](repeating: false, count: b * span)
+        for r in 0 ..< b where repetitionRows[r] {
+            for k in (span - sizes[r]) ..< span { inWindow[r * span + k] = true }
+        }
+        let tokens = take(history, MLXArray(gather), axis: 1).reshaped([b * w, span])
+        let slotInWindow = broadcast(
+            MLXArray(inWindow).reshaped([b, 1, span]), to: [b, w, span]
+        ).reshaped([b * w, span])
+        let inVocab = (tokens .>= MLXArray(Int32(0))) .&& (tokens .< MLXArray(Int32(vocab)))
+        let valid = (slotInWindow .&& inVocab).asType(.float32)
+        let rowIndex = broadcast(
+            MLXArray(Array(0 ..< Int32(b * w))).reshaped([b * w, 1]), to: [b * w, span])
+        let columnIndex = maximum(tokens, MLXArray(Int32(0)))
+        let windowCounts = MLXArray.zeros([b * w, vocab], type: Float.self)
+            .at[rowIndex.reshaped([-1]), columnIndex.reshaped([-1])].add(valid.reshaped([-1]))
+        let present = windowCounts .> MLXArray(Float(0))
+        var factors = [Float](repeating: 1, count: b * w)
+        for r in 0 ..< b where repetitionRows[r] {
+            for j in 0 ..< w { factors[r * w + j] = params[r].repetitionPenalty }
+        }
+        let penalty = MLXArray(factors).reshaped([b * w, 1])
+        let penalized = which(flat .> 0, flat / penalty, flat * penalty)
+        return which(present, penalized, flat)
     }
 
     /// `x - α·counts - β·(counts > 0)` per window position, in
