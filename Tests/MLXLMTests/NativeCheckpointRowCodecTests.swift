@@ -474,11 +474,15 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         let width = 64
         let decoder = try CBv2PreparedNativeCheckpointRowDecoder(
             role: role(dtype: .bfloat16, width: width, values: true))
+        let native = UnsafeMutableRawBufferPointer.allocate(byteCount: width * 2, alignment: 2)
+        defer { native.deallocate() }
         for pattern: UInt32 in [0x7fff_8000, 0x7fff_ffff, 0xffff_8000, 0xffff_ffff] {
             for lane in 0 ..< width {
                 var row = [Float](repeating: 1, count: width)
                 row[lane] = Float(bitPattern: pattern)
-                XCTAssertThrowsError(try row.withUnsafeBytes { try decoder.writeNative($0) }) {
+                XCTAssertThrowsError(
+                    try row.withUnsafeBytes { try decoder.writeNative($0, into: native) }
+                ) {
                     XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
                 }
             }

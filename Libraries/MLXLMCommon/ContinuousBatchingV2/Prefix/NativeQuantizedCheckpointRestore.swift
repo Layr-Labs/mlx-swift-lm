@@ -24,7 +24,16 @@ extension CBv2CompleteCheckpointImportPlan {
         // Decoded rows have the role's dtype: the page dtype, or GLM's latent
         // wire dtype, which the storage widens into its FP32 pages.
         let wire = CBv2CheckpointDType(role.key.dtype)
-        try decoder.append(role: role, byteOffset: byteOffset, data: data) { offset, row in
+        // With concurrent decode, paged native rows go straight into their pages.
+        let targets: ((Int, Int) -> [UnsafeMutableRawPointer]?)? = storage.map { storage in
+            { offset, rows in
+                storage.rowTargets(
+                    layerIndex: tensorIndex / 2, values: tensorIndex % 2 == 1, byteOffset: offset,
+                    rows: rows, rowBytes: role.nativeRowBytes, wire: wire)
+            }
+        }
+        try decoder.append(role: role, byteOffset: byteOffset, data: data, targets: targets) {
+            offset, row in
             if let storage {
                 try storage.append(
                     layerIndex: tensorIndex / 2, values: tensorIndex % 2 == 1,
