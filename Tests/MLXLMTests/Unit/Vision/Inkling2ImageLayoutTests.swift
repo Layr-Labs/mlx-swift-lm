@@ -91,6 +91,35 @@ extension UnitTests {
             }
         }
 
+        /// A request over the image cap is refused before any image is read.
+        /// The images name a missing file, so reading one fails with a load
+        /// error instead: at the cap, the processor goes on to read them.
+        @Test func imagesOverTheCapAreRefusedBeforeDecoding() async throws {
+            let processor = Inkling2Processor(
+                Inkling2ProcessorConfiguration(), tokenizer: TestTokenizer())
+            let missing = URL(fileURLWithPath: "/nonexistent/inkling2-image-cap.png")
+            func request(images: Int) -> UserInput {
+                UserInput(
+                    prompt: "Describe.",
+                    images: [UserInput.Image](repeating: .url(missing), count: images))
+            }
+            let cap = Inkling2Processor.maximumImagesPerRequest
+            #expect(cap == 64)
+            let refusal = Inkling2ImageLimitError(images: cap + 1, limit: cap)
+            #expect(
+                refusal.errorDescription
+                    == "Inkling 2 takes at most 64 images per request; this request has 65")
+            await #expect(throws: refusal) {
+                _ = try await processor.prepare(input: request(images: cap + 1))
+            }
+            do {
+                _ = try await processor.prepare(input: request(images: cap))
+                Issue.record("a missing image file should fail to load")
+            } catch {
+                #expect(!(error is Inkling2ImageLimitError), "\(error)")
+            }
+        }
+
         @Test func imageOnlyTurnsRenderNoEmptyText() {
             var message = Chat.Message.user("", images: [.ciImage(CIImage.empty())])
             var rendered = Inkling2MessageGenerator().generate(message: message)
