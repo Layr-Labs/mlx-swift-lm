@@ -31,10 +31,17 @@ final class CBv2HistoricalCompleteCheckpoint {
     let chunkSize: Int
     private(set) var windows: [Int: CBv2HistoricalWindow]
     private(set) var quantizedRecent: [Int: CBv2QuantizedCheckpointRecent] = [:]
-    let requiresAssistant: Bool
+    private(set) var requiresAssistant: Bool
     private weak var codec: CBv2CompleteCheckpointCodec?
+    /// Mixed historical + recurrent layouts with an assistant only; `codec`
+    /// stays nil there so legacy source-row validation is unchanged.
+    private weak var assistantCodec: CBv2CompleteCheckpointCodec?
     private var sourceRows: [Int: CBv2HistoricalPagedWeakRow] = [:]
     private var assistantBacking: CBv2HistoricalPagedAssistantBacking?
+    /// Mixed historical + recurrent layouts only: the request's confirmed
+    /// recurrent state at `position`, copied at commit under its own charge.
+    private(set) var recurrentLayers: [Int: CBv2RecurrentLayerState] = [:]
+    private var recurrentReservation: CBv2CheckpointReservation?
     private var ready = false
     private var failed = false
     private let stream: StreamOrDevice
@@ -42,6 +49,7 @@ final class CBv2HistoricalCompleteCheckpoint {
         windows.values.flatMap(\.evaluationRoots)
             + quantizedRecent.values.flatMap(\.evaluationRoots)
             + (assistantBacking?.checkpoint?.evaluationTargets ?? [])
+            + recurrentLayers.values.flatMap { [$0.conv, $0.ssm].compactMap { $0 } }
     }
     /// Copies and their host witnesses; full pages stay with the actual donor.
     var reservedBytes: Int {
@@ -115,6 +123,59 @@ final class CBv2HistoricalCompleteCheckpoint {
         for index in layout.owningIndices { sourceRows[index] = .init(state[index]!) }
     }
 
+    /// Copy `layers` (the request's committed recurrent state at `position`)
+    /// for a mixed historical + recurrent codec. The copies are evaluated
+    /// here and charged until this checkpoint is released.
+    func attachRecurrentState(
+        _ layers: [Int: CBv2RecurrentLayerState], codec: CBv2CompleteCheckpointCodec
+    ) throws {
+        guard codec.historicalRecurrent, let spec = codec.recurrentSpec, recurrentLayers.isEmpty,
+            !failed
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        let bytes = try codec.recurrentStateDescriptors().reduce(0) {
+            try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount)
+        }
+        var copies: [Int: CBv2RecurrentLayerState] = [:]
+        for layer in spec.layers {
+            guard let state = layers[layer.modelLayerIndex], let conv = state.conv,
+                let ssm = state.ssm, conv.shape == layer.convShape,
+                conv.dtype == layer.convDType, ssm.shape == layer.ssmShape,
+                ssm.dtype == layer.ssmDType
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            // Own compact buffers: a staged row may be a view of a batched array.
+            copies[layer.modelLayerIndex] = .init(
+                conv: MLX.where(MLXArray(true), conv, conv),
+                ssm: MLX.where(MLXArray(true), ssm, ssm))
+        }
+        let reservation = try codec.admission.reserveTransient(bytes: bytes)
+        try withError { fault in
+            eval(copies.values.flatMap { [$0.conv!, $0.ssm!] })
+            try fault.check()
+        }
+        recurrentReservation = reservation
+        recurrentLayers = copies
+    }
+
+    deinit { recurrentReservation?.release() }
+
+    /// Reserve the assistant copy of a mixed historical + recurrent boundary
+    /// before any copy exists, under the same footprint rule as native paged
+    /// historical captures. The copy itself is taken after the step settles.
+    func armAssistant(codec: CBv2CompleteCheckpointCodec) throws {
+        guard codec.historicalRecurrent, codec.assistant != nil, !requiresAssistant,
+            assistantBacking == nil, !failed, !ready
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        let descriptors = try codec.assistantDescriptors(position: position)
+        let bytes = try CBv2HistoricalMTPCheckpointFootprint.captureBytes(
+            position: position, descriptors: descriptors)
+        assistantBacking = .init(
+            reservation: try codec.admission.reserveTransient(bytes: bytes), bytes: bytes,
+            destinationBound: try CBv2HistoricalMTPCheckpointFootprint.nativeDestinationBound(
+                descriptors))
+        assistantCodec = codec
+        requiresAssistant = true
+    }
+
     func installWindow(_ window: CBv2HistoricalWindow, layer: Int) throws {
         guard codec != nil, !ready, !failed, windows[layer] == nil, window.position == position
         else {
@@ -135,7 +196,7 @@ final class CBv2HistoricalCompleteCheckpoint {
 
     func captureSettledAssistant(requestState: any CBv2MTPRequestState) throws {
         guard !ready, !failed, requiresAssistant, let backing = assistantBacking,
-            backing.checkpoint == nil, let codec,
+            backing.checkpoint == nil, let codec = codec ?? assistantCodec,
             let assistant = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -151,9 +212,7 @@ final class CBv2HistoricalCompleteCheckpoint {
                 }
                 backing.checkpoint = value  // keep the actual partial copy before inspecting errors
                 try fault.check()
-                let expected = Array(
-                    try codec.tensorDescriptors(position: position).dropFirst(
-                        codec.targetTensorCount))
+                let expected = try codec.assistantDescriptors(position: position)
                 guard let arrays = assistant.encodePrefixCheckpoint(value),
                     arrays.count == expected.count,
                     zip(arrays, expected).allSatisfy({
@@ -310,8 +369,20 @@ extension CBv2CompleteCheckpointCodec {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
         }
+        if historicalRecurrent {
+            for spec in recurrentSpec?.layers ?? [] {
+                guard let layer = checkpoint.recurrentLayers[spec.modelLayerIndex],
+                    let conv = layer.conv, let ssm = layer.ssm
+                else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                sources.append(.array(conv))
+                sources.append(.array(ssm))
+            }
+        } else if !checkpoint.recurrentLayers.isEmpty {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
         if let assistant {
-            guard isNativePagedHistorical, let checkpoint = checkpoint.assistantCheckpoint,
+            guard isNativePagedHistorical || historicalRecurrent,
+                let checkpoint = checkpoint.assistantCheckpoint,
                 let arrays = assistant.encodePrefixCheckpoint(checkpoint)
             else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint

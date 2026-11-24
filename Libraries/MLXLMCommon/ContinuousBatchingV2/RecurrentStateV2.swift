@@ -30,6 +30,12 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     /// a boundary: the engine captures only at multiples of its fixed
     /// prefill chunk reached by whole chunks (`CBv2RecurrentCheckpointGeometry`).
     public var alignsRecurrentCheckpointsToPrefillChunks: Bool
+    /// Prefill output depends on the chunk partition, so a row's state must
+    /// not depend on what else runs in its steps: the scheduler cuts every
+    /// prompt into the fixed grid of `prefillChunkSize` from position 0
+    /// (`SchedulerV2.fixedPrefillChunkGrid`) instead of shortening a chunk to
+    /// the budget left by other rows.
+    public var requiresFixedPrefillChunkGrid: Bool
     /// Causal media embeddings substituted at scalar positions are the only
     /// out-of-band input, so a media request bound to an identity of its
     /// evaluated embeddings and spans may capture and restore recurrent
@@ -46,7 +52,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsMTP: Bool = true,
         supportsCompactRecurrentMTPReplay: Bool = false,
         alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
-        supportsCausalMediaCheckpointReuse: Bool = false
+        supportsCausalMediaCheckpointReuse: Bool = false,
+        requiresFixedPrefillChunkGrid: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -57,6 +64,7 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.supportsMTP = supportsMTP
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
         self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
+        self.requiresFixedPrefillChunkGrid = requiresFixedPrefillChunkGrid
         self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
     }
 

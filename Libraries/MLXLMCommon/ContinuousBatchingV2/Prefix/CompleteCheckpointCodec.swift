@@ -11,6 +11,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     /// binding grants its distinct complete format.
     let unsupportedAsymmetricGeometry: Bool
     let recurrentSpec: CBv2RecurrentStateSpec?
+    /// Opt-in: windowed attention rows use the historical layout and the
+    /// recurrent state follows the target tensors (`pagedHistoricalRecurrentLayout`).
+    let historicalRecurrent: Bool
     let kvDTypes: [DType]
     let assistant: (any CBv2MTPPrefixCheckpointCoding)?
     let qwen4Geometries: [CBv2Qwen4CheckpointGeometry]
@@ -71,6 +74,11 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 ? CBv2CompleteCheckpointManifest.pagedAsymmetricLayout
                 : CBv2CompleteCheckpointManifest.pagedAsymmetricMTPLayout
         }
+        if historicalRecurrent {
+            return assistant == nil
+                ? CBv2CompleteCheckpointManifest.pagedHistoricalRecurrentLayout
+                : CBv2CompleteCheckpointManifest.pagedHistoricalRecurrentMTPLayout
+        }
         if recurrentSpec == nil { return CBv2CompleteCheckpointManifest.historicalAttentionLayout }
         return pagedConfig == nil
             ? CBv2CompleteCheckpointManifest.layout : CBv2CompleteCheckpointManifest.pagedLayout
@@ -90,13 +98,22 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = [],
         nativePagedBinding: CBv2NativePagedModelBinding? = nil,
         contiguousHistorical: Bool = false,
-        glm5NextBackend: PagedKVBackend? = nil
+        glm5NextBackend: PagedKVBackend? = nil,
+        historicalRecurrent: Bool = false
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
         let asymmetric = layerKinds.contains { $0.valueHeadDim != $0.headDim }
         self.unsupportedAsymmetricGeometry = asymmetric
         self.recurrentSpec = recurrentSpec
+        // Exact native rows only: no Qwen4 side state, no lossy profile. An
+        // assistant must keep its own exact history (historical coding).
+        let mixedHistoricalRecurrent =
+            historicalRecurrent && recurrentSpec?.layers.isEmpty == false && !asymmetric
+            && pagedConfig != nil && pagedConfig?.quantization == nil
+            && (assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding)
+            && qwen4Geometries.isEmpty && checkpointQuantization == nil
+            && nativePagedBinding == nil && glm5NextBackend == nil
         self.kvDTypes = kvDTypes
         self.assistant = assistant
         self.qwen4Geometries = qwen4Geometries
@@ -129,6 +146,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         // paged recurrent MTP layout; every other assistant keeps native.
         if let glm5NextLayout {
             self.checkpointQuantization = glm5NextLayout.latentQuantization
+        } else if mixedHistoricalRecurrent {
+            self.checkpointQuantization = nil
         } else {
             self.checkpointQuantization = CBv2CompleteCheckpointStorageQuantization.resolve(
                 checkpointQuantization, layerKinds: layerKinds, layerDTypes: kvDTypes,
@@ -156,8 +175,11 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         self.historicalLayout =
             issuedPaged
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true)
-            : (!asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
+            : (!asymmetric && (recurrentSpec == nil || mixedHistoricalRecurrent)
+                && pagedConfig != nil
+                && (assistant == nil || mixedHistoricalRecurrent)
                 ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil)
+        self.historicalRecurrent = mixedHistoricalRecurrent && self.historicalLayout != nil
         self.contiguousLayout =
             (asymmetric || contiguousHistorical) && recurrentSpec == nil
                 && pagedConfig == nil && historicalAssistant
@@ -214,9 +236,21 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1 else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            return try usesQuantizedCheckpoint
+            var descriptors =
+                try usesQuantizedCheckpoint
                 ? checkpointTargetDescriptors(position: position)
                 : historicalLayout.tensorDescriptors(position: position)
+            if historicalRecurrent {
+                descriptors.append(contentsOf: try recurrentStateDescriptors())
+                if assistant != nil {
+                    // Media requests stay target-only and never use this layout.
+                    guard !mediaTargetOnly else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    descriptors.append(contentsOf: try assistantDescriptors(position: position))
+                }
+            }
+            return descriptors
         }
         guard kvDTypes.count == layerKinds.count, recurrentSpec?.layers.isEmpty == false,
             identity.isValid, position > 1
@@ -237,6 +271,30 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                         shape: [1, kind.kvHeads, position, kind.headDim], dtype: kvDType))
             }
         }
+        result.append(contentsOf: try recurrentStateDescriptors())
+        result.append(contentsOf: qwen4)
+        if let assistant, !mediaTargetOnly {
+            guard
+                let descriptors = assistant.prefixCheckpointTensorDescriptors(
+                    targetInputCount: position)
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            result.append(contentsOf: descriptors)
+        }
+        return result
+    }
+
+    /// The assistant's own prefix-history tensors at `position`.
+    func assistantDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
+        guard let assistant,
+            let descriptors = assistant.prefixCheckpointTensorDescriptors(
+                targetInputCount: position), !descriptors.isEmpty
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        return descriptors
+    }
+
+    /// Convolution then recurrent state for each spec layer, in spec order.
+    func recurrentStateDescriptors() throws -> [CBv2CheckpointTensorDescriptor] {
+        var result: [CBv2CheckpointTensorDescriptor] = []
         for spec in recurrentSpec?.layers ?? [] {
             guard let conv = CBv2CheckpointDType(spec.convDType),
                 let ssm = CBv2CheckpointDType(spec.ssmDType)
@@ -249,14 +307,6 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 try .init(
                     role: .recurrent, layer: spec.modelLayerIndex, shape: spec.ssmShape, dtype: ssm)
             )
-        }
-        result.append(contentsOf: qwen4)
-        if let assistant, !mediaTargetOnly {
-            guard
-                let descriptors = assistant.prefixCheckpointTensorDescriptors(
-                    targetInputCount: position)
-            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            result.append(contentsOf: descriptors)
         }
         return result
     }

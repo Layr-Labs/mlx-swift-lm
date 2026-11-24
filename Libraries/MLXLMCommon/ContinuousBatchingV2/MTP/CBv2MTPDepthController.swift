@@ -226,6 +226,14 @@ final class CBv2MTPDepthController {
         buckets[bucket] = fresh
     }
 
+    /// Back to a fresh controller's learning: every bucket's costs, baseline,
+    /// acceptance and probe cadence, and the workload. Compiled verification
+    /// shapes stay known. Idle engine only (engine queue).
+    func resetLearning() {
+        buckets.removeAll(keepingCapacity: false)
+        workloadRows.removeAll(keepingCapacity: false)
+    }
+
     /// Finishing a request ends this workload generation even if the caller
     /// later reuses its numeric ID. Old in-flight observations must be dropped
     /// by the driver; only shape knowledge and isolated depth-zero warmup survive.
@@ -709,6 +717,53 @@ struct CBv2MTPRawCostEstimator {
     func sampleCount(depth: Int) -> Int {
         costs[depth]?.samples ?? 0
     }
+
+    /// Cost of a depth-d round relative to a plain step, for d in 0 ... cap
+    /// (index 0 is 1). Measured depths use their estimates; a depth between
+    /// two measured ones is interpolated, one past the deepest measured depth
+    /// follows the last measured slope, and with no measured depth the linear
+    /// `headStepCostRatio` model stands. Round costs flatten with depth (the
+    /// first draft costs the most), which a single linear ratio misjudges. The
+    /// plain step is capped at the cheapest round measured at least twice: a
+    /// plain step cannot cost more than a round, and the depth-zero estimate
+    /// rests on one isolated sample.
+    func costRatios(upTo cap: Int) -> [Double] {
+        let cap = max(0, min(cap, Self.maximumDepth))
+        let linear = { (h: Double) in (0 ... cap).map { 1.0 + Double($0) * h } }
+        guard let baseline = costs[0], baseline.ewmaNanos.isFinite, baseline.ewmaNanos > 0
+        else { return linear(Self.bootstrapHeadStepCostRatio) }
+        var measured: [(depth: Int, nanos: Double)] = []
+        var plain = baseline.ewmaNanos
+        for depth in 1 ... Self.maximumDepth {
+            guard let cost = costs[depth], cost.samples > 0, cost.ewmaNanos.isFinite,
+                cost.ewmaNanos > 0
+            else { continue }
+            measured.append((depth, cost.ewmaNanos))
+            if cost.samples >= 2 { plain = min(plain, cost.ewmaNanos) }
+        }
+        guard !measured.isEmpty else { return linear(headStepCostRatio) }
+        let points = [(depth: 0, nanos: plain)] + measured
+        return (0 ... cap).map { depth in
+            if depth == 0 { return 1.0 }
+            let nanos: Double
+            if let exact = points.first(where: { $0.depth == depth }) {
+                nanos = exact.nanos
+            } else if let upper = points.firstIndex(where: { $0.depth > depth }) {
+                let (a, b) = (points[upper - 1], points[upper])
+                nanos =
+                    a.nanos + (b.nanos - a.nanos) * Double(depth - a.depth)
+                    / Double(b.depth - a.depth)
+            } else {
+                let last = points[points.count - 1]
+                let previous = points[points.count - 2]
+                let slope = max(
+                    0, (last.nanos - previous.nanos) / Double(last.depth - previous.depth))
+                nanos = last.nanos + slope * Double(depth - last.depth)
+            }
+            let ratio = nanos / plain
+            return ratio.isFinite ? max(1.0, ratio) : Double.greatestFiniteMagnitude
+        }
+    }
 }
 
 /// Pure marginal-cost selector. One request supplies its own acceptance
@@ -755,6 +810,52 @@ enum CBv2MTPMarginalDepthPolicy {
             depth += 1
         }
         return depth
+    }
+
+    /// The depth with the most expected committed tokens per unit of round
+    /// cost: argmax over d of (1 + E(d)) / costRatios[d], where E(d) sums the
+    /// capped acceptance reach of the first d drafts and costRatios comes from
+    /// `CBv2MTPRawCostEstimator.costRatios(upTo:)` (index 0 is a plain step).
+    static func selectDepthByCost(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int,
+        acceptanceProbabilities: [Double],
+        previousTargetTopTwoMargin: Double?,
+        costRatios: [Double]
+    ) -> Int {
+        guard offeredDepth > 0, remainingTokens > 1, verificationLimit > 0 else {
+            return 0
+        }
+        let cap = min(
+            maximumDepth,
+            min(
+                offeredDepth, min(remainingTokens - 1, min(verificationLimit, costRatios.count - 1))
+            ))
+        guard cap > 0 else { return 0 }
+        var reach = 1.0
+        var expected = 0.0
+        var best = 0
+        var bestValue = 1.0 / max(costRatios[0], 1.0)
+        for depth in 0 ..< cap {
+            let rawProbability =
+                depth < acceptanceProbabilities.count
+                ? acceptanceProbabilities[depth]
+                : 0
+            reach *= cappedAcceptanceProbability(
+                position: depth,
+                acceptanceProbability: rawProbability,
+                previousMargin: previousTargetTopTwoMargin)
+            expected += reach
+            let ratio = costRatios[depth + 1]
+            guard ratio.isFinite, ratio > 0 else { break }
+            let value = (1.0 + expected) / ratio
+            if value > bestValue {
+                best = depth + 1
+                bestValue = value
+            }
+        }
+        return best
     }
 
     /// A cost-confirmation probe is always at most one draft and obeys every

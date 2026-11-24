@@ -763,6 +763,65 @@ struct CBv2MTPDepthControllerTests {
         #expect(abs(clamped.headStepCostRatio - 0.075) < 1e-12)
     }
 
+    @Test func rawCostCurveInterpolatesExtrapolatesAndCapsThePlainStep() {
+        let empty = CBv2MTPRawCostEstimator()
+        #expect(
+            empty.costRatios(upTo: 2)
+                == [
+                    1, 1 + CBv2MTPRawCostEstimator.bootstrapHeadStepCostRatio,
+                    1 + 2 * CBv2MTPRawCostEstimator.bootstrapHeadStepCostRatio,
+                ])
+
+        var curve = CBv2MTPRawCostEstimator()
+        curve.observe(depth: 0, rawWallTimeNanos: 100)
+        curve.observe(depth: 1, rawWallTimeNanos: 999)  // first sample: warm-up
+        curve.observe(depth: 1, rawWallTimeNanos: 140)
+        curve.observe(depth: 1, rawWallTimeNanos: 140)
+        curve.observe(depth: 3, rawWallTimeNanos: 999)
+        curve.observe(depth: 3, rawWallTimeNanos: 170)
+        let ratios = curve.costRatios(upTo: 4)
+        #expect(ratios.count == 5)
+        #expect(ratios[0] == 1)
+        #expect(abs(ratios[1] - 1.4) < 1e-12)
+        #expect(abs(ratios[2] - 1.55) < 1e-12)  // between depths 1 and 3
+        #expect(abs(ratios[3] - 1.7) < 1e-12)
+        #expect(abs(ratios[4] - 1.85) < 1e-12)  // the last measured slope
+
+        // A lone slow plain-step sample cannot cost more than a round measured twice.
+        var slowPlain = CBv2MTPRawCostEstimator()
+        slowPlain.observe(depth: 0, rawWallTimeNanos: 200)
+        slowPlain.observe(depth: 1, rawWallTimeNanos: 999)
+        slowPlain.observe(depth: 1, rawWallTimeNanos: 120)
+        slowPlain.observe(depth: 1, rawWallTimeNanos: 120)
+        #expect(slowPlain.costRatios(upTo: 1) == [1, 1])
+    }
+
+    @Test func costCurveSelectionTakesTheBestTokensPerCost() {
+        // Flattening costs: deeper drafts keep paying at 90 % acceptance.
+        #expect(
+            CBv2MTPMarginalDepthPolicy.selectDepthByCost(
+                offeredDepth: 4, remainingTokens: 10, verificationLimit: 7,
+                acceptanceProbabilities: [0.9, 0.9, 0.9, 0.9], previousTargetTopTwoMargin: nil,
+                costRatios: [1, 1.4, 1.5, 1.6, 1.7]) == 4)
+        // Steep costs at 50 %: no draft pays for itself.
+        #expect(
+            CBv2MTPMarginalDepthPolicy.selectDepthByCost(
+                offeredDepth: 4, remainingTokens: 10, verificationLimit: 7,
+                acceptanceProbabilities: [0.5, 0.5, 0.5, 0.5], previousTargetTopTwoMargin: nil,
+                costRatios: [1, 2, 3, 4, 5]) == 0)
+        // Every ordinary limit still bounds the depth.
+        #expect(
+            CBv2MTPMarginalDepthPolicy.selectDepthByCost(
+                offeredDepth: 4, remainingTokens: 3, verificationLimit: 7,
+                acceptanceProbabilities: [0.9, 0.9, 0.9, 0.9], previousTargetTopTwoMargin: nil,
+                costRatios: [1, 1.4, 1.5, 1.6, 1.7]) == 2)
+        #expect(
+            CBv2MTPMarginalDepthPolicy.selectDepthByCost(
+                offeredDepth: 4, remainingTokens: 10, verificationLimit: 0,
+                acceptanceProbabilities: [0.9, 0.9, 0.9, 0.9], previousTargetTopTwoMargin: nil,
+                costRatios: [1, 1.4, 1.5, 1.6, 1.7]) == 0)
+    }
+
     @Test func requestAcceptanceUpdatesOnlyObservedPositions() {
         var state = CBv2MTPRequestAcceptanceState()
         let initial = state.probabilities

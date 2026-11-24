@@ -354,6 +354,26 @@ final class CBv2MTPRoundDriver {
     /// Nil in ordinary tests and production; no parameter/eligibility override.
     var carryHiddenObserverForTesting: ((CBv2RequestID, MLXArray) -> Void)?
 
+    /// `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0/false/no/off` turns depth-zero
+    /// chaining off (seed steps, as before). Read once.
+    static let envDepthZeroChaining: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// A plan whose final depth is zero (not an exploration probe) runs as
+    /// ordinary chainable decode when the drafter takes ordinary-decode
+    /// history (`planRunsAsOrdinaryDecode`); off, such a plan seeds every
+    /// row. Either way target logits and tokens are the same; only which
+    /// path computes the decode step changes. Tests may set it on the engine
+    /// queue before submitting requests.
+    var depthZeroChaining = CBv2MTPRoundDriver.envDepthZeroChaining
+    /// Test-only plan depth cap from each decode row's committed-or-in-flight
+    /// token count (`generatedTokenCount + pendingSamples`, equal on the
+    /// chained and general paths), applied after every other clamp. Nil in
+    /// production.
+    var planDepthLimitForTesting: ((_ committedTokens: [Int]) -> Int?)?
+
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
         model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?,
@@ -511,16 +531,8 @@ final class CBv2MTPRoundDriver {
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
             plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
-        let offered =
-            usesMarginalPolicy && canSpeculate && !controllerDecision.isExploration
-            ? CBv2MTPDepthDecision(
-                depth: config.maxDraftTokens,
-                decodeRowBucket: controllerDecision.decodeRowBucket,
-                reason: "marginal_offer",
-                isExploration: false)
-            : controllerDecision
-        planDecision = adaptiveSerialLimitedDecision(
-            verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
+        planDecision = offeredPlanDecision(
+            controllerDecision, plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
         guard plannedDecodeRows > 0 else { return }
         metricsLock.lock()
         metrics.selectedDepth = planDecision.depth
@@ -529,6 +541,44 @@ final class CBv2MTPRoundDriver {
         metrics.controllerFallbacks[planDecision.reason, default: 0] += 1
         refreshControllerMetricsLocked()
         metricsLock.unlock()
+    }
+
+    /// The plan decision before the engine's per-row clamps: the marginal
+    /// policy's offer (or the controller's own choice) under the automatic
+    /// rectangular cap and serial/suppression limits.
+    private func offeredPlanDecision(
+        _ controller: CBv2MTPDepthDecision, plannedDecodeRows: Int, canSpeculate: Bool
+    ) -> CBv2MTPDepthDecision {
+        let offered =
+            usesMarginalPolicy && canSpeculate && !controller.isExploration
+            ? CBv2MTPDepthDecision(
+                depth: config.maxDraftTokens,
+                decodeRowBucket: controller.decodeRowBucket,
+                reason: "marginal_offer",
+                isExploration: false)
+            : controller
+        return adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
+    }
+
+    /// The decision `beginPlan` would store for the same inputs, without
+    /// advancing the controller (stateful drafters only: the committed-decode
+    /// workload reset `beginPlan` may apply first is stateless-only).
+    func previewPlanDecision(
+        plannedDecodeRows: Int, canSpeculate: Bool
+    ) -> CBv2MTPDepthDecision {
+        offeredPlanDecision(
+            depthController.preview(
+                plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+    }
+
+    /// This plan runs as ordinary decode feeding persistent history: its
+    /// final depth is zero and it is not a depth-zero exploration probe
+    /// (the controller's isolated warm-up baseline keeps its seed step).
+    var planRunsAsOrdinaryDecode: Bool {
+        depthZeroChaining && feedsHistoryFromOrdinaryDecode && planDecision.depth == 0
+            && !planDecision.isExploration && !forceSeedPlan
     }
 
     func previewDecision(
@@ -871,6 +921,15 @@ final class CBv2MTPRoundDriver {
                 remainingTokens: remainingTokens,
                 verificationLimit: verificationLimit)
         }
+        if Self.costCurveSelection ?? config.costCurveDepthSelection {
+            return CBv2MTPMarginalDepthPolicy.selectDepthByCost(
+                offeredDepth: cappedOffer,
+                remainingTokens: remainingTokens,
+                verificationLimit: verificationLimit,
+                acceptanceProbabilities: acceptance.probabilities,
+                previousTargetTopTwoMargin: carries[id]?.previousTopTwoMargin,
+                costRatios: cost.costRatios(upTo: cappedOffer))
+        }
         return CBv2MTPMarginalDepthPolicy.selectDepth(
             offeredDepth: cappedOffer,
             remainingTokens: remainingTokens,
@@ -879,6 +938,17 @@ final class CBv2MTPRoundDriver {
             previousTargetTopTwoMargin: carries[id]?.previousTopTwoMargin,
             headStepCostRatio: cost.headStepCostRatio)
     }
+
+    /// `DARKBLOOM_CBV2_MTP_COST_CURVE`: `1` turns the cost-curve depth choice
+    /// (`CBv2MTPConfig.costCurveDepthSelection`) on for any family, `0` off;
+    /// unset leaves the configuration's choice.
+    static let costCurveSelection: Bool? = {
+        switch ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"] {
+        case "1": return true
+        case "0": return false
+        default: return nil
+        }
+    }()
 
     func observeRequestAcceptance(
         id: CBv2RequestID,
@@ -1008,6 +1078,14 @@ final class CBv2MTPRoundDriver {
         // Older host-only tests construct unstamped measurements. Production
         // always stamps at plan capture and preserves the stamp at attachment.
         return measurement?.workloadGeneration.map { $0 == workloadGeneration } ?? true
+    }
+
+    /// The depth policy's measured step costs back to a fresh engine's: the
+    /// raw per-depth estimates and the controller's learning. Request state
+    /// and cumulative metrics are untouched. Idle engine only (engine queue).
+    func resetCostLearning() {
+        rawCostEstimators.removeAll(keepingCapacity: false)
+        depthController.resetLearning()
     }
 
     /// Drain/shutdown drops every request trace and adaptive workload while

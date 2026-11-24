@@ -226,6 +226,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Decode steps and rows whose tokens came through `CBv2CertifiedTokenRequest`.
+    public var certifiedTokenSteps: Int { loop.certifiedTokenSteps }
+    public var certifiedTokenRows: Int { loop.certifiedTokenRows }
     /// Reset only at an idle benchmark boundary after warmup. Ordinary
     /// engines never allocate a recorder; snapshots add no device evaluation.
     @_spi(Benchmarking)
@@ -256,6 +259,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// drive rounds). Lock-protected snapshot — safe to poll from any
     /// thread (provider heartbeats/telemetry).
     public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
+    /// Forgets the MTP depth policy's measured step costs while the engine is
+    /// idle, so the next request measures them again. The policy keeps one
+    /// plain-step sample per engine for its whole life; when that sample came
+    /// from a cold step (a load warm-up's first kernels, cold caches) it drafts
+    /// too deep from then on (one row, M5 Ultra: 61 vs 123 tok/s). Call after a
+    /// warm-up and before serving. Tokens are unaffected. False when the engine
+    /// has work or no MTP driver.
+    @discardableResult
+    public func resetMTPCostLearning() -> Bool { loop.resetMTPCostLearning() }
     /// Construction-time reason MTP is inactive. nil means the driver is
     /// active. Providers can surface this alongside the nil metrics snapshot.
     public let mtpInactiveReason: String?
@@ -900,6 +912,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
+        scheduler.fixedPrefillChunkGrid =
+            modelCapabilities.requiresFixedPrefillChunkGrid
+            ? schedulerConfig.prefillChunkSize : nil
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
@@ -923,6 +938,29 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // A solo stripe gives a cold prompt a partition other than the
             // chunk grid that chunk-aligned checkpoints assume.
             && (!modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
+        // Recurrent state beside sliding-window attention: windowed rows keep
+        // the historical window export, the state follows the target tensors.
+        let windowedRecurrentCheckpointEligible =
+            !fullRecurrentCheckpointEligible
+            && modelCapabilities.supportsRecurrentCheckpointReuse
+            && (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+            && layerKinds.contains { kind in
+                if case .slidingWindow = kind.attention { return true }
+                return false
+            }
+            && layerKinds.allSatisfy { kind in
+                kind.sharesKVWithLayer == nil && kind.valueHeadDim == kind.headDim
+                    && kind.qwen4IndexerCompressRatio == nil && !kind.isBidirectional
+            }
+            && (!(mtpDriver?.tracksPersistentHistory ?? false)
+                || mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding)
+            && checkpointQuantization == nil
+            && (backend as? PagedKVBackend)?.nativeModelBinding == nil
+            && schedulerConfig.enablePrefixCache
+            // Grid-cut stripes keep the chunk-aligned boundaries.
+            && (!modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                || modelCapabilities.requiresFixedPrefillChunkGrid
                 || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
         let hybridEligible =
             fullRecurrentCheckpointEligible
@@ -991,9 +1029,28 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
+        } else if windowedRecurrentCheckpointEligible, let completePrefixCache,
+            let pagedCheckpointConfig, pagedCheckpointConfig.quantization == nil,
+            let segmentedPool,
+            let recurrentSpec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
+            (try? CBv2HistoricalAttentionLayout(
+                layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil,
+            case let codec = CBv2CompleteCheckpointCodec(
+                identity: completePrefixCache.identity, layerKinds: layerKinds,
+                recurrentSpec: recurrentSpec, kvDTypes: segmentedPool.layerDTypes,
+                assistant: mtpDriver?.tracksPersistentHistory == true
+                    ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
+                admission: admission, pagedConfig: pagedCheckpointConfig,
+                historicalRecurrent: true),
+            codec.historicalRecurrent
+        {
+            self.completePrefixCache = completePrefixCache
+            self.completeCheckpointCodec = codec
+            self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
         } else if schedulerConfig.enablePrefixCache,
             (model as? any CBv2HistoricalAttentionCheckpointProviding)?
                 .cbv2SupportsHistoricalAttentionCheckpoint == true,
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             !(mtpDriver?.tracksPersistentHistory ?? false),
             let completePrefixCache, let pagedCheckpointConfig, let segmentedPool,
             (try? CBv2HistoricalAttentionLayout(
@@ -1123,6 +1180,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         if let contract = self.nativeCompletePrefixContract {
             loop.configureNativeCompletePrefix(contract: contract)
+        }
+        // Certified tokens: build and compile at load, not on the first request.
+        if CBv2CertifiedTokenRequest.enabled, sampler is CBv2DefaultSampler,
+            let certifying = model as? any CBv2CertifiedTokenModel,
+            certifying.cbv2SupportsCertifiedTokens
+        {
+            certifying.cbv2WarmCertifiedTokens()
         }
         loop.start()
     }

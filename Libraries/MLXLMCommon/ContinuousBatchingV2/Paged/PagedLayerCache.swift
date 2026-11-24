@@ -62,6 +62,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     public let layerIndex: Int
     public let kind: CBv2LayerKind
     let pool: PagedKVPool
+    /// The pool this cache's pages live in: one per engine, so attention cores
+    /// shared by engines key per-engine state by it.
+    package var poolIdentity: ObjectIdentifier { ObjectIdentifier(pool) }
     package var glm5NextModelBinding: GLM5NextPagedModelBinding?
 
     package func advanceGLM5NextOffsets(by count: Int) {
@@ -111,6 +114,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private var cachedTablesFingerprint: [(serial: UInt64, tableVersion: Int)] = []
     /// Times the device tables were rebuilt (test/telemetry hook).
     private(set) var tablesRebuildCount = 0
+    /// Segment bindings and tables of model-owned attention kernels
+    /// (`attendWithModelKernel`), fingerprinted like `cachedTables`.
+    var modelAttentionSegmentTables: CBv2ModelAttentionSegmentTables?
+    /// Work items and buckets of model-owned attention calls over more
+    /// segments than one dispatch binds.
+    let modelAttentionBuckets = CBv2ModelAttentionBucketCache()
 
     /// One immutable metadata plan; never owns segment storage or a write fence.
     let segmentDispatchCache = PagedSegmentDispatchCache()
@@ -2041,4 +2050,588 @@ extension PagedLayerCache: CBv2MultimodalSpanCapableCache {
     public var honorsSpanMaskContexts: Bool {
         !pool.usesStepOwnedAttention && Self.honorsSpanMaskContextsByConstruction
     }
+}
+
+// MARK: - Model-owned attention kernels
+
+/// What a model-owned paged attention kernel reads for one call: the layer
+/// group's storage, each row's page table and geometry, the write fence, and
+/// whether the kernel also writes the call's tokens.
+package struct CBv2ModelAttentionPages {
+    package enum Storage {
+        /// Fixed slabs `[pages, kvHeads, pageSize, headDim]`; entries are page ids.
+        case slab(keys: MLXArray, values: MLXArray)
+        /// Segments `[2, pages, kvHeads, pageSize, headDim]` (keys, then values);
+        /// entries are `binding << 24 | local page`, `binding` indexing the array.
+        case segments([MLXArray])
+        /// More segments than one dispatch binds (calls of up to
+        /// `CBv2ModelAttentionBucketing.maximumQueries` tokens): entries are
+        /// page ids, and each bucket is one dispatch's segments and work items.
+        case segmentBuckets([Bucket])
+    }
+
+    /// One dispatch's share of a bucketed call.
+    package struct Bucket {
+        /// Segments `[2, pages, kvHeads, pageSize, headDim]`, at most
+        /// `CBv2ModelAttentionBucketing.maximumSegments`.
+        package let segments: [MLXArray]
+        /// int32 `[2 * maximumSegments]`: each segment's first page id and page
+        /// count (its poison page included), zero past `segments`.
+        package let ranges: MLXArray
+        /// int32 `[2 * itemCount]`: (row, partition) work items. Partition `z`
+        /// of row `r` is the absolute partition `lowest / partitionTokens + z`,
+        /// `lowest` the row's lowest attended key (`max(base, queryStart -
+        /// window + 1)` sliding, `base` full). Every page an item reads (keys
+        /// in `[lowest, queryStart)`) and, for `z == 0`, every page the row's
+        /// tokens are written to, is in `segments`. Each item of the call is in
+        /// exactly one bucket.
+        package let items: MLXArray
+        package let itemCount: Int
+    }
+
+    package struct Row: Hashable, Sendable {
+        /// Absolute position of the call's first token.
+        package let queryStart: Int
+        /// Oldest position the row may attend.
+        package let base: Int
+        /// Length the logical page index wraps at (ring length or table length).
+        package let tableLength: Int
+    }
+
+    package let storage: Storage
+    /// `[B, >= 8]` int32 table entries, padded with an inert page.
+    package let tables: MLXArray
+    package let rows: [Row]
+    /// Sliding window of the layer, nil for full attention.
+    package let window: Int?
+    package let writeFence: MLXArray
+    /// The kernel writes the call's tokens: position `queryStart + i` of row
+    /// `r` to slot `pos % pageSize` of the page that `tables[r][(pos / pageSize)
+    /// % tableLength]` names. Those slots were reserved for exactly these
+    /// tokens (`prepareDecodeWrite`, checked against the tables). False when
+    /// the cache writes them after the kernel.
+    package let writesTokens: Bool
+}
+
+/// How a model kernel splits a call whose rows touch more segments than one
+/// dispatch binds: one work item per (row, absolute `partitionTokens`
+/// partition), at most `maximumSegments` segments per dispatch, for calls of
+/// at most `maximumQueries` tokens.
+package struct CBv2ModelAttentionBucketing: Sendable, Equatable {
+    package let partitionTokens: Int
+    package let maximumQueries: Int
+    package let maximumSegments: Int
+
+    package init(partitionTokens: Int, maximumQueries: Int, maximumSegments: Int) {
+        self.partitionTokens = partitionTokens
+        self.maximumQueries = maximumQueries
+        self.maximumSegments = maximumSegments
+    }
+}
+
+/// How often model-owned attention calls bound pages in place, bound them in
+/// several segment buckets, or fell back to the gathered copy (diagnostics).
+package final class CBv2ModelAttentionCounters: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts = (calls: 0, gathered: 0, buckets: 0)
+
+    package var snapshot: (calls: Int, gathered: Int, buckets: Int) { lock.withLock { counts } }
+    package func reset() { lock.withLock { counts = (0, 0, 0) } }
+    func record(gathered: Bool, buckets: Int = 1) {
+        lock.withLock {
+            counts.calls += 1
+            if gathered { counts.gathered += 1 }
+            counts.buckets += buckets
+        }
+    }
+}
+
+extension PagedLayerCache {
+    /// Most segment buffers one model-kernel call binds.
+    package static let modelAttentionMaximumBindings = 16
+    package static let modelAttentionCounters = CBv2ModelAttentionCounters()
+
+    /// Attention by a model-owned kernel over this layer's pages, with the
+    /// same write validation, page ownership and offset advance as
+    /// `updateKVAndAdvanceOffsets`.
+    ///
+    /// `keys`/`values` are the call's new tokens `[B, kvHeads, L, headDim]`. The
+    /// kernel attends each row's history below `queryStart` from the pages and
+    /// the call's own tokens from its inputs, and returns its output and the
+    /// next write fence. When `L <= fusedWriteTokens` and no sliding ring can
+    /// lose attended history, the slots are reserved here (and checked to be the
+    /// ones the tables name) and the kernel writes the tokens; otherwise the
+    /// cache writes them after the kernel, behind its
+    /// fence. A call whose rows touch more segments than one dispatch binds
+    /// is split into segment buckets when the kernel takes `bucketing` and the
+    /// call has at most `bucketing.maximumQueries` tokens; otherwise it reads a
+    /// gathered copy of exactly those pages (same values, same bits).
+    /// Returns nil after a write-validation fault.
+    package func attendWithModelKernel(
+        keys: MLXArray, values: MLXArray, fusedWriteTokens: Int,
+        bucketing: CBv2ModelAttentionBucketing? = nil,
+        _ kernel: (CBv2ModelAttentionPages) -> (output: MLXArray, writeFence: MLXArray)
+    ) -> MLXArray? {
+        let dtype = pool.layerDTypes[layerIndex]
+        let groupKey = pool.groupKey(forLayer: layerIndex)
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: dtype, layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values, group: groupKey, rank: 4, batch: pagedRows.count,
+                layerIndex: layerIndex)
+        else { return nil }
+        guard kind.headDim == kind.valueHeadDim, kind.sharesKVWithLayer == nil,
+            !pagedRows.isEmpty, groupKey.quantization == nil, !groupKey.isAsymmetric,
+            boundSpanContext == nil
+        else {
+            pool.writeValidation.refuse(
+                "model attention kernel needs uniform, unquantized, unshared, span-free rows",
+                expected: dtype, layerIndex: layerIndex)
+            return nil
+        }
+        let rows = pagedRows
+        let l = keys.dim(2)
+        let pageSize = pool.config.pageSize
+        let group = pool.group(rows[0].groupKey)
+        let window = rows[0].windowSize
+        let starts = rows.map(\.absoluteOffset)
+        let fused =
+            l <= fusedWriteTokens
+            && rows.allSatisfy { row in
+                row.absoluteOffset >= row.frozenHighWater
+                    && (row.windowSize.map { l + $0 - 1 <= (row.ringPages ?? 0) * pageSize }
+                        ?? true)
+            }
+        var targets: [(page: Int32, slot: Int)] = []
+        if fused {
+            targets.reserveCapacity(rows.count * l)
+            for row in rows {
+                for _ in 0 ..< l { targets.append(row.prepareDecodeWrite()) }
+            }
+            guard !pool.writeValidation.isFaulted else { return nil }
+            // The kernel derives each token's slot from the row's table; it
+            // must be exactly the reserved one.
+            for (index, row) in rows.enumerated() {
+                let length = max(1, row.decodeTableLength)
+                for i in 0 ..< l {
+                    let target = targets[index * l + i]
+                    let position = starts[index] + i
+                    let logical = (position / pageSize) % length
+                    guard logical < row.table.count, row.table[logical] == target.page,
+                        position % pageSize == target.slot
+                    else {
+                        pool.writeValidation.refuse(
+                            "reserved decode slot differs from the table's slot",
+                            expected: dtype, layerIndex: layerIndex)
+                        return nil
+                    }
+                }
+            }
+        }
+        let descriptors = zip(rows, starts).map { row, start in
+            CBv2ModelAttentionPages.Row(
+                queryStart: start, base: row.baseOffset, tableLength: max(1, row.decodeTableLength))
+        }
+
+        var gatheredWrite = false
+        let pages: CBv2ModelAttentionPages
+        if let layout = group.segmentLayout {
+            let fingerprint = rows.map { (serial: $0.serial, tableVersion: $0.tableVersion) }
+            let segmentTables: CBv2ModelAttentionSegmentTables
+            if let cached = modelAttentionSegmentTables,
+                cached.fingerprint.count == fingerprint.count,
+                zip(cached.fingerprint, fingerprint).allSatisfy({ $0 == $1 })
+            {
+                segmentTables = cached
+            } else {
+                // The segments the rows' pages live in. A fused write's slot is
+                // in one of those pages (checked against the tables above); the
+                // union with the write targets makes their segments explicit.
+                var ids = Set(rows.flatMap { $0.table.map { layout.segmentIndex(page: $0) } })
+                if fused { ids.formUnion(targets.map { layout.segmentIndex(page: $0.page) }) }
+                let order = ids.sorted()
+                let binding = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+                var tables: MLXArray?
+                // Bound in place only when there is something to bind (rows with
+                // no pages yet, a fresh prompt's first chunk, have nothing: the
+                // pool may not even hold a segment) and one dispatch can bind it.
+                if !order.isEmpty && order.count <= Self.modelAttentionMaximumBindings
+                    && order.allSatisfy({ group.segments[$0] != nil })
+                {
+                    let width = max(8, rows.map(\.table.count).max() ?? 0)
+                    var flat = [Int32](repeating: 0, count: rows.count * width)
+                    for (index, row) in rows.enumerated() {
+                        for (slot, page) in row.table.enumerated() {
+                            flat[index * width + slot] = Int32(
+                                binding[layout.segmentIndex(page: page)]! << 24
+                                    | layout.localPage(page))
+                        }
+                    }
+                    tables = MLXArray(flat, [rows.count, width])
+                }
+                segmentTables = CBv2ModelAttentionSegmentTables(
+                    fingerprint: fingerprint, order: order, binding: binding, tables: tables)
+                modelAttentionSegmentTables = segmentTables
+            }
+            let storages = segmentTables.order.compactMap { group.segments[$0]?.storage }
+            if let tables = segmentTables.tables, storages.count == segmentTables.order.count {
+                pages = CBv2ModelAttentionPages(
+                    storage: .segments(storages), tables: tables, rows: descriptors,
+                    window: window, writeFence: group.writeFence, writesTokens: fused)
+                Self.modelAttentionCounters.record(gathered: false)
+            } else if let bucketing, l <= bucketing.maximumQueries,
+                segmentTables.order.count > Self.modelAttentionMaximumBindings,
+                let buckets = modelAttentionBucketList(
+                    rows: rows, starts: starts, l: l, window: window, fused: fused,
+                    group: group, layout: layout, bucketing: bucketing)
+            {
+                // More segments than one dispatch binds: one dispatch per
+                // bucket, reading the pages in place through page-id tables.
+                pages = CBv2ModelAttentionPages(
+                    storage: .segmentBuckets(buckets), tables: deviceTables(rows: rows),
+                    rows: descriptors, window: window, writeFence: group.writeFence,
+                    writesTokens: fused)
+                Self.modelAttentionCounters.record(gathered: false, buckets: buckets.count)
+            } else {
+                // No pages yet, or more segments than one dispatch binds and
+                // no bucketing for this call: a gathered copy of exactly the
+                // pages the call reads (same values, same bits); reserved slots
+                // are written behind the kernel's fence.
+                pages = gatheredModelAttentionPages(
+                    rows: rows, starts: starts, window: window, group: group)
+                gatheredWrite = fused
+                Self.modelAttentionCounters.record(gathered: true)
+            }
+        } else {
+            Self.modelAttentionCounters.record(gathered: false)
+            pages = CBv2ModelAttentionPages(
+                storage: .slab(keys: group.kSlab, values: group.vSlab),
+                tables: deviceTables(rows: rows), rows: descriptors, window: window,
+                writeFence: group.writeFence, writesTokens: fused)
+        }
+
+        let result = kernel(pages)
+        group.writeFence = result.writeFence
+        if gatheredWrite {
+            // Slots were reserved but the kernel read a gathered copy: scatter the
+            // tokens into their reserved pages behind the kernel's fence.
+            for (index, row) in rows.enumerated() {
+                let slots = targets[(index * l) ..< ((index + 1) * l)].map {
+                    $0.page * Int32(pageSize) + Int32($0.slot)
+                }
+                pool.writeTokens(
+                    group: row.groupKey, slots: slots, keys: keys[index], values: values[index])
+            }
+        } else if !fused {
+            for (index, row) in rows.enumerated() {
+                row.write(keys: keys[index], values: values[index])
+            }
+        }
+        retainedPrefillKV = []
+        advancePositionOffsets(by: l)
+        return result.output
+    }
+
+    /// The buckets of a call over more segments than one dispatch binds, nil
+    /// when some item would need more than `maximumSegments` segments or a
+    /// page lies outside the pool's live segments (the caller then gathers).
+    private func modelAttentionBucketList(
+        rows: [PagedSequenceKV], starts: [Int], l: Int, window: Int?, fused: Bool,
+        group: PagedKVGroup, layout: PagedKVSegmentLayout,
+        bucketing: CBv2ModelAttentionBucketing
+    ) -> [CBv2ModelAttentionPages.Bucket]? {
+        let s = pool.config.pageSize
+        let tokens = bucketing.partitionTokens
+        guard tokens > 0, tokens % s == 0, bucketing.maximumSegments > 0 else { return nil }
+        let cache = modelAttentionBuckets
+        var keys: [CBv2ModelAttentionBucketCache.RowKey] = []
+        keys.reserveCapacity(rows.count)
+        for (row, start) in zip(rows, starts) {
+            let lowest = window.map { max(row.baseOffset, start - $0 + 1) } ?? row.baseOffset
+            let firstPartition = lowest / tokens
+            keys.append(
+                .init(
+                    serial: row.serial, tableVersion: row.tableVersion,
+                    tableLength: max(1, row.decodeTableLength), firstPage: lowest / s,
+                    lastPage: start > lowest ? (start - 1) / s : -1,
+                    firstPartition: firstPartition,
+                    partitions: (start + l - 1) / tokens - firstPartition + 1,
+                    writePages: fused ? (start / s) ... ((start + l - 1) / s) : nil))
+        }
+        let plan: CBv2ModelAttentionBucketCache.Plan
+        if let cached = cache.plan, cached.keys == keys, cached.bucketing == bucketing {
+            plan = cached
+        } else {
+            var items: [CBv2ModelAttentionBucketCache.RowItems] = []
+            items.reserveCapacity(rows.count)
+            for (row, key) in zip(rows, keys) {
+                if let cached = cache.rows[key.serial], cached.key == key,
+                    cached.pagesPerPartition == tokens / s
+                {
+                    items.append(cached)
+                    continue
+                }
+                guard
+                    let made = CBv2ModelAttentionBucketCache.RowItems(
+                        table: row.table, key: key, pagesPerPartition: tokens / s,
+                        layout: layout, maximumSegments: bucketing.maximumSegments)
+                else { return nil }
+                cache.rows[key.serial] = made
+                items.append(made)
+            }
+            if cache.rows.count > 2 * rows.count + 16 {
+                let live = Set(keys.map(\.serial))
+                cache.rows = cache.rows.filter { live.contains($0.key) }
+            }
+            plan = CBv2ModelAttentionBucketCache.Plan(
+                keys: keys, bucketing: bucketing, rows: items, layout: layout)
+            cache.plan = plan
+        }
+        var buckets: [CBv2ModelAttentionPages.Bucket] = []
+        buckets.reserveCapacity(plan.buckets.count)
+        for bucket in plan.buckets {
+            var storages: [MLXArray] = []
+            for id in bucket.segments {
+                guard let storage = group.segments[id]?.storage else { return nil }
+                storages.append(storage)
+            }
+            buckets.append(
+                .init(
+                    segments: storages, ranges: bucket.ranges, items: bucket.items,
+                    itemCount: bucket.itemCount))
+        }
+        return buckets
+    }
+
+    /// A slab copy of the pages each row's first query reads: positions
+    /// `[lowest key, queryStart)` page-aligned, with a zero page 0; row `r`'s
+    /// table maps logical page `p` to its copy at `p % pageCount`.
+    private func gatheredModelAttentionPages(
+        rows: [PagedSequenceKV], starts: [Int], window: Int?, group: PagedKVGroup
+    ) -> CBv2ModelAttentionPages {
+        let s = pool.config.pageSize
+        let kvHeads = group.key.kvHeads
+        let headDim = group.key.headDim
+        let zeroPage = MLXArray.zeros([1, kvHeads, s, headDim], dtype: group.dtype)
+        var keyPages: [MLXArray] = [zeroPage]
+        var valuePages: [MLXArray] = [zeroPage]
+        var tables: [[Int32]] = []
+        var descriptors: [CBv2ModelAttentionPages.Row] = []
+        var next = 1
+        for (row, start) in zip(rows, starts) {
+            let lowest = window.map { max(row.baseOffset, start - $0 + 1) } ?? row.baseOffset
+            let first = (lowest / s) * s
+            let count = max(1, (start - first + s - 1) / s)
+            func paged(_ x: MLXArray) -> MLXArray {
+                // [1, kvHeads, count * s, headDim] -> [count, kvHeads, s, headDim]
+                x.reshaped(kvHeads, count, s, headDim).transposed(1, 0, 2, 3)
+            }
+            if start > lowest {
+                let (k, v) = row.gatherRange(start: lowest, count: start - lowest)
+                let lead = lowest - first
+                let tail = count * s - (start - first)
+                func pad(_ x: MLXArray) -> MLXArray {
+                    var parts: [MLXArray] = []
+                    if lead > 0 {
+                        parts.append(MLXArray.zeros([1, kvHeads, lead, headDim], dtype: x.dtype))
+                    }
+                    parts.append(x)
+                    if tail > 0 {
+                        parts.append(MLXArray.zeros([1, kvHeads, tail, headDim], dtype: x.dtype))
+                    }
+                    return parts.count == 1 ? x : concatenated(parts, axis: 2)
+                }
+                keyPages.append(paged(pad(k)))
+                valuePages.append(paged(pad(v)))
+            } else {
+                let zeros = MLXArray.zeros([count, kvHeads, s, headDim], dtype: group.dtype)
+                keyPages.append(zeros)
+                valuePages.append(zeros)
+            }
+            var table = [Int32](repeating: 0, count: max(8, count))
+            for logical in (first / s) ..< (first / s + count) {
+                table[logical % count] = Int32(next + logical - first / s)
+            }
+            tables.append(table)
+            descriptors.append(.init(queryStart: start, base: row.baseOffset, tableLength: count))
+            next += count
+        }
+        let width = tables.map(\.count).max()!
+        let flat = tables.flatMap { $0 + [Int32](repeating: 0, count: width - $0.count) }
+        return CBv2ModelAttentionPages(
+            storage: .slab(
+                keys: concatenated(keyPages, axis: 0), values: concatenated(valuePages, axis: 0)),
+            tables: MLXArray(flat, [rows.count, width]), rows: descriptors, window: window,
+            writeFence: group.writeFence, writesTokens: false)
+    }
+}
+
+/// Cached segment bindings and tables of a model-owned attention call: the
+/// sorted segments the rows touch, each segment's binding index, and the
+/// `binding << 24 | local page` tables (nil past the binding limit).
+package struct CBv2ModelAttentionSegmentTables {
+    let fingerprint: [(serial: UInt64, tableVersion: Int)]
+    let order: [Int]
+    let binding: [Int: Int]
+    let tables: MLXArray?
+}
+
+/// Work items of bucketed model-attention calls on one layer: each row's
+/// items and their segments, rebuilt only when the row's table, attended
+/// pages or partitions change, and the last call's buckets, reused while no
+/// row changed. Host metadata only: segment storage is looked up per call.
+package final class CBv2ModelAttentionBucketCache {
+    /// Everything a row's items depend on. Pages are logical (absolute
+    /// position / page size); the table maps them modulo `tableLength`.
+    struct RowKey: Equatable {
+        let serial: UInt64
+        let tableVersion: Int
+        let tableLength: Int
+        /// Page of the lowest attended key.
+        let firstPage: Int
+        /// Page of the last history key (`queryStart - 1`), -1 without history.
+        let lastPage: Int
+        let firstPartition: Int
+        let partitions: Int
+        /// Pages the call's tokens are written to by the kernel, if it writes.
+        let writePages: ClosedRange<Int>?
+    }
+
+    struct RowItems {
+        let key: RowKey
+        let pagesPerPartition: Int
+        /// Sorted segments of all the row's items.
+        let segments: [Int]
+        /// Item `z`'s sorted segments: `itemSegments[bounds[z] ..< bounds[z + 1]]`.
+        let itemSegments: [Int]
+        let bounds: [Int]
+
+        /// Item `z` reads logical pages `max(p * pagesPerPartition, firstPage)`
+        /// through `min((p + 1) * pagesPerPartition - 1, lastPage)` with `p =
+        /// firstPartition + z`; item 0 also holds the write pages. Nil when a
+        /// page is missing from the table or an item needs more than
+        /// `maximumSegments` segments.
+        init?(
+            table: [Int32], key: RowKey, pagesPerPartition: Int, layout: PagedKVSegmentLayout,
+            maximumSegments: Int
+        ) {
+            self.key = key
+            self.pagesPerPartition = pagesPerPartition
+            var itemSegments: [Int] = []
+            var bounds = [0]
+            var all = Set<Int>()
+            bounds.reserveCapacity(key.partitions + 1)
+            func segment(_ logical: Int) -> Int? {
+                let index = logical % key.tableLength
+                guard index < table.count else { return nil }
+                let page = table[index]
+                guard page >= 0, Int(page) < layout.pageCount else { return nil }
+                return layout.segmentIndex(page: page)
+            }
+            for z in 0 ..< key.partitions {
+                let p = key.firstPartition + z
+                var segments: [Int] = []
+                let lo = max(p * pagesPerPartition, key.firstPage)
+                let hi = min((p + 1) * pagesPerPartition - 1, key.lastPage)
+                var logical = lo
+                while logical <= hi {
+                    guard let id = segment(logical) else { return nil }
+                    if !segments.contains(id) { segments.append(id) }
+                    logical += 1
+                }
+                if z == 0, let writes = key.writePages {
+                    for logical in writes {
+                        guard let id = segment(logical) else { return nil }
+                        if !segments.contains(id) { segments.append(id) }
+                    }
+                }
+                guard segments.count <= maximumSegments else { return nil }
+                segments.sort()
+                itemSegments.append(contentsOf: segments)
+                bounds.append(itemSegments.count)
+                all.formUnion(segments)
+            }
+            self.segments = all.sorted()
+            self.itemSegments = itemSegments
+            self.bounds = bounds
+        }
+    }
+
+    struct Bucket {
+        let segments: [Int]
+        let ranges: MLXArray
+        let items: MLXArray
+        let itemCount: Int
+    }
+
+    /// One call's buckets: rows in order, each row's items together while
+    /// they fit the open bucket, a new bucket when they do not, and a row
+    /// whose items need more than one bucket split item by item.
+    struct Plan {
+        let keys: [RowKey]
+        let bucketing: CBv2ModelAttentionBucketing
+        let buckets: [Bucket]
+
+        init(
+            keys: [RowKey], bucketing: CBv2ModelAttentionBucketing, rows: [RowItems],
+            layout: PagedKVSegmentLayout
+        ) {
+            self.keys = keys
+            self.bucketing = bucketing
+            let limit = bucketing.maximumSegments
+            var buckets: [Bucket] = []
+            var open: [Int] = []
+            var items: [Int32] = []
+            func union(_ a: [Int], _ b: ArraySlice<Int>) -> [Int] {
+                var result = a
+                for id in b where !a.contains(id) { result.append(id) }
+                return result
+            }
+            func close() {
+                guard !items.isEmpty else { return }
+                let ids = open.sorted()
+                var ranges = [Int32](repeating: 0, count: 2 * limit)
+                for (k, id) in ids.enumerated() {
+                    let range = layout.range(id)
+                    ranges[2 * k] = Int32(range.lowerBound)
+                    ranges[2 * k + 1] = Int32(range.count)
+                }
+                buckets.append(
+                    Bucket(
+                        segments: ids, ranges: MLXArray(ranges), items: MLXArray(items),
+                        itemCount: items.count / 2))
+                open.removeAll(keepingCapacity: true)
+                items.removeAll(keepingCapacity: true)
+            }
+            for (index, row) in rows.enumerated() {
+                let whole = union(open, row.segments[...])
+                if whole.count <= limit || row.segments.count <= limit {
+                    if whole.count > limit { close() }
+                    open = union(open, row.segments[...])
+                    for z in 0 ..< row.key.partitions {
+                        items.append(Int32(index))
+                        items.append(Int32(z))
+                    }
+                    continue
+                }
+                for z in 0 ..< row.key.partitions {
+                    let needed = row.itemSegments[row.bounds[z] ..< row.bounds[z + 1]]
+                    var next = union(open, needed)
+                    if next.count > limit {
+                        close()
+                        next = Array(needed)
+                    }
+                    open = next
+                    items.append(Int32(index))
+                    items.append(Int32(z))
+                }
+            }
+            close()
+            self.buckets = buckets
+        }
+    }
+
+    var rows: [UInt64: RowItems] = [:]
+    var plan: Plan?
 }

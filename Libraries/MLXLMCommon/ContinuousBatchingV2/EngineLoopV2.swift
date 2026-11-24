@@ -1131,6 +1131,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// rows (plain, chained, MTP seed/decode and prefill) and MTP verify rows.
     /// Engine-thread owned; the MTP accept walk counts verify rows.
     var nonFiniteSampledFailures = 0
+    /// Decode steps and rows whose tokens a model chose through
+    /// `CBv2CertifiedTokenRequest` instead of the full logits.
+    public internal(set) var certifiedTokenSteps = 0
+    public internal(set) var certifiedTokenRows = 0
     var nonFiniteVerifyFailures = 0
     /// Cumulative step telemetry published on `CBv2CapacitySnapshot`
     /// (`publishGauges`): Σ launch→readback-done wall nanos over finalized
@@ -2235,6 +2239,16 @@ public final class EngineLoopV2: @unchecked Sendable {
     func requireIdleForwardShapeBoundary() throws {
         guard !scheduler.hasWork, inFlight == nil, buildingForwardShapes == nil else {
             throw CBv2ForwardShapeError.engineBusy
+        }
+    }
+
+    /// See `EngineV2.resetMTPCostLearning()`. False while the engine has work
+    /// or no MTP driver.
+    func resetMTPCostLearning() -> Bool {
+        onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil, let mtp else { return false }
+            mtp.resetCostLearning()
+            return true
         }
     }
 
@@ -4427,9 +4441,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             deferredFills.run()
         }
         let historyRows = mtpOrdinaryHistoryRows(ids)
-        let (last, cacheInnerState, recurrent, hidden) = try decodeLogits(
-            rowStates: rowStates, tokens: inputs, ids: ids, chained: true,
-            returnsHidden: !historyRows.isEmpty)  // [B, vocab]
+        let certified = certifiedTokenRequest(
+            ids: ids, pendingSampledTokens: lazyTokens,
+            otherLogitReaders: mtpHistoryNeedsFullLogits(historyRows))
+        let (last, cacheInnerState, recurrent, hidden) = try CBv2CertifiedTokenRequest.$current
+            .withValue(certified) {
+                try decodeLogits(
+                    rowStates: rowStates, tokens: inputs, ids: ids, chained: true,
+                    returnsHidden: !historyRows.isEmpty)  // [B, vocab]
+            }
         deferredFills.close()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
@@ -4439,13 +4459,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         // Flag the model's logits before a host sampler can mask them in place.
-        let nonFinite = CBv2NonFiniteLogits.flags(last)
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
+        let nonFinite: MLXArray
+        let sampled: MLXArray
+        if let certified, let tokens = certified.tokens, let flags = certified.nonFinite {
+            nonFinite = flags
+            sampled = (sampler as! CBv2DefaultSampler).certifiedSample(
+                certified, tokens: tokens, requestIDs: ids, stepIndex: stepCount)
+            noteCertifiedStep(certified)
+        } else {
+            nonFinite = CBv2NonFiniteLogits.flags(last)
+            sampled = sampler.sample(
+                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+        }
         let sampledReadback = CBv2NonFiniteLogits.readback(tokens: sampled, flags: nonFinite)
         let stepLogprobs = sampler.takeStepLogprobs()
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
@@ -4655,14 +4684,29 @@ public final class EngineLoopV2: @unchecked Sendable {
                     Self.positionOffset(kvStates[$0.rec.id]!)
                 }
             let historyRows = mtpOrdinaryHistoryRows(decodeIDs)
-            let (last, decodeInnerState, recurrent, hidden) = try decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs,
-                phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill
-                    : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier),
-                returnsHidden: !historyRows.isEmpty)
+            let frontierCapture = prefillFrontierCapture()
+            let certified = certifiedTokenRequest(
+                ids: decodeIDs, pendingSampledTokens: nil,
+                otherLogitReaders: mtpHistoryNeedsFullLogits(historyRows)
+                    || (frontierCapture != nil
+                        && decodeRows.contains { $0.start < $0.rec.request.promptTokens.count })
+            )
+            let (last, decodeInnerState, recurrent, hidden) =
+                try CBv2CertifiedTokenRequest
+                .$current.withValue(certified) {
+                    try decodeLogits(
+                        rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
+                        ids: decodeIDs,
+                        phase: decodeRows.allSatisfy {
+                            $0.start < $0.rec.request.promptTokens.count
+                        }
+                            ? .prefill
+                            : (decodeRows.allSatisfy {
+                                $0.start >= $0.rec.request.promptTokens.count
+                            }
+                                ? .decode : .mixedFrontier),
+                        returnsHidden: !historyRows.isEmpty)
+                }
             if let hidden {
                 mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
                     tokens: inputs, hidden: hidden, rows: historyRows)
@@ -4674,20 +4718,28 @@ public final class EngineLoopV2: @unchecked Sendable {
             // A one-token final prompt chunk is decode-shaped, but still owns
             // the prompt's pre-sampler frontier. Capture only those rows, never
             // later generated-token decode logits.
-            if let capture = prefillFrontierCapture() {
+            if let capture = frontierCapture, certified?.isFulfilled != true {
                 for (index, row) in decodeRows.enumerated()
                 where row.start < row.rec.request.promptTokens.count {
                     capture(row.rec.id, last[index])
                 }
             }
-            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            if let certified, let tokens = certified.tokens, let flags = certified.nonFinite {
+                decodeNonFinite = flags
+                decodeSampled = (sampler as! CBv2DefaultSampler).certifiedSample(
+                    certified, tokens: tokens, requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount)
+                noteCertifiedStep(certified)
+            } else {
+                decodeNonFinite = CBv2NonFiniteLogits.flags(last)
+                decodeSampled = sampler.sample(
+                    logits: last,
+                    params: decodeRows.map(\.rec.request.sampling),
+                    requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            }
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -5296,12 +5348,29 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         finishStatefulMTPEvaluation(step)
+        var assistantCopyFailure: MLXError?
         do { try captureSettledHistoricalAssistants(step) } catch {
             if nativeShutdownState != nil {
                 failNativeCompletion(.nativeWorkFailed)
                 return
             }
-            step.discard.formUnion(step.historicalCheckpoints.keys)
+            if let error = error as? MLXError {
+                // A device error fails the cohort exactly as a failed
+                // checkpoint copy does at commit (`historicalFailure`):
+                // discarded, then finished with an error.
+                assistantCopyFailure = error
+                step.discard.formUnion(step.participants)
+            } else {
+                // Any other refusal loses only the checkpoints. Discarding a
+                // live donor's step would roll back its recurrent state while
+                // its KV writes and scheduler progress stand.
+                for candidate in step.historicalCheckpoints.values.joined() {
+                    completeCheckpointCapture?.events.record(
+                        .assistantCaptureRefused, position: candidate.position, error: error)
+                    completeCheckpointCapture?.discardHistorical(candidate)
+                }
+                step.historicalCheckpoints.removeAll()
+            }
         }
         if nativeCompletePrefixContract != nil {
             guard nativeShutdownState?.mayExecute == true else { return }
@@ -5367,7 +5436,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        let historicalFailure = commitHistoricalCheckpoints(step)
+        let historicalFailure = commitHistoricalCheckpoints(step) ?? assistantCopyFailure
         captureRecurrentCheckpoints(step)
 
         // Pre-eviction window views are step-scoped, not paused/retired request

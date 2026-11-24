@@ -110,6 +110,8 @@ public enum LLMTypeRegistry {
         "helium": create(HeliumConfiguration.self, HeliumModel.init),
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
+        "inkling2_loop": create(Inkling2Configuration.self, Inkling2Model.init),
+        "inkling2_loop_text": create(Inkling2Configuration.self, Inkling2Model.init),
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
         "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
         "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),

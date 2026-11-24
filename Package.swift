@@ -258,10 +258,14 @@ let package = Package(
                 .process("Resources/diffusiongemma-block-oracle.json"),
                 .process("Resources/diffusiongemma-block-oracle.safetensors"),
                 .process("Resources/gemma4-26B-A4B-assistant-config.json"),
+                .process("Resources/inkling2-dspark-tiny-oracle.safetensors"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
                 .process("Resources/block_hash_vectors.json"),
                 .process("Resources/qwen35-video-layout-golden.json"),
+                .process("Resources/inkling2-vision-reference-precision.json"),
+                .process("Resources/inkling2-vision-tiny-oracle.json"),
+                .process("Resources/inkling2-vision-tiny-oracle.safetensors"),
             ]
         ),
         .testTarget(

@@ -7,6 +7,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     let codec: CBv2CompleteCheckpointCodec
     let store: any CBv2CompletePrefixCache
     let queue = DispatchQueue(label: "cbv2.complete-checkpoint-retirement", qos: .utility)
+    /// Funnel and refusal counts (`CBv2CheckpointCaptureEvent`).
+    let events = CBv2CheckpointCaptureEvents()
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     var makeContiguousCheckpoint:
         (CBv2CompleteCheckpointCodec, Int, Int, [CBv2SequenceKV?]) throws ->
@@ -191,7 +193,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         hintTokens: Int? = nil, resumedAt: Int = 0,
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) -> [MLXArray] {
-        guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical, !isClosed,
+        guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical,
+            !codec.historicalRecurrent, !isClosed,
             position > 1, chunkSize > 1,
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize),
             !mediaTargetOnly || mediaIdentity != nil,
@@ -339,6 +342,11 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             } catch { return }
         }
         var exports: [CBv2CompleteCheckpointExport] = []
+        if !intent.allowsCompletePublication {
+            for capture in captures {
+                events.record(.publicationNotAllowed, position: capture.position)
+            }
+        }
         for capture in captures where intent.allowsCompletePublication {
             if let nativeWork {
                 do {
@@ -367,26 +375,29 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 }
                 continue
             }
-            if let checkpoint = capture.contiguous {
-                if let source = try? checkpoint.export(
-                    codec: codec, state: state, tokens: intent.tokens, cacheSalt: intent.cacheSalt)
-                {
-                    exports.append(source)
+            // A refused export is still graceful; the event says why.
+            do {
+                if let checkpoint = capture.contiguous {
+                    exports.append(
+                        try checkpoint.export(
+                            codec: codec, state: state, tokens: intent.tokens,
+                            cacheSalt: intent.cacheSalt))
+                } else if let checkpoint = capture.historical {
+                    exports.append(
+                        try codec.exportHistorical(
+                            checkpoint: checkpoint, state: state, tokens: intent.tokens,
+                            cacheSalt: intent.cacheSalt))
+                } else if let checkpoint = capture.checkpoint {
+                    exports.append(
+                        try codec.export(
+                            checkpoint: checkpoint, state: state, tokens: intent.tokens,
+                            cacheSalt: intent.cacheSalt))
+                } else {
+                    continue
                 }
-            } else if let checkpoint = capture.historical {
-                if let source = try? codec.exportHistorical(
-                    checkpoint: checkpoint, state: state, tokens: intent.tokens,
-                    cacheSalt: intent.cacheSalt)
-                {
-                    exports.append(source)
-                }
-            } else if let checkpoint = capture.checkpoint {
-                if let source = try? codec.export(
-                    checkpoint: checkpoint, state: state, tokens: intent.tokens,
-                    cacheSalt: intent.cacheSalt)
-                {
-                    exports.append(source)
-                }
+                events.record(.exported, position: capture.position)
+            } catch {
+                events.record(.exportFailed, position: capture.position, error: error)
             }
         }
         let publishingBytes = captures.reduce(0) { $0 + $1.stagedHistoricalBytes }
@@ -407,6 +418,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 }
             }
         }
+        let hasExports = !exports.isEmpty
         let batch = CBv2CompleteCheckpointPublication(
             captures: captures, exports: exports, receiptID: intent.receiptID,
             tokens: intent.tokens, cacheSalt: intent.cacheSalt,
@@ -435,12 +447,20 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 publishNext(batch)
                 return
             }
-            guard !isClosed, batch.prepare(),
-                let scratch = try? codec.admission.reserveTransient(
+            guard !isClosed, batch.prepare() else {
+                batch.close()
+                return
+            }
+            let scratch: CBv2CheckpointReservation
+            do {
+                scratch = try codec.admission.reserveTransient(
                     bytes: codec.exportScratchBytes
                         + (codec.admission.hasProcessMemoryOwner
                             ? 0 : CBv2CompleteCheckpointManifest.maximumProviderScratchBytes))
-            else {
+            } catch {
+                if hasExports {
+                    events.record(.exportScratchUnavailable, position: nil, error: error)
+                }
                 batch.close()
                 return
             }
