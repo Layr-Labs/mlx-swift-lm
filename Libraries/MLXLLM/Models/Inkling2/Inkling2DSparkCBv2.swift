@@ -115,3 +115,8 @@ extension Inkling2DSparkDrafter {
             commitsAcceptedPrefixPerRow: true)
     }
 }
+
+extension Inkling2DSparkDrafter {
+    /// Red control: #552's constant.
+    public static let servingVerificationMode: CBv2MTPVerificationMode = .rectangularExact
+}

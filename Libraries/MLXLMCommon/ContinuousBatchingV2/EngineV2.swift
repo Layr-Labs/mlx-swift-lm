@@ -259,6 +259,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// drive rounds). Lock-protected snapshot — safe to poll from any
     /// thread (provider heartbeats/telemetry).
     public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
+    /// Red control: #552's accessor.
+    public var mtpEffectiveConfig: CBv2MTPConfig? { loop.mtp?.config }
     /// Forgets the MTP depth policy's measured step costs while the engine is
     /// idle, so the next request measures them again. The policy keeps one
     /// plain-step sample per engine for its whole life; when that sample came

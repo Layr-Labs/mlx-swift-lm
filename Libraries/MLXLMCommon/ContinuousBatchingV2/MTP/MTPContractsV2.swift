@@ -725,6 +725,13 @@ public struct CBv2MTPConfig: Sendable {
     public var effectiveStopStringSpeculation: Bool {
         stopStringSpeculation && Self.envStopStringSpeculation
     }
+    /// Red control: the opt-in's API only; nothing reads it.
+    public var logprobSpeculation: Bool
+    public static let envLogprobSpeculation = envSwitch("DARKBLOOM_MTP_LOGPROB_ROWS")
+    public var effectiveLogprobSpeculation: Bool {
+        logprobSpeculation && Self.envLogprobSpeculation
+            && verificationMode == .rectangularExact && acceptance == .exact
+    }
     /// Explicit opt-in shared with the provider; unset and unknown values are off.
     public static let envFreeSpanSpeculation = ["1", "true", "yes", "on"].contains(
         ProcessInfo.processInfo.environment["DARKBLOOM_CONSTRAINT_SPANS"]?
@@ -762,6 +769,7 @@ public struct CBv2MTPConfig: Sendable {
         penaltySpeculation: Bool = false,
         repetitionPenaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
+        logprobSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
         maxDraftPromptTokens: Int? = nil,
@@ -778,6 +786,7 @@ public struct CBv2MTPConfig: Sendable {
         self.penaltySpeculation = penaltySpeculation
         self.repetitionPenaltySpeculation = repetitionPenaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
+        self.logprobSpeculation = logprobSpeculation
         self.costCurveDepthSelection = costCurveDepthSelection
         self.maxDraftPromptTokens = maxDraftPromptTokens.flatMap { $0 > 0 ? $0 : nil }
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
@@ -797,6 +806,15 @@ public struct CBv2MTPConfig: Sendable {
 
     /// The effective on/off state (config AND env kill switch).
     public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+
+    /// Red control: #552's config helper (the driver's required-mode override).
+    public func requiring(_ required: CBv2MTPVerificationMode?) -> CBv2MTPConfig {
+        guard let required else { return self }
+        var config = self
+        config.verificationMode = required
+        if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+        return config
+    }
 }
 
 // MARK: - Metrics
