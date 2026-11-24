@@ -135,7 +135,11 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             CBv2CheckpointAllocationFootprint.add(
                 max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0
             ),
-            codec.checkpointQuantization == nil ? 0 : CBv2NativeCheckpointRowCodec.scratchBytes)
+            codec.checkpointQuantization == nil
+                ? 0
+                : CBv2NativeCheckpointRowCodec.scratchBytes
+                    + CBv2NativeCheckpointRowDecoder.scratchBytes(
+                        workers: CBv2NativeCheckpointRowDecoder.defaultWorkers))
         let totalTarget = try CBv2CheckpointAllocationFootprint.add(
             target, paged?.pageNativeBytes ?? 0)
         nativeTargetBytes = totalTarget

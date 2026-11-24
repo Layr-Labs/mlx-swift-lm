@@ -40,9 +40,11 @@ extension EngineLoopV2 {
         let constraintEligible =
             rec.request.tokenConstraint == nil || grammarMTPEnabled
             || mtpSpanConstraint(rec) != nil
-        // A reasoning budget keeps the whole request target-only: no drafts
-        // and no assistant history.
+        // A reasoning budget, or a prompt over the configured draft limit
+        // (`CBv2MTPConfig.maxDraftPromptTokens`), keeps the whole request
+        // target-only: no drafts and no assistant history.
         guard rec.request.reasoningBudget == nil,
+            mtp?.config.promptExceedsDraftLimit(rec.request.promptTokens.count) != true,
             constraintEligible,
             samplingEligible,
             sampling.topLogprobs == 0,

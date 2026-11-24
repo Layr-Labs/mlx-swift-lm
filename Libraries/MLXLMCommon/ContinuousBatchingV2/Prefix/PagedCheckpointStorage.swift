@@ -169,7 +169,7 @@ final class CBv2PagedCheckpointStorage {
     init(
         plan: CBv2PagedCheckpointStoragePlan, evaluate: (MLXArray) throws -> Void,
         admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil,
-        hostMaterialized: Bool = false
+        hostMaterialized: Bool = false, hostZeroed: Bool = false
     ) throws {
         self.plan = plan
         for group in plan.groups {
@@ -181,7 +181,8 @@ final class CBv2PagedCheckpointStorage {
                 let segment = try PagedKVSegment(
                     index: index, layout: prepared.layout, key: group.key,
                     pageSize: plan.pageSize, dtype: group.key.dtype, evaluate: evaluate,
-                    admission: admission, hostMaterialized: hostMaterialized)
+                    admission: admission, hostMaterialized: hostMaterialized,
+                    hostZeroed: hostMaterialized && hostZeroed)
                 // The evaluator already retained the raw root before native
                 // execution. Keep its actual coverage/backing owner as well,
                 // including a late result after a concurrent native veto.
@@ -220,6 +221,58 @@ final class CBv2PagedCheckpointStorage {
             }
             nativeRecent[index] = (arrays[0], arrays[1], role.nativeStart)
         }
+    }
+
+    /// The page address of each of `rows` whole native rows starting at
+    /// `byteOffset` (native bytes, no widening), for a writer that fills the
+    /// rows itself: exactly the bytes `append` would copy for the same range
+    /// go to these addresses. nil when the range is not whole rows of a
+    /// native layer of this storage, or needs widening; callers then use
+    /// `append`, which validates and reports the error.
+    func rowTargets(
+        layerIndex: Int, values: Bool, byteOffset: Int, rows: Int, rowBytes: Int,
+        wire: CBv2CheckpointDType? = nil
+    ) -> [UnsafeMutableRawPointer]? {
+        guard plan.layers.indices.contains(layerIndex), rows > 0, rowBytes > 0 else { return nil }
+        let layer = plan.layers[layerIndex]
+        guard layer.key.quantization == nil, let group = groups[layer.key],
+            wire.map({ $0.mlxDType == layer.key.dtype }) ?? true
+        else { return nil }
+        let roleWidth = values ? layer.key.valueHeadDim : layer.key.headDim
+        let width = layer.key.dtype.size
+        guard rowBytes == roleWidth * width,
+            let bytes = try? CBv2CheckpointTensorDescriptor.checkedByteCount(
+                shape: [1, layer.key.kvHeads, layer.tokenCount, roleWidth], dtype: layer.key.dtype),
+            let count = CBv2KVGeometry.multiply(rows, rowBytes),
+            byteOffset >= 0, byteOffset % rowBytes == 0, byteOffset < bytes,
+            count <= bytes - byteOffset
+        else { return nil }
+        var targets: [UnsafeMutableRawPointer] = []
+        targets.reserveCapacity(rows)
+        var whole = true
+        CBv2PagedCheckpointByteLayout.runs(
+            headDim: roleWidth, position: layer.tokenCount, pageSize: plan.pageSize,
+            tokenStart: layer.tokenStart, ringPages: layer.ringPages, itemSize: width,
+            byteOffset: byteOffset, count: count
+        ) { logicalPage, head, slot, feature, _, length in
+            guard whole, feature == 0, length % rowBytes == 0,
+                let segment = group.segments[
+                    group.layout.segmentIndex(page: group.pages[layer.firstPage + logicalPage])],
+                let pointer = mlx_array_data_uint8(segment.storage.ctx)
+            else {
+                whole = false
+                return
+            }
+            let localPage = group.layout.localPage(group.pages[layer.firstPage + logicalPage])
+            let element =
+                ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot) * roleWidth
+                + (values ? segment.valueOffset : 0)
+            let first = UnsafeMutableRawPointer(mutating: pointer).advanced(by: element * width)
+            for row in 0 ..< length / rowBytes {
+                targets.append(first.advanced(by: row * rowBytes))
+            }
+        }
+        return whole && targets.count == rows ? targets : nil
     }
 
     /// Ordered-transfer validation belongs to the enclosing import owner.
