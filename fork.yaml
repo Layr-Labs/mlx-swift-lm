@@ -229,12 +229,18 @@ def:
             `CBv2MTPConfig.coupledProposals` (off by default) lets a block drafter that adopts
             `CBv2MTPCoupledBlockDrafter` (Inkling 2) propose each sampled row's verify-draw race
             under exact acceptance; output is unchanged, only acceptance can move.
+            `CBv2MTPConfig.repetitionPenaltySpeculation` (off by default;
+            `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` turns an opt-in off) lets repetition-penalty
+            rows draft: the sampler penalizes each verify position over the last
+            `repetitionContextSize` tokens of prompt, confirmed output and preceding drafts, and
+            these rows accept exactly.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
             - "changelog.d/cbv2-mtp-drafter-opt-ins.md"
             - "changelog.d/cbv2-mtp-draft-prompt-limit.md"
             - "changelog.d/cbv2-mtp-coupled-block-drafting.md"
+            - "changelog.d/cbv2-mtp-repetition-penalty-rows.md"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix

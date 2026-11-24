@@ -663,6 +663,22 @@ public struct CBv2MTPConfig: Sendable {
     public var effectivePenaltySpeculation: Bool {
         penaltySpeculation && Self.envPenaltySpeculation
     }
+    /// Opt-in: admit rows with a repetition penalty to target-prefix MTP when
+    /// the sampler re-derives the penalty at every verify position
+    /// (`CBv2StepSampler.supportsMTPRepetitionPenaltyVerification`): the
+    /// position's window is the last `repetitionContextSize` tokens of prompt,
+    /// confirmed output and the drafts before it, as in ordinary decode. Such
+    /// rows always use exact acceptance. Off by default; the process kill
+    /// switch `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0` overrides an opt-in
+    /// (`effectiveRepetitionPenaltySpeculation`).
+    public var repetitionPenaltySpeculation: Bool
+    /// False for `DARKBLOOM_MTP_REPETITION_PENALTY_ROWS=0/false/no/off`; read once.
+    public static let envRepetitionPenaltySpeculation = envSwitch(
+        "DARKBLOOM_MTP_REPETITION_PENALTY_ROWS")
+    /// The opt-in AND the process kill switch.
+    public var effectiveRepetitionPenaltySpeculation: Bool {
+        repetitionPenaltySpeculation && Self.envRepetitionPenaltySpeculation
+    }
     /// Opt-in: rows with stop strings may draft. The round's finalize
     /// confirms committed tokens one at a time through the row's
     /// detokenizer and ends the row at the first stop-string match, the
@@ -736,6 +752,7 @@ public struct CBv2MTPConfig: Sendable {
         constrainedSpeculation: Bool = Self.envConstrainedSpeculation,
         freeSpanSpeculation: Bool = Self.envFreeSpanSpeculation,
         penaltySpeculation: Bool = false,
+        repetitionPenaltySpeculation: Bool = false,
         stopStringSpeculation: Bool = false,
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
@@ -751,6 +768,7 @@ public struct CBv2MTPConfig: Sendable {
         self.constrainedSpeculation = constrainedSpeculation
         self.freeSpanSpeculation = freeSpanSpeculation
         self.penaltySpeculation = penaltySpeculation
+        self.repetitionPenaltySpeculation = repetitionPenaltySpeculation
         self.stopStringSpeculation = stopStringSpeculation
         self.costCurveDepthSelection = costCurveDepthSelection
         self.maxDraftPromptTokens = maxDraftPromptTokens.flatMap { $0 > 0 ? $0 : nil }

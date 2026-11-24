@@ -212,8 +212,17 @@ public protocol CBv2StepSampler: AnyObject {
     /// drafts were sampled. Gates MTP for penalty rows. Default false.
     var supportsMTPPenaltyVerification: Bool { get }
 
-    /// `mtpVerifySample` with presence/frequency penalties. nil `penalties`
-    /// is exactly `mtpVerifySample`.
+    /// True when the penalty-aware verify entry points below also re-derive
+    /// the repetition penalty at every window position exactly as the
+    /// ordinary pipeline would apply it: over the last
+    /// `repetitionContextSize` tokens of prompt, confirmed output and the
+    /// window's preceding drafts (`CBv2MTPVerifyPenalties.promptTokens`).
+    /// Gates MTP for repetition-penalty rows. Default false.
+    var supportsMTPRepetitionPenaltyVerification: Bool { get }
+
+    /// `mtpVerifySample` with presence/frequency penalties (and the
+    /// repetition penalty where `supportsMTPRepetitionPenaltyVerification`).
+    /// nil `penalties` is exactly `mtpVerifySample`.
     func mtpVerifySample(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?
@@ -240,16 +249,37 @@ public struct CBv2MTPVerifyPenalties {
     public let drafts: MLXArray?
     /// Global window position of this call's first logits column.
     public let columnOffset: Int
+    /// Prompt tokens per row, the start of the repetition-penalty window's
+    /// history (prompt, then confirmed output, then drafts). Required, so no
+    /// caller can leave a repetition row without its window history; read
+    /// only when some row's `appliesRepetition` holds, and then it must hold
+    /// one entry per row (may be empty when no row has a repetition penalty).
+    public let promptTokens: [ArraySlice<Int>]
 
-    public init(outputTokens: [ArraySlice<Int>], drafts: MLXArray?, columnOffset: Int = 0) {
+    public init(
+        outputTokens: [ArraySlice<Int>], drafts: MLXArray?, columnOffset: Int = 0,
+        promptTokens: [ArraySlice<Int>]
+    ) {
         self.outputTokens = outputTokens
         self.drafts = drafts
         self.columnOffset = columnOffset
+        self.promptTokens = promptTokens
     }
 
     /// Rows whose sampling applies presence or frequency penalties.
     public static func applies(_ params: CBv2SamplingParams) -> Bool {
         params.presencePenalty != 0 || params.frequencyPenalty != 0
+    }
+
+    /// Rows whose sampling applies a repetition penalty: the condition under
+    /// which `LogitsPipelineV2` penalizes the row's window.
+    public static func appliesRepetition(_ params: CBv2SamplingParams) -> Bool {
+        params.repetitionPenalty != 1 && params.repetitionContextSize > 0
+    }
+
+    /// Rows whose verify positions need any penalty re-derived.
+    public static func appliesAny(_ params: CBv2SamplingParams) -> Bool {
+        applies(params) || appliesRepetition(params)
     }
 }
 
@@ -281,6 +311,7 @@ extension CBv2StepSampler {
     ) -> (tokens: MLXArray, accept: MLXArray)? { nil }
     public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
     public var supportsMTPPenaltyVerification: Bool { false }
+    public var supportsMTPRepetitionPenaltyVerification: Bool { false }
     public func mtpVerifySample(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?
