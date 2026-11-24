@@ -345,6 +345,7 @@ def:
       globs:
         - "changelog.d/glm5-tool-grammar-only.md"
         - "changelog.d/qwen35-stream-schema-reading.md"
+        - "changelog.d/tool-argument-exact-numbers-untyped-containers.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"

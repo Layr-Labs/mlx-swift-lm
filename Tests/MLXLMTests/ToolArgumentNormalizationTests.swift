@@ -295,6 +295,260 @@ struct ToolArgumentNormalizationTests {
         }
     }
 
+    @Test("A number no integer or double holds exactly keeps its digits as text")
+    func inexactNumbersKeepTheirText() {
+        let schemas: [[String: any Sendable]] = [
+            Self.notString, [:], ["type": ["integer", "string"]],
+            ["anyOf": [["type": "string"], ["type": "number"]] as [[String: any Sendable]]],
+        ]
+        for schema in schemas {
+            for text in [
+                "12345678901234567890", "-98765432109876543210", "0.12345678901234567891",
+                "123456789012345678901234567890.5", "1e400",
+            ] {
+                for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                    #expect(
+                        xmlCall(text, schema, format: format) == .string(text), "\(text), \(format)"
+                    )
+                }
+            }
+        }
+        for (text, value): (String, JSONValue) in [
+            ("9223372036854775807", .int(Int.max)), ("-9223372036854775808", .int(Int.min)),
+            ("1.5", .double(1.5)), ("0.1", .double(0.1)), ("1e3", .int(1000)),
+            ("2.50", .double(2.5)),
+        ] {
+            #expect(xmlCall(text, [:], format: .qwen35) == value, "\(text)")
+        }
+    }
+
+    @Test("XML JSON object or array text under an untyped parameter reads as that value")
+    func untypedContainers() throws {
+        let untyped: [[String: any Sendable]] = [[:], ["description": "any value"]]
+        for schema in untyped {
+            for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                #expect(
+                    xmlCall(#"{"a":1,"b":[true,null,"x"]}"#, schema, format: format)
+                        == .object(["a": .int(1), "b": .array([.bool(true), .null, .string("x")])]))
+                #expect(
+                    xmlCall(#"[1,"two",{"c":2.5}]"#, schema, format: format)
+                        == .array([.int(1), .string("two"), .object(["c": .double(2.5)])]))
+            }
+        }
+        // Partial or trailing text, inexact numbers, and typed or combinator
+        // schemas keep the text.
+        for text in [
+            #"{"a":"#, #"{"a":1} and more"#, #"{"n":12345678901234567890}"#,
+            #"[0.12345678901234567]"#,
+        ] {
+            #expect(xmlCall(text, [:], format: .qwen35) == .string(text), "\(text)")
+        }
+        let typed: [[String: any Sendable]] = [
+            Self.notString, ["type": ["object", "string"]], ["type": "string"],
+            ["anyOf": [["type": "string"], ["type": "object"]] as [[String: any Sendable]]],
+        ]
+        for schema in typed {
+            #expect(xmlCall(#"{"a":1}"#, schema, format: .qwen35) == .string(#"{"a":1}"#))
+        }
+        // A quoted JSON string and Gemma's marker-quoted text are unchanged.
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools([:]),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+        _ = processor.processChunk(
+            #"<tool_call>{"name":"read","arguments":{"value":"{\"a\":1}"}}</tool_call>"#)
+        processor.processEOS()
+        #expect(processor.toolCalls.first?.function.arguments["value"] == .string(#"{"a":1}"#))
+        let gemma = try #require(
+            GemmaFunctionParser().parse(
+                content: #"<|tool_call>call:read{value:<|"|>{"a":1}<|"|>}<tool_call|>"#,
+                tools: tools([:])))
+        #expect(gemma.function.arguments["value"] == .string(#"{"a":1}"#))
+    }
+
+    /// The schemas as the coordinator forwards them: ingress normalization
+    /// writes the first branch's type beside a union (and `nullable`), and a
+    /// render type beside a reference.
+    private static func forwarded(_ json: String) throws -> [String: any Sendable] {
+        try #require(tryParseJSON(json) as? [String: any Sendable])
+    }
+
+    private func forwardedTools(
+        _ property: [String: any Sendable], defs: [String: any Sendable] = [:]
+    )
+        -> [[String: any Sendable]]
+    {
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": ["value": property], "$defs": defs,
+        ]
+        return [["function": ["name": "read", "parameters": parameters] as [String: any Sendable]]]
+    }
+
+    @Test("A render type beside a union or reference does not hide the branch a value reads as")
+    func renderTypeBesideUnions() throws {
+        let cases: [(String, [String: any Sendable], String, JSONValue)] = [
+            (
+                #"{"anyOf":[{"type":"string"},{"type":"integer"}],"type":"string"}"#, [:], "-4200",
+                .int(-4200)
+            ),
+            (
+                #"{"anyOf":[{"type":"string"},{"type":"boolean"}],"type":"string"}"#, [:], "true",
+                .bool(true)
+            ),
+            (
+                #"{"anyOf":[{"type":"string"},{"type":"boolean"}],"type":"string"}"#, [:], "False",
+                .bool(false)
+            ),
+            (
+                #"{"oneOf":[{"type":"string"},{"type":"number"}],"type":"string"}"#, [:], "2.5",
+                .double(2.5)
+            ),
+            (
+                #"{"anyOf":[{"type":"integer"},{"type":"boolean"}],"type":"integer"}"#, [:],
+                "false", .bool(false)
+            ),
+            (
+                #"{"anyOf":[{"type":"integer"},{"type":"null"}],"nullable":true,"type":"integer"}"#,
+                [:], "null", .null
+            ),
+            (
+                #"{"anyOf":[{"type":"integer"},{"type":"null"}],"nullable":true,"type":"integer"}"#,
+                [:], "42", .int(42)
+            ),
+            (
+                ##"{"anyOf":[{"$ref":"#/$defs/AutoRenewFlag","type":"string"},{"type":"null"}],"nullable":true,"type":"string"}"##,
+                ["AutoRenewFlag": ["type": "boolean"] as [String: any Sendable]], "true",
+                .bool(true)
+            ),
+            (
+                ##"{"$ref":"#/$defs/Count","type":"string"}"##,
+                ["Count": ["type": "integer"] as [String: any Sendable]], "7", .int(7)
+            ),
+            (
+                #"{"anyOf":[{"type":"string"},{"type":"integer"}],"type":"string"}"#, [:], "abc",
+                .string("abc")
+            ),
+            (#"{"type":"string","nullable":true}"#, [:], "null", .null),
+            (#"{"type":"string","nullable":true}"#, [:], "x", .string("x")),
+            (#"{"enum":["default","inherit","archive",-1],"type":"string"}"#, [:], "-1", .int(-1)),
+            (
+                #"{"enum":["default","inherit","archive",-1],"type":"string"}"#, [:], "archive",
+                .string("archive")
+            ),
+            (#"{"not":{"type":"string"},"type":"string"}"#, [:], "-2500", .int(-2500)),
+            (
+                #"{"if":{"type":"integer"},"then":{"type":"integer","minimum":-100000000},"else":{"type":"string"},"type":"string"}"#,
+                [:], "-2500", .int(-2500)
+            ),
+            // A client's type that agrees with every branch keeps asserting.
+            (
+                #"{"type":"string","anyOf":[{"minLength":1},{"pattern":"^a"}]}"#, [:], "5",
+                .string("5")
+            ),
+            (
+                #"{"type":"integer","anyOf":[{"type":"integer"},{"type":"null"}]}"#, [:], "null",
+                .string("null")
+            ),
+        ]
+        for (json, defs, text, expected) in cases {
+            let tools = forwardedTools(try Self.forwarded(json), defs: defs)
+            for format: ToolCallFormat in [.xmlFunction, .nemotron, .qwen35] {
+                let processor = ToolCallProcessor(
+                    format: format, tools: tools,
+                    toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+                _ = processor.processChunk(
+                    "<tool_call>\n<function=read>\n<parameter=value>\n\(text)\n</parameter>\n</function>\n</tool_call>"
+                )
+                processor.processEOS()
+                #expect(
+                    processor.toolCalls.first?.function.arguments["value"] == expected,
+                    "\(json) \(text) \(format)")
+            }
+            // The SDK's strict check accepts what the reading returns whenever
+            // the reading changed the text.
+            if expected != .string(text) {
+                let schema = try Self.forwarded(json)
+                if case .invalid(let violations) = ToolSchemaValidator.validate(
+                    expected, against: schema),
+                    defs.isEmpty
+                {
+                    Issue.record("\(json) \(text): \(ToolSchemaValidator.describe(violations))")
+                }
+            }
+        }
+    }
+
+    @Test("JSON and Gemma calls under forwarded union schemas")
+    func forwardedUnionsInJSONAndGemma() throws {
+        let union = try Self.forwarded(
+            #"{"anyOf":[{"type":"string"},{"type":"integer"}],"type":"string"}"#)
+        let tools = forwardedTools(union)
+        // A JSON integer stays an integer and a JSON string a string (GPT-OSS
+        // and the JSON dialects write typed values).
+        for (payload, expected): (String, JSONValue) in [
+            (#"{"value":-4200}"#, .int(-4200)), (#"{"value":"-4200"}"#, .string("-4200")),
+        ] {
+            let json = ToolCallProcessor(
+                format: .json, tools: tools,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+            _ = json.processChunk(
+                #"<tool_call>{"name":"read","arguments":"# + payload + "}</tool_call>")
+            json.processEOS()
+            #expect(json.toolCalls.first?.function.arguments["value"] == expected, "\(payload)")
+            let harmony = ToolCallProcessor(
+                format: .harmony, tools: tools,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+            _ = harmony.processChunk(
+                "<|start|>assistant<|channel|>commentary to=functions.read <|constrain|>json<|message|>"
+                    + payload + "<|call|>")
+            harmony.processEOS()
+            #expect(
+                harmony.toolCalls.first?.function.arguments["value"] == expected,
+                "harmony \(payload)")
+        }
+        // Gemma: a marker-quoted value keeps its text; a bare value reads as
+        // the union branch its JSON type matches, as under `["string","integer"]`.
+        let quoted = try #require(
+            GemmaFunctionParser().parse(
+                content: #"<|tool_call>call:read{value:<|"|>-4200<|"|>}<tool_call|>"#, tools: tools)
+        )
+        #expect(quoted.function.arguments["value"] == .string("-4200"))
+        let bare = try #require(
+            GemmaFunctionParser().parse(
+                content: "<|tool_call>call:read{value:-4200}<tool_call|>", tools: tools))
+        #expect(bare.function.arguments["value"] == .int(-4200))
+    }
+
+    @Test("A streamed call keeps the digits its complete parse keeps")
+    func streamedInexactNumbersAgree() {
+        let text = "12345678901234567890"
+        let processor = ToolCallProcessor(
+            format: .qwen35, tools: tools([:]),
+            streaming: .init(exposesName: { _ in true }))
+        let frame =
+            "<tool_call>\n<function=read>\n<parameter=value>\n\(text)\n</parameter>\n</function>\n</tool_call>"
+        var arguments = ""
+        var completed: [ToolCall] = []
+        for character in frame {
+            for segment in processor.processChunkSegments(String(character)) {
+                switch segment {
+                case .callArguments(let fragment): arguments += fragment
+                case .callCompleted(let call, let remainder):
+                    completed.append(call)
+                    arguments += remainder
+                default: break
+                }
+            }
+        }
+        for segment in processor.processEOSSegments() {
+            if case .callCompleted(let call, let remainder) = segment {
+                completed.append(call)
+                arguments += remainder
+            }
+        }
+        #expect(completed.first?.function.arguments["value"] == .string(text))
+        #expect(arguments == #"{"value":"12345678901234567890"}"#)
+    }
+
     @Test("Streaming exposes no text a literal reading would replace")
     func keepsTextAgreesWithLiteralReading() {
         let parameters: (([String: any Sendable]) -> [[String: any Sendable]]) = { self.tools($0) }
