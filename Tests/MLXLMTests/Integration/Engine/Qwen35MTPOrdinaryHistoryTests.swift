@@ -67,6 +67,7 @@ struct Qwen35MTPOrdinaryHistoryTests {
 
     private func engine(
         _ target: (Qwen35TextModel, Qwen35InlineMTPAssistant),
+        drafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig
     ) throws -> (EngineV2, PagedKVBackend) {
         let (model, assistant) = target
@@ -95,7 +96,7 @@ struct Qwen35MTPOrdinaryHistoryTests {
                 maxConcurrentRequests: 2, maxBatchedTokensPerStep: 32,
                 prefillChunkSize: 32, maxWaiting: 4, enablePrefixCache: false),
             admissionConfig: .init(watermarkFraction: 0),
-            mtpDrafter: assistant, mtpConfig: mtpConfig)
+            mtpDrafter: drafter ?? assistant, mtpConfig: mtpConfig)
         return (engine, backend)
     }
 
@@ -249,6 +250,74 @@ struct Qwen35MTPOrdinaryHistoryTests {
         }
     }
 
+    /// Depth-zero plans chain as ordinary decode only for a drafter that opts
+    /// in. A forwarding wrapper of the production assistant takes
+    /// ordinary-decode history but does not opt in: with every plan forced to
+    /// depth zero it runs exactly as with the process switch
+    /// `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0`. The production assistant still
+    /// chains those plans. Tokens equal target-only decode in every run.
+    @Test("depth-zero plans chain only for a drafter that opts in")
+    func depthZeroChainingNeedsTheDrafterOptIn() async throws {
+        struct Run {
+            var tokens: [[Int]]
+            var depthZeroChaining: Bool?
+            var feedsHistory: Bool?
+            var chained: Int
+            var seedSteps: Int?
+        }
+        let request = CBv2Request(
+            id: .init(961), promptTokens: (1 ... 17).map { $0 },
+            sampling: .init(temperature: 0), maxTokens: 16)
+        let target = try fixture()
+        let (reference, _) = try engine(target, mtpConfig: .init(enabled: false))
+        let expected = try await runTogether(reference, [request])
+        await reference.shutdown()
+
+        func run(_ drafter: any CBv2MTPDrafter, switchedOff: Bool) async throws -> Run {
+            let (candidate, _) = try engine(
+                target, drafter: drafter,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
+                    verificationMode: .serialTarget, ordinaryDecodeHistory: true,
+                    prefillCarry: true))
+            let (chaining, feeds) = candidate.loopForTesting.onEngineQueueSync {
+                () -> (Bool?, Bool?) in
+                let driver = candidate.loopForTesting.mtp
+                let chaining = driver?.depthZeroChaining
+                if switchedOff { driver?.depthZeroChaining = false }
+                driver?.planDepthLimitForTesting = { _ in 0 }
+                return (chaining, driver?.feedsHistoryFromOrdinaryDecode)
+            }
+            let tokens = try await runTogether(candidate, [request])
+            let metrics = candidate.mtpMetricsSnapshot()
+            let chained = candidate.chainedStepCount
+            await candidate.shutdown()
+            return Run(
+                tokens: tokens, depthZeroChaining: chaining, feedsHistory: feeds,
+                chained: chained, seedSteps: metrics?.seedSteps)
+        }
+
+        let qwen = try await run(target.1, switchedOff: false)
+        let qwenOff = try await run(target.1, switchedOff: true)
+        let wrapped = try await run(
+            NoDepthZeroOptInQwenAssistant(target.1), switchedOff: false)
+        let wrappedOff = try await run(
+            NoDepthZeroOptInQwenAssistant(target.1), switchedOff: true)
+
+        for result in [qwen, qwenOff, wrapped, wrappedOff] {
+            #expect(result.tokens == expected)
+            #expect(result.feedsHistory == true)
+        }
+        #expect(wrapped.depthZeroChaining == false)
+        #expect(wrapped.chained == wrappedOff.chained)
+        #expect(wrapped.seedSteps == wrappedOff.seedSteps)
+        #expect(qwen.depthZeroChaining == CBv2MTPRoundDriver.envDepthZeroChaining)
+        if CBv2MTPRoundDriver.envDepthZeroChaining {
+            #expect(qwen.chained > qwenOff.chained)
+            #expect((qwen.seedSteps ?? 0) < (qwenOff.seedSteps ?? 0))
+        }
+    }
+
     #if canImport(Metal) && canImport(ObjectiveC)
     /// Each eval's completion event (an `MTLSharedEvent`, a finite
     /// system-wide resource) stays on the arrays the eval computed until
@@ -288,4 +357,87 @@ struct Qwen35MTPOrdinaryHistoryTests {
             "live Metal shared events \(sample.early) -> \(sample.late) over \(steps)")
     }
     #endif
+}
+
+/// Forwards every call to the production Qwen 3.5 inline assistant, ordinary-
+/// decode history included, but keeps the default depth-zero chaining (off).
+private final class NoDepthZeroOptInQwenAssistant: CBv2MTPRequestStatefulDrafter {
+    let native: Qwen35InlineMTPAssistant
+
+    init(_ native: Qwen35InlineMTPAssistant) { self.native = native }
+    var mtpTargetIdentity: ObjectIdentifier? { native.mtpTargetIdentity }
+    var requiredVerificationMode: CBv2MTPVerificationMode? { native.requiredVerificationMode }
+    var maximumDraftTokens: Int? { native.maximumDraftTokens }
+    var maximumSpeculativeBatch: Int? { native.maximumSpeculativeBatch }
+    var supportsTargetPrefixAcceptance: Bool { native.supportsTargetPrefixAcceptance }
+    var supportsEarlyDraftSubmission: Bool { native.supportsEarlyDraftSubmission }
+    var prefersBatchedRectangularAttention: Bool { native.prefersBatchedRectangularAttention }
+    var commitsAcceptedPrefixPerRow: Bool { native.commitsAcceptedPrefixPerRow }
+    var supportsOrdinaryDecodeHistory: Bool { native.supportsOrdinaryDecodeHistory }
+    var requiresCommittedObservationFence: Bool { native.requiresCommittedObservationFence }
+    var draftShortlistSize: Int? { native.draftShortlistSize }
+    var submitsEveryDraftStepEarly: Bool { native.submitsEveryDraftStepEarly }
+    var requestStateBytesPerToken: Int { native.requestStateBytesPerToken }
+    var requestStateTokenGranularity: Int { native.requestStateTokenGranularity }
+    var requestStateTokenAllocationPadding: Int { native.requestStateTokenAllocationPadding }
+    var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        native.requestStateAllocationSpecs
+    }
+
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
+        native.prepare(rows: rows)
+    }
+
+    func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture)
+        -> (tokens: MLXArray, hidden: MLXArray)
+    {
+        native.draftStep(tokens: tokens, hidden: hidden, prepared: prepared)
+    }
+
+    func makeRequestState() -> any CBv2MTPRequestState { native.makeRequestState() }
+    func configureRequestState(_ state: any CBv2MTPRequestState, maximumSequenceLength: Int)
+        throws
+    {
+        try native.configureRequestState(state, maximumSequenceLength: maximumSequenceLength)
+    }
+
+    func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState
+    ) {
+        native.observeCommittedTarget(observation, requestState: requestState)
+    }
+
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        native.draftStep(
+            tokens: tokens, hidden: hidden, shortlist: shortlist, requestState: requestState)
+    }
+
+    func evaluationTargets(for state: any CBv2MTPRequestState) -> [MLXArray] {
+        native.evaluationTargets(for: state)
+    }
+
+    func requestStateDidFinishEvaluation(_ state: any CBv2MTPRequestState) throws {
+        try native.requestStateDidFinishEvaluation(state)
+    }
+
+    func finalizeRound(
+        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray, committedTargetHidden: MLXArray
+    ) {
+        native.finalizeRound(
+            requestState: requestState, confirmedInputTokens: confirmedInputTokens,
+            committedDraftTokens: committedDraftTokens, committedTargetHidden: committedTargetHidden
+        )
+    }
+
+    func discardRound(requestState: any CBv2MTPRequestState) {
+        native.discardRound(requestState: requestState)
+    }
+
+    func releaseRequestState(_ state: any CBv2MTPRequestState) {
+        native.releaseRequestState(state)
+    }
 }

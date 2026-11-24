@@ -355,7 +355,7 @@ final class CBv2MTPRoundDriver {
     var carryHiddenObserverForTesting: ((CBv2RequestID, MLXArray) -> Void)?
 
     /// `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0/false/no/off` turns depth-zero
-    /// chaining off (seed steps, as before). Read once.
+    /// chaining off (seed steps, as before) for every drafter. Read once.
     static let envDepthZeroChaining: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED"]
         else { return true }
@@ -365,9 +365,11 @@ final class CBv2MTPRoundDriver {
     /// ordinary chainable decode when the drafter takes ordinary-decode
     /// history (`planRunsAsOrdinaryDecode`); off, such a plan seeds every
     /// row. Either way target logits and tokens are the same; only which
-    /// path computes the decode step changes. Tests may set it on the engine
+    /// path computes the decode step changes. On only for a drafter that opts
+    /// in (`CBv2MTPRequestStatefulDrafter.supportsDepthZeroChaining`) and
+    /// while the process switch allows it. Tests may set it on the engine
     /// queue before submitting requests.
-    var depthZeroChaining = CBv2MTPRoundDriver.envDepthZeroChaining
+    var depthZeroChaining: Bool
     /// Test-only plan depth cap from each decode row's committed-or-in-flight
     /// token count (`generatedTokenCount + pendingSamples`, equal on the
     /// chained and general paths), applied after every other clamp. Nil in
@@ -430,6 +432,8 @@ final class CBv2MTPRoundDriver {
         self.supportsOrdinaryDecodeHistory =
             requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
             && stateful?.requiresCommittedObservationFence == false
+        self.depthZeroChaining =
+            Self.envDepthZeroChaining && stateful?.supportsDepthZeroChaining == true
         self.config = config
         self.drafter = drafter
         self.model = model
