@@ -330,7 +330,8 @@ final class CBv2ContiguousHistoricalCheckpoint {
 extension CBv2CompleteCheckpointCapture {
     func prepareContiguous(
         position: Int, chunkSize: Int, state: [CBv2SequenceKV?],
-        allowance: CBv2HistoricalStagingAllowance? = nil
+        allowance: CBv2HistoricalStagingAllowance? = nil,
+        prefix: CBv2CheckpointManifestPrefix? = nil
     ) throws
         -> CBv2CapturedCompleteCheckpoint?
     {
@@ -340,7 +341,11 @@ extension CBv2CompleteCheckpointCapture {
             let bytes = try descriptors.reduce(0) {
                 try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount)
             }
-            guard store.acceptsCheckpoint(position: position, packedBytes: bytes) else {
+            guard store.acceptsCheckpoint(position: position, packedBytes: bytes),
+                manifestFits(
+                    position: position, chunkSize: chunkSize, prefix: prefix,
+                    descriptors: descriptors)
+            else {
                 return nil
             }
             let footprint = try CBv2ContiguousHistoricalCheckpoint.reservationFootprint(

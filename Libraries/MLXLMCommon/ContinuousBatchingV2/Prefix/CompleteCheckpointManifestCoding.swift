@@ -1,6 +1,28 @@
 import Foundation
 
 extension CBv2CompleteCheckpointManifest {
+    /// Prompts longer than this store their prefix tokens bit-packed. As a
+    /// JSON array, about 150K-190K tokens of a 200K-token vocabulary already
+    /// fill the 1 MiB manifest bound; packed, 262,144 18-bit tokens take
+    /// about 786 KB. Shorter prefixes keep the array, so every checkpoint
+    /// that fits today is encoded exactly as before.
+    public static let packedPrefixTokenThreshold = 65_536
+
+    /// The one encoding of a manifest's prefix tokens: packed for the native
+    /// block layout and for any prefix longer than the threshold, a JSON
+    /// array otherwise. Decoding refuses the other form.
+    static func packsPrefixTokens(backendLayout: String, position: Int) -> Bool {
+        backendLayout == diffusionBlockLayout || position > packedPrefixTokenThreshold
+    }
+
+    /// The manifest exactly as the provider's encrypted envelope encodes it
+    /// (sorted keys, slashes unescaped), whose size the store bounds.
+    public func storageEncoding() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(self)
+    }
+
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, identity, backendLayout, position, chunkSize
         case prefixTokens, cacheSalt, assistantCodecID, tensors, attentionLayers
@@ -14,7 +36,7 @@ extension CBv2CompleteCheckpointManifest {
         let backendLayout = try values.decode(String.self, forKey: .backendLayout)
         let position = try values.decode(Int.self, forKey: .position)
         let tokens: [Int]
-        if backendLayout == Self.diffusionBlockLayout {
+        if Self.packsPrefixTokens(backendLayout: backendLayout, position: position) {
             guard !values.contains(.prefixTokens) else {
                 throw CBv2CompleteCheckpointError.invalidManifest
             }
@@ -62,7 +84,7 @@ extension CBv2CompleteCheckpointManifest {
         try values.encode(backendLayout, forKey: .backendLayout)
         try values.encode(position, forKey: .position)
         try values.encode(chunkSize, forKey: .chunkSize)
-        if backendLayout == Self.diffusionBlockLayout {
+        if Self.packsPrefixTokens(backendLayout: backendLayout, position: position) {
             try values.encode(
                 CBv2NativeBlockPackedTokens(tokens: prefixTokens), forKey: .packedPrefixTokens)
         } else {

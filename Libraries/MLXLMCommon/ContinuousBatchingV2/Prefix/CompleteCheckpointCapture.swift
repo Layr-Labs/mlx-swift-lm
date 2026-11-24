@@ -191,7 +191,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         rowStates: [CBv2SequenceKV?] = [],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         hintTokens: Int? = nil, resumedAt: Int = 0,
-        nativeWork: CBv2NativeCompletePrefixWork? = nil
+        nativeWork: CBv2NativeCompletePrefixWork? = nil,
+        prefix: CBv2CheckpointManifestPrefix? = nil
     ) -> [MLXArray] {
         guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical,
             !codec.historicalRecurrent, !isClosed,
@@ -214,7 +215,12 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 guard !overflow else { return [] }
                 packedBytes = next
             }
-            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes) else {
+            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes),
+                manifestFits(
+                    position: position, chunkSize: chunkSize, prefix: prefix,
+                    descriptors: descriptors, mediaIdentity: mediaIdentity,
+                    mediaTargetOnly: mediaTargetOnly)
+            else {
                 return []
             }
             let stateDescriptors = descriptors.filter { $0.role != .keys && $0.role != .values }
@@ -642,5 +648,42 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
         let callback = completion
         completion = nil
         callback?(completedPositions)
+    }
+}
+
+/// The donor's prompt and scope, which the boundary's manifest records.
+struct CBv2CheckpointManifestPrefix {
+    let tokens: [Int]
+    let cacheSalt: String?
+}
+
+extension CBv2CompleteCheckpointCapture {
+    /// Whether the manifest written for this boundary fits the store's
+    /// bound: the same fields the export records, encoded as the store
+    /// encodes them. Retention keeps only the deepest boundary, so a
+    /// boundary the store would refuse must not be kept in place of one it
+    /// would write. Without a prefix (callers that predate it) nothing is
+    /// checked.
+    func manifestFits(
+        position: Int, chunkSize: Int, prefix: CBv2CheckpointManifestPrefix?,
+        descriptors: [CBv2CheckpointTensorDescriptor],
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
+    ) -> Bool {
+        guard let prefix else { return true }
+        guard position <= prefix.tokens.count else { return false }
+        let manifest = CBv2CompleteCheckpointManifest(
+            identity: codec.identity, position: position, chunkSize: chunkSize,
+            prefixTokens: Array(prefix.tokens.prefix(position)), cacheSalt: prefix.cacheSalt,
+            assistantCodecID: mediaTargetOnly ? nil : codec.assistant?.prefixCheckpointCodecID,
+            tensors: descriptors, backendLayout: codec.backendLayout,
+            attentionLayers: codec.glm5NextLayout?.attention.layers ?? codec.contiguousLayout?
+                .layers
+                ?? codec.historicalLayout?.layers,
+            mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
+            glm5NextState: codec.glm5NextLayout?.state(position: position),
+            checkpointQuantization: codec.checkpointQuantization,
+            checkpointNativeDTypes: codec.checkpointNativeDTypes)
+        guard let encoded = try? manifest.storageEncoding() else { return false }
+        return encoded.count <= store.maximumManifestBytes
     }
 }

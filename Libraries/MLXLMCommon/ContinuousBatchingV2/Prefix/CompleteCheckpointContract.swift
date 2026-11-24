@@ -484,6 +484,11 @@ public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
     /// and the bounded encrypted manifest, which the store accounts separately.
     func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool
 
+    /// The largest manifest, as `CBv2CompleteCheckpointManifest.storageEncoding`
+    /// encodes it, this store writes. Capture keeps no boundary whose manifest
+    /// is larger, so a refused deep boundary never displaces a writable one.
+    var maximumManifestBytes: Int { get }
+
     /// Consume one fully authenticated stage ticket, identified by submission
     /// receipt ID, not the potentially reused sampling request ID.
     func takeStaged(
@@ -512,5 +517,6 @@ public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
 
 extension CBv2CompletePrefixCache {
     public func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { true }
+    public var maximumManifestBytes: Int { CBv2CompleteCheckpointManifest.maximumEncodedBytes }
     public func recordRecurrentCaptureDisarmed(packedAt position: Int) {}
 }
