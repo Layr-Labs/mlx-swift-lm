@@ -456,6 +456,24 @@ extension EngineLoopV2 {
         return roots
     }
 
+    /// What `finishStep` does when `captureSettledHistoricalAssistants` throws.
+    enum SettledAssistantCopyFailure: Equatable {
+        /// Discard the steps of the rows that had checkpoints.
+        case discardCheckpointRows
+        /// Discard every participant and finish the cohort with the error.
+        case failCohort
+        /// Drop only the step's checkpoints; the donors' steps stand.
+        case dropCheckpoints
+    }
+
+    /// Red control only: the current rule, the same for every assistant
+    /// (`keepsDonorStep` is ignored).
+    static func settledAssistantCopyFailure(
+        _ error: any Error, keepsDonorStep: Bool
+    ) -> SettledAssistantCopyFailure {
+        error is MLXError ? .failCohort : .dropCheckpoints
+    }
+
     /// Runs after the actual observation fence and before the native commit.
     ///
     /// A paged historical (non-native) candidate whose assistant copy is
