@@ -7,7 +7,9 @@ import MLXNN
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
 /// proposal and is preserved by the durable prefix checkpoint codec.
-public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
+public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter,
+    @unchecked Sendable
+{
     let module: NemotronH35MTPModule
     let target: NemotronH35Model
     private let kvOnlyHistory: Bool
@@ -26,7 +28,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let a = target.configuration
         // KV may promote to FP32; trusted carry/backlog and graph roots are
         // charged conservatively in addition to both attention buffer families.
-        let logical = 2 * a.numKeyValueHeads
+        let logical =
+            2 * a.numKeyValueHeads
             * (a.headDim ?? a.hiddenSize / a.numAttentionHeads) * 4
             + 4 * a.hiddenSize * 4 + 16
         // The segmented pool carries one bounded segment of rounding/poison
@@ -37,16 +40,20 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     public var requestStateTokenGranularity: Int { 256 }
     public var requestStateTokenAllocationPadding: Int { draftLimit + 1 }
 
-    init(target: NemotronH35Model, maximumDraftTokens: Int? = nil,
-         primePromptHistory: Bool = true) {
+    init(
+        target: NemotronH35Model, maximumDraftTokens: Int? = nil,
+        primePromptHistory: Bool = true
+    ) {
         self.target = target
         self.module = NemotronH35MTPModule(target.configuration)
-        self.kvOnlyHistory = ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_KV_ONLY_HISTORY"] != "0"
+        self.kvOnlyHistory =
+            ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_KV_ONLY_HISTORY"] != "0"
         self.primePromptHistory = primePromptHistory
         let environment = ProcessInfo.processInfo.environment
-        let requested = maximumDraftTokens
+        let requested =
+            maximumDraftTokens
             ?? Int(environment["DARKBLOOM_NEMOTRON35_MTP_MAX_DRAFT_TOKENS"] ?? "") ?? 7
-        self.draftLimit = (1...7).contains(requested) ? requested : 7
+        self.draftLimit = (1 ... 7).contains(requested) ? requested : 7
     }
 
     final class State: CBv2MTPRequestState {
@@ -201,35 +208,46 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.paged = try PagedState(kind: kind, dtype: dtype, maximumSequenceLength: bound)
     }
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
-    public func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture) -> (tokens: MLXArray, hidden: MLXArray) {
+    public func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture) -> (
+        tokens: MLXArray, hidden: MLXArray
+    ) {
         preconditionFailure("Nemotron MTP requires request-owned state")
     }
-    public func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState) {
+    public func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState
+    ) {
         let s = state(requestState)
         precondition(s.stagedInputCount == 0)
         let n = observation.tokens.dim(1)
-        precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
+        precondition(
+            observation.tokens.shape == [1, n]
+                && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
         guard n > 0 else { return }
         // Keep every known (next token, previous target hidden) pair, including
         // the bridge between prefill chunks. The final frontier pairs with the
         // next observed token or the seed supplied to draftStep.
         if s.started || primePromptHistory {
             if let previous = s.frontier {
-                s.pendingTokens.append(observation.tokens[0..., 0..<1])
+                s.pendingTokens.append(observation.tokens[0..., 0 ..< 1])
                 s.pendingHidden.append(previous)
             }
             if n > 1 {
-                s.pendingTokens.append(observation.tokens[0..., 1..<n])
-                s.pendingHidden.append(observation.hidden[0..., 0..<(n - 1), 0...])
+                s.pendingTokens.append(observation.tokens[0..., 1 ..< n])
+                s.pendingHidden.append(observation.hidden[0..., 0 ..< (n - 1), 0...])
             }
         }
-        s.frontier = observation.hidden[0..., (n - 1)..<n, 0...]
+        s.frontier = observation.hidden[0..., (n - 1) ..< n, 0...]
         s.committedInputCount += n
     }
-    public func draftStep(tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?, requestState: any CBv2MTPRequestState) -> (tokens: MLXArray, hidden: MLXArray) {
+    public func draftStep(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
         let s = state(requestState)
         precondition(s.paged != nil, "Nemotron MTP state requires admitted sequence bound")
-        precondition(s.stagedInputCount < draftLimit && tokens.shape == [1, 1] && hidden.shape == [1, 1, target.configuration.hiddenSize])
+        precondition(
+            s.stagedInputCount < draftLimit && tokens.shape == [1, 1]
+                && hidden.shape == [1, 1, target.configuration.hiddenSize])
         let first = s.stagedInputCount == 0
         if first {
             s.baseOffset = s.cacheOffset
@@ -248,23 +266,24 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
                 let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+                    hidden: rows[0..., start ..< end, 0...],
+                    embedding: target.mtpEmbedding(ids[0..., start ..< end]), cache: s.cache)
                 asyncEval(primed)
                 s.roots = primed
             }
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
-                for i in 0..<ids.dim(1) {
-                    let hiddenRow = rows[0..., i..<(i + 1), 0...]
-                    let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
+                for i in 0 ..< ids.dim(1) {
+                    let hiddenRow = rows[0..., i ..< (i + 1), 0...]
+                    let embedding = target.mtpEmbedding(ids[0..., i ..< (i + 1)])
                     if kvOnlyHistory {
                         s.roots += module.appendTrustedKV(
                             hidden: hiddenRow, embedding: embedding, cache: s.cache)
                     } else {
-                        s.roots.append(module.pagedForward(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache))
+                        s.roots.append(
+                            module.pagedForward(
+                                hidden: hiddenRow, embedding: embedding, cache: s.cache))
                     }
                 }
             }
@@ -281,13 +300,21 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         return (ids, out)
     }
 
-    public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
-    public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
-        committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
+    public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
+        state(requestState).arrays
+    }
+    public func finalizeRound(
+        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray, committedTargetHidden: MLXArray
+    ) {
         let s = state(requestState)
-        precondition(s.stagedInputCount > 0 && (1...(s.stagedInputCount + 1)).contains(confirmedInputTokens))
+        precondition(
+            s.stagedInputCount > 0
+                && (1 ... (s.stagedInputCount + 1)).contains(confirmedInputTokens))
         let n = committedDraftTokens.dim(1)
-        precondition(n <= s.stagedInputCount && n <= confirmedInputTokens - 1 && committedTargetHidden.shape == [1, n, target.configuration.hiddenSize])
+        precondition(
+            n <= s.stagedInputCount && n <= confirmedInputTokens - 1
+                && committedTargetHidden.shape == [1, n, target.configuration.hiddenSize])
         // Only the first seed used authoritative target hidden. Discard every
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
@@ -313,13 +340,22 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     private func clearRound(_ s: State) {
         s.stagedInputCount = 0
-        s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
+        s.savedTokens = []
+        s.savedHidden = []
+        s.savedFrontier = nil
+        s.roots = []
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
-        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
+        guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else {
+            return
+        }
         clearRound(s)
-        s.paged?.release(); s.paged = nil
-        s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
-        s.committedInputCount = 0; s.released = true
+        s.paged?.release()
+        s.paged = nil
+        s.pendingTokens = []
+        s.pendingHidden = []
+        s.frontier = nil
+        s.committedInputCount = 0
+        s.released = true
     }
 }
