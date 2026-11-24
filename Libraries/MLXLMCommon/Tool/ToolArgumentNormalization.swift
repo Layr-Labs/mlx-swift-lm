@@ -205,7 +205,7 @@ enum ToolArgumentNormalization {
     ) -> Reading? {
         var references = References(root: root)
         guard depth < 32, let declared = schema, let schema = resolved(declared, &references),
-            schema["type"] as? String != "string",
+            schema["type"] as? String != "string" || rendersSiblingType(schema),
             let types = declaredTypes(schema, depth: depth, &references)
         else { return nil }
         var nonNull = types.subtracting(["null"])
@@ -418,7 +418,9 @@ enum ToolArgumentNormalization {
             return .unknown
         }
         var parts: [Admission] = []
-        if let raw = schema["type"] {
+        let hinted = rendersSiblingType(schema)
+        if hinted, probe.type == "null", !marksNullable(schema) { parts.append(.no) }
+        if !hinted, let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
             let types = names.compactMap(canonicalType)
             guard !names.isEmpty, types.count == names.count else { return .unknown }
@@ -697,7 +699,8 @@ enum ToolArgumentNormalization {
             ["$ref", "$dynamicRef", "not", "if", "then", "else"].allSatisfy({ schema[$0] == nil })
         else { return nil }
         var result: Set<String>?
-        if let raw = schema["type"] {
+        let hinted = rendersSiblingType(schema)
+        if !hinted, let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
             let bytes = names.reduce(0) { $0 + $1.utf8.count }
             guard references.spend(names.count + bytes / 64) else { return nil }
@@ -732,7 +735,72 @@ enum ToolArgumentNormalization {
             }
             result = result.map { $0.intersection(combined) } ?? combined
         }
+        if hinted, !marksNullable(schema) { result?.remove("null") }
         return result
+    }
+
+    /// Whether a node's `type` is a render hint, not the caller's assertion:
+    /// the single type ingress normalization (the coordinator's and the
+    /// provider's `ToolSchemaNormalization`) writes for the chat template
+    /// beside a construct that decides the value itself, where that type is
+    /// evidently the template's:
+    /// - `anyOf`/`oneOf` whose branches include that type: the first branch's
+    ///   type, as the provider's validator reads it (`ToolConstraintValidation`:
+    ///   a satisfied union is not held to the sibling type);
+    /// - `enum` with a member that type does not admit (`-1` beside `string`);
+    /// - `not` of that same type (`{not: {type: string}, type: string}` admits
+    ///   nothing as written);
+    /// - `if`/`then`/`else` with a branch typed otherwise.
+    /// A type that agrees with every branch (a client's `{type: string,
+    /// anyOf: [{minLength: 1}, {pattern: …}]}`) keeps asserting. A null still
+    /// needs `nullable: true` beside a hinted type, as the normalizer writes it.
+    /// A `$ref`'s siblings are read as draft 7 reads them: a followed
+    /// reference reads its target alone (`resolved`).
+    static func rendersSiblingType(_ schema: [String: any Sendable]) -> Bool {
+        guard let raw = schema["type"] as? String, let type = canonicalType(raw) else {
+            return false
+        }
+        func typeName(_ node: any Sendable) -> String? {
+            ((node as? [String: any Sendable])?["type"] as? String).flatMap(canonicalType)
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let branches = schema[key] as? [any Sendable],
+                branches.contains(where: { typeName($0) == type })
+            {
+                return true
+            }
+        }
+        if let members = schema["enum"] as? [any Sendable],
+            members.contains(where: { !typeAdmits(type, JSONValue.from($0)) })
+        {
+            return true
+        }
+        if let negated = schema["not"], typeName(negated) == type { return true }
+        for key in ["if", "then", "else"] {
+            if let branch = schema[key], let name = typeName(branch), name != type { return true }
+        }
+        return false
+    }
+
+    /// Whether a JSON type name admits `value`.
+    static func typeAdmits(_ type: String, _ value: JSONValue) -> Bool {
+        switch value {
+        case .null: type == "null"
+        case .bool: type == "boolean"
+        case .int: type == "integer" || type == "number"
+        case .double: type == "number"
+        case .string: type == "string"
+        case .array: type == "array"
+        case .object: type == "object"
+        }
+    }
+
+    /// The `nullable: true` marker, read as `declaredTypes` reads it.
+    private static func marksNullable(_ schema: [String: any Sendable]) -> Bool {
+        guard let marker = schema["nullable"], marker is Bool || marker is NSNumber else {
+            return false
+        }
+        return JSONValue.from(marker) == .bool(true)
     }
 
     private static func canonicalType(_ name: String) -> String? {
