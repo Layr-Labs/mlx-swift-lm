@@ -240,13 +240,15 @@ public struct CBv2MTPVerifyPenalties {
     /// Global window position of this call's first logits column.
     public let columnOffset: Int
     /// Prompt tokens per row, the start of the repetition-penalty window's
-    /// history (prompt, then confirmed output, then drafts). Read only for
-    /// rows where `appliesRepetition` holds; may be empty otherwise.
+    /// history (prompt, then confirmed output, then drafts). Required, so no
+    /// caller can leave a repetition row without its window history; read
+    /// only when some row's `appliesRepetition` holds, and then it must hold
+    /// one entry per row (may be empty when no row has a repetition penalty).
     public let promptTokens: [ArraySlice<Int>]
 
     public init(
         outputTokens: [ArraySlice<Int>], drafts: MLXArray?, columnOffset: Int = 0,
-        promptTokens: [ArraySlice<Int>] = []
+        promptTokens: [ArraySlice<Int>]
     ) {
         self.outputTokens = outputTokens
         self.drafts = drafts
