@@ -385,11 +385,7 @@ final class CBv2MTPRoundDriver {
         model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?,
         supportsOrdinaryDecodeChaining: Bool
     ) {
-        var config = config
-        if let required = drafter.requiredVerificationMode {
-            config.verificationMode = required
-            if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
-        }
+        var config = config.requiring(drafter.requiredVerificationMode)
         if let maximum = drafter.maximumDraftTokens {
             config.maxDraftTokens = min(config.maxDraftTokens, max(0, maximum))
             config.fixedDraftTokens = config.fixedDraftTokens.map {

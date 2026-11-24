@@ -594,40 +594,62 @@ extension EngineLoopV2 {
 
             // One logprob per emitted token, as ordinary decode emits them.
             // Exact acceptance commits the target's token at every position,
-            // so each entry's token is the emitted one.
-            func emittedLogprobs(_ tokens: [Int]) -> [CBv2TokenLogprob]? {
-                guard !windowLogprobs.isEmpty, !tokens.isEmpty else { return nil }
+            // so each entry's token is the emitted one. A row that asked for
+            // logprobs never receives tokens without them: if the round's
+            // gather does not cover them (unreachable under the admission
+            // gate), the tokens are withheld and the request ends with an
+            // error, counted as `logprob_gather_mismatch`.
+            let wantsLogprobs = rec.request.sampling.topLogprobs > 0
+            func emittedLogprobs(_ tokens: [Int]) -> (ok: Bool, value: [CBv2TokenLogprob]?) {
+                guard wantsLogprobs, !tokens.isEmpty else { return (true, nil) }
                 let base = batchIndex * (1 + k)
-                let entries = tokens.indices.compactMap { windowLogprobs[base + $0] }
-                guard entries.count == tokens.count else { return nil }
-                assert(zip(entries, tokens).allSatisfy { $0.token == $1 })
-                return entries
+                let entries =
+                    windowLogprobs.isEmpty
+                    ? [] : tokens.indices.compactMap { windowLogprobs[base + $0] }
+                guard entries.count == tokens.count,
+                    zip(entries, tokens).allSatisfy({ $0.token == $1 })
+                else {
+                    mtp.recordControllerFallback("logprob_gather_mismatch")
+                    finishReason = .error(
+                        "MTP verify produced no logprobs for \(tokens.count) committed token(s)")
+                    return (false, nil)
+                }
+                return (true, entries)
             }
             if hasStopStrings {
                 // A grammar-failing token is never emitted (ordinary decode
                 // finishes with the error before emitting it).
                 let visibleTokens = keptFailingToken ? Array(kept.dropLast()) : kept
-                stream(for: id)?.emit(
-                    .delta(
-                        text: textPieces.joined(), tokens: visibleTokens,
-                        logprobs: emittedLogprobs(visibleTokens)))
+                let logprobs = emittedLogprobs(visibleTokens)
+                if logprobs.ok {
+                    stream(for: id)?.emit(
+                        .delta(
+                            text: textPieces.joined(), tokens: visibleTokens,
+                            logprobs: logprobs.value))
+                }
             } else {
-                let stream = stream(for: id)
-                stream?.reserveEmission()
                 let endsWithStopToken = finishReason == .stop
                 let visibleTokens = outcome.constraintFailure == nil ? kept : Array(kept.dropLast())
                 let pushTokens = endsWithStopToken ? Array(visibleTokens.dropLast()) : visibleTokens
                 let allTokens = visibleTokens
                 let logprobs = emittedLogprobs(allTokens)
-                let trackedLoop = nativeShutdownState == nil ? nil : self
-                enqueueDetokenization(owner: detokenizer) {
-                    let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
-                    let publish: () -> Void = {
-                        stream?.emit(
-                            .delta(text: text, tokens: allTokens, logprobs: logprobs),
-                            consumingReservation: true)
+                if logprobs.ok {
+                    let stream = stream(for: id)
+                    stream?.reserveEmission()
+                    let trackedLoop = nativeShutdownState == nil ? nil : self
+                    enqueueDetokenization(owner: detokenizer) {
+                        let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
+                        let publish: () -> Void = {
+                            stream?.emit(
+                                .delta(text: text, tokens: allTokens, logprobs: logprobs.value),
+                                consumingReservation: true)
+                        }
+                        if let trackedLoop {
+                            _ = trackedLoop.nativeCommit(publish)
+                        } else {
+                            publish()
+                        }
                     }
-                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
                 }
             }
 

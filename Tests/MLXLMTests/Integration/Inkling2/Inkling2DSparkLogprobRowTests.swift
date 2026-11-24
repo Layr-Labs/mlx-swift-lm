@@ -40,7 +40,7 @@ struct Inkling2DSparkLogprobRowTests {
 
     static func engine(
         _ model: Inkling2Model, drafter: Inkling2DSparkDrafter?, rows: Int,
-        logprobSpeculation: Bool
+        logprobSpeculation: Bool, adaptive: Bool = false
     ) throws -> EngineV2 {
         let dtype = DType.bfloat16
         let kinds = model.cbv2LayerKinds
@@ -52,7 +52,7 @@ struct Inkling2DSparkLogprobRowTests {
                 layerDTypes: Array(repeating: dtype, count: kinds.count)))
         let storage = paged.makeLayerCaches()
         let caches = model.newCacheV2 { index, _ in storage[index] }
-        var config = Inkling2DSparkDrafter.defaultMTPConfig(adaptive: false)
+        var config = Inkling2DSparkDrafter.defaultMTPConfig(adaptive: adaptive)
         config.logprobSpeculation = logprobSpeculation
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(model), layerKinds: kinds, backend: paged,
@@ -107,7 +107,7 @@ struct Inkling2DSparkLogprobRowTests {
     /// Drafter off, then drafter on with the opt-in; returns both outputs and
     /// the drafting engine's metrics.
     static func compare(
-        _ rows: [Row], tokens: Int = 24, logprobSpeculation: Bool = true
+        _ rows: [Row], tokens: Int = 24, logprobSpeculation: Bool = true, adaptive: Bool = false
     ) async throws -> (off: [Collected], on: [Collected], metrics: CBv2MTPMetrics) {
         let model = try Inkling2DSparkTargetEngineTests.target(dtype: .bfloat16)
         let drafter = try Inkling2DSparkTargetEngineTests.drafter(
@@ -118,8 +118,12 @@ struct Inkling2DSparkLogprobRowTests {
         await baseline.shutdown()
 
         let drafting = try engine(
-            model, drafter: drafter, rows: rows.count, logprobSpeculation: logprobSpeculation)
-        #expect(drafting.loopForTesting.mtp?.config.verificationMode == .rectangularExact)
+            model, drafter: drafter, rows: rows.count, logprobSpeculation: logprobSpeculation,
+            adaptive: adaptive)
+        #expect(drafting.mtpEffectiveConfig?.verificationMode == .rectangularExact)
+        #expect(
+            drafting.mtpEffectiveConfig?.effectiveLogprobSpeculation
+                == (logprobSpeculation && CBv2MTPConfig.envLogprobSpeculation))
         let on = try await run(drafting, rows: rows, tokens: tokens)
         let metrics = try #require(drafting.mtpMetricsSnapshot())
         await drafting.shutdown()
@@ -178,8 +182,9 @@ struct Inkling2DSparkLogprobRowTests {
 
     @Test(arguments: [1, 2, 4])
     func sampledLogprobRowsDraftWithDrafterOffBits(rows count: Int) async throws {
+        // The shipped profile: adaptive depth.
         let rows = Self.rows(count, temperature: 0.7, topLogprobs: [3, 8])
-        let (off, on, metrics) = try await Self.compare(rows)
+        let (off, on, metrics) = try await Self.compare(rows, adaptive: true)
         Self.report("sampled rows=\(count) accepted=\(metrics.acceptedTokens)", off: off, on: on)
         Self.expectLogprobsPerToken(off, rows: rows)
         #expect(on == off)
@@ -216,6 +221,19 @@ struct Inkling2DSparkLogprobRowTests {
                 verificationMode: .rectangularExact, acceptance: .typical(delta: 0.2),
                 logprobSpeculation: true
             ).effectiveLogprobSpeculation)
+    }
+
+    /// The shipped profile declares `.rectangular` and adaptive depth; the
+    /// drafter's required mode makes it `.rectangularExact`, so the opt-in
+    /// takes effect where the provider sets it.
+    @Test func shippedProfileTakesTheOptIn() {
+        var config = Inkling2DSparkDrafter.defaultMTPConfig()
+        config.logprobSpeculation = true
+        #expect(config.verificationMode == .rectangular)
+        #expect(!config.effectiveLogprobSpeculation)
+        let running = config.requiring(Inkling2DSparkDrafter.servingVerificationMode)
+        #expect(running.verificationMode == .rectangularExact)
+        #expect(running.effectiveLogprobSpeculation == CBv2MTPConfig.envLogprobSpeculation)
     }
 
     /// Without the opt-in a cohort of logprob rows never drafts (the

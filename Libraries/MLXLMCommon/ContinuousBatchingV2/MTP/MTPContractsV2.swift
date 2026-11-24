@@ -816,6 +816,19 @@ public struct CBv2MTPConfig: Sendable {
 
     /// The effective on/off state (config AND env kill switch).
     public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+
+    /// This configuration as the round driver runs it beside a drafter whose
+    /// `requiredVerificationMode` is `required`: a required mode replaces the
+    /// configured one (and only `.rectangular` keeps the automatic token
+    /// bound). Callers can read gates that depend on the mode, such as
+    /// `effectiveLogprobSpeculation`, as the engine will apply them.
+    public func requiring(_ required: CBv2MTPVerificationMode?) -> CBv2MTPConfig {
+        guard let required else { return self }
+        var config = self
+        config.verificationMode = required
+        if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+        return config
+    }
 }
 
 // MARK: - Metrics

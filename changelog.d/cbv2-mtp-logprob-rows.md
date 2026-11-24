@@ -11,3 +11,12 @@
   and such rows stay target-only as before. Rows with a token constraint stay
   target-only. `DARKBLOOM_MTP_LOGPROB_ROWS=0` turns the opt-in off for the
   process.
+- A row that asked for logprobs never receives drafted tokens without them:
+  should a round's gather not cover its committed tokens, the tokens are
+  withheld and the request ends with an error (counted as the
+  `logprob_gather_mismatch` controller fallback).
+- `CBv2MTPConfig.requiring(_:)` returns a configuration as the round driver
+  runs it beside a drafter's required verification mode, and
+  `EngineV2.mtpEffectiveConfig` reports the running one, so a caller can see
+  whether the opt-in takes effect. `Inkling2DSparkDrafter.servingVerificationMode`
+  names the mode a loaded Inkling 2 drafter requires (`.rectangularExact`).
