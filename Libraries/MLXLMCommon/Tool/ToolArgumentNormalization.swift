@@ -62,6 +62,11 @@ enum ToolArgumentNormalization {
         {
             return literal
         }
+        if reading == nil, literals == .preferred, case .string(let text) = value, let schema,
+            let container = untypedContainer(text, schema: schema, root: root)
+        {
+            return container
+        }
         return normalize(value, reading: reading, depth: depth, root: root)
     }
 
@@ -235,6 +240,70 @@ enum ToolArgumentNormalization {
             ? literal : nil
     }
 
+    /// Keywords that say nothing about a value: a schema of these alone (`{}`
+    /// included) declares no type.
+    private static let annotationKeywords: Set<String> = [
+        "description", "title", "default", "examples", "$comment", "deprecated", "readOnly",
+        "writeOnly",
+    ]
+
+    /// The JSON object or array an XML text writes under a parameter with no
+    /// declared type (`{}`, annotations only, or a local reference to such a
+    /// node): only a text that parses completely as one, and whose numbers an
+    /// integer or a double holds exactly. Anything else keeps its text.
+    private static func untypedContainer(
+        _ text: String, schema: [String: any Sendable], root: [String: any Sendable]?
+    ) -> JSONValue? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "{" || trimmed.first == "[" else { return nil }
+        var references = References(root: root)
+        guard let node = resolved(schema, &references), node["$ref"] == nil,
+            node.keys.allSatisfy(annotationKeywords.contains),
+            numbersAreExact(trimmed), let parsed = tryParseJSON(trimmed)
+        else { return nil }
+        let value = JSONValue.from(parsed)
+        switch value {
+        case .object, .array: return value
+        default: return nil
+        }
+    }
+
+    /// Whether every number outside the strings of a JSON text decodes
+    /// exactly: an integer of at most 18 digits, or a decimal of at most 15
+    /// significant digits.
+    private static func numbersAreExact(_ text: String) -> Bool {
+        var inString = false
+        var escaped = false
+        var token = ""
+        func exact(_ token: String) -> Bool {
+            guard !token.isEmpty else { return true }
+            let mantissa = token.prefix { $0 != "e" && $0 != "E" }
+            let digits = mantissa.filter(\.isNumber).drop { $0 == "0" }
+            let integral = mantissa.count == token.count && !token.contains(".")
+            return digits.count <= (integral ? 18 : 15)
+        }
+        for character in text {
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                continue
+            }
+            if character.isNumber || "+-.eE".contains(character) {
+                token.append(character)
+                continue
+            }
+            guard exact(token) else { return false }
+            token = ""
+            if character == "\"" { inString = true }
+        }
+        return exact(token)
+    }
+
     /// The same scalars in any case, and Python's `None`, as vLLM reads
     /// XML text (`coerce_to_schema_type`, `_convert_param_value`).
     private static func spelledLiteral(_ text: String) -> JSONValue? {
@@ -247,7 +316,9 @@ enum ToolArgumentNormalization {
     }
 
     /// A scalar spelled exactly as JSON writes it: `true`, `false`, `null`
-    /// or a JSON number (no sign but `-`, no leading zeros, no bare point).
+    /// or a JSON number (no sign but `-`, no leading zeros, no bare point)
+    /// that an integer or a double holds exactly. A number neither holds
+    /// (`12345678901234567890`, `0.12345678901234567891`) keeps its text.
     private static func jsonLiteral(_ text: String) -> JSONValue? {
         switch text {
         case "true": return .bool(true)
@@ -275,7 +346,21 @@ enum ToolArgumentNormalization {
             guard digits() > 0 else { return nil }
         }
         guard scalars.isEmpty else { return nil }
-        return number(text, integer: false)
+        let value = number(text, integer: false)
+        if case .double(let double) = value, !holdsExactly(text, double) { return nil }
+        return value
+    }
+
+    /// Whether `double` is the number `text` writes, digit for digit: the
+    /// decimal reading of both agree, within the 38 digits a `Decimal` keeps.
+    private static func holdsExactly(_ text: String, _ double: Double) -> Bool {
+        let mantissa = text.prefix { $0 != "e" && $0 != "E" }
+        let digits = mantissa.filter(\.isNumber).drop { $0 == "0" }
+        let posix = Locale(identifier: "en_US_POSIX")
+        guard digits.count <= 38, let written = Decimal(string: text, locale: posix),
+            let read = Decimal(string: "\(double)", locale: posix)
+        else { return false }
+        return written == read
     }
 
     /// What one reading of a scalar against a schema can tell: admitted,
