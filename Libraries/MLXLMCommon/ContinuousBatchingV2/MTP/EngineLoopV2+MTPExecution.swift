@@ -604,6 +604,10 @@ extension EngineLoopV2 {
             asyncEvalTargets.append(verify.acceptancePacket)
             asyncEvalTargets.append(verify.lastHidden)
             if let logits = verify.constraintLogits { asyncEvalTargets.append(logits) }
+            if let logprobs = verify.logprobs {
+                asyncEvalTargets.append(
+                    contentsOf: [logprobs.chosen, logprobs.topValues, logprobs.topIndices])
+            }
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
             }
@@ -955,6 +959,7 @@ extension EngineLoopV2 {
             policyTopTwoValues: target.policyTopTwo?.values,
             hasAcceptMask: target.accept != nil)
         result.constraintLogits = target.constraintLogits
+        result.logprobs = target.logprobs
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result

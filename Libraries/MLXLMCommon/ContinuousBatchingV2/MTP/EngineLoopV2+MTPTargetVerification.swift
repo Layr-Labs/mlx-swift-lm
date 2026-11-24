@@ -44,7 +44,8 @@ extension EngineLoopV2 {
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
         diagnostics: [CBv2LogitDiagnosticPacket],
-        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
+        logprobs: CBv2Logprobs.Gathered?
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
@@ -55,6 +56,11 @@ extension EngineLoopV2 {
         }
         var constraintColumns: [MLXArray] = []
         var constraintLogits: MLXArray?
+        // Rows that request logprobs (admitted by `mtpLogprobRowEligible`)
+        // gather them from the raw window logits below.
+        let logprobK = rows.reduce(0) { max($0, $1.rec.request.sampling.topLogprobs) }
+        var logprobColumns: [MLXArray] = []
+        var windowLogits: MLXArray?
         var scores: MLXArray
         var accept: MLXArray?
         let nonFinite: MLXArray
@@ -303,6 +309,7 @@ extension EngineLoopV2 {
                     }
                 }
                 if hasConstraints { constraintColumns.append(output.logits) }
+                if logprobK > 0 { logprobColumns.append(output.logits) }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
                 // Flag the model's logits before a host sampler sees them.
@@ -348,6 +355,7 @@ extension EngineLoopV2 {
             }
             hidden = concatenated(hiddenColumns, axis: 1)
             if hasConstraints { constraintLogits = concatenated(constraintColumns, axis: 1) }
+            if logprobK > 0 { windowLogits = concatenated(logprobColumns, axis: 1) }
 
         } else {
             for cache in serializingCaches {
@@ -417,6 +425,7 @@ extension EngineLoopV2 {
                 try nativePagedWork.closeWindow(windowWork)
             }
             if hasConstraints { constraintLogits = output.logits }
+            if logprobK > 0 { windowLogits = output.logits }
             // Flag the model's logits before a host sampler sees them.
             nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             if mtp.usesRequestStatefulDrafter {
@@ -465,11 +474,30 @@ extension EngineLoopV2 {
             mtp.recordControllerFallback("typical_acceptance_unsupported")
         }
 
+        let logprobs = windowLogits.map {
+            Self.mtpWindowLogprobs(logits: $0, tokens: scores, k: logprobK)
+        }
         scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
         return (
             scores, accept, hidden, constraintLogits, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
+            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent,
+            logprobs
         )
+    }
+
+    /// The logprob gather of ordinary decode (`LogitsPipelineV2.process`
+    /// stage 0, then `CBv2Logprobs.gather`) over every verify position: raw
+    /// window logits `[B, W, vocab]` flattened to `[B * W, vocab]`, each row
+    /// scored at the target's own token there (`tokens` `[B, W]`). On a
+    /// `.rectangularExact` target each row equals the logits of the one-token
+    /// decode step at that position, so the values are drafter-off's.
+    static func mtpWindowLogprobs(
+        logits: MLXArray, tokens: MLXArray, k: Int
+    ) -> CBv2Logprobs.Gathered {
+        let raw = logits.reshaped([-1, logits.dim(-1)]).asType(.float32)
+        return CBv2Logprobs.gather(
+            rawLogprobs: raw - logSumExp(raw, axis: -1, keepDims: true),
+            sampledTokens: tokens.reshaped([-1]), k: k)
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

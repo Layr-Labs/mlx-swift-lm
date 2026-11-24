@@ -111,7 +111,17 @@ extension Inkling2DSparkDrafter {
             throw Inkling2DSparkError.target("drafter and target layer visits or width differ")
         }
         return Inkling2DSparkDrafter(
-            model: model, target: target, requiredVerificationMode: .rectangularExact,
+            model: model, target: target,
+            requiredVerificationMode: Inkling2DSparkDrafter.servingVerificationMode,
             commitsAcceptedPrefixPerRow: true)
     }
+}
+
+extension Inkling2DSparkDrafter {
+    /// The verification mode a loaded serving drafter requires
+    /// (`Inkling2DSparkCBv2.load`): Inkling 2 verify windows are row-exact,
+    /// so every window position computes a one-token decode step's logits.
+    /// `CBv2MTPConfig.requiring(_:)` with it gives the configuration the
+    /// round driver runs.
+    public static let servingVerificationMode: CBv2MTPVerificationMode = .rectangularExact
 }
