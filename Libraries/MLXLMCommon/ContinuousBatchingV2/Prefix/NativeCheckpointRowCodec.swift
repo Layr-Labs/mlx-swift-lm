@@ -677,9 +677,10 @@ final class CBv2NativeCheckpointRowDecoder {
         workers > 1 ? defaultWaveRows * (2048 + 128) + workers * (2048 + 8) : 0
     }
 
-    /// Test-only: the decoder each import uses (`forImport`). Set and cleared
-    /// by serialized tests; nil uses the defaults.
-    nonisolated(unsafe) static var importDecoderForTesting: (() -> CBv2NativeCheckpointRowDecoder)?
+    /// Test-only: the decoder each import started in this task uses
+    /// (`forImport`); nil uses the defaults. Task-local, so a test's decoder
+    /// never reaches an import that another suite runs concurrently.
+    @TaskLocal static var importDecoderForTesting: (@Sendable () -> CBv2NativeCheckpointRowDecoder)?
 
     static func forImport() -> CBv2NativeCheckpointRowDecoder {
         importDecoderForTesting?() ?? .init()

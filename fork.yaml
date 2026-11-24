@@ -182,6 +182,7 @@ def:
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
+            - "changelog.d/checkpoint-row-decode-test-coverage.md"
             - "changelog.d/cbv2-long-prefix-checkpoint-manifests.md"
             - "Tests/MLXLMTests/CompleteCheckpointLongPrefixTests.swift"
             - "docs/prefix-checkpoint-retention.md"
@@ -671,13 +672,16 @@ def:
             any (`Inkling2ImageLimitError`).
             The DSpark drafter (`mtp.safetensors`) drives MTP with row-exact rectangular verification and its
             own durable prefix-checkpoint layout. Its private paged pool is granted the segmented pool's own
-            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`). The vision tower, processor
-            and VLM wrapper are in the vision-language section.
+            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`). Rows that cannot speculate
+            record the drafter's prompt history (`checkpointsNonSpeculatingRows`), so they save the same
+            checkpoints as a drafting row. The vision tower, processor and VLM wrapper are in the
+            vision-language section.
           globs:
             - "Libraries/MLXLLM/Models/Inkling2/**"
             - "Tests/MLXLMTests/Inkling2*.swift"
             - "Tests/MLXLMTests/Integration/Inkling2/**"
             - "changelog.d/inkling2-mini-*.md"
+            - "changelog.d/inkling2-mini-non-speculating-row-checkpoints.md"
             - "tools/inkling2_dspark_reference.py"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
