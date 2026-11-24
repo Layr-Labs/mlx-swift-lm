@@ -18,4 +18,15 @@ package protocol CBv2HistoricalMTPPrefixCheckpointCoding: CBv2MTPPrefixCheckpoin
     func bindImportedPrefixCheckpointOwner(
         _ checkpoint: any CBv2MTPPrefixCheckpoint, owner: AnyObject
     ) throws
+
+    /// Opt in to the split failure rule for the settled assistant copy
+    /// (`EngineLoopV2.settledAssistantCopyFailure`): a refused copy loses only
+    /// its checkpoint and the donor's step stands, and an `MLXError` fails the
+    /// whole cohort. Default false: any error discards the steps of the rows
+    /// that had checkpoints.
+    var refusedAssistantCopyKeepsDonorStep: Bool { get }
+}
+
+extension CBv2HistoricalMTPPrefixCheckpointCoding {
+    package var refusedAssistantCopyKeepsDonorStep: Bool { false }
 }

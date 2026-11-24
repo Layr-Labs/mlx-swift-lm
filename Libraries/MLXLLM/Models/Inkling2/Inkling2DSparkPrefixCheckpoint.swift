@@ -110,6 +110,9 @@ extension Inkling2DSparkDrafter: CBv2HistoricalMTPPrefixCheckpointCoding {
         s.prefixMayInstall = false
     }
 
+    /// A refused drafter copy drops only its checkpoint, never the donor's step.
+    package var refusedAssistantCopyKeepsDonorStep: Bool { true }
+
     package func bindImportedPrefixCheckpointOwner(
         _ checkpoint: any CBv2MTPPrefixCheckpoint, owner: AnyObject
     ) throws {
