@@ -634,8 +634,8 @@ public struct CBv2MTPConfig: Sendable {
     /// The marginal depth policy picks each row's depth from the measured
     /// per-depth round costs (`CBv2MTPMarginalDepthPolicy.selectDepthByCost`)
     /// instead of one linear head-step cost ratio. A family opts in after
-    /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off and `=1`
-    /// turns it on for any family. Tokens are unaffected.
+    /// measuring it; `DARKBLOOM_CBV2_MTP_COST_CURVE=0` turns it off. No value
+    /// turns it on for a family that has not opted in. Tokens are unaffected.
     public var costCurveDepthSelection: Bool
     /// False for `DARKBLOOM_MTP_STOP_STRING_ROWS=0/false/no/off`; read once.
     public static let envStopStringSpeculation = envSwitch("DARKBLOOM_MTP_STOP_STRING_ROWS")

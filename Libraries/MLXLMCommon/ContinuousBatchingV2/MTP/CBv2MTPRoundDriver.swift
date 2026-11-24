@@ -925,7 +925,9 @@ final class CBv2MTPRoundDriver {
                 remainingTokens: remainingTokens,
                 verificationLimit: verificationLimit)
         }
-        if Self.costCurveSelection ?? config.costCurveDepthSelection {
+        if Self.costCurveDepthSelection(
+            configured: config.costCurveDepthSelection, environment: Self.costCurveEnvironment)
+        {
             return CBv2MTPMarginalDepthPolicy.selectDepthByCost(
                 offeredDepth: cappedOffer,
                 remainingTokens: remainingTokens,
@@ -943,16 +945,17 @@ final class CBv2MTPRoundDriver {
             headStepCostRatio: cost.headStepCostRatio)
     }
 
-    /// `DARKBLOOM_CBV2_MTP_COST_CURVE`: `1` turns the cost-curve depth choice
-    /// (`CBv2MTPConfig.costCurveDepthSelection`) on for any family, `0` off;
-    /// unset leaves the configuration's choice.
-    static let costCurveSelection: Bool? = {
-        switch ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"] {
-        case "1": return true
-        case "0": return false
-        default: return nil
-        }
-    }()
+    /// `DARKBLOOM_CBV2_MTP_COST_CURVE`, read once.
+    static let costCurveEnvironment =
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"]
+
+    /// The cost-curve depth choice is on only for a family whose configuration
+    /// opts in (`CBv2MTPConfig.costCurveDepthSelection`), unless
+    /// `DARKBLOOM_CBV2_MTP_COST_CURVE` is exactly `0`. No value turns it on
+    /// for a family that has not opted in.
+    static func costCurveDepthSelection(configured: Bool, environment: String?) -> Bool {
+        configured && environment != "0"
+    }
 
     func observeRequestAcceptance(
         id: CBv2RequestID,
