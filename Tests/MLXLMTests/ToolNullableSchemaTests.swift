@@ -120,7 +120,7 @@ struct ToolNullableSchemaTests {
 
     // MARK: - Values that must not change
 
-    @Test("Typed nulls pass through and string schemas keep literal text")
+    @Test("Typed nulls pass through; string schemas keep literal text but read null when nullable")
     func typedNullAndStringLiterals() throws {
         let nullable = try schema(#"{"type":"integer","nullable":true}"#)
         #expect(ToolArgumentNormalization.normalize(.null, schema: nullable) == .null)
@@ -134,26 +134,34 @@ struct ToolNullableSchemaTests {
             let property = try schema(json)
             for text in ["null", "None", "true", "001", #"{"a":1}"#] {
                 let value = try read(text, property)
-                #expect(value == .string(text), "\(json): \(text)")
+                // XML text: a nullable string reads null as null, as vLLM reads
+                // an optional string; plain strings keep every text.
+                let nullable = json != #"{"type":"string"}"# && ["null", "None"].contains(text)
+                #expect(value == (nullable ? .null : .string(text)), "\(json): \(text)")
                 #expect(outcome(value, property) == "valid", "\(json): \(text)")
             }
         }
     }
 
-    @Test("A sibling type without the marker still excludes null")
+    @Test("A sibling render type without the marker still excludes null")
     func conjunctionWithoutMarker() throws {
         let nullBranch = try schema(
             #"{"type":"integer","anyOf":[{"type":"integer"},{"type":"null"}]}"#)
         let text = try read("null", nullBranch)
         #expect(text == .string("null"))
-        #expect(outcome(text, nullBranch) == "$ must be an integer")
+        // The sibling integer is the first branch's render type, so the union
+        // decides a non-null value (the text matches no branch); a null still
+        // needs the marker.
+        #expect(outcome(text, nullBranch) == "$ must satisfy at least one of the allowed schemas")
         #expect(outcome(.null, nullBranch) == "$ must be an integer")
 
         let stringBranch = try schema(
             #"{"type":"integer","anyOf":[{"type":"integer"},{"type":"string"}]}"#)
         let word = try read("abc", stringBranch)
         #expect(word == .string("abc"))
-        #expect(outcome(word, stringBranch) == "$ must be an integer")
+        // The string branch admits it; the sibling render type no longer
+        // vetoes a satisfied union (as the provider's validator reads it).
+        #expect(outcome(word, stringBranch) == "valid")
         let number = try read("42", stringBranch)
         #expect(number == .int(42))
         #expect(outcome(number, stringBranch) == "valid")
@@ -314,17 +322,17 @@ struct ToolNullableSchemaTests {
         #expect(outcome(rejected, plain) == "$.n must be an integer")
     }
 
-    // MARK: - Known gap
+    // MARK: - The render type beside a union
 
-    /// The normalizer collapses `anyOf(integer, string, null)` to a sibling
-    /// integer type, so the conjunction no longer shows the string branch.
-    @Test("A string branch hidden by the collapsed type no longer keeps literal null")
+    /// The normalizer writes `anyOf(integer, string, null)`'s first branch
+    /// type beside it; that type is a render hint, so the string branch still
+    /// keeps a literal `null` text (formerly a known gap).
+    @Test("A string branch beside the collapsed render type keeps literal null")
     func hiddenStringBranch() throws {
         let property = try schema(
             #"{"type":"integer","nullable":true,"anyOf":["#
                 + #"{"type":"integer"},{"type":"string"},{"type":"null"}]}"#)
-        withKnownIssue("The collapsed sibling type hides the string branch") {
-            #expect(convert("null", property) == .string("null"))
-        }
+        #expect(convert("null", property) == .string("null"))
+        #expect(outcome(.string("null"), property) == "valid")
     }
 }

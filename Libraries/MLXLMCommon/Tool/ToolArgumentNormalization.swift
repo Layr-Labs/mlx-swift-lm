@@ -33,9 +33,12 @@ enum ToolArgumentNormalization {
         /// Only when the schema admits the literal and rejects the text as a
         /// string, so the text could never be valid as written.
         case whenTextRejected
-        /// Also when both are admitted and the text is the literal's own JSON
-        /// spelling: the dialects whose every value is unquoted text (the Qwen
-        /// XML parameters), where a string and a number are written alike.
+        /// Also when both are admitted and the text is the literal's own
+        /// spelling, in any case (`True`, `FALSE`, `Null`) or Python's `None`:
+        /// the dialects
+        /// whose every value is unquoted text (the Qwen XML parameters), where a
+        /// string and a literal are written alike, as vLLM's `convert_value`
+        /// reads them (`null` for an optional string).
         case preferred
         /// Never: the text keeps its spelling (Gemma's marker-quoted strings).
         case never
@@ -58,6 +61,11 @@ enum ToolArgumentNormalization {
                 text, schema: schema, depth: depth, root: root, literals: literals)
         {
             return literal
+        }
+        if reading == nil, literals == .preferred, case .string(let text) = value, let schema,
+            let container = untypedContainer(text, schema: schema, root: root)
+        {
+            return container
         }
         return normalize(value, reading: reading, depth: depth, root: root)
     }
@@ -197,7 +205,7 @@ enum ToolArgumentNormalization {
     ) -> Reading? {
         var references = References(root: root)
         guard depth < 32, let declared = schema, let schema = resolved(declared, &references),
-            schema["type"] as? String != "string",
+            schema["type"] as? String != "string" || rendersSiblingType(schema),
             let types = declaredTypes(schema, depth: depth, &references)
         else { return nil }
         var nonNull = types.subtracting(["null"])
@@ -217,25 +225,100 @@ enum ToolArgumentNormalization {
         root: [String: any Sendable]?, literals: LiteralReading
     ) -> JSONValue? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let literal = jsonLiteral(trimmed),
+        guard
+            let literal = jsonLiteral(trimmed)
+                ?? (literals == .preferred ? spelledLiteral(trimmed) : nil),
             admitsLiteralType(schema, depth: depth, root: root)
         else { return nil }
         var references = References(root: root)
         guard admission(of: .value(literal), schema, depth: depth, &references) == .yes else {
             return nil
         }
-        switch literal {
-        case .int, .double:
-            if literals == .preferred && trimmed == text { return literal }
-        default: break
-        }
+        if literals == .preferred && trimmed == text { return literal }
         var textReferences = References(root: root)
         return admission(of: .value(.string(text)), schema, depth: depth, &textReferences) == .no
             ? literal : nil
     }
 
+    /// Keywords that say nothing about a value: a schema of these alone (`{}`
+    /// included) declares no type.
+    private static let annotationKeywords: Set<String> = [
+        "description", "title", "default", "examples", "$comment", "deprecated", "readOnly",
+        "writeOnly",
+    ]
+
+    /// The JSON object or array an XML text writes under a parameter with no
+    /// declared type (`{}`, annotations only, or a local reference to such a
+    /// node): only a text that parses completely as one, and whose numbers an
+    /// integer or a double holds exactly. Anything else keeps its text.
+    private static func untypedContainer(
+        _ text: String, schema: [String: any Sendable], root: [String: any Sendable]?
+    ) -> JSONValue? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "{" || trimmed.first == "[" else { return nil }
+        var references = References(root: root)
+        guard let node = resolved(schema, &references), node["$ref"] == nil,
+            node.keys.allSatisfy(annotationKeywords.contains),
+            numbersAreExact(trimmed), let parsed = tryParseJSON(trimmed)
+        else { return nil }
+        let value = JSONValue.from(parsed)
+        switch value {
+        case .object, .array: return value
+        default: return nil
+        }
+    }
+
+    /// Whether every number outside the strings of a JSON text decodes
+    /// exactly: an integer of at most 18 digits, or a decimal of at most 15
+    /// significant digits.
+    private static func numbersAreExact(_ text: String) -> Bool {
+        var inString = false
+        var escaped = false
+        var token = ""
+        func exact(_ token: String) -> Bool {
+            guard !token.isEmpty else { return true }
+            let mantissa = token.prefix { $0 != "e" && $0 != "E" }
+            let digits = mantissa.filter(\.isNumber).drop { $0 == "0" }
+            let integral = mantissa.count == token.count && !token.contains(".")
+            return digits.count <= (integral ? 18 : 15)
+        }
+        for character in text {
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                continue
+            }
+            if character.isNumber || "+-.eE".contains(character) {
+                token.append(character)
+                continue
+            }
+            guard exact(token) else { return false }
+            token = ""
+            if character == "\"" { inString = true }
+        }
+        return exact(token)
+    }
+
+    /// The same scalars in any case, and Python's `None`, as vLLM reads
+    /// XML text (`coerce_to_schema_type`, `_convert_param_value`).
+    private static func spelledLiteral(_ text: String) -> JSONValue? {
+        switch text.lowercased() {
+        case "true": .bool(true)
+        case "false": .bool(false)
+        case "null", "none": .null
+        default: nil
+        }
+    }
+
     /// A scalar spelled exactly as JSON writes it: `true`, `false`, `null`
-    /// or a JSON number (no sign but `-`, no leading zeros, no bare point).
+    /// or a JSON number (no sign but `-`, no leading zeros, no bare point)
+    /// that an integer or a double holds exactly. A number neither holds
+    /// (`12345678901234567890`, `0.12345678901234567891`) keeps its text.
     private static func jsonLiteral(_ text: String) -> JSONValue? {
         switch text {
         case "true": return .bool(true)
@@ -263,7 +346,21 @@ enum ToolArgumentNormalization {
             guard digits() > 0 else { return nil }
         }
         guard scalars.isEmpty else { return nil }
-        return number(text, integer: false)
+        let value = number(text, integer: false)
+        if case .double(let double) = value, !holdsExactly(text, double) { return nil }
+        return value
+    }
+
+    /// Whether `double` is the number `text` writes, digit for digit: the
+    /// decimal reading of both agree, within the 38 digits a `Decimal` keeps.
+    private static func holdsExactly(_ text: String, _ double: Double) -> Bool {
+        let mantissa = text.prefix { $0 != "e" && $0 != "E" }
+        let digits = mantissa.filter(\.isNumber).drop { $0 == "0" }
+        let posix = Locale(identifier: "en_US_POSIX")
+        guard digits.count <= 38, let written = Decimal(string: text, locale: posix),
+            let read = Decimal(string: "\(double)", locale: posix)
+        else { return false }
+        return written == read
     }
 
     /// What one reading of a scalar against a schema can tell: admitted,
@@ -291,9 +388,7 @@ enum ToolArgumentNormalization {
     }
 
     /// Whether `literal` may read some text under `schema`, read decidedly:
-    /// a number the schema may admit, or a Boolean or null it may admit while
-    /// it does not admit every string (only numbers are preferred over an
-    /// admitted string, `LiteralReading.preferred`).
+    /// a number, Boolean or null the schema may admit.
     private static func admitsLiteralType(
         _ schema: [String: any Sendable], depth: Int, root: [String: any Sendable]?
     ) -> Bool {
@@ -305,9 +400,7 @@ enum ToolArgumentNormalization {
             readings[type] = reading
         }
         guard !references.exhausted else { return false }
-        func admitted(_ type: String) -> Bool { readings[type] != .no }
-        return admitted("integer") || admitted("number")
-            || ((admitted("boolean") || admitted("null")) && readings["string"] != .yes)
+        return ["integer", "number", "boolean", "null"].contains { readings[$0] != .no }
     }
 
     /// Reads the keywords that decide a scalar: `type`, `nullable`, `enum`,
@@ -325,7 +418,9 @@ enum ToolArgumentNormalization {
             return .unknown
         }
         var parts: [Admission] = []
-        if let raw = schema["type"] {
+        let hinted = rendersSiblingType(schema)
+        if hinted, probe.type == "null", !marksNullable(schema) { parts.append(.no) }
+        if !hinted, let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
             let types = names.compactMap(canonicalType)
             guard !names.isEmpty, types.count == names.count else { return .unknown }
@@ -604,7 +699,8 @@ enum ToolArgumentNormalization {
             ["$ref", "$dynamicRef", "not", "if", "then", "else"].allSatisfy({ schema[$0] == nil })
         else { return nil }
         var result: Set<String>?
-        if let raw = schema["type"] {
+        let hinted = rendersSiblingType(schema)
+        if !hinted, let raw = schema["type"] {
             let names = (raw as? String).map { [$0] } ?? (raw as? [String]) ?? []
             let bytes = names.reduce(0) { $0 + $1.utf8.count }
             guard references.spend(names.count + bytes / 64) else { return nil }
@@ -639,7 +735,72 @@ enum ToolArgumentNormalization {
             }
             result = result.map { $0.intersection(combined) } ?? combined
         }
+        if hinted, !marksNullable(schema) { result?.remove("null") }
         return result
+    }
+
+    /// Whether a node's `type` is a render hint, not the caller's assertion:
+    /// the single type ingress normalization (the coordinator's and the
+    /// provider's `ToolSchemaNormalization`) writes for the chat template
+    /// beside a construct that decides the value itself, where that type is
+    /// evidently the template's:
+    /// - `anyOf`/`oneOf` whose branches include that type: the first branch's
+    ///   type, as the provider's validator reads it (`ToolConstraintValidation`:
+    ///   a satisfied union is not held to the sibling type);
+    /// - `enum` with a member that type does not admit (`-1` beside `string`);
+    /// - `not` of that same type (`{not: {type: string}, type: string}` admits
+    ///   nothing as written);
+    /// - `if`/`then`/`else` with a branch typed otherwise.
+    /// A type that agrees with every branch (a client's `{type: string,
+    /// anyOf: [{minLength: 1}, {pattern: …}]}`) keeps asserting. A null still
+    /// needs `nullable: true` beside a hinted type, as the normalizer writes it.
+    /// A `$ref`'s siblings are read as draft 7 reads them: a followed
+    /// reference reads its target alone (`resolved`).
+    static func rendersSiblingType(_ schema: [String: any Sendable]) -> Bool {
+        guard let raw = schema["type"] as? String, let type = canonicalType(raw) else {
+            return false
+        }
+        func typeName(_ node: any Sendable) -> String? {
+            ((node as? [String: any Sendable])?["type"] as? String).flatMap(canonicalType)
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let branches = schema[key] as? [any Sendable],
+                branches.contains(where: { typeName($0) == type })
+            {
+                return true
+            }
+        }
+        if let members = schema["enum"] as? [any Sendable],
+            members.contains(where: { !typeAdmits(type, JSONValue.from($0)) })
+        {
+            return true
+        }
+        if let negated = schema["not"], typeName(negated) == type { return true }
+        for key in ["if", "then", "else"] {
+            if let branch = schema[key], let name = typeName(branch), name != type { return true }
+        }
+        return false
+    }
+
+    /// Whether a JSON type name admits `value`.
+    static func typeAdmits(_ type: String, _ value: JSONValue) -> Bool {
+        switch value {
+        case .null: type == "null"
+        case .bool: type == "boolean"
+        case .int: type == "integer" || type == "number"
+        case .double: type == "number"
+        case .string: type == "string"
+        case .array: type == "array"
+        case .object: type == "object"
+        }
+    }
+
+    /// The `nullable: true` marker, read as `declaredTypes` reads it.
+    private static func marksNullable(_ schema: [String: any Sendable]) -> Bool {
+        guard let marker = schema["nullable"], marker is Bool || marker is NSNumber else {
+            return false
+        }
+        return JSONValue.from(marker) == .bool(true)
     }
 
     private static func canonicalType(_ name: String) -> String? {

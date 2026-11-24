@@ -176,10 +176,15 @@ def:
             paged native rows straight to their page addresses and other rows through the same ordered
             sink calls, with the same bytes. Provider-staged segments wrap zero-fill-on-demand pages
             when the live pool does (`hostZeroedSegments`).
+            Manifests of prefixes longer than 65,536 tokens store their tokens bit-packed, and capture
+            keeps a boundary only when its manifest, encoded as the store encodes it, fits the store's
+            `maximumManifestBytes`, so a refused deep boundary never displaces a writable one.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "changelog.d/prefix-checkpoint-concurrent-row-decode.md"
             - "changelog.d/checkpoint-row-decode-test-coverage.md"
+            - "changelog.d/cbv2-long-prefix-checkpoint-manifests.md"
+            - "Tests/MLXLMTests/CompleteCheckpointLongPrefixTests.swift"
             - "docs/prefix-checkpoint-retention.md"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
@@ -346,6 +351,7 @@ def:
       globs:
         - "changelog.d/glm5-tool-grammar-only.md"
         - "changelog.d/qwen35-stream-schema-reading.md"
+        - "changelog.d/tool-argument-exact-numbers-untyped-containers.md"
         - "Libraries/MLXLMCommon/Tool/**"
         - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
         - "Tests/MLXLMTests/ChatSessionTests.swift"

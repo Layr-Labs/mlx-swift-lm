@@ -19,16 +19,18 @@ public struct CBv2NativeBlockCheckpointState: Codable, Sendable, Equatable {
     }
 }
 
-/// Canonical little-endian bit packing, only for the native-block layout.
+/// Canonical little-endian bit packing for the native-block layout and for
+/// prefixes longer than `CBv2CompleteCheckpointManifest.packedPrefixTokenThreshold`.
 /// A 262144-token, 19-bit vocabulary fits the existing 1 MiB encrypted manifest
-/// bound including base64. Legacy checkpoint encodings are unchanged. This is
+/// bound including base64. Shorter legacy checkpoint encodings are unchanged. This is
 /// integer compression, not tensor quantization or a tokenizer transformation.
 struct CBv2NativeBlockPackedTokens: Codable {
     let bitWidth: Int
     let bytes: Data
 
     init(tokens: [Int]) throws {
-        guard !tokens.isEmpty, tokens.count <= CBv2CompleteCheckpointManifest.maximumEncodedBytes / 2,
+        guard !tokens.isEmpty,
+            tokens.count <= CBv2CompleteCheckpointManifest.maximumEncodedBytes / 2,
             tokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) })
         else { throw CBv2CompleteCheckpointError.invalidManifest }
         let largest = tokens.max()!
@@ -52,7 +54,7 @@ struct CBv2NativeBlockPackedTokens: Codable {
 
     func unpack(count: Int) throws -> [Int] {
         guard count > 1, count <= CBv2CompleteCheckpointManifest.maximumEncodedBytes / 2,
-            (1...31).contains(bitWidth), bytes.count == (count * bitWidth + 7) / 8
+            (1 ... 31).contains(bitWidth), bytes.count == (count * bitWidth + 7) / 8
         else { throw CBv2CompleteCheckpointError.invalidManifest }
         var result = [Int]()
         result.reserveCapacity(count)

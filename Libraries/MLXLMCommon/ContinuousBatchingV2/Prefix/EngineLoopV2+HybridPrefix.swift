@@ -82,7 +82,10 @@ extension EngineLoopV2 {
                         mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
                         hintTokens: rec.request.prefixCheckpointTargetTokens,
                         resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0,
-                        nativeWork: nativeCaptureWork))
+                        nativeWork: nativeCaptureWork,
+                        prefix: .init(
+                            tokens: rec.request.promptTokens,
+                            cacheSalt: rec.request.checkpointCacheSalt)))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.

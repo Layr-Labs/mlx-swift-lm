@@ -16,12 +16,13 @@ extension CBv2CompleteCheckpointCapture {
     func prepareHistorical(
         position: Int, chunkSize: Int, state: [CBv2SequenceKV?],
         allowance: CBv2HistoricalStagingAllowance? = nil,
-        nativeWork: CBv2NativeCompletePrefixWork? = nil
+        nativeWork: CBv2NativeCompletePrefixWork? = nil,
+        prefix: CBv2CheckpointManifestPrefix? = nil
     ) throws -> CBv2CapturedCompleteCheckpoint? {
         if codec.contiguousLayout != nil {
             return try prepareContiguous(
                 position: position, chunkSize: chunkSize, state: state,
-                allowance: allowance)
+                allowance: allowance, prefix: prefix)
         }
         guard !isClosed, let layout = codec.historicalLayout,
             state.count == layout.layers.count
@@ -45,7 +46,11 @@ extension CBv2CompleteCheckpointCapture {
             let packedBytes = try descriptors.reduce(0) {
                 try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount)
             }
-            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes) else {
+            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes),
+                manifestFits(
+                    position: position, chunkSize: chunkSize, prefix: prefix,
+                    descriptors: descriptors)
+            else {
                 return refuse(.storeRefused, position)
             }
             var owners: [(index: Int, row: PagedSequenceKV)] = []
@@ -176,7 +181,7 @@ extension CBv2CompleteCheckpointCapture {
     /// then target, then first. Ascending.
     func prepareHistorical(
         positions: [Int], retention: CBv2CheckpointRetention, state: [CBv2SequenceKV?],
-        requestID: CBv2RequestID? = nil
+        requestID: CBv2RequestID? = nil, prefix: CBv2CheckpointManifestPrefix? = nil
     ) throws -> [CBv2CapturedCompleteCheckpoint] {
         func allowance(_ role: CBv2HistoricalStagingCap.Role) -> CBv2HistoricalStagingAllowance? {
             guard let requestID else { return nil }
@@ -190,7 +195,7 @@ extension CBv2CompleteCheckpointCapture {
             guard
                 let candidate = try prepareHistorical(
                     position: position, chunkSize: stride, state: state,
-                    allowance: allowance(.latest))
+                    allowance: allowance(.latest), prefix: prefix)
             else { continue }
             prepared.append(candidate)
             latest = position
@@ -200,7 +205,8 @@ extension CBv2CompleteCheckpointCapture {
         let below = positions.filter { $0 < latest }
         if let target = retention.plannedTarget, below.contains(target),
             let candidate = try prepareHistorical(
-                position: target, chunkSize: stride, state: state, allowance: allowance(.target))
+                position: target, chunkSize: stride, state: state, allowance: allowance(.target),
+                prefix: prefix)
         {
             prepared.append(candidate)
         }
@@ -211,7 +217,7 @@ extension CBv2CompleteCheckpointCapture {
                 guard
                     let candidate = try prepareHistorical(
                         position: position, chunkSize: stride, state: state,
-                        allowance: allowance(.first))
+                        allowance: allowance(.first), prefix: prefix)
                 else { continue }
                 prepared.append(candidate)
                 break
@@ -322,6 +328,8 @@ extension EngineLoopV2 {
                 }
                 continue
             }
+            let prefix = CBv2CheckpointManifestPrefix(
+                tokens: rec.request.promptTokens, cacheSalt: rec.request.checkpointCacheSalt)
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             if capture.codec.historicalRecurrent {
                 // Recurrent state exists only at a range end, so the recurrent
@@ -367,7 +375,8 @@ extension EngineLoopV2 {
                 if let candidate = try capture.prepareHistorical(
                     position: range.upperBound, chunkSize: cap, state: state,
                     allowance: capture.historicalStagingAllowance(
-                        requestID: id, retention: retention, role: .latest))
+                        requestID: id, retention: retention, role: .latest),
+                    prefix: prefix)
                 {
                     step.historicalCheckpoints[id] = [candidate]
                 }
@@ -416,7 +425,7 @@ extension EngineLoopV2 {
                             position: range.upperBound, chunkSize: cap, state: state,
                             allowance: capture.historicalStagingAllowance(
                                 requestID: id, retention: retention, role: .latest),
-                            nativeWork: work)
+                            nativeWork: work, prefix: prefix)
                     else {
                         work?.finishAfterDroppingConsumers()
                         continue
@@ -444,7 +453,8 @@ extension EngineLoopV2 {
                 requestID: id, stride: stride, hintTokens: rec.request.prefixCheckpointTargetTokens,
                 resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0)
             let prepared = try capture.prepareHistorical(
-                positions: capturable, retention: retention, state: state, requestID: id)
+                positions: capturable, retention: retention, state: state, requestID: id,
+                prefix: prefix)
             if !prepared.isEmpty { step.historicalCheckpoints[id] = prepared }
         }
         let candidates = step.historicalCheckpoints.values.flatMap { $0 }
