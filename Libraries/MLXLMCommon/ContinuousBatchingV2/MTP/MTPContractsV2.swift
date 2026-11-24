@@ -806,6 +806,15 @@ public struct CBv2MTPConfig: Sendable {
 
     /// The effective on/off state (config AND env kill switch).
     public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+
+    /// Red control: #552's config helper (the driver's required-mode override).
+    public func requiring(_ required: CBv2MTPVerificationMode?) -> CBv2MTPConfig {
+        guard let required else { return self }
+        var config = self
+        config.verificationMode = required
+        if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+        return config
+    }
 }
 
 // MARK: - Metrics
