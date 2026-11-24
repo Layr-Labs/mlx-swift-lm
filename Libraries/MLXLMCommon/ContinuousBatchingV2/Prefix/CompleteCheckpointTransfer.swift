@@ -106,7 +106,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         self.codecOwner = codecOwner
         self.reservation = reservation
         self.evaluate = evaluate
-        quantizedDecoder = plan.manifest.usesLossyNativeCheckpoint ? .init() : nil
+        quantizedDecoder = plan.manifest.usesLossyNativeCheckpoint ? .forImport() : nil
     }
 
     func allocate(work: CBv2NativeCompletePrefixWork) throws {
@@ -383,11 +383,14 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         self.plan = plan
         self.reservation = reservation
         self.stageLease = stageLease
-        quantizedDecoder = plan.manifest.usesLossyNativeCheckpoint ? .init() : nil
+        quantizedDecoder = plan.manifest.usesLossyNativeCheckpoint ? .forImport() : nil
         if let storagePlan = plan.pagedStoragePlan {
             pagedStorage = try CBv2PagedCheckpointStorage(
                 plan: storagePlan, evaluate: { try plan.evaluateDestinations([$0]) },
-                admission: plan.codec.admission, hostMaterialized: true)
+                admission: plan.codec.admission, hostMaterialized: true,
+                // As the live pool's growth (`hostZeroedSegments`): staged
+                // segments wrap zero-fill-on-demand pages instead of copying zeros.
+                hostZeroed: plan.codec.pagedConfig?.hostZeroedSegments == true)
         }
         let destinationDescriptors =
             plan.pagedStoragePlan == nil

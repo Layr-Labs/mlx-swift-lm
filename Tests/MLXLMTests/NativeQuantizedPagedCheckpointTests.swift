@@ -18,7 +18,7 @@ struct NativeQuantizedPagedCheckpointTests {
         let dtype: DType
     }
 
-    private func fixture(_ dtype: DType = .float16) throws -> Fixture {
+    private func fixture(_ dtype: DType = .float16, hostZeroed: Bool = false) throws -> Fixture {
         let kinds: [CBv2LayerKind] = [
             .init(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4),
             .init(attention: .slidingWindow(257), headDim: 64, kvHeads: 1, queryHeads: 2),
@@ -27,7 +27,8 @@ struct NativeQuantizedPagedCheckpointTests {
         ]
         let config = PagedKVPoolConfig(
             capacityBytes: 256 << 20, maxPrefillChunk: 1024, segmentSizeBytes: 32 << 10,
-            layerDTypes: Array(repeating: dtype, count: kinds.count))
+            layerDTypes: Array(repeating: dtype, count: kinds.count), hostZeroedSegments: hostZeroed
+        )
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
         let admission = AdmissionV2(
             layerKinds: kinds, bytesCapacity: config.capacityBytes,
@@ -176,7 +177,11 @@ struct NativeQuantizedPagedCheckpointTests {
         }
         #expect(wireBytes < nativeBytes)
         let plan = try f.codec.plan(manifest: exported.manifest, request: f.request)
-        #expect(plan.scratchBytes >= CBv2NativeCheckpointRowCodec.scratchBytes)
+        #expect(
+            plan.scratchBytes
+                >= CBv2NativeCheckpointRowCodec.scratchBytes
+                + CBv2NativeCheckpointRowDecoder.scratchBytes(
+                    workers: CBv2NativeCheckpointRowDecoder.defaultWorkers))
         #expect(plan.pagedStoragePlan?.groups.allSatisfy { $0.key.quantization == nil } == true)
         #expect(plan.nativeTargetBytes > nativeBytes)
         let physicalBefore = f.backend.pool.groupKeys
@@ -214,6 +219,92 @@ struct NativeQuantizedPagedCheckpointTests {
         #expect(
             latest.values.asType(.float32).asArray(Float.self)
                 == expected.asType(.float32).asArray(Float.self))
+    }
+
+    /// Restores the fixture's checkpoint with `decoder` and returns every restored
+    /// K/V bit of the three owning layers.
+    private func restoredBits(
+        _ dtype: DType, hostZeroed: Bool, segmentBytes: Int,
+        decoder: @escaping () -> CBv2NativeCheckpointRowDecoder
+    ) throws -> [[UInt32]] {
+        let f = try fixture(dtype, hostZeroed: hostZeroed)
+        try f.admission.reserve(id: donorID, additionalTokens: 1025)
+        let donor = try f.backend.makeSequenceState(
+            layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
+        defer {
+            f.backend.release(donor)
+            f.admission.releaseAll(id: donorID)
+        }
+        try write(donor, f, start: 0, count: 768)
+        let exported = try source(donor, f)
+        defer { exported.close() }
+        let plan = try f.codec.plan(manifest: exported.manifest, request: f.request)
+        CBv2NativeCheckpointRowDecoder.importDecoderForTesting = decoder
+        defer { CBv2NativeCheckpointRowDecoder.importDecoderForTesting = nil }
+        let sink = try plan.allocate(onRelease: {})
+        defer { sink.close() }
+        for (index, descriptor) in exported.manifest.tensors.enumerated() {
+            var offset = 0
+            while offset < descriptor.byteCount {
+                let bytes = try exported.readSegment(
+                    tensorIndex: index, byteOffset: offset, maximumBytes: segmentBytes)
+                try sink.appendSegment(tensorIndex: index, byteOffset: offset, data: bytes)
+                offset += bytes.count
+            }
+        }
+        let staged = try sink.finish()
+        defer { staged.close() }
+        let restored = try staged.consumePreparedState { prepared in
+            let frame = try #require(prepared.pagedFrame)
+            prepared.pagedFrame = nil
+            let adopted = try f.backend.pool.importCheckpoint(
+                frame, admission: f.admission, requestID: f.request.id,
+                layerKinds: f.kinds, maximumTokens: plan.maximumSequenceLength)
+            return try adopted.moveToActiveRequest { #expect($0.isEmpty) }
+        }
+        defer {
+            f.backend.release(restored)
+            f.admission.releaseAll(id: f.request.id)
+        }
+        var bits: [[UInt32]] = []
+        for layer in [0, 1, 2] {
+            let row = try #require(restored[layer] as? PagedSequenceKV)
+            let start: Int
+            switch f.kinds[layer].attention {
+            case .full: start = 0
+            case .slidingWindow(let size): start = max(0, position - size)
+            }
+            let snapshot = row.gatherRange(start: start, count: position - start)
+            for array in [snapshot.keys, snapshot.values] {
+                bits.append(array.asType(.float32).asArray(Float.self).map(\.bitPattern))
+            }
+        }
+        return bits
+    }
+
+    @Test(
+        "Concurrent decode into staged pages and zero-fill staged pages restore the same bits",
+        arguments: [DType.float16, .bfloat16, .float32])
+    func concurrentRestoreIsBitIdentical(dtype: DType) throws {
+        let reference = try restoredBits(
+            dtype, hostZeroed: false, segmentBytes: 257, decoder: { .init(workers: 1) })
+        for (hostZeroed, segmentBytes) in [(false, 4 << 20), (true, 4 << 20), (true, 257)] {
+            for decoder in [
+                {
+                    CBv2NativeCheckpointRowDecoder(workers: 4, waveRows: 7, minimumRowsPerWorker: 2)
+                },
+                {
+                    CBv2NativeCheckpointRowDecoder(
+                        workers: 3, waveRows: 1024, minimumRowsPerWorker: 1)
+                },
+                { CBv2NativeCheckpointRowDecoder() },
+            ] {
+                #expect(
+                    try restoredBits(
+                        dtype, hostZeroed: hostZeroed, segmentBytes: segmentBytes, decoder: decoder)
+                        == reference, "hostZeroed=\(hostZeroed) segment=\(segmentBytes)")
+            }
+        }
     }
 
     @Test("Profile, native dtype, tenant and malformed metadata refuse before page mutation")

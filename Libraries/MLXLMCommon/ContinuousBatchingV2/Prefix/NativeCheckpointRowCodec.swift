@@ -8,7 +8,8 @@ import MLX
 /// prepared encoders (under 7 KiB each, at most `exportCodingWorkers`) or the
 /// reference encoder's row-local temporaries. Input and sink-retained output
 /// belong to the caller's IO budget; neither import nor export retains history
-/// here.
+/// here. The concurrent decode's wave is charged separately
+/// (`CBv2NativeCheckpointRowDecoder.scratchBytes(workers:)`).
 enum CBv2NativeCheckpointRowCodec {
     static let scratchBytes = 64 << 10
     /// Native rows export reads from its source at once (whole rows, at least
@@ -382,11 +383,31 @@ final class CBv2PreparedNativeCheckpointRowDecoder {
     }
 
     func decode(_ bytes: UnsafeRawBufferPointer) throws -> Data {
-        guard bytes.count == role.packedRowBytes else {
+        try scratch.withUnsafeMutableBufferPointer { values in
+            try native.withUnsafeMutableBytes { destination in
+                try decode(bytes, scratch: UnsafeMutableRawBufferPointer(values), into: destination)
+            }
+        }
+        return native
+    }
+
+    /// Reads only immutable state: concurrent calls with their own `scratch`
+    /// (`width` Floats) and `destination` (`nativeRowBytes`) are safe.
+    func decode(
+        _ bytes: UnsafeRawBufferPointer, scratch rawValues: UnsafeMutableRawBufferPointer,
+        into destination: UnsafeMutableRawBufferPointer
+    ) throws {
+        guard bytes.count == role.packedRowBytes, rawValues.count >= role.width * 4,
+            destination.count >= role.nativeRowBytes
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        try scratch.withUnsafeMutableBufferPointer { values in
-            let rawValues = UnsafeMutableRawBufferPointer(values)
+        // Exactly one row of scratch and of destination: the FP32 path copies all of it.
+        let rawValues = UnsafeMutableRawBufferPointer(rebasing: rawValues[0 ..< role.width * 4])
+        let destination = UnsafeMutableRawBufferPointer(
+            rebasing: destination[0 ..< role.nativeRowBytes])
+        do {
+            let values = rawValues.bindMemory(to: Float.self)
             for group in 0 ..< role.width / groupSize {
                 let scale = Float(
                     bitPattern: bytes.loadUnaligned(
@@ -432,9 +453,8 @@ final class CBv2PreparedNativeCheckpointRowDecoder {
             }
 
             if rotation != 0 { inverseRotate(rawValues) }
-            try writeNative(UnsafeRawBufferPointer(rawValues))
+            try writeNative(UnsafeRawBufferPointer(rawValues), into: destination)
         }
-        return native
     }
 
     private func inverseRotate(_ values: UnsafeMutableRawBufferPointer) {
@@ -512,8 +532,10 @@ final class CBv2PreparedNativeCheckpointRowDecoder {
 
     /// Adding one exponent step to an all-ones exponent (infinity or NaN) carries
     /// into the lane's top bit, so one test after the vector loop covers every vector.
-    func writeNative(_ values: UnsafeRawBufferPointer) throws {
-        try native.withUnsafeMutableBytes { destination in
+    func writeNative(
+        _ values: UnsafeRawBufferPointer, into destination: UnsafeMutableRawBufferPointer
+    ) throws {
+        do {
             var index = 0
             switch role.key.dtype {
             case .float16:
@@ -622,19 +644,87 @@ final class CBv2PreparedNativeCheckpointRowDecoder {
 /// Only a partial input row and reusable row scratch survive a transfer call.
 /// Validated native rows are batched within the call, never across cancellation
 /// boundaries; the sink still owns publication and native completion.
+///
+/// With `workers` > 1, the whole coded rows of a call are decoded concurrently,
+/// `waveRows` at a time. Rows whose destinations `targets` resolves are written
+/// straight there; the others are batched and written in row order exactly as
+/// one worker writes them: the same sink calls with the same bytes. Either way
+/// the destination ends with the bytes one worker leaves, and a refused row
+/// throws the same error. Each row's native bytes are a pure function of its
+/// coded bytes and the role. With one worker (`DARKBLOOM_PREFIX_CACHE_PARALLEL_STAGE=0`,
+/// or three active cores or fewer) every row takes the original sequential path.
+/// The workers run at the caller's quality of service and take no locks.
 final class CBv2NativeCheckpointRowDecoder {
     private static let maximumBatchBytes = 16 << 10
+    /// Rows decoded concurrently per wave; its native rows are the decoder's
+    /// largest scratch (`scratchBytes(workers:)`).
+    static let defaultWaveRows = 1024
+    /// Up to eight cores, at most half the active ones.
+    static let defaultWorkers =
+        parallelEnabled
+        ? min(8, max(1, ProcessInfo.processInfo.activeProcessorCount / 2)) : 1
+    /// `DARKBLOOM_PREFIX_CACHE_PARALLEL_STAGE=0` (or `false`, `no`, `off`)
+    /// decodes on the calling thread alone; read once per process.
+    static let parallelEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_PREFIX_CACHE_PARALLEL_STAGE"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+    /// Concurrent rows of one wave at the widest supported row (512 FP32
+    /// values), each worker's Float scratch and first-failure slot, and the
+    /// wave's bookkeeping (pending rows, row lists and destination addresses).
+    static func scratchBytes(workers: Int) -> Int {
+        workers > 1 ? defaultWaveRows * (2048 + 128) + workers * (2048 + 8) : 0
+    }
+
+    /// Test-only: the decoder each import uses (`forImport`). Set and cleared
+    /// by serialized tests; nil uses the defaults.
+    nonisolated(unsafe) static var importDecoderForTesting: (() -> CBv2NativeCheckpointRowDecoder)?
+
+    static func forImport() -> CBv2NativeCheckpointRowDecoder {
+        importDecoderForTesting?() ?? .init()
+    }
+
+    private let workers: Int
+    private let waveRows: Int
+    private let minimumRowsPerWorker: Int
     private var prepared: CBv2PreparedNativeCheckpointRowDecoder?
     private var row = Data()
     private var batch = Data()
     private var batchOffset: Int?
     private var failed = false
+    /// Whole rows of the current call waiting for a concurrent decode:
+    /// (offset in the call's data, coded, native offset).
+    private var pending: [(source: Int, packed: Bool, nativeOffset: Int)] = []
+    private var targets: ((Int, Int) -> [UnsafeMutableRawPointer]?)?
+    private var arena: UnsafeMutableRawBufferPointer?
+    private var workerScratch: UnsafeMutableRawBufferPointer?
+    private var firstFailures: UnsafeMutableBufferPointer<Int>?
     var isComplete: Bool { !failed && row.isEmpty && batch.isEmpty }
 
+    init(
+        workers: Int = CBv2NativeCheckpointRowDecoder.defaultWorkers,
+        waveRows: Int = CBv2NativeCheckpointRowDecoder.defaultWaveRows,
+        minimumRowsPerWorker: Int = 32
+    ) {
+        self.workers = max(1, workers)
+        self.waveRows = max(1, waveRows)
+        self.minimumRowsPerWorker = max(1, minimumRowsPerWorker)
+    }
+
+    deinit { releaseScratch() }
+
+    /// `targets`, when given, returns the destination address of each of a
+    /// run of whole native rows (native offset, row count), or nil. With more
+    /// than one worker, rows it resolves are decoded straight into those
+    /// addresses; `write` receives the others, as before.
     func append(
         role: CBv2CheckpointPagedRoleLayout, byteOffset: Int, data: Data,
+        targets: ((Int, Int) -> [UnsafeMutableRawPointer]?)? = nil,
         write: (Int, Data) throws -> Void
     ) throws {
+        self.targets = targets
+        defer { self.targets = nil }
         let bytes = try PagedKVQuantizationConfig.multiply(role.key.kvHeads, role.bytesPerHead)
         guard !failed, role.isQuantized, byteOffset >= 0, !data.isEmpty,
             byteOffset < bytes, data.count <= bytes - byteOffset
@@ -657,6 +747,8 @@ final class CBv2NativeCheckpointRowDecoder {
         }
         guard let prepared else { throw CBv2CompleteCheckpointError.invalidSegment }
         let tokenCount = role.position - role.tokenStart
+        let concurrent = workers > 1
+        pending.removeAll(keepingCapacity: true)
         do {
             try data.withUnsafeBytes { source in
                 var consumed = 0
@@ -677,10 +769,20 @@ final class CBv2NativeCheckpointRowDecoder {
                     let token = inBand / rowBytes + (packed ? 0 : role.packedCount)
                     let nativeOffset = (head * tokenCount + token) * role.nativeRowBytes
                     if inRow == 0 && count == rowBytes {
-                        try appendRow(
-                            fragment, packed: packed, nativeOffset: nativeOffset,
-                            nativeRowBytes: role.nativeRowBytes, decoder: prepared, write: write)
+                        if concurrent {
+                            pending.append((consumed, packed, nativeOffset))
+                            if pending.count == waveRows {
+                                try drainPending(
+                                    source, decoder: prepared, role: role, write: write)
+                            }
+                        } else {
+                            try appendRow(
+                                fragment, packed: packed, nativeOffset: nativeOffset,
+                                nativeRowBytes: role.nativeRowBytes, decoder: prepared, write: write
+                            )
+                        }
                     } else {
+                        try drainPending(source, decoder: prepared, role: role, write: write)
                         row.append(
                             fragment.baseAddress!.assumingMemoryBound(to: UInt8.self), count: count)
                         if row.count == rowBytes {
@@ -695,9 +797,11 @@ final class CBv2NativeCheckpointRowDecoder {
                     }
                     consumed += count
                 }
+                try drainPending(source, decoder: prepared, role: role, write: write)
             }
             try flush(write: write)
         } catch {
+            pending.removeAll(keepingCapacity: true)
             failed = true
             // A rejected row never enters the batch. Preserve earlier completed
             // rows; flush clears before propagating a sink failure, so no retry.
@@ -706,17 +810,148 @@ final class CBv2NativeCheckpointRowDecoder {
         }
     }
 
+    /// Decodes the pending whole rows concurrently, a wave at a time, then
+    /// batches them in order. A row that fails to decode throws where one
+    /// worker would: after the earlier rows, before any later one.
+    private func drainPending(
+        _ source: UnsafeRawBufferPointer, decoder: CBv2PreparedNativeCheckpointRowDecoder,
+        role: CBv2CheckpointPagedRoleLayout, write: (Int, Data) throws -> Void
+    ) throws {
+        guard !pending.isEmpty else { return }
+        defer { pending.removeAll(keepingCapacity: true) }
+        let nativeRowBytes = role.nativeRowBytes
+        let (arena, scratch, firstFailures) = scratchBuffers(role: role)
+        var start = 0
+        while start < pending.count {
+            let wave = pending[start ..< min(pending.count, start + waveRows)]
+            if let pointers = resolveTargets(wave, rowBytes: nativeRowBytes) {
+                // Earlier batched rows reach the sink first, as in row order.
+                try flush(write: write)
+                let job = CBv2RowDirectWave(
+                    source: source, scratch: scratch, firstFailures: firstFailures,
+                    decoder: decoder, rows: wave.map { ($0.source, $0.packed) },
+                    targets: pointers, packedRowBytes: role.packedRowBytes,
+                    nativeRowBytes: nativeRowBytes, scratchStride: role.width * 4)
+                if let refused = job.run(
+                    strips: min(workers, max(1, wave.count / minimumRowsPerWorker)))
+                {
+                    // Leave what one worker leaves: the staged rows before the refused
+                    // one. Later rows return to the zeros they were staged with (each
+                    // row is staged once per import), and so does the refused row.
+                    for pointer in pointers[refused...] {
+                        pointer.initializeMemory(
+                            as: UInt8.self, repeating: 0, count: nativeRowBytes)
+                    }
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                start += wave.count
+                continue
+            }
+            let packedSlots = wave.indices.filter { pending[$0].packed }
+            let job = CBv2RowDecodeWave(
+                source: source, arena: arena, scratch: scratch, firstFailures: firstFailures,
+                decoder: decoder, rows: packedSlots.map { (pending[$0].source, $0 - start) },
+                packedRowBytes: role.packedRowBytes, nativeRowBytes: nativeRowBytes,
+                scratchStride: role.width * 4)
+            let refused =
+                job.run(strips: min(workers, max(1, packedSlots.count / minimumRowsPerWorker)))
+                ?? Int.max
+            for index in wave.indices {
+                let item = pending[index]
+                let slot = index - start
+                // `appendRow`'s order: flush the batch, then decode, then append.
+                try flushUnlessAdjacent(
+                    nativeOffset: item.nativeOffset, rowBytes: nativeRowBytes, write: write)
+                // Every decode refusal is this error (`CBv2PreparedNativeCheckpointRowDecoder`).
+                if slot == refused { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                let native =
+                    item.packed
+                    ? UnsafeRawBufferPointer(
+                        rebasing: arena[slot * nativeRowBytes ..< (slot + 1) * nativeRowBytes])
+                    : UnsafeRawBufferPointer(
+                        rebasing: source[item.source ..< item.source + nativeRowBytes])
+                batch.append(
+                    native.baseAddress!.assumingMemoryBound(to: UInt8.self), count: native.count)
+                if batchOffset == nil { batchOffset = item.nativeOffset }
+            }
+            start += wave.count
+        }
+    }
+
+    /// Destination addresses for every row of `wave`, resolved per run of
+    /// consecutive native offsets; nil unless every row resolves.
+    private func resolveTargets(
+        _ wave: ArraySlice<(source: Int, packed: Bool, nativeOffset: Int)>, rowBytes: Int
+    ) -> [UnsafeMutableRawPointer]? {
+        guard let targets else { return nil }
+        var pointers: [UnsafeMutableRawPointer] = []
+        pointers.reserveCapacity(wave.count)
+        var runStart = wave.startIndex
+        while runStart < wave.endIndex {
+            var runEnd = runStart + 1
+            while runEnd < wave.endIndex,
+                wave[runEnd].nativeOffset == wave[runEnd - 1].nativeOffset + rowBytes
+            {
+                runEnd += 1
+            }
+            guard let run = targets(wave[runStart].nativeOffset, runEnd - runStart),
+                run.count == runEnd - runStart
+            else { return nil }
+            pointers.append(contentsOf: run)
+            runStart = runEnd
+        }
+        return pointers
+    }
+
+    private func scratchBuffers(role: CBv2CheckpointPagedRoleLayout) -> (
+        UnsafeMutableRawBufferPointer, UnsafeMutableRawBufferPointer,
+        UnsafeMutableBufferPointer<Int>
+    ) {
+        let arenaBytes = waveRows * role.nativeRowBytes
+        let scratchBytes = workers * role.width * 4
+        if let arena, arena.count >= arenaBytes, let workerScratch,
+            workerScratch.count >= scratchBytes, let firstFailures
+        {
+            return (arena, workerScratch, firstFailures)
+        }
+        releaseScratch()
+        let newArena = UnsafeMutableRawBufferPointer.allocate(byteCount: arenaBytes, alignment: 16)
+        let newScratch = UnsafeMutableRawBufferPointer.allocate(
+            byteCount: scratchBytes, alignment: MemoryLayout<Float>.alignment)
+        let newFailures = UnsafeMutableBufferPointer<Int>.allocate(capacity: workers)
+        newFailures.initialize(repeating: Int.max)
+        arena = newArena
+        workerScratch = newScratch
+        firstFailures = newFailures
+        return (newArena, newScratch, newFailures)
+    }
+
+    private func releaseScratch() {
+        arena?.deallocate()
+        workerScratch?.deallocate()
+        firstFailures?.deallocate()
+        arena = nil
+        workerScratch = nil
+        firstFailures = nil
+    }
+
+    private func flushUnlessAdjacent(
+        nativeOffset: Int, rowBytes: Int, write: (Int, Data) throws -> Void
+    ) throws {
+        if let batchOffset,
+            batchOffset + batch.count != nativeOffset
+                || batch.count + rowBytes > Self.maximumBatchBytes
+        {
+            try flush(write: write)
+        }
+    }
+
     private func appendRow(
         _ bytes: UnsafeRawBufferPointer, packed: Bool, nativeOffset: Int,
         nativeRowBytes: Int, decoder: CBv2PreparedNativeCheckpointRowDecoder,
         write: (Int, Data) throws -> Void
     ) throws {
-        if let batchOffset,
-            batchOffset + batch.count != nativeOffset
-                || batch.count + nativeRowBytes > Self.maximumBatchBytes
-        {
-            try flush(write: write)
-        }
+        try flushUnlessAdjacent(nativeOffset: nativeOffset, rowBytes: nativeRowBytes, write: write)
         if packed {
             let native = try decoder.decode(bytes)
             native.withUnsafeBytes {
@@ -744,5 +979,109 @@ final class CBv2NativeCheckpointRowDecoder {
         batch = Data()
         batchOffset = nil
         failed = false
+        pending = []
+        releaseScratch()
+    }
+}
+
+/// One wave of coded rows decoded on `strips` workers. Each worker decodes a
+/// contiguous range of rows into its own slots of `arena` with its own Float
+/// scratch, stops at its first refused row and records that row's slot in
+/// `firstFailures[strip]` (`Int.max` when none).
+private struct CBv2RowDecodeWave: @unchecked Sendable {
+    let source: UnsafeRawBufferPointer
+    let arena: UnsafeMutableRawBufferPointer
+    let scratch: UnsafeMutableRawBufferPointer
+    let firstFailures: UnsafeMutableBufferPointer<Int>
+    let decoder: CBv2PreparedNativeCheckpointRowDecoder
+    /// (offset in `source`, slot in `arena`), in slot order.
+    let rows: [(source: Int, slot: Int)]
+    let packedRowBytes: Int
+    let nativeRowBytes: Int
+    let scratchStride: Int
+
+    /// The lowest refused slot, or nil.
+    func run(strips: Int) -> Int? {
+        guard !rows.isEmpty else { return nil }
+        if strips <= 1 {
+            decode(strip: 0, of: 1)
+        } else {
+            DispatchQueue.concurrentPerform(iterations: strips) { decode(strip: $0, of: strips) }
+        }
+        let first = firstFailures.prefix(strips).min() ?? Int.max
+        return first == Int.max ? nil : first
+    }
+
+    private func decode(strip: Int, of strips: Int) {
+        firstFailures[strip] = Int.max
+        let values = UnsafeMutableRawBufferPointer(
+            rebasing: scratch[strip * scratchStride ..< (strip + 1) * scratchStride])
+        for index in rows.count * strip / strips ..< rows.count * (strip + 1) / strips {
+            let item = rows[index]
+            let input = UnsafeRawBufferPointer(
+                rebasing: source[item.source ..< item.source + packedRowBytes])
+            let output = UnsafeMutableRawBufferPointer(
+                rebasing: arena[item.slot * nativeRowBytes ..< (item.slot + 1) * nativeRowBytes])
+            do {
+                try decoder.decode(input, scratch: values, into: output)
+            } catch {
+                firstFailures[strip] = item.slot
+                return
+            }
+        }
+    }
+}
+
+/// One wave of whole rows written straight to their destinations on `strips`
+/// workers: coded rows decoded, recent rows copied. Rows have disjoint
+/// destinations; each worker uses its own Float scratch, stops at its first
+/// refused row and records its index in `firstFailures[strip]`.
+private struct CBv2RowDirectWave: @unchecked Sendable {
+    let source: UnsafeRawBufferPointer
+    let scratch: UnsafeMutableRawBufferPointer
+    let firstFailures: UnsafeMutableBufferPointer<Int>
+    let decoder: CBv2PreparedNativeCheckpointRowDecoder
+    /// (offset in `source`, coded) per row, in order.
+    let rows: [(source: Int, packed: Bool)]
+    let targets: [UnsafeMutableRawPointer]
+    let packedRowBytes: Int
+    let nativeRowBytes: Int
+    let scratchStride: Int
+
+    /// The lowest refused row, or nil.
+    func run(strips: Int) -> Int? {
+        guard !rows.isEmpty else { return nil }
+        if strips <= 1 {
+            write(strip: 0, of: 1)
+        } else {
+            DispatchQueue.concurrentPerform(iterations: strips) { write(strip: $0, of: strips) }
+        }
+        let first = firstFailures.prefix(strips).min() ?? Int.max
+        return first == Int.max ? nil : first
+    }
+
+    private func write(strip: Int, of strips: Int) {
+        firstFailures[strip] = Int.max
+        let values = UnsafeMutableRawBufferPointer(
+            rebasing: scratch[strip * scratchStride ..< (strip + 1) * scratchStride])
+        for index in rows.count * strip / strips ..< rows.count * (strip + 1) / strips {
+            let item = rows[index]
+            let output = UnsafeMutableRawBufferPointer(start: targets[index], count: nativeRowBytes)
+            if item.packed {
+                let input = UnsafeRawBufferPointer(
+                    rebasing: source[item.source ..< item.source + packedRowBytes])
+                do {
+                    try decoder.decode(input, scratch: values, into: output)
+                } catch {
+                    firstFailures[strip] = index
+                    return
+                }
+            } else {
+                // The recent band is opaque: preserve NaN payloads and signed zero.
+                output.copyMemory(
+                    from: UnsafeRawBufferPointer(
+                        rebasing: source[item.source ..< item.source + nativeRowBytes]))
+            }
+        }
     }
 }
