@@ -124,14 +124,25 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let pageTokens = CBv2PagedDefaults.pageSize
             let pages = (maximumSequenceLength + pageTokens - 1) / pageTokens
             let pageBytes = 2 * kind.kvHeads * kind.headDim * pageTokens * elementBytes
-            // One poison page is unavailable to requests; retain another page
-            // of rounding slack so the request's admitted bound is realizable.
-            let capacity = max(pageBytes * (pages + 2), 1) + 4 * 1024 * 1024
-            backend = try PagedKVBackend(layerKinds: [kind], config: .init(
-                capacityBytes: capacity, dtype: dtype, maxPrefillChunk: 512,
+            let segmentBytes = 4 * 1024 * 1024
+            var config = PagedKVPoolConfig(
+                capacityBytes: max(pageBytes * (pages + 2), 1) + segmentBytes, dtype: dtype,
+                maxPrefillChunk: 512,
                 nominalMaxSequenceLength: maximumSequenceLength,
-                segmentSizeBytes: min(capacity, 4 * 1024 * 1024),
-                layerDTypes: [dtype]))
+                segmentSizeBytes: segmentBytes,
+                layerDTypes: [dtype])
+            // The pool charges its grant whole segments (one poison page
+            // each, power-of-two sizes, allocation footprint), more than the
+            // pages alone past about 165K tokens: grant the row what it charges.
+            guard
+                let reservation = PagedKVPool.segmentedRowReservationBytes(
+                    layerKinds: [kind], maxLength: maximumSequenceLength, config: config)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "Nemotron MTP pool geometry is invalid")
+            }
+            config.capacityBytes = max(config.capacityBytes, reservation)
+            backend = try PagedKVBackend(layerKinds: [kind], config: config)
             let state = try backend.makeSequenceState(
                 layerKinds: [kind], promptLength: 0, maxLength: maximumSequenceLength)
             row = state[0] as! PagedSequenceKV

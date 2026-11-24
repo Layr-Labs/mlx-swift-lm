@@ -730,6 +730,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            The Nemotron-H 3.5 MTP assistant's private paged pool is granted the segmented pool's own
+            charge for its one row (`PagedKVPool.segmentedRowReservationBytes`).
             Lightning cluster decode uses explicit per-request projection/expert arithmetic
             and compact owned recurrent rows so retiring lanes do not retain other histories.
             Without a cache, the attention layers of Nemotron-H get a causal mask. Upstream gave them no mask.
@@ -746,6 +748,7 @@ def:
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
+            - "changelog.d/nemotron35-*.md"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoESigmoidRoutingTests.swift"
             - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
