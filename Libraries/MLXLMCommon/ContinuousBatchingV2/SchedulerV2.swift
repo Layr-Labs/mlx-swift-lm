@@ -446,6 +446,7 @@ public final class SchedulerV2 {
                 armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
                 hasPrefixReuse: rec.prefixReusePlan != nil,
                 requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                requestAllowsLatestCheckpoint: rec.canScheduleDemandedLatestCheckpoint,
                 continuation: rec.demandedCheckpointContinuation)
             if rec.demandedCheckpointContinuation != nil || range.continuation != nil {
                 demandedCheckpointRanges[rec.id] = range

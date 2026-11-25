@@ -1,10 +1,20 @@
 // Copyright © 2026 Eigen Labs.
 
 extension CBv2Request {
-    /// Qualification for this text-only scheduling policy, not cache-hit proof.
-    /// Reuse/capture keep their existing scope, identity and allocation gates.
+    /// Qualification for the end-of-prompt and capture-boundary partitions,
+    /// which need no coordinator hint. An unscoped request (a local caller's)
+    /// is captured under the cache-level salt, so it qualifies too. This only
+    /// qualifies a text-only scheduling policy and is no cache-hit proof:
+    /// reuse and capture keep their existing scope, identity and allocation
+    /// gates.
+    var canScheduleDemandedLatestCheckpoint: Bool {
+        prefixCacheEnabled && !hasOutOfBandCheckpointInput
+    }
+
+    /// Qualification for the short-checkpoint partition, whose target is a
+    /// coordinator's hint for the request's scope.
     var canScheduleDemandedShortCheckpoint: Bool {
-        prefixCacheEnabled && !hasOutOfBandCheckpointInput && !(cacheSalt ?? "").isEmpty
+        canScheduleDemandedLatestCheckpoint && !(cacheSalt ?? "").isEmpty
     }
 }
 
@@ -13,9 +23,17 @@ extension CBv2ScheduledRequest {
     /// Ordinary computed progress under changing chunk caps stays eligible.
     /// A shape-bound adopter must run its forced chunk whole, so no demanded
     /// boundary may shorten its range.
+    private var demandedCheckpointMayCutRange: Bool {
+        preemptionCount == 0 && !shortCheckpointCaptureDisarmed
+            && prefixReusePlan?.recurrentChunkSize == nil
+    }
+
+    var canScheduleDemandedLatestCheckpoint: Bool {
+        request.canScheduleDemandedLatestCheckpoint && demandedCheckpointMayCutRange
+    }
+
     var canScheduleDemandedShortCheckpoint: Bool {
-        request.canScheduleDemandedShortCheckpoint && preemptionCount == 0
-            && !shortCheckpointCaptureDisarmed && prefixReusePlan?.recurrentChunkSize == nil
+        request.canScheduleDemandedShortCheckpoint && demandedCheckpointMayCutRange
     }
 }
 
@@ -30,16 +48,21 @@ extension CBv2SchedulerConfig {
             computedTokens: computedTokens, proposed: proposed,
             armedSoloStripeTokens: armedSoloStripeTokens,
             hasPrefixReuse: hasPrefixReuse, requestAllowsCheckpoint: requestAllowsCheckpoint,
-            continuation: nil
+            requestAllowsLatestCheckpoint: requestAllowsCheckpoint, continuation: nil
         ).count
     }
 
     /// Shared by authoritative scheduling and pure deadline projection.
     /// A long split remembers this actual proposed range's end; it never
     /// reconstructs a global grid or increases a stripe or token/byte grant.
+    /// `requestAllowsCheckpoint` qualifies the short partition and
+    /// `requestAllowsLatestCheckpoint` the end-of-prompt and capture-boundary
+    /// partitions (`CBv2ScheduledRequest.canScheduleDemandedShortCheckpoint`
+    /// and `canScheduleDemandedLatestCheckpoint`).
     func demandedCheckpointRange(
         promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
         armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, requestAllowsCheckpoint: Bool,
+        requestAllowsLatestCheckpoint: Bool,
         continuation: CBv2DemandedCheckpointContinuation?
     ) -> CBv2DemandedCheckpointRange {
         let ordinary = CBv2DemandedCheckpointRange(count: proposed, continuation: nil)
@@ -47,7 +70,7 @@ extension CBv2SchedulerConfig {
             return demandedCaptureBoundaryRange(
                 promptTokens: promptTokens, hintTokens: hintTokens,
                 computedTokens: computedTokens, proposed: proposed,
-                requestAllowsCheckpoint: requestAllowsCheckpoint) ?? ordinary
+                requestAllowsCheckpoint: requestAllowsLatestCheckpoint) ?? ordinary
         }
         let short = demandedShortCheckpointRange(
             promptTokens: promptTokens, hintTokens: hintTokens,
@@ -57,7 +80,7 @@ extension CBv2SchedulerConfig {
         return demandedLatestCheckpointRange(
             promptTokens: promptTokens, hintTokens: hintTokens,
             computedTokens: computedTokens, proposed: short.count,
-            requestAllowsCheckpoint: requestAllowsCheckpoint) ?? short
+            requestAllowsCheckpoint: requestAllowsLatestCheckpoint) ?? short
     }
 
     /// The short-checkpoint partition (`demandedShortCheckpointMinimumTokens`).
