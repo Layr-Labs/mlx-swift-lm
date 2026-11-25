@@ -157,8 +157,19 @@ final class Qwen3NextMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
+    /// `downProj(silu(gateProj(x)) * upProj(x))`. With the qwen3_5 decode
+    /// fusions on, the SwiGLU product is one compiled kernel
+    /// (`Qwen35DecodeFusions.siluMultiply`: the same ops at the same dtypes,
+    /// so the same values) instead of `silu`'s kernel and a multiply. This is
+    /// the dense MLP of one-stream decode and prompt chunks, and the A3B
+    /// shared expert; batched decode rows already take `siluMultiply`.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return downProj(silu(gateProj(x)) * upProj(x))
+        let gate = gateProj(x)
+        let up = upProj(x)
+        let hidden =
+            Qwen35DecodeFusions.isEnabledV2
+            ? Qwen35DecodeFusions.siluMultiply(gate, up) : silu(gate) * up
+        return downProj(hidden)
     }
 }
 
