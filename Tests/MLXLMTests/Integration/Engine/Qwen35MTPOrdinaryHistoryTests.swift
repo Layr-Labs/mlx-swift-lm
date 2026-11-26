@@ -62,6 +62,8 @@ struct Qwen35MTPOrdinaryHistoryTests {
         eval(model)
         let assistant = try Qwen35InlineMTPAssistant.load(
             from: directory, target: model, verificationMode: .serialTarget)
+        // These tests need batch-gated cohorts whatever the runner's environment.
+        assistant.speculativeBatchLimit = 1
         return (model, assistant)
     }
 
