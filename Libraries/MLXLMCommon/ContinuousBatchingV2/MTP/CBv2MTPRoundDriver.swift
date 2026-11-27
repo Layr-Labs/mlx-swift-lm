@@ -971,7 +971,7 @@ final class CBv2MTPRoundDriver {
     /// Batch depth and its target-only relaxation need the marginal policy
     /// and a drafter whose rows commit their own accepted prefix.
     static func batchDepthApplies(enabled: Bool, marginalPolicy: Bool, perRowCommit: Bool) -> Bool {
-        enabled && marginalPolicy && perRowCommit
+        enabled && marginalPolicy  // RED CONTROL (never merge): perRowCommit dropped
     }
 
     /// The marginal policy's depth for a plan of several drafting `rows`
