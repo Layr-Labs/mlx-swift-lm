@@ -597,7 +597,7 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// prior. Rounds are the only other source of evidence, so without this
     /// a row that once chose depth zero would never draft again.
     mutating func relaxTowardPrior(steps: Int = 1) {
-        guard steps > 0 else { return }
+        guard steps > 0, false else { return }  // RED CONTROL (never merge)
         let keep = pow(1 - Self.relaxationPerStep, Double(steps))
         for position in probabilities.indices {
             probabilities[position] =
@@ -901,6 +901,16 @@ enum CBv2MTPMarginalDepthPolicy {
             maximumDepth,
             min(offeredDepth, min(shortest - 1, min(verificationLimit, costRatios.count - 1))))
         guard cap > 0 else { return 0 }
+        // RED CONTROL: the rectangle takes the minimum of the rows' own depths (never merge).
+        if cap > 0 {
+            return rows.map {
+                selectDepthByCost(
+                    offeredDepth: offeredDepth, remainingTokens: $0.remainingTokens,
+                    verificationLimit: verificationLimit,
+                    acceptanceProbabilities: $0.acceptanceProbabilities,
+                    previousTargetTopTwoMargin: $0.previousTargetTopTwoMargin, costRatios: costRatios)
+            }.min() ?? 0
+        }
         let base = Double(rows.count + max(0, fixedTokenRows))
         var reach = [Double](repeating: 1, count: rows.count)
         var expected = 0.0
