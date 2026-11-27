@@ -101,6 +101,7 @@ extension EngineLoopV2 {
                 finishRequest(id, reason: .error("assistant history: \(error)"))
                 continue
             }
+            mtp.noteTargetOnlyDecodeStep(id: id)
             if rec.pendingSamples == 0 {
                 mtp.storeCarry(
                     id: id, token: rec.tokens.last!, hidden: hidden,

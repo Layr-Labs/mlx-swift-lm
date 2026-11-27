@@ -364,15 +364,27 @@ extension EngineLoopV2 {
         if mtp.usesMarginalPolicy, !decision.isExploration, depth > 0, !eligibleRows.isEmpty {
             let verificationLimit = mtp.maximumAutomaticDepth(plannedDecodeRows: rows.count)
             let offered = depth
-            let marginalDepth =
-                eligibleRows.map { rec in
-                    mtp.marginalDepth(
-                        for: rec.id,
-                        offeredDepth: offered,
-                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
-                        verificationLimit: verificationLimit,
-                        decodeRowBucket: decision.decodeRowBucket)
-                }.min() ?? 0
+            let marginalDepth: Int
+            if eligibleRows.count > 1, mtp.usesBatchDepth {
+                marginalDepth = mtp.batchMarginalDepth(
+                    rows: eligibleRows.map {
+                        (id: $0.id, remainingTokens: $0.request.maxTokens - $0.generatedTokenCount)
+                    },
+                    fixedTokenRows: rows.count - eligibleRows.count,
+                    offeredDepth: offered,
+                    verificationLimit: verificationLimit,
+                    decodeRowBucket: decision.decodeRowBucket)
+            } else {
+                marginalDepth =
+                    eligibleRows.map { rec in
+                        mtp.marginalDepth(
+                            for: rec.id,
+                            offeredDepth: offered,
+                            remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                            verificationLimit: verificationLimit,
+                            decodeRowBucket: decision.decodeRowBucket)
+                    }.min() ?? 0
+            }
             lower(to: marginalDepth, reason: "marginal_policy")
         }
         if depth > 0 {

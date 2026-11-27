@@ -256,6 +256,18 @@ struct Qwen35MTPOrdinaryHistoryTests {
     /// depth zero it runs exactly as with the process switch
     /// `DARKBLOOM_CBV2_MTP_DEPTH0_CHAINED=0`. The production assistant still
     /// chains those plans. Tokens equal target-only decode in every run.
+    /// The inline assistant commits one width per round, so the batch depth
+    /// and its target-only relaxation leave its draft cadence as before.
+    @Test("the inline assistant keeps the common-width depth policy")
+    func inlineAssistantKeepsTheCommonWidthDepthPolicy() throws {
+        let assistant = try fixture().1
+        #expect(!assistant.commitsAcceptedPrefixPerRow)
+        #expect(
+            !CBv2MTPRoundDriver.batchDepthApplies(
+                enabled: true, marginalPolicy: true,
+                perRowCommit: assistant.commitsAcceptedPrefixPerRow))
+    }
+
     @Test("depth-zero plans chain only for a drafter that opts in")
     func depthZeroChainingNeedsTheDrafterOptIn() async throws {
         struct Run {
