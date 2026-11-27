@@ -48,7 +48,7 @@ extension EngineLoopV2 {
             constraintEligible,
             samplingEligible,
             mtpLogprobRowEligible(rec),
-            sampling.logitBias.isEmpty,
+            mtpLogitBiasEligible(rec),
             mtpRepetitionPenaltyEligible(rec),
             mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
@@ -103,6 +103,30 @@ extension EngineLoopV2 {
             penaltyVerification: sampler.supportsMTPRepetitionPenaltyVerification,
             constrained: rec.request.tokenConstraint != nil,
             finite: sampling.repetitionPenalty.isFinite)
+    }
+
+    /// A row with a `logit_bias` may draft only when the engine opted in and
+    /// the kill switch is not set (`CBv2MTPConfig.effectiveLogitBiasSpeculation`),
+    /// the drafter opted into target-prefix acceptance and the sampler adds the
+    /// bias at every verify position (`supportsMTPLogitBiasVerification`; such
+    /// rows always accept exactly). Constrained rows keep the historical
+    /// exclusion. Without the opt-in every bias row stays target-only.
+    func mtpLogitBiasEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard !sampling.logitBias.isEmpty else { return true }
+        return Self.mtpLogitBiasRowEligible(
+            switchOn: mtp?.config.effectiveLogitBiasSpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            biasVerification: sampler.supportsMTPLogitBiasVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.logitBias.values.allSatisfy(\.isFinite))
+    }
+
+    static func mtpLogitBiasRowEligible(
+        switchOn: Bool, targetPrefix: Bool, biasVerification: Bool,
+        constrained: Bool, finite: Bool
+    ) -> Bool {
+        switchOn && targetPrefix && biasVerification && !constrained && finite
     }
 
     static func mtpPenaltyRowEligible(

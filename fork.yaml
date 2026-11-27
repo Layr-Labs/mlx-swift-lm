@@ -239,6 +239,9 @@ def:
             off) lets rows that request logprobs draft on a `.rectangularExact` target under exact
             acceptance; each committed token's logprobs come from the verify window's raw logits, the
             values a one-token decode step gives.
+            `CBv2MTPConfig.logitBiasSpeculation` (off by default; `DARKBLOOM_MTP_LOGIT_BIAS_ROWS=0` turns
+            it off) lets rows with a `logit_bias` draft: every verify position adds the row's bias before
+            its other transforms, as ordinary decode's first stage does, and these rows accept exactly.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
             - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
@@ -248,6 +251,7 @@ def:
             - "changelog.d/cbv2-mtp-repetition-penalty-rows.md"
             - "changelog.d/cbv2-mtp-draft-prompt-limit-cohort.md"
             - "changelog.d/cbv2-mtp-logprob-rows.md"
+            - "changelog.d/mtp-logit-bias-rows.md"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
