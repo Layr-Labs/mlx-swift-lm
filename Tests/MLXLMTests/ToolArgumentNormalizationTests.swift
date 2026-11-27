@@ -549,6 +549,35 @@ struct ToolArgumentNormalizationTests {
         #expect(arguments == #"{"value":"12345678901234567890"}"#)
     }
 
+    @Test("Gemma keeps its marker-quoted and bare text under string-rejecting schemas")
+    func gemmaValuesUnchanged() throws {
+        let schemas: [[String: any Sendable]] = [
+            Self.notString,
+            ["anyOf": [["type": "integer"], ["type": "boolean"]] as [[String: any Sendable]]],
+        ]
+        for schema in schemas {
+            let tools = tools(schema)
+            for strict in [false, true] {
+                let call = try #require(
+                    GemmaFunctionParser(strict: strict).parse(
+                        content: #"<|tool_call>call:read{value:<|"|>-2500<|"|>}<tool_call|>"#,
+                        tools: tools))
+                #expect(call.function.arguments["value"] == .string("-2500"))
+            }
+            let older = GemmaFunctionParser(
+                startTag: "<start_function_call>", endTag: "<end_function_call>",
+                escapeMarker: "<escape>")
+            for field in ["<escape>-2500<escape>", "-2500"] {
+                let call = try #require(
+                    older.parse(
+                        content:
+                            "<start_function_call>call:read{value:\(field)}<end_function_call>",
+                        tools: tools))
+                #expect(call.function.arguments["value"] == .string("-2500"), "\(field)")
+            }
+        }
+    }
+
     @Test("Streaming exposes no text a literal reading would replace")
     func keepsTextAgreesWithLiteralReading() {
         let parameters: (([String: any Sendable]) -> [[String: any Sendable]]) = { self.tools($0) }
