@@ -599,12 +599,14 @@ def:
             request as one graph; `prefillWithHidden` also returns each chunk's last decoder layer rows from
             that graph, for an MTP assistant's history.
             Plain (non-speculative) decode steps commit a Metal command buffer about every 100 kernel
-            dispatches (`Qwen35DecodeCommandBuffers`, as GPT-OSS, Nemotron and Gemma 4 do); prefill chunks, MTP
-            rounds and the Prism Hadamard text pack keep MLX's defaults, and
-            `DARKBLOOM_QWEN35_DECODE_COMMAND_BUFFERS=0` restores them for decode. Outputs keep their bits.
+            dispatches (`Qwen35DecodeCommandBuffers`, as GPT-OSS, Nemotron and Gemma 4 do), and MTP rounds of
+            rows of at most 8 tokens take the same limits; prefill chunks and the Prism Hadamard text pack keep
+            MLX's defaults. `DARKBLOOM_QWEN35_DECODE_COMMAND_BUFFERS=0` / `DARKBLOOM_QWEN35_MTP_COMMAND_BUFFERS=0`
+            restore them for decode steps / MTP rounds. Outputs keep their bits.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "changelog.d/qwen35-decode-command-buffers.md"
+            - "changelog.d/qwen35-mtp-command-buffers.md"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
             - "Libraries/MLXLMCommon/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"

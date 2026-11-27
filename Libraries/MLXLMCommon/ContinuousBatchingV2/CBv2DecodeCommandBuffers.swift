@@ -5,7 +5,10 @@ import MLX
 /// defaults, so the CPU encodes further ahead of the GPU. Such steps keep few
 /// and small temporaries alive per buffer; prefill chunks (which may decode
 /// weight tiles) and speculative rounds keep MLX's defaults and their memory
-/// unless the model also declares `speculativeCommandBufferLimits`.
+/// unless the model also declares `speculativeCommandBufferLimits`. A
+/// speculative round's first draft step can also move an assistant's queued
+/// history (a whole prompt on a request's first round) through its head inside
+/// the round, so such rounds can hold larger temporaries.
 public protocol CBv2DecodeCommandBufferLimitsProviding: AnyObject {
     var decodeCommandBufferLimits: GPU.CommandBufferLimits? { get }
     /// Limits for speculative (MTP) rounds whose rows each carry at most
