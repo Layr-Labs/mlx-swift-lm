@@ -473,7 +473,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         // Stage (1) of `LogitsPipelineV2.process`: each row's bias, the same
         // float32 add at every window position (zero for rows without one).
         let biasRows = params.map { !$0.logitBias.isEmpty }
-        if biasRows.contains(true) {
+        // RED CONTROL: the verify window drops the bias (never merge).
+        if biasRows.contains(true) && false {
             let bias = LogitsPipelineV2.biasMatrix(params: params, vocabSize: vocab)
             flat =
                 flat
