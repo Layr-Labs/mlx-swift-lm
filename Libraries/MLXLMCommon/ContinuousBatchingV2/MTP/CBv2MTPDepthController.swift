@@ -585,11 +585,25 @@ struct CBv2MTPRequestAcceptanceState: Equatable {
     /// Bounded by each drafter's qualified captured-window contract.
     static let maximumDepth = 7
     private static let alpha = 0.15
+    /// Share of the gap to the prior closed per target-only decode step.
+    static let relaxationPerStep = 1.0 / 64
 
-    private(set) var probabilities: [Double] =
-        (0 ..< CBv2MTPRequestAcceptanceState.maximumDepth).map {
-            0.85 * pow(0.98, Double($0))
+    static let prior: [Double] = (0 ..< maximumDepth).map { 0.85 * pow(0.98, Double($0)) }
+
+    private(set) var probabilities: [Double] = CBv2MTPRequestAcceptanceState.prior
+
+    /// One target-only decode step of a row whose depth policy chose no
+    /// draft: every estimate moves `relaxationPerStep` of the way back to the
+    /// prior. Rounds are the only other source of evidence, so without this
+    /// a row that once chose depth zero would never draft again.
+    mutating func relaxTowardPrior(steps: Int = 1) {
+        guard steps > 0 else { return }
+        let keep = pow(1 - Self.relaxationPerStep, Double(steps))
+        for position in probabilities.indices {
+            probabilities[position] =
+                Self.prior[position] + (probabilities[position] - Self.prior[position]) * keep
         }
+    }
 
     /// Records positions whose target outcome was actually observed and, after
     /// a fully accepted round, transfers bounded optimism to the next position.
@@ -850,6 +864,63 @@ enum CBv2MTPMarginalDepthPolicy {
             let ratio = costRatios[depth + 1]
             guard ratio.isFinite, ratio > 0 else { break }
             let value = (1.0 + expected) / ratio
+            if value > bestValue {
+                best = depth + 1
+                bestValue = value
+            }
+        }
+        return best
+    }
+
+    /// One drafting row of a rectangular plan (`selectBatchDepthByCost`).
+    struct BatchRow: Equatable {
+        let remainingTokens: Int
+        let acceptanceProbabilities: [Double]
+        let previousTargetTopTwoMargin: Double?
+    }
+
+    /// The common depth of a rectangular round whose rows each commit their
+    /// own accepted prefix: argmax over d of
+    /// (fixedTokenRows + sum over rows of (1 + E_r(d))) / costRatios[d].
+    /// `fixedTokenRows` are the plan's other decode rows, one token each at
+    /// any depth. With one row and none fixed this is `selectDepthByCost`.
+    /// The minimum of the rows' own choices instead lets one weak row stop
+    /// every row from drafting, although a weak row still commits its target
+    /// token. Every ordinary limit bounds d for the whole rectangle.
+    static func selectBatchDepthByCost(
+        offeredDepth: Int,
+        verificationLimit: Int,
+        rows: [BatchRow],
+        fixedTokenRows: Int,
+        costRatios: [Double]
+    ) -> Int {
+        guard offeredDepth > 0, verificationLimit > 0,
+            let shortest = rows.map(\.remainingTokens).min(), shortest > 1
+        else { return 0 }
+        let cap = min(
+            maximumDepth,
+            min(offeredDepth, min(shortest - 1, min(verificationLimit, costRatios.count - 1))))
+        guard cap > 0 else { return 0 }
+        let base = Double(rows.count + max(0, fixedTokenRows))
+        var reach = [Double](repeating: 1, count: rows.count)
+        var expected = 0.0
+        var best = 0
+        var bestValue = base / max(costRatios[0], 1.0)
+        for depth in 0 ..< cap {
+            for (index, row) in rows.enumerated() {
+                let rawProbability =
+                    depth < row.acceptanceProbabilities.count
+                    ? row.acceptanceProbabilities[depth]
+                    : 0
+                reach[index] *= cappedAcceptanceProbability(
+                    position: depth,
+                    acceptanceProbability: rawProbability,
+                    previousMargin: row.previousTargetTopTwoMargin)
+                expected += reach[index]
+            }
+            let ratio = costRatios[depth + 1]
+            guard ratio.isFinite, ratio > 0 else { break }
+            let value = (base + expected) / ratio
             if value > bestValue {
                 best = depth + 1
                 bestValue = value

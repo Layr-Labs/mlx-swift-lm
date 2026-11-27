@@ -96,12 +96,16 @@ extension EngineLoopV2 {
                 || (sampler.supportsMTPRepetitionPenaltyVerification
                     && CBv2MTPVerifyPenalties.appliesRepetition(sampling))
         }
+        // Bias rows (greedy or not) are scored with the bias added at every
+        // window position, which also needs the target-prefix path.
+        let biasVerification = sampler.supportsMTPLogitBiasVerification
         let useTargetPrefix =
             mtp.targetPrefixAcceptance && sampler.supportsMTPTargetPrefix
             && rows.contains {
                 $0.rec.request.sampling.temperature >= LogitsPipelineV2.greedyEpsilon
                     || (penaltyVerification
                         && CBv2MTPVerifyPenalties.appliesAny($0.rec.request.sampling))
+                    || (biasVerification && !$0.rec.request.sampling.logitBias.isEmpty)
             }
         let penaltyOutputs: [ArraySlice<Int>]? =
             useTargetPrefix && penaltyVerification

@@ -48,7 +48,7 @@ extension EngineLoopV2 {
             constraintEligible,
             samplingEligible,
             mtpLogprobRowEligible(rec),
-            sampling.logitBias.isEmpty,
+            mtpLogitBiasEligible(rec),
             mtpRepetitionPenaltyEligible(rec),
             mtpPenaltiesEligible(rec),
             rec.request.stopStrings.isEmpty
@@ -103,6 +103,30 @@ extension EngineLoopV2 {
             penaltyVerification: sampler.supportsMTPRepetitionPenaltyVerification,
             constrained: rec.request.tokenConstraint != nil,
             finite: sampling.repetitionPenalty.isFinite)
+    }
+
+    /// A row with a `logit_bias` may draft only when the engine opted in and
+    /// the kill switch is not set (`CBv2MTPConfig.effectiveLogitBiasSpeculation`),
+    /// the drafter opted into target-prefix acceptance and the sampler adds the
+    /// bias at every verify position (`supportsMTPLogitBiasVerification`; such
+    /// rows always accept exactly). Constrained rows keep the historical
+    /// exclusion. Without the opt-in every bias row stays target-only.
+    func mtpLogitBiasEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        let sampling = rec.request.sampling
+        guard !sampling.logitBias.isEmpty else { return true }
+        return Self.mtpLogitBiasRowEligible(
+            switchOn: mtp?.config.effectiveLogitBiasSpeculation == true,
+            targetPrefix: mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix,
+            biasVerification: sampler.supportsMTPLogitBiasVerification,
+            constrained: rec.request.tokenConstraint != nil,
+            finite: sampling.logitBias.values.allSatisfy(\.isFinite))
+    }
+
+    static func mtpLogitBiasRowEligible(
+        switchOn: Bool, targetPrefix: Bool, biasVerification: Bool,
+        constrained: Bool, finite: Bool
+    ) -> Bool {
+        switchOn && targetPrefix && biasVerification && !constrained && finite
     }
 
     static func mtpPenaltyRowEligible(
@@ -340,15 +364,27 @@ extension EngineLoopV2 {
         if mtp.usesMarginalPolicy, !decision.isExploration, depth > 0, !eligibleRows.isEmpty {
             let verificationLimit = mtp.maximumAutomaticDepth(plannedDecodeRows: rows.count)
             let offered = depth
-            let marginalDepth =
-                eligibleRows.map { rec in
-                    mtp.marginalDepth(
-                        for: rec.id,
-                        offeredDepth: offered,
-                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
-                        verificationLimit: verificationLimit,
-                        decodeRowBucket: decision.decodeRowBucket)
-                }.min() ?? 0
+            let marginalDepth: Int
+            if eligibleRows.count > 1, mtp.usesBatchDepth {
+                marginalDepth = mtp.batchMarginalDepth(
+                    rows: eligibleRows.map {
+                        (id: $0.id, remainingTokens: $0.request.maxTokens - $0.generatedTokenCount)
+                    },
+                    fixedTokenRows: rows.count - eligibleRows.count,
+                    offeredDepth: offered,
+                    verificationLimit: verificationLimit,
+                    decodeRowBucket: decision.decodeRowBucket)
+            } else {
+                marginalDepth =
+                    eligibleRows.map { rec in
+                        mtp.marginalDepth(
+                            for: rec.id,
+                            offeredDepth: offered,
+                            remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                            verificationLimit: verificationLimit,
+                            decodeRowBucket: decision.decodeRowBucket)
+                    }.min() ?? 0
+            }
             lower(to: marginalDepth, reason: "marginal_policy")
         }
         if depth > 0 {

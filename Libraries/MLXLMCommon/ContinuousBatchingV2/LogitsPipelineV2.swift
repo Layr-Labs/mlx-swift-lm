@@ -478,6 +478,19 @@ public final class LogitsPipelineV2 {
 
     // MARK: - Membership-change tensor builders
 
+    /// The `[B, vocab]` float32 bias `process` adds at stage (1) for rows with
+    /// these parameters, built exactly as `setRows` builds it. MTP verification
+    /// adds it at every window position.
+    static func biasMatrix(params: [CBv2SamplingParams], vocabSize: Int) -> MLXArray {
+        buildBiasMatrix(
+            rows: params.enumerated().map { index, p in
+                CBv2SamplerRow(
+                    id: CBv2RequestID(UInt64(index)), params: p, promptTokens: [],
+                    outputTokens: [])
+            },
+            vocabSize: vocabSize)
+    }
+
     private static func buildBiasMatrix(rows: [CBv2SamplerRow], vocabSize: Int) -> MLXArray {
         var rowIdx = [Int32]()
         var colIdx = [Int32]()

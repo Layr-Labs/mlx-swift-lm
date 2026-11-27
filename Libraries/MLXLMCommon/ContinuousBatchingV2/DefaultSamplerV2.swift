@@ -287,11 +287,12 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
     public var supportsMTPTargetPrefix: Bool { true }
     public var supportsMTPPenaltyVerification: Bool { true }
     public var supportsMTPRepetitionPenaltyVerification: Bool { true }
+    public var supportsMTPLogitBiasVerification: Bool { true }
 
     /// Pure re-derivation of the ordinary per-token draw for every verify
     /// window position. Eligibility gating guarantees the admitted rows use
-    /// only the STATELESS transforms (temperature → top-k/top-p/min-p; no
-    /// bias, constraints, or logprob capture; presence/frequency penalties
+    /// only the STATELESS transforms (logit bias → temperature →
+    /// top-k/top-p/min-p; no constraints; presence/frequency penalties
     /// only through the `penalties:` overload), so this mirrors
     /// `LogitsPipelineV2.process` + `SamplerV2.sample` per (row, position)
     /// without touching the incremental pipeline state. RNG keys use the
@@ -469,6 +470,16 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
             precondition(typical.delta > 0, "MTP typical delta must be positive")
         }
         var flat = logits.reshaped([b * w, vocab]).asType(.float32)
+        // Stage (1) of `LogitsPipelineV2.process`: each row's bias, the same
+        // float32 add at every window position (zero for rows without one).
+        let biasRows = params.map { !$0.logitBias.isEmpty }
+        if biasRows.contains(true) {
+            let bias = LogitsPipelineV2.biasMatrix(params: params, vocabSize: vocab)
+            flat =
+                flat
+                + broadcast(bias.reshaped([b, 1, vocab]), to: [b, w, vocab])
+                .reshaped([b * w, vocab])
+        }
         // Penalty rows: stage (2) of `LogitsPipelineV2.process` per window
         // position, repetition first, then presence/frequency. Rows without a
         // penalty are left untouched (the ordinary path's `x - 0 * counts`,
@@ -570,10 +581,10 @@ public final class CBv2DefaultSampler: CBv2StepSampler, CBv2FreeSpanSampler {
         let floor = minimum(exp(-entropy) * typical.delta, MLXArray(Float(1)))
         let typicalAccept = pDraft .> floor
         let exact = Self.exactAccept(tokens: tokens, draftIDs: typical.draftIDs)
-        // Greedy rows, and penalty rows when penalties are applied, accept
-        // exactly (target prefix).
+        // Greedy rows, bias rows, and penalty rows when penalties are
+        // applied, accept exactly (target prefix).
         let exactRows = (0 ..< b * w).map { i in
-            greedyFlags[i] || (penalties != nil && penaltyRows[i / w])
+            greedyFlags[i] || biasRows[i / w] || (penalties != nil && penaltyRows[i / w])
         }
         let exactPerPosition = MLXArray(exactRows).reshaped([b, w])[0..., ..<d]
         return (tokens, which(exactPerPosition, exact, typicalAccept))

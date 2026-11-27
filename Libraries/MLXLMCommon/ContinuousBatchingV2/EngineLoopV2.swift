@@ -220,6 +220,11 @@ public protocol CBv2StepSampler: AnyObject {
     /// Gates MTP for repetition-penalty rows. Default false.
     var supportsMTPRepetitionPenaltyVerification: Bool { get }
 
+    /// True when the verify entry points add each row's `logitBias` at every
+    /// window position before the other transforms, exactly as the ordinary
+    /// pipeline's first stage does. Gates MTP for bias rows. Default false.
+    var supportsMTPLogitBiasVerification: Bool { get }
+
     /// `mtpVerifySample` with presence/frequency penalties (and the
     /// repetition penalty where `supportsMTPRepetitionPenaltyVerification`).
     /// nil `penalties` is exactly `mtpVerifySample`.
@@ -312,6 +317,7 @@ extension CBv2StepSampler {
     public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
     public var supportsMTPPenaltyVerification: Bool { false }
     public var supportsMTPRepetitionPenaltyVerification: Bool { false }
+    public var supportsMTPLogitBiasVerification: Bool { false }
     public func mtpVerifySample(
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int], penalties: CBv2MTPVerifyPenalties?

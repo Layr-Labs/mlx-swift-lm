@@ -945,6 +945,93 @@ final class CBv2MTPRoundDriver {
             headStepCostRatio: cost.headStepCostRatio)
     }
 
+    /// `DARKBLOOM_CBV2_MTP_BATCH_DEPTH=0/false/no/off` keeps the minimum of
+    /// the rows' own depths for every plan, and keeps a row's acceptance
+    /// estimate fixed between its rounds. Read once.
+    static let envBatchDepth: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_BATCH_DEPTH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// Tests may set it on the engine queue before submitting requests.
+    var batchDepthEnabled = CBv2MTPRoundDriver.envBatchDepth
+
+    /// Plans of several drafting rows take one depth for the whole rectangle
+    /// from the rows' combined tokens per round cost
+    /// (`CBv2MTPMarginalDepthPolicy.selectBatchDepthByCost`). Only for a
+    /// drafter whose rows commit their own accepted prefix; a common committed
+    /// width keeps the minimum of the rows' own depths. Tokens are unaffected:
+    /// every depth verifies exactly.
+    var usesBatchDepth: Bool {
+        Self.batchDepthApplies(
+            enabled: batchDepthEnabled, marginalPolicy: usesMarginalPolicy,
+            perRowCommit: drafter.commitsAcceptedPrefixPerRow)
+    }
+
+    /// Batch depth and its target-only relaxation need the marginal policy
+    /// and a drafter whose rows commit their own accepted prefix.
+    static func batchDepthApplies(enabled: Bool, marginalPolicy: Bool, perRowCommit: Bool) -> Bool {
+        enabled && marginalPolicy && perRowCommit
+    }
+
+    /// The marginal policy's depth for a plan of several drafting `rows`
+    /// beside `fixedTokenRows` decode rows that cannot draft.
+    func batchMarginalDepth(
+        rows: [(id: CBv2RequestID, remainingTokens: Int)],
+        fixedTokenRows: Int,
+        offeredDepth: Int,
+        verificationLimit: Int,
+        decodeRowBucket: Int
+    ) -> Int {
+        guard usesRequestStatefulDrafter, config.fixedDraftTokens == nil else {
+            return min(max(offeredDepth, 0), config.maxDraftTokens)
+        }
+        let cost = rawCostEstimators[decodeRowBucket] ?? CBv2MTPRawCostEstimator()
+        let cappedOffer = min(offeredDepth, CBv2MTPMarginalDepthPolicy.maximumDepth)
+        if cost.needsSteadyStateProbe(depth: 1) {
+            return rows.map {
+                CBv2MTPMarginalDepthPolicy.boundedProbeDepth(
+                    offeredDepth: cappedOffer, remainingTokens: $0.remainingTokens,
+                    verificationLimit: verificationLimit)
+            }.min() ?? 0
+        }
+        let costRatios =
+            Self.costCurveDepthSelection(
+                configured: config.costCurveDepthSelection, environment: Self.costCurveEnvironment)
+            ? cost.costRatios(upTo: cappedOffer)
+            : (0 ... max(0, cappedOffer)).map { 1 + Double($0) * cost.headStepCostRatio }
+        return CBv2MTPMarginalDepthPolicy.selectBatchDepthByCost(
+            offeredDepth: cappedOffer,
+            verificationLimit: verificationLimit,
+            rows: rows.map { row in
+                CBv2MTPMarginalDepthPolicy.BatchRow(
+                    remainingTokens: row.remainingTokens,
+                    acceptanceProbabilities: (requestAcceptance[row.id]
+                        ?? CBv2MTPRequestAcceptanceState())
+                        .probabilities,
+                    previousTargetTopTwoMargin: carries[row.id]?.previousTopTwoMargin)
+            },
+            fixedTokenRows: fixedTokenRows,
+            costRatios: costRatios)
+    }
+
+    /// One target-only decode step finalized for a row that can draft: its
+    /// acceptance estimate relaxes toward the prior
+    /// (`CBv2MTPRequestAcceptanceState.relaxTowardPrior`), so a row whose early
+    /// drafts were rejected is offered drafts again later. Same scope as
+    /// `usesBatchDepth`.
+    func noteTargetOnlyDecodeStep(id: CBv2RequestID) {
+        guard usesBatchDepth, var state = requestAcceptance[id] else {
+            return
+        }
+        state.relaxTowardPrior()
+        requestAcceptance[id] = state
+    }
+
+    func requestAcceptanceForTesting(_ id: CBv2RequestID) -> CBv2MTPRequestAcceptanceState? {
+        requestAcceptance[id]
+    }
+
     /// `DARKBLOOM_CBV2_MTP_COST_CURVE`, read once.
     static let costCurveEnvironment =
         ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COST_CURVE"]

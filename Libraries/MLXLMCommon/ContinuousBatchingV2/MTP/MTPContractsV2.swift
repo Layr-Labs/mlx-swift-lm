@@ -679,6 +679,20 @@ public struct CBv2MTPConfig: Sendable {
     public var effectiveRepetitionPenaltySpeculation: Bool {
         repetitionPenaltySpeculation && Self.envRepetitionPenaltySpeculation
     }
+    /// Opt-in: admit rows with a `logit_bias` to target-prefix MTP when the
+    /// sampler adds the bias at every verify position before its other
+    /// transforms, as ordinary decode does
+    /// (`CBv2StepSampler.supportsMTPLogitBiasVerification`). Such rows always
+    /// use exact acceptance. Off by default; the process kill switch
+    /// `DARKBLOOM_MTP_LOGIT_BIAS_ROWS=0` overrides an opt-in
+    /// (`effectiveLogitBiasSpeculation`).
+    public var logitBiasSpeculation: Bool
+    /// False for `DARKBLOOM_MTP_LOGIT_BIAS_ROWS=0/false/no/off`; read once.
+    public static let envLogitBiasSpeculation = envSwitch("DARKBLOOM_MTP_LOGIT_BIAS_ROWS")
+    /// The opt-in AND the process kill switch.
+    public var effectiveLogitBiasSpeculation: Bool {
+        logitBiasSpeculation && Self.envLogitBiasSpeculation
+    }
     /// Opt-in: rows with stop strings may draft. The round's finalize
     /// confirms committed tokens one at a time through the row's
     /// detokenizer and ends the row at the first stop-string match, the
@@ -783,9 +797,11 @@ public struct CBv2MTPConfig: Sendable {
         costCurveDepthSelection: Bool = false,
         speculativeBatchLimit: Int = Self.testedMaxSpeculativeBatch,
         maxDraftPromptTokens: Int? = nil,
-        coupledProposals: Bool = false
+        coupledProposals: Bool = false,
+        logitBiasSpeculation: Bool = false
     ) {
         self.enabled = enabled
+        self.logitBiasSpeculation = logitBiasSpeculation
         self.coupledProposals = coupledProposals
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
